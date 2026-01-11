@@ -3,6 +3,7 @@ const config = @import("../config.zig");
 const buffer_pool = @import("buffer_pool.zig");
 const connection = @import("connection.zig");
 const kqueue_backend = @import("backend/kqueue.zig");
+const epoll_backend = @import("backend/epoll.zig");
 
 pub const IoRuntime = struct {
     allocator: std.mem.Allocator,
@@ -58,6 +59,11 @@ pub const IoRuntime = struct {
                 const count = translateKqueueEvents(kev, self.events);
                 return self.events[0..count];
             },
+            .linux_epoll => |*ep| {
+                const epev = try ep.poll(timeout_ms);
+                const count = translateEpollEvents(epev, self.events);
+                return self.events[0..count];
+            },
             else => {
                 if (timeout_ms > 0) {
                     sleepMs(timeout_ms);
@@ -69,8 +75,9 @@ pub const IoRuntime = struct {
 
     pub fn nextPollTimeoutMs(self: *IoRuntime, now_ms: u64) u32 {
         var min_timeout: u32 = 10;
-        for (self.connections.entries) |*conn| {
-            if (conn.state == .closed) continue;
+        // Iterate only active connections - O(active) instead of O(max)
+        for (self.connections.activeConnections()) |index| {
+            const conn = &self.connections.entries[index];
             const remaining = conn.remainingTimeoutMs(now_ms, self.cfg.timeouts);
             if (remaining == 0) return 0;
             if (remaining < min_timeout) min_timeout = remaining;
@@ -133,8 +140,10 @@ pub const IoRuntime = struct {
     }
 
     pub fn enforceTimeouts(self: *IoRuntime, now_ms: u64) void {
-        for (self.connections.entries) |*conn| {
-            if (conn.state == .closed or conn.state == .err) continue;
+        // Iterate only active connections - O(active) instead of O(max)
+        for (self.connections.activeConnections()) |index| {
+            const conn = &self.connections.entries[index];
+            if (conn.state == .err) continue;
             if (!conn.isTimedOut(now_ms, conn.timeout_phase, self.cfg.timeouts)) continue;
             const next_state: connection.State = switch (conn.timeout_phase) {
                 .idle => .draining,
@@ -147,6 +156,15 @@ pub const IoRuntime = struct {
     pub fn registerListener(self: *IoRuntime, fd: std.posix.fd_t) !void {
         return switch (self.backend_state) {
             .bsd_kqueue => |*kq| kq.registerListener(fd),
+            .linux_epoll => |*ep| ep.registerListener(fd),
+            else => error.UnsupportedBackend,
+        };
+    }
+
+    pub fn registerUdpSocket(self: *IoRuntime, fd: std.posix.fd_t) !void {
+        return switch (self.backend_state) {
+            .bsd_kqueue => |*kq| kq.registerUdpSocket(fd),
+            .linux_epoll => |*ep| ep.registerUdpSocket(fd),
             else => error.UnsupportedBackend,
         };
     }
@@ -154,6 +172,7 @@ pub const IoRuntime = struct {
     pub fn registerConnection(self: *IoRuntime, conn_id: u64, fd: std.posix.fd_t) !void {
         return switch (self.backend_state) {
             .bsd_kqueue => |*kq| kq.registerConnection(conn_id, fd),
+            .linux_epoll => |*ep| ep.registerConnection(conn_id, fd),
             else => error.UnsupportedBackend,
         };
     }
@@ -161,6 +180,7 @@ pub const IoRuntime = struct {
     pub fn unregister(self: *IoRuntime, fd: std.posix.fd_t) !void {
         return switch (self.backend_state) {
             .bsd_kqueue => |*kq| kq.unregister(fd),
+            .linux_epoll => |*ep| ep.unregister(fd),
             else => error.UnsupportedBackend,
         };
     }
@@ -186,11 +206,15 @@ pub const EventKind = enum {
     read,
     write,
     err,
+    datagram,
 };
+
+/// Magic identifier for UDP socket events to distinguish from TCP listener (0) and connections
+pub const UDP_SOCKET_ID: u64 = std.math.maxInt(u64) - 1;
 
 fn pickBackend() Backend {
     return switch (@import("builtin").os.tag) {
-        .linux => .linux_io_uring,
+        .linux => .linux_epoll,
         .macos, .freebsd, .netbsd, .openbsd, .dragonfly => .bsd_kqueue,
         .windows => .windows_iocp,
         else => .unknown,
@@ -199,7 +223,7 @@ fn pickBackend() Backend {
 
 pub const BackendState = union(Backend) {
     linux_io_uring: void,
-    linux_epoll: void,
+    linux_epoll: epoll_backend.EpollBackend,
     bsd_kqueue: kqueue_backend.KqueueBackend,
     windows_iocp: void,
     unknown: void,
@@ -208,8 +232,8 @@ pub const BackendState = union(Backend) {
 fn initBackend(allocator: std.mem.Allocator, backend: Backend, max_events: usize) !BackendState {
     return switch (backend) {
         .bsd_kqueue => .{ .bsd_kqueue = try kqueue_backend.KqueueBackend.init(allocator, max_events) },
+        .linux_epoll => .{ .linux_epoll = try epoll_backend.EpollBackend.init(allocator, max_events) },
         .linux_io_uring => .{ .linux_io_uring = {} },
-        .linux_epoll => .{ .linux_epoll = {} },
         .windows_iocp => .{ .windows_iocp = {} },
         .unknown => .{ .unknown = {} },
     };
@@ -218,11 +242,12 @@ fn initBackend(allocator: std.mem.Allocator, backend: Backend, max_events: usize
 fn deinitBackend(state: *BackendState, allocator: std.mem.Allocator) void {
     switch (state.*) {
         .bsd_kqueue => |*kq| kq.deinit(allocator),
+        .linux_epoll => |*ep| ep.deinit(allocator),
         else => {},
     }
 }
 
-fn translateKqueueEvents(events: []const std.posix.Kevent, out: []Event) usize {
+fn translateKqueueEvents(events: []const kqueue_backend.Kevent, out: []Event) usize {
     var count: usize = 0;
     for (events) |ev| {
         if (count >= out.len) break;
@@ -250,13 +275,23 @@ fn translateKqueueEvents(events: []const std.posix.Kevent, out: []Event) usize {
         const bytes: usize = @intCast(ev.data);
         if (ev.filter == kqueue_backend.EVFILT_READ) {
             if (ev.udata == 0) {
+                // TCP listener socket
                 out[count] = .{
                     .kind = .accept,
                     .conn_id = 0,
                     .bytes = 0,
                     .handle = @intCast(ev.ident),
                 };
+            } else if (ev.udata == std.math.maxInt(usize) - 1) {
+                // UDP socket - datagram ready
+                out[count] = .{
+                    .kind = .datagram,
+                    .conn_id = UDP_SOCKET_ID,
+                    .bytes = bytes,
+                    .handle = @intCast(ev.ident),
+                };
             } else {
+                // Connection read event
                 out[count] = .{
                     .kind = .read,
                     .conn_id = @intCast(ev.udata),
@@ -276,6 +311,72 @@ fn translateKqueueEvents(events: []const std.posix.Kevent, out: []Event) usize {
             };
             count += 1;
             continue;
+        }
+    }
+    return count;
+}
+
+fn translateEpollEvents(events: []const epoll_backend.EpollEvent, out: []Event) usize {
+    var count: usize = 0;
+    for (events) |ev| {
+        if (count >= out.len) break;
+        const conn_id = ev.data.u64;
+
+        // Check for error conditions
+        if ((ev.events & epoll_backend.EPOLLERR) != 0 or (ev.events & epoll_backend.EPOLLHUP) != 0) {
+            out[count] = .{
+                .kind = .err,
+                .conn_id = conn_id,
+                .bytes = 0,
+                .handle = null,
+            };
+            count += 1;
+            continue;
+        }
+
+        // Handle read events (including accept on listener where conn_id == 0)
+        if ((ev.events & epoll_backend.EPOLLIN) != 0) {
+            if (conn_id == 0) {
+                // TCP listener socket
+                // For epoll, we stored conn_id=0 for listener, but we need the fd
+                // The server will use its stored listener_fd
+                out[count] = .{
+                    .kind = .accept,
+                    .conn_id = 0,
+                    .bytes = 0,
+                    .handle = null, // Server uses its listener_fd
+                };
+            } else if (conn_id == UDP_SOCKET_ID) {
+                // UDP socket - datagram ready
+                out[count] = .{
+                    .kind = .datagram,
+                    .conn_id = UDP_SOCKET_ID,
+                    .bytes = 0, // epoll doesn't provide bytes available
+                    .handle = null, // Server uses its udp_fd
+                };
+            } else {
+                // Connection read event
+                out[count] = .{
+                    .kind = .read,
+                    .conn_id = conn_id,
+                    .bytes = 0, // epoll doesn't provide bytes available
+                    .handle = null,
+                };
+            }
+            count += 1;
+            // Don't continue - check for write too (edge-triggered)
+        }
+
+        // Handle write events
+        if ((ev.events & epoll_backend.EPOLLOUT) != 0 and conn_id != 0) {
+            if (count >= out.len) break;
+            out[count] = .{
+                .kind = .write,
+                .conn_id = conn_id,
+                .bytes = 0,
+                .handle = null,
+            };
+            count += 1;
         }
     }
     return count;

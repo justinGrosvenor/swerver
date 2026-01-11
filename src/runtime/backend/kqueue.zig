@@ -14,15 +14,25 @@ const is_supported = switch (builtin.os.tag) {
     else => false,
 };
 
+// Use std.posix.Kevent on BSD, stub type on other platforms
+pub const Kevent = if (is_supported) std.posix.Kevent else extern struct {
+    ident: usize,
+    filter: i16,
+    flags: u16,
+    fflags: u32,
+    data: isize,
+    udata: usize,
+};
+
 pub const KqueueBackend = struct {
     kq: std.posix.fd_t,
-    events: []std.posix.Kevent,
+    events: []Kevent,
 
     pub fn init(allocator: std.mem.Allocator, max_events: usize) !KqueueBackend {
         if (!is_supported) return error.Unsupported;
         const kq = std.posix.system.kqueue();
         if (kq < 0) return error.KqueueFailed;
-        const events = try allocator.alloc(std.posix.Kevent, max_events);
+        const events = try allocator.alloc(Kevent, max_events);
         return .{
             .kq = kq,
             .events = events,
@@ -34,32 +44,44 @@ pub const KqueueBackend = struct {
         std.posix.close(self.kq);
     }
 
-    pub fn poll(self: *KqueueBackend, timeout_ms: u32) ![]std.posix.Kevent {
+    pub fn poll(self: *KqueueBackend, timeout_ms: u32) ![]Kevent {
+        if (!is_supported) return error.Unsupported;
         const ts = std.posix.timespec{
             .sec = @intCast(timeout_ms / 1000),
             .nsec = @intCast((timeout_ms % 1000) * std.time.ns_per_ms),
         };
-        const count = try std.Io.Kqueue.kevent(self.kq, &[_]std.posix.Kevent{}, self.events, &ts);
+        const count = try std.Io.Kqueue.kevent(self.kq, &[_]Kevent{}, self.events, &ts);
         return self.events[0..count];
     }
 
     pub fn registerListener(self: *KqueueBackend, fd: std.posix.fd_t) !void {
+        if (!is_supported) return error.Unsupported;
         try self.registerEvent(fd, EVFILT_READ, 0);
     }
 
+    /// Register a UDP socket for read events.
+    /// Uses a special udata value to distinguish from TCP listener.
+    pub fn registerUdpSocket(self: *KqueueBackend, fd: std.posix.fd_t) !void {
+        if (!is_supported) return error.Unsupported;
+        // Use max u64 - 1 as magic value for UDP socket to distinguish from TCP listener (0)
+        try self.registerEvent(fd, EVFILT_READ, std.math.maxInt(usize) - 1);
+    }
+
     pub fn registerConnection(self: *KqueueBackend, conn_id: u64, fd: std.posix.fd_t) !void {
+        if (!is_supported) return error.Unsupported;
         const token: usize = @intCast(conn_id);
         try self.registerEvent(fd, EVFILT_READ, token);
         try self.registerEvent(fd, EVFILT_WRITE, token);
     }
 
     pub fn unregister(self: *KqueueBackend, fd: std.posix.fd_t) !void {
+        if (!is_supported) return error.Unsupported;
         try self.unregisterEvent(fd, EVFILT_READ);
         try self.unregisterEvent(fd, EVFILT_WRITE);
     }
 
     fn registerEvent(self: *KqueueBackend, fd: std.posix.fd_t, filter: i16, udata: usize) !void {
-        const ev = std.posix.Kevent{
+        const ev = Kevent{
             .ident = @intCast(fd),
             .filter = filter,
             .flags = EV_ADD | EV_ENABLE,
@@ -67,12 +89,12 @@ pub const KqueueBackend = struct {
             .data = 0,
             .udata = udata,
         };
-        var out: [0]std.posix.Kevent = .{};
-        _ = try std.Io.Kqueue.kevent(self.kq, &[_]std.posix.Kevent{ev}, out[0..], null);
+        var out: [0]Kevent = .{};
+        _ = try std.Io.Kqueue.kevent(self.kq, &[_]Kevent{ev}, out[0..], null);
     }
 
     fn unregisterEvent(self: *KqueueBackend, fd: std.posix.fd_t, filter: i16) !void {
-        const ev = std.posix.Kevent{
+        const ev = Kevent{
             .ident = @intCast(fd),
             .filter = filter,
             .flags = EV_DELETE,
@@ -80,7 +102,7 @@ pub const KqueueBackend = struct {
             .data = 0,
             .udata = 0,
         };
-        var out: [0]std.posix.Kevent = .{};
-        _ = std.Io.Kqueue.kevent(self.kq, &[_]std.posix.Kevent{ev}, out[0..], null) catch {};
+        var out: [0]Kevent = .{};
+        _ = std.Io.Kqueue.kevent(self.kq, &[_]Kevent{ev}, out[0..], null) catch {};
     }
 };

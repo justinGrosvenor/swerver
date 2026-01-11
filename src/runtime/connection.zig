@@ -51,6 +51,8 @@ pub const Connection = struct {
     write_paused: bool,
     timeout_phase: TimeoutPhase,
     read_buffer: ?buffer_pool.BufferHandle,
+    // Position in active list for O(1) removal
+    active_list_pos: u32,
 
     pub fn init(index: u32) Connection {
         return .{
@@ -77,6 +79,7 @@ pub const Connection = struct {
             .write_paused = false,
             .timeout_phase = .idle,
             .read_buffer = null,
+            .active_list_pos = 0,
         };
     }
 
@@ -101,6 +104,7 @@ pub const Connection = struct {
         self.write_paused = false;
         self.timeout_phase = .idle;
         self.read_buffer = null;
+        // active_list_pos is set by ConnectionPool.acquire
     }
 
     pub fn transition(self: *Connection, next: State, now_ms: u64) TransitionError!void {
@@ -169,16 +173,18 @@ pub const Connection = struct {
     }
 
     pub fn remainingTimeoutMs(self: *Connection, now_ms: u64, timeouts: config.Timeouts) u32 {
-        const limit = switch (self.timeout_phase) {
+        const limit: u64 = switch (self.timeout_phase) {
             .idle => timeouts.idle_ms,
             .header => timeouts.header_ms,
             .body => timeouts.body_ms,
             .write => timeouts.write_ms,
         };
-        if (now_ms <= self.last_active_ms) return limit;
+        if (now_ms <= self.last_active_ms) return @intCast(@min(limit, std.math.maxInt(u32)));
         const elapsed = now_ms - self.last_active_ms;
         if (elapsed >= limit) return 0;
-        return @intCast(limit - elapsed);
+        const remaining = limit - elapsed;
+        // Defensive bounds check - remaining should fit in u32 since limit was u32
+        return @intCast(@min(remaining, std.math.maxInt(u32)));
     }
 
     pub fn enqueueWrite(self: *Connection, handle: buffer_pool.BufferHandle, len: usize) bool {
@@ -231,10 +237,14 @@ pub const ConnectionPool = struct {
     free_stack: []u32,
     free_len: usize,
     next_id: u64,
+    // Active connection tracking for O(active) iteration
+    active_list: []u32,
+    active_count: usize,
 
     pub fn init(allocator: std.mem.Allocator, max_connections: usize) !ConnectionPool {
         const entries = try allocator.alloc(Connection, max_connections);
         const free_stack = try allocator.alloc(u32, max_connections);
+        const active_list = try allocator.alloc(u32, max_connections);
         for (0..max_connections) |i| {
             const index: u32 = @intCast(i);
             entries[i] = Connection.init(index);
@@ -247,12 +257,15 @@ pub const ConnectionPool = struct {
             .free_stack = free_stack,
             .free_len = max_connections,
             .next_id = 1,
+            .active_list = active_list,
+            .active_count = 0,
         };
     }
 
     pub fn deinit(self: *ConnectionPool) void {
         self.allocator.free(self.entries);
         self.allocator.free(self.free_stack);
+        self.allocator.free(self.active_list);
     }
 
     pub fn acquire(self: *ConnectionPool, now_ms: u64) ?*Connection {
@@ -262,10 +275,26 @@ pub const ConnectionPool = struct {
         const conn = &self.entries[index];
         conn.reset(self.next_id, now_ms);
         self.next_id += 1;
+        // Add to active list
+        conn.active_list_pos = @intCast(self.active_count);
+        self.active_list[self.active_count] = conn.index;
+        self.active_count += 1;
         return conn;
     }
 
     pub fn release(self: *ConnectionPool, conn: *Connection) void {
+        // Remove from active list using swap-remove for O(1)
+        if (self.active_count > 0) {
+            const pos = conn.active_list_pos;
+            const last_pos = self.active_count - 1;
+            if (pos < last_pos) {
+                // Swap with last element
+                const last_index = self.active_list[last_pos];
+                self.active_list[pos] = last_index;
+                self.entries[last_index].active_list_pos = pos;
+            }
+            self.active_count -= 1;
+        }
         conn.state = .closed;
         conn.fd = null;
         conn.read_offset = 0;
@@ -282,6 +311,11 @@ pub const ConnectionPool = struct {
         std.debug.assert(self.free_len < self.free_stack.len);
         self.free_stack[self.free_len] = conn.index;
         self.free_len += 1;
+    }
+
+    /// Returns slice of active connection indices for O(active) iteration
+    pub fn activeConnections(self: *ConnectionPool) []const u32 {
+        return self.active_list[0..self.active_count];
     }
 };
 

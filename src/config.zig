@@ -10,6 +10,7 @@ pub const ServerConfig = struct {
     buffer_pool: BufferPoolConfig,
     pinned_buffers_per_conn: u8,
     x402: X402Config,
+    quic: QuicConfig,
 
     pub fn default() ServerConfig {
         return .{
@@ -22,6 +23,7 @@ pub const ServerConfig = struct {
             .buffer_pool = .{},
             .pinned_buffers_per_conn = 2,
             .x402 = .{},
+            .quic = .{},
         };
     }
 
@@ -52,6 +54,11 @@ pub const ServerConfig = struct {
         if (self.limits.max_header_count == 0) return error.InvalidHeaderTable;
         if (self.pinned_buffers_per_conn == 0) return error.InvalidPinnedBuffers;
         if (self.x402.enabled and self.x402.payment_required_b64.len == 0) return error.InvalidX402Config;
+        if (self.quic.enabled) {
+            if (self.quic.cert_path.len == 0 or self.quic.key_path.len == 0) return error.InvalidQuicConfig;
+            if (self.quic.max_idle_timeout_ms == 0) return error.InvalidQuicConfig;
+            if (self.quic.max_streams_bidi == 0 and self.quic.max_streams_uni == 0) return error.InvalidQuicConfig;
+        }
     }
 };
 
@@ -85,6 +92,32 @@ pub const X402Config = struct {
     payment_required_b64: []const u8 = "",
 };
 
+pub const QuicConfig = struct {
+    enabled: bool = false,
+    port: u16 = 443,
+    cert_path: [:0]const u8 = "",
+    key_path: [:0]const u8 = "",
+    max_idle_timeout_ms: u32 = 30_000,
+    max_streams_bidi: u64 = 100,
+    max_streams_uni: u64 = 100,
+    initial_max_data: u64 = 10 * 1024 * 1024,
+    initial_max_stream_data_bidi_local: u64 = 1024 * 1024,
+    initial_max_stream_data_bidi_remote: u64 = 1024 * 1024,
+    initial_max_stream_data_uni: u64 = 1024 * 1024,
+    ack_delay_exponent: u8 = 3,
+    max_ack_delay_ms: u32 = 25,
+    active_connection_id_limit: u64 = 2,
+    /// Max-age for Alt-Svc header (seconds)
+    alt_svc_max_age: u32 = 86400,
+
+    /// Build Alt-Svc header value for advertising HTTP/3
+    /// Format: h3=":<port>"; ma=<max_age>
+    pub fn buildAltSvcHeader(self: QuicConfig, buf: []u8) ![]const u8 {
+        if (!self.enabled) return "";
+        return std.fmt.bufPrint(buf, "h3=\":{d}\"; ma={d}", .{ self.port, self.alt_svc_max_age }) catch return error.BufferTooSmall;
+    }
+};
+
 pub const ConfigError = error{
     InvalidMaxConnections,
     InvalidBufferPool,
@@ -93,4 +126,5 @@ pub const ConfigError = error{
     InvalidHeaderTable,
     InvalidPinnedBuffers,
     InvalidX402Config,
+    InvalidQuicConfig,
 };

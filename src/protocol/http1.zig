@@ -245,7 +245,8 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
         var value: []const u8 = header_line[colon + 1 ..];
         // RFC 7230 Section 3.2.4: OWS should be trimmed from both ends
         value = std.mem.trim(u8, value, " \t");
-        if (header_count >= _limits.max_header_count) {
+        // Check both configured limit and actual storage capacity for defense-in-depth
+        if (header_count >= _limits.max_header_count or header_count >= _limits.headers_storage.len) {
             return .{
                 .state = .err,
                 .view = emptyView(),

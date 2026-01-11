@@ -622,8 +622,8 @@ Missing tests:
 ## Summary Checklist
 
 ### P0 - Must Fix Before Any Use
-- [ ] Fix memory leak in `main.zig` x402 payload
-- [ ] Fix HTTP/2 frame type enum cast panic
+- [x] Fix memory leak in `main.zig` x402 payload ✓ FIXED
+- [x] Fix HTTP/2 frame type enum cast panic ✓ FIXED
 - [ ] Implement Linux epoll backend
 
 ### P1 - Required for Production
@@ -636,7 +636,7 @@ Missing tests:
 - [ ] Add static file serving
 
 ### P2 - Important Improvements
-- [ ] Add Huffman decoding for HTTP/2
+- [x] ~~Add Huffman decoding for HTTP/2~~ - Already implemented!
 - [ ] Add Host header validation
 - [ ] Add configuration file support
 - [ ] Add metrics endpoint
@@ -644,11 +644,11 @@ Missing tests:
 - [ ] Add integration tests
 
 ### P3 - Nice to Have
-- [ ] Optimize HTTP/2 stream lookup
+- [x] Optimize HTTP/2 stream lookup ✓ FIXED
 - [ ] Add fuzz testing
 - [ ] Add API documentation
 - [ ] Add deployment guide
-- [ ] Deduplicate Header structs
+- [x] Deduplicate Header structs ✓ FIXED
 
 ---
 
@@ -988,16 +988,16 @@ The check at line 36 validates `headers_storage.len < max_header_count` which ca
 ## Updated Summary Checklist
 
 ### P0 - Must Fix Before Any Use
-- [ ] Fix memory leak in `main.zig` x402 payload (#1)
-- [ ] Fix HTTP/2 frame type enum cast panic (#2)
+- [x] Fix memory leak in `main.zig` x402 payload (#1) ✓ FIXED
+- [x] Fix HTTP/2 frame type enum cast panic (#2) ✓ FIXED
 - [ ] Implement Linux epoll backend (#8)
-- [ ] Fix HPACK ring buffer overflow (#34)
+- [x] Fix HPACK ring buffer overflow (#34) ✓ FIXED
 
 ### P1 - Required for Production
-- [ ] Fix file descriptor leak on accept (#29)
-- [ ] Fix silent response failures (#30)
-- [ ] Fix HTTP/2 window overflow (#32)
-- [ ] Fix HTTP/2 stream exhaustion (#33)
+- [x] Fix file descriptor leak on accept (#29) ✓ FIXED
+- [x] Fix silent response failures (#30) ✓ FIXED
+- [x] Fix HTTP/2 window overflow (#32) ✓ FIXED
+- [x] Fix HTTP/2 stream exhaustion (#33) ✓ FIXED
 - [ ] Add request rate limiting (#4)
 - [ ] Implement actual routing with handlers (#14)
 - [ ] Add TLS support (#12)
@@ -1006,12 +1006,12 @@ The check at line 36 validates `headers_storage.len < max_header_count` which ca
 - [ ] Implement graceful shutdown (#16)
 
 ### P2 - Important Improvements
-- [ ] Fix O(n) timeout scanning (#38)
-- [ ] Fix kqueue event truncation (#39)
-- [ ] Fix HTTP/2 flow control sign issue (#40)
-- [ ] Validate HTTP/2 SETTINGS values (#42)
-- [ ] Handle GOAWAY frames (#43)
-- [ ] Add Huffman decoding for HTTP/2 (#13)
+- [x] Fix O(n) timeout scanning (#38) ✓ FIXED - Now O(active) with active connection list
+- [x] Fix kqueue event truncation (#39) ✓ FIXED
+- [x] Fix HTTP/2 flow control sign issue (#40) ✓ FIXED
+- [x] Validate HTTP/2 SETTINGS values (#42) ✓ FIXED
+- [x] Handle GOAWAY frames (#43) ✓ FIXED
+- [x] ~~Add Huffman decoding for HTTP/2 (#13)~~ - Already implemented!
 - [ ] Add Host header validation (#6)
 - [ ] Add configuration file support (#17)
 - [ ] Add metrics endpoint (#18)
@@ -1019,15 +1019,57 @@ The check at line 36 validates `headers_storage.len < max_header_count` which ca
 - [ ] Add integration tests (#25)
 
 ### P3 - Nice to Have
-- [ ] Fix header value trailing whitespace (#36)
-- [ ] Fix Connection header parsing (#37)
-- [ ] Optimize HTTP/2 stream lookup (#22)
-- [ ] Handle PRIORITY frames (#44)
+- [x] Fix header value trailing whitespace (#36) ✓ FIXED
+- [x] Fix Connection header parsing (#37) ✓ FIXED
+- [x] Optimize HTTP/2 stream lookup (#22) ✓ FIXED - Added last-accessed cache
+- [x] Handle PRIORITY frames (#44) ✓ FIXED
 - [ ] Add fuzz testing (#26)
 - [ ] Add API documentation (#27)
 - [ ] Add deployment guide (#28)
-- [ ] Deduplicate Header structs (#21)
+- [x] Deduplicate Header structs (#21) ✓ FIXED
+
+### Additional Fixes (from code review)
+- [x] Fix integer truncation in timeout calculation (#3) ✓ FIXED
+- [x] Fix silently ignored transition errors (#19) ✓ FIXED
+- [x] Fix connection ID truncation (#35) ✓ FIXED
+- [x] Fix partial response on buffer failure (#31) ✓ FIXED
+- [x] Fix header storage bounds check (#45) ✓ FIXED
 
 ---
 
-*Last updated: 2026-01-10 (Second Audit)*
+## Summary of Completed Bug Fixes
+
+**22 bugs fixed across 4 batches:**
+
+| Issue | Description | File(s) |
+|-------|-------------|---------|
+| #1 | Memory leak in x402 payload | `main.zig` |
+| #2 | HTTP/2 frame type enum panic | `http2.zig` |
+| #3 | Integer truncation in timeout | `connection.zig` |
+| #19 | Silently ignored transitions | `server.zig` |
+| #21 | Duplicate Header structs | `response.zig` |
+| #22 | Linear stream lookup O(n) | `http2.zig` |
+| #29 | File descriptor leak on accept | `server.zig` |
+| #30 | Silent response failure | `server.zig` |
+| #31 | Partial response buffer failure | `server.zig` |
+| #32 | HTTP/2 window overflow | `http2.zig` |
+| #33 | HTTP/2 stream exhaustion | `http2.zig` |
+| #34 | HPACK ring buffer overflow | `http2.zig` |
+| #35 | Connection ID truncation | `server.zig` |
+| #36 | Header value trailing whitespace | `http1.zig` |
+| #37 | Connection header multi-value | `http1.zig` |
+| #38 | O(n) timeout scanning | `connection.zig`, `io.zig` |
+| #39 | Kqueue event data truncation | `io.zig` |
+| #40 | HTTP/2 flow control sign | `http2.zig` |
+| #42 | HTTP/2 SETTINGS validation | `http2.zig` |
+| #43 | HTTP/2 GOAWAY handling | `http2.zig` |
+| #44 | HTTP/2 PRIORITY frames | `http2.zig` |
+| #45 | Header storage bounds check | `http1.zig` |
+
+**Notes:**
+- #13 (Huffman decoding) was already implemented - todo was outdated
+- #41 (Chunked leading zeros) is not a bug - RFC 7230 allows leading zeros
+
+---
+
+*Last updated: 2026-01-10 (Bug fixes completed)*

@@ -11,6 +11,7 @@ const http2 = @import("protocol/http2.zig");
 const http3 = @import("protocol/http3.zig");
 const tls = @import("tls/provider.zig");
 const build_options = @import("build_options");
+const quic_handler = @import("quic/handler.zig");
 
 pub const Server = struct {
     allocator: std.mem.Allocator,
@@ -18,9 +19,13 @@ pub const Server = struct {
     io: runtime.IoRuntime,
     app_router: router.Router,
     listener_fd: ?std.posix.fd_t,
+    udp_fd: ?std.posix.fd_t,
     tls_provider: ?tls.Provider,
     http2_stack: ?http2.Stack,
     http3_stack: ?http3.Stack,
+    quic: ?quic_handler.Handler,
+    /// Buffer for receiving UDP datagrams
+    udp_recv_buf: [2048]u8 = undefined,
 
     pub fn init(allocator: std.mem.Allocator, cfg: config.ServerConfig) !Server {
         if (cfg.limits.max_header_count > connection.HeaderCapacity) return error.InvalidHeaderTable;
@@ -32,6 +37,10 @@ pub const Server = struct {
         const tls_provider: ?tls.Provider = if (build_options.enable_tls) tls.Provider.init() else null;
         const http2_stack: ?http2.Stack = if (build_options.enable_http2) http2.Stack.init() else null;
         const http3_stack: ?http3.Stack = if (build_options.enable_http3) http3.Stack.init() else null;
+        const quic: ?quic_handler.Handler = if (build_options.enable_http3 and cfg.quic.enabled)
+            quic_handler.Handler.init(allocator, true, cfg.quic.max_connections)
+        else
+            null;
 
         return .{
             .allocator = allocator,
@@ -39,14 +48,18 @@ pub const Server = struct {
             .io = io_runtime,
             .app_router = app_router,
             .listener_fd = null,
+            .udp_fd = null,
             .tls_provider = tls_provider,
             .http2_stack = http2_stack,
             .http3_stack = http3_stack,
+            .quic = quic,
         };
     }
 
     pub fn deinit(self: *Server) void {
         if (self.listener_fd) |fd| std.posix.close(fd);
+        if (self.udp_fd) |fd| std.posix.close(fd);
+        if (self.quic) |*q| q.deinit();
         self.io.deinit();
     }
 
@@ -57,6 +70,22 @@ pub const Server = struct {
             self.listener_fd = fd;
             try self.io.registerListener(fd);
         }
+        // Initialize UDP listener for QUIC if enabled
+        if (self.quic != null and self.udp_fd == null) {
+            const quic_port = self.cfg.quic.port;
+            if (quic_port > 0) {
+                const udp_fd = net.bindUdp(self.cfg.address, quic_port) catch |err| {
+                    std.log.warn("Failed to bind UDP port {}: {}", .{ quic_port, err });
+                    return err;
+                };
+                self.udp_fd = udp_fd;
+                self.io.registerUdpSocket(udp_fd) catch |err| {
+                    std.log.warn("Failed to register UDP socket: {}", .{err});
+                    std.posix.close(udp_fd);
+                    self.udp_fd = null;
+                };
+            }
+        }
         const deadline = if (run_for_ms) |ms| self.io.nowMs() + ms else null;
         while (true) {
             if (deadline) |limit| {
@@ -66,13 +95,33 @@ pub const Server = struct {
             const timeout_ms = self.io.nextPollTimeoutMs(now_ms);
             const events = try self.io.pollWithTimeout(timeout_ms);
             self.io.enforceTimeouts(self.io.nowMs());
+            // Periodic QUIC cleanup
+            if (self.quic) |*q| {
+                q.cleanup();
+            }
             if (events.len == 0) continue;
             for (events) |event| {
                 switch (event.kind) {
-                    .accept => if (event.handle) |fd| try self.handleAccept(fd),
-                    .read => try self.handleRead(@intCast(event.conn_id)),
-                    .write => try self.handleWrite(@intCast(event.conn_id)),
-                    .err => try self.handleError(@intCast(event.conn_id)),
+                    .accept => {
+                        // Use event.handle if provided (kqueue), otherwise use listener_fd (epoll)
+                        const fd = event.handle orelse self.listener_fd orelse continue;
+                        try self.handleAccept(fd);
+                    },
+                    .datagram => {
+                        // UDP datagram received - QUIC packet handling
+                        try self.handleDatagram();
+                    },
+                    .read, .write, .err => {
+                        // Validate conn_id fits in u32 before casting
+                        if (event.conn_id > std.math.maxInt(u32)) continue;
+                        const index: u32 = @intCast(event.conn_id);
+                        switch (event.kind) {
+                            .read => try self.handleRead(index),
+                            .write => try self.handleWrite(index),
+                            .err => try self.handleError(index),
+                            .accept, .datagram => unreachable,
+                        }
+                    },
                 }
             }
         }
@@ -97,7 +146,13 @@ pub const Server = struct {
             return;
         }
         conn.fd = client_fd;
-        _ = conn.transition(.active, now_ms) catch {};
+        conn.transition(.active, now_ms) catch {
+            // Invalid state transition - close connection
+            if (conn.read_buffer) |buf| self.io.releaseBuffer(buf);
+            self.io.releaseConnection(conn);
+            std.posix.close(client_fd);
+            return;
+        };
         self.io.setTimeoutPhase(conn, .header);
         self.io.registerConnection(conn.index, client_fd) catch |err| {
             if (conn.read_buffer) |buf| self.io.releaseBuffer(buf);
@@ -105,6 +160,47 @@ pub const Server = struct {
             std.posix.close(client_fd);
             return err;
         };
+    }
+
+    fn handleDatagram(self: *Server) !void {
+        const udp_fd = self.udp_fd orelse return;
+        var quic = &(self.quic orelse return);
+
+        // Receive datagram
+        const recv_result = net.recvfrom(udp_fd, &self.udp_recv_buf) catch |err| {
+            switch (err) {
+                error.WouldBlock => return,
+                else => return,
+            }
+        };
+
+        if (recv_result.bytes_read == 0) return;
+
+        // Convert peer address to our internal format (zero-init to avoid undefined bytes)
+        var peer_addr: quic_handler.connection_pool.SockAddrStorage = undefined;
+        @memset(std.mem.asBytes(&peer_addr), 0);
+        @memcpy(std.mem.asBytes(&peer_addr)[0..@sizeOf(@TypeOf(recv_result.peer_addr))], std.mem.asBytes(&recv_result.peer_addr));
+
+        // Process the QUIC packet
+        const result = quic.processPacket(self.udp_recv_buf[0..recv_result.bytes_read], peer_addr) catch |err| {
+            // Log error but don't crash
+            std.log.debug("QUIC packet error: {}", .{err});
+            return;
+        };
+
+        // Send response if any
+        if (result.response) |response| {
+            _ = net.sendto(udp_fd, response, recv_result.peer_addr) catch |err| {
+                std.log.debug("Failed to send QUIC response: {}", .{err});
+            };
+        }
+
+        // Handle connection state changes
+        if (result.close_connection) {
+            if (result.conn) |conn| {
+                quic.pool.removeConnection(conn);
+            }
+        }
     }
 
     fn handleRead(self: *Server, index: u32) !void {

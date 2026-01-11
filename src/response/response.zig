@@ -1,7 +1,6 @@
-pub const Header = struct {
-    name: []const u8,
-    value: []const u8,
-};
+const request = @import("../protocol/request.zig");
+
+pub const Header = request.Header;
 
 pub const Response = struct {
     status: u16,

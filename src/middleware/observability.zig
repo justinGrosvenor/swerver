@@ -1,0 +1,386 @@
+const std = @import("std");
+const request = @import("../protocol/request.zig");
+const response = @import("../response/response.zig");
+const middleware = @import("middleware.zig");
+
+/// Observability Middleware
+///
+/// Provides structured logging, request tracing, and request ID propagation.
+/// Uses pre-allocated buffers for zero heap allocations.
+
+/// Log levels
+pub const Level = enum {
+    debug,
+    info,
+    warn,
+    err,
+
+    pub fn toString(self: Level) []const u8 {
+        return switch (self) {
+            .debug => "DEBUG",
+            .info => "INFO",
+            .warn => "WARN",
+            .err => "ERROR",
+        };
+    }
+};
+
+/// Structured log entry
+pub const LogEntry = struct {
+    level: Level = .info,
+    timestamp_ns: i128 = 0,
+    request_id: ?[]const u8 = null,
+    protocol: middleware.Context.Protocol = .http1,
+    stream_id: u64 = 0,
+    method: ?request.Method = null,
+    path: ?[]const u8 = null,
+    status: u16 = 0,
+    latency_us: u64 = 0,
+    client_ip: ?[4]u8 = null,
+    route: ?[]const u8 = null,
+    message: ?[]const u8 = null,
+    error_msg: ?[]const u8 = null,
+
+    /// Format as JSON (no heap allocation)
+    pub fn formatJson(self: *const LogEntry, buf: []u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const writer = fbs.writer();
+
+        try writer.writeAll("{");
+
+        // Timestamp
+        try writer.print("\"ts\":{d}", .{self.timestamp_ns});
+
+        // Level
+        try writer.print(",\"level\":\"{s}\"", .{self.level.toString()});
+
+        // Request ID
+        if (self.request_id) |rid| {
+            try writer.print(",\"request_id\":\"{s}\"", .{rid});
+        }
+
+        // Protocol
+        try writer.print(",\"protocol\":\"{s}\"", .{self.protocol.toString()});
+
+        // Stream ID (for HTTP/2 and HTTP/3)
+        if (self.stream_id != 0) {
+            try writer.print(",\"stream_id\":{d}", .{self.stream_id});
+        }
+
+        // Method
+        if (self.method) |m| {
+            try writer.print(",\"method\":\"{s}\"", .{@tagName(m)});
+        }
+
+        // Path
+        if (self.path) |p| {
+            try writer.print(",\"path\":\"{s}\"", .{p});
+        }
+
+        // Status
+        if (self.status != 0) {
+            try writer.print(",\"status\":{d}", .{self.status});
+        }
+
+        // Latency
+        if (self.latency_us != 0) {
+            try writer.print(",\"latency_us\":{d}", .{self.latency_us});
+        }
+
+        // Client IP
+        if (self.client_ip) |ip| {
+            try writer.print(",\"client_ip\":\"{d}.{d}.{d}.{d}\"", .{ ip[0], ip[1], ip[2], ip[3] });
+        }
+
+        // Route
+        if (self.route) |r| {
+            try writer.print(",\"route\":\"{s}\"", .{r});
+        }
+
+        // Message
+        if (self.message) |msg| {
+            try writer.print(",\"msg\":\"{s}\"", .{msg});
+        }
+
+        // Error
+        if (self.error_msg) |err| {
+            try writer.print(",\"error\":\"{s}\"", .{err});
+        }
+
+        try writer.writeAll("}\n");
+
+        return fbs.getWritten();
+    }
+
+    /// Format as logfmt (key=value pairs)
+    pub fn formatLogfmt(self: *const LogEntry, buf: []u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const writer = fbs.writer();
+
+        try writer.print("ts={d} level={s}", .{ self.timestamp_ns, self.level.toString() });
+
+        if (self.request_id) |rid| {
+            try writer.print(" request_id={s}", .{rid});
+        }
+
+        try writer.print(" protocol={s}", .{self.protocol.toString()});
+
+        if (self.stream_id != 0) {
+            try writer.print(" stream_id={d}", .{self.stream_id});
+        }
+
+        if (self.method) |m| {
+            try writer.print(" method={s}", .{@tagName(m)});
+        }
+
+        if (self.path) |p| {
+            try writer.print(" path=\"{s}\"", .{p});
+        }
+
+        if (self.status != 0) {
+            try writer.print(" status={d}", .{self.status});
+        }
+
+        if (self.latency_us != 0) {
+            try writer.print(" latency_us={d}", .{self.latency_us});
+        }
+
+        if (self.client_ip) |ip| {
+            try writer.print(" client_ip={d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] });
+        }
+
+        if (self.route) |r| {
+            try writer.print(" route=\"{s}\"", .{r});
+        }
+
+        if (self.message) |msg| {
+            try writer.print(" msg=\"{s}\"", .{msg});
+        }
+
+        if (self.error_msg) |err| {
+            try writer.print(" error=\"{s}\"", .{err});
+        }
+
+        try writer.writeAll("\n");
+
+        return fbs.getWritten();
+    }
+};
+
+/// Logger configuration
+pub const Config = struct {
+    /// Minimum log level
+    min_level: Level = .info,
+    /// Output format
+    format: Format = .json,
+    /// Log to stderr
+    log_stderr: bool = true,
+    /// Include request/response bodies in debug logs
+    log_bodies: bool = false,
+    /// Propagate request ID header
+    request_id_header: []const u8 = "X-Request-Id",
+    /// Generate request ID if not present
+    generate_request_id: bool = true,
+
+    pub const Format = enum {
+        json,
+        logfmt,
+    };
+};
+
+/// Global logger config
+var config: Config = .{};
+
+/// Initialize logger
+pub fn init(cfg: Config) void {
+    config = cfg;
+}
+
+/// Thread-local format buffer
+threadlocal var format_buf: [4096]u8 = undefined;
+
+/// Log a structured entry
+pub fn log(entry: LogEntry) void {
+    if (@intFromEnum(entry.level) < @intFromEnum(config.min_level)) return;
+
+    const output = switch (config.format) {
+        .json => entry.formatJson(&format_buf) catch return,
+        .logfmt => entry.formatLogfmt(&format_buf) catch return,
+    };
+
+    if (config.log_stderr) {
+        std.io.getStdErr().writeAll(output) catch {};
+    }
+}
+
+/// Request ID storage (per-connection/request)
+pub const RequestIdStorage = struct {
+    buf: [64]u8 = undefined,
+    len: usize = 0,
+
+    pub fn set(self: *RequestIdStorage, id: []const u8) void {
+        const copy_len = @min(id.len, 64);
+        @memcpy(self.buf[0..copy_len], id[0..copy_len]);
+        self.len = copy_len;
+    }
+
+    pub fn generate(self: *RequestIdStorage) void {
+        // Generate simple request ID from timestamp + random
+        const ts: u64 = @intCast(@mod(std.time.nanoTimestamp(), std.math.maxInt(u64)));
+        const hash = std.hash.Wyhash.hash(ts, &[_]u8{ 0, 1, 2, 3, 4, 5, 6, 7 });
+
+        const result = std.fmt.bufPrint(&self.buf, "{x:0>16}", .{hash}) catch {
+            self.len = 0;
+            return;
+        };
+        self.len = result.len;
+    }
+
+    pub fn get(self: *const RequestIdStorage) ?[]const u8 {
+        if (self.len == 0) return null;
+        return self.buf[0..self.len];
+    }
+};
+
+/// Extract or generate request ID
+pub fn getOrGenerateRequestId(req: request.RequestView, storage: *RequestIdStorage) []const u8 {
+    // Look for existing request ID header
+    for (req.headers) |hdr| {
+        if (std.ascii.eqlIgnoreCase(hdr.name, config.request_id_header)) {
+            storage.set(hdr.value);
+            return storage.get() orelse "";
+        }
+    }
+
+    // Generate new ID if configured
+    if (config.generate_request_id) {
+        storage.generate();
+        return storage.get() orelse "";
+    }
+
+    return "";
+}
+
+/// Observability middleware - extracts request ID
+pub fn evaluate(ctx: *middleware.Context, req: request.RequestView) middleware.Decision {
+    // Record request start time
+    ctx.request_start = std.time.Instant.now() catch null;
+
+    // Look for existing request ID header
+    var found_id: ?[]const u8 = null;
+    for (req.headers) |hdr| {
+        if (std.ascii.eqlIgnoreCase(hdr.name, config.request_id_header)) {
+            found_id = hdr.value;
+            break;
+        }
+    }
+
+    if (found_id) |id| {
+        // Copy into context-owned buffer
+        ctx.setRequestId(id);
+    } else if (config.generate_request_id) {
+        // Generate new ID into context-owned buffer
+        ctx.generateRequestId();
+    }
+
+    // Return modification with request ID header if we have one
+    if (ctx.request_id) |rid| {
+        // Response header value points to context buffer (safe)
+        return .{ .modify = .{
+            .response_headers = &[_]response.Header{
+                .{ .name = "X-Request-Id", .value = rid },
+            },
+            .continue_chain = true,
+        } };
+    }
+
+    return .allow;
+}
+
+/// Post-response logging hook
+pub fn postResponse(ctx: *middleware.Context, req: request.RequestView, resp: response.Response, elapsed_ns: u64) void {
+    const level: Level = if (resp.status >= 500)
+        .err
+    else if (resp.status >= 400)
+        .warn
+    else
+        .info;
+
+    const entry = LogEntry{
+        .level = level,
+        .timestamp_ns = std.time.nanoTimestamp(),
+        .request_id = ctx.request_id,
+        .protocol = ctx.protocol,
+        .stream_id = ctx.stream_id,
+        .method = req.method,
+        .path = req.path,
+        .status = resp.status,
+        .latency_us = elapsed_ns / 1000,
+        .client_ip = ctx.client_ip,
+        .route = ctx.route,
+        .message = null,
+        .error_msg = null,
+    };
+
+    log(entry);
+}
+
+/// Log a custom message
+pub fn logMessage(level: Level, ctx: *const middleware.Context, message: []const u8) void {
+    const entry = LogEntry{
+        .level = level,
+        .timestamp_ns = std.time.nanoTimestamp(),
+        .request_id = ctx.request_id,
+        .protocol = ctx.protocol,
+        .stream_id = ctx.stream_id,
+        .message = message,
+    };
+
+    log(entry);
+}
+
+// Tests
+test "log entry format json" {
+    const entry = LogEntry{
+        .level = .info,
+        .timestamp_ns = 1234567890,
+        .request_id = "abc123",
+        .method = .GET,
+        .path = "/api/users",
+        .status = 200,
+        .latency_us = 1500,
+    };
+
+    var buf: [1024]u8 = undefined;
+    const output = try entry.formatJson(&buf);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"level\":\"INFO\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"request_id\":\"abc123\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"status\":200") != null);
+}
+
+test "log entry format logfmt" {
+    const entry = LogEntry{
+        .level = .warn,
+        .timestamp_ns = 1234567890,
+        .method = .POST,
+        .path = "/api/data",
+        .status = 400,
+    };
+
+    var buf: [1024]u8 = undefined;
+    const output = try entry.formatLogfmt(&buf);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "level=WARN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "method=POST") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "status=400") != null);
+}
+
+test "request id generation" {
+    var storage = RequestIdStorage{};
+    storage.generate();
+
+    const id = storage.get();
+    try std.testing.expect(id != null);
+    try std.testing.expect(id.?.len == 16);
+}

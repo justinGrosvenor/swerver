@@ -666,6 +666,9 @@ pub const Stack = struct {
     headers_storage: [MaxHeaders]request.Header,
     goaway_received: bool,
     goaway_last_stream_id: u32,
+    // Cache for last accessed stream to optimize repeated lookups
+    cached_stream_id: u32,
+    cached_stream_index: usize,
 
     pub fn init() Stack {
         var stack = Stack{
@@ -682,6 +685,8 @@ pub const Stack = struct {
             .headers_storage = undefined,
             .goaway_received = false,
             .goaway_last_stream_id = 0,
+            .cached_stream_id = 0,
+            .cached_stream_index = 0,
         };
         for (&stack.streams, 0..) |*stream, i| {
             stream.reset(@intCast(i), DefaultInitialWindow);
@@ -746,6 +751,7 @@ pub const Stack = struct {
             .rst_stream => self.handleRstStream(frame, events),
             .ping => self.handlePing(frame, events),
             .goaway => self.handleGoaway(frame, events),
+            .priority => self.handlePriority(frame, events),
             else => .{ .state = .complete, .error_code = .none, .event_count = 0 },
         };
     }
@@ -909,6 +915,28 @@ pub const Stack = struct {
         return .{ .state = .complete, .error_code = .none, .event_count = 0 };
     }
 
+    fn handlePriority(self: *Stack, frame: Frame, events: []Event) FrameHandle {
+        _ = self;
+        _ = events;
+        // RFC 7540 Section 6.3: PRIORITY frame is exactly 5 bytes
+        if (frame.payload.len != 5) return .{ .state = .err, .error_code = .frame_size_error, .event_count = 0 };
+        // PRIORITY must be on a non-zero stream
+        if (frame.header.stream_id == 0) return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
+        // Parse priority fields (we acknowledge but don't implement scheduling)
+        // Exclusive flag (1 bit) + Stream Dependency (31 bits) + Weight (8 bits)
+        const dependency_raw = (@as(u32, frame.payload[0]) << 24) |
+            (@as(u32, frame.payload[1]) << 16) |
+            (@as(u32, frame.payload[2]) << 8) |
+            @as(u32, frame.payload[3]);
+        const stream_dependency = dependency_raw & 0x7FFF_FFFF;
+        // Validate: stream cannot depend on itself
+        if (stream_dependency == frame.header.stream_id) {
+            return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
+        }
+        // Priority acknowledged - no scheduling implemented yet
+        return .{ .state = .complete, .error_code = .none, .event_count = 0 };
+    }
+
     fn handleGoaway(self: *Stack, frame: Frame, events: []Event) FrameHandle {
         _ = events;
         // GOAWAY must be on stream 0 and have at least 8 bytes (last-stream-id + error-code)
@@ -961,27 +989,45 @@ pub const Stack = struct {
         // Reject new streams after GOAWAY received
         if (self.goaway_received) return null;
         // Try to find a closed stream slot to reuse
-        for (self.streams[0..self.stream_count]) |*stream| {
+        for (self.streams[0..self.stream_count], 0..) |*stream, idx| {
             if (stream.state == .closed) {
                 self.last_stream_id = stream_id;
                 stream.reset(stream_id, self.initial_stream_window);
                 stream.state = .idle;
+                // Update cache
+                self.cached_stream_id = stream_id;
+                self.cached_stream_index = idx;
                 return stream;
             }
         }
         // No closed slots, try to allocate a new one
         if (self.stream_count >= self.streams.len) return null;
         self.last_stream_id = stream_id;
-        var stream = &self.streams[self.stream_count];
+        const idx = self.stream_count;
+        var stream = &self.streams[idx];
         stream.reset(stream_id, self.initial_stream_window);
         stream.state = .idle;
         self.stream_count += 1;
+        // Update cache
+        self.cached_stream_id = stream_id;
+        self.cached_stream_index = idx;
         return stream;
     }
 
     fn findStream(self: *Stack, stream_id: u32) ?*Stream {
-        for (self.streams[0..self.stream_count]) |*stream| {
-            if (stream.id == stream_id) return stream;
+        // Check cache first for O(1) lookup on repeated access
+        if (self.cached_stream_id == stream_id and self.cached_stream_index < self.stream_count) {
+            const cached = &self.streams[self.cached_stream_index];
+            if (cached.id == stream_id) return cached;
+        }
+        // Fall back to linear scan
+        for (self.streams[0..self.stream_count], 0..) |*stream, idx| {
+            if (stream.id == stream_id) {
+                // Update cache
+                self.cached_stream_id = stream_id;
+                self.cached_stream_index = idx;
+                return stream;
+            }
         }
         return null;
     }

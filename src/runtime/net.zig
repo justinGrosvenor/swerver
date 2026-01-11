@@ -6,7 +6,7 @@ const has_len_field = switch (builtin.os.tag) {
     else => false,
 };
 
-const SockAddrIn = if (has_len_field)
+pub const SockAddrIn = if (has_len_field)
     extern struct {
         len: u8,
         family: u8,
@@ -22,7 +22,7 @@ else
         zero: [8]u8,
     };
 
-const SockAddrIn6 = if (has_len_field)
+pub const SockAddrIn6 = if (has_len_field)
     extern struct {
         len: u8,
         family: u8,
@@ -55,6 +55,48 @@ pub const AcceptError = error{
     WouldBlock,
     NonBlockingFailed,
 } || std.posix.FcntlError;
+
+pub const UdpError = error{
+    UnsupportedPlatform,
+    UnsupportedAddress,
+    SocketFailed,
+    BindFailed,
+    SetSockOptFailed,
+    NonBlockingFailed,
+    RecvFailed,
+    SendFailed,
+    WouldBlock,
+} || std.posix.FcntlError;
+
+pub const RecvFromResult = struct {
+    bytes_read: usize,
+    peer_addr: SockAddrStorage,
+};
+
+pub const PeerAddress = struct {
+    storage: SockAddrStorage,
+
+    pub fn getPort(self: PeerAddress) u16 {
+        return switch (self.storage) {
+            .ip4 => |sa| std.mem.bigToNative(u16, sa.port),
+            .ip6 => |sa| std.mem.bigToNative(u16, sa.port),
+        };
+    }
+
+    pub fn getIp4Bytes(self: PeerAddress) ?[4]u8 {
+        return switch (self.storage) {
+            .ip4 => |sa| @bitCast(sa.addr),
+            .ip6 => null,
+        };
+    }
+
+    pub fn getIp6Bytes(self: PeerAddress) ?[16]u8 {
+        return switch (self.storage) {
+            .ip4 => null,
+            .ip6 => |sa| sa.addr,
+        };
+    }
+};
 
 const NonBlockingError = error{NonBlockingFailed} || std.posix.FcntlError;
 
@@ -101,6 +143,107 @@ pub fn accept(listener_fd: std.posix.fd_t) AcceptError!std.posix.fd_t {
     errdefer std.posix.close(fd);
     setNonBlocking(fd) catch return error.NonBlockingFailed;
     return fd;
+}
+
+/// Bind a UDP socket to the given address and port.
+/// Unlike TCP listen(), this only binds and does not call listen().
+pub fn bindUdp(address: []const u8, port: u16) UdpError!std.posix.fd_t {
+    if (!isSupportedPlatform()) return error.UnsupportedPlatform;
+
+    const addr = parseAddress(address, port) catch return error.UnsupportedAddress;
+    const domain: c_uint = switch (addr) {
+        .ip4 => @intCast(std.posix.AF.INET),
+        .ip6 => @intCast(std.posix.AF.INET6),
+    };
+    const fd = std.posix.system.socket(domain, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP);
+    if (fd < 0) return error.SocketFailed;
+    errdefer std.posix.close(fd);
+
+    setReuseAddr(fd) catch return error.SetSockOptFailed;
+    setReusePort(fd) catch return error.SetSockOptFailed;
+    setNonBlocking(fd) catch return error.NonBlockingFailed;
+
+    var storage = buildSockaddr(addr);
+    const sockaddr_ptr: *const std.posix.sockaddr = switch (storage) {
+        .ip4 => |*sa| @ptrCast(sa),
+        .ip6 => |*sa| @ptrCast(sa),
+    };
+    const addr_len: std.posix.socklen_t = switch (storage) {
+        .ip4 => @intCast(@sizeOf(SockAddrIn)),
+        .ip6 => @intCast(@sizeOf(SockAddrIn6)),
+    };
+    if (std.posix.system.bind(fd, sockaddr_ptr, addr_len) != 0) return error.BindFailed;
+
+    return fd;
+}
+
+/// Receive a UDP datagram from the socket.
+/// Returns the number of bytes read and the peer address.
+pub fn recvfrom(fd: std.posix.fd_t, buf: []u8) UdpError!RecvFromResult {
+    if (!isSupportedPlatform()) return error.RecvFailed;
+
+    var peer_storage: SockAddrStorage = .{ .ip6 = undefined };
+    var addr_len: std.posix.socklen_t = @sizeOf(SockAddrIn6);
+
+    const sockaddr_ptr: *std.posix.sockaddr = @ptrCast(&peer_storage.ip6);
+    const rc = std.posix.system.recvfrom(
+        fd,
+        buf.ptr,
+        buf.len,
+        0,
+        sockaddr_ptr,
+        &addr_len,
+    );
+
+    if (rc < 0) {
+        switch (std.posix.errno(rc)) {
+            .AGAIN => return error.WouldBlock,
+            else => return error.RecvFailed,
+        }
+    }
+
+    // Determine if it's IPv4 or IPv6 based on family
+    if (addr_len == @sizeOf(SockAddrIn)) {
+        const ip4_ptr: *SockAddrIn = @ptrCast(&peer_storage.ip6);
+        peer_storage = .{ .ip4 = ip4_ptr.* };
+    }
+
+    return .{
+        .bytes_read = @intCast(rc),
+        .peer_addr = peer_storage,
+    };
+}
+
+/// Send a UDP datagram to the specified peer address.
+pub fn sendto(fd: std.posix.fd_t, buf: []const u8, peer: SockAddrStorage) UdpError!usize {
+    if (!isSupportedPlatform()) return error.SendFailed;
+
+    const sockaddr_ptr: *const std.posix.sockaddr = switch (peer) {
+        .ip4 => |*sa| @ptrCast(sa),
+        .ip6 => |*sa| @ptrCast(sa),
+    };
+    const addr_len: std.posix.socklen_t = switch (peer) {
+        .ip4 => @intCast(@sizeOf(SockAddrIn)),
+        .ip6 => @intCast(@sizeOf(SockAddrIn6)),
+    };
+
+    const rc = std.posix.system.sendto(
+        fd,
+        buf.ptr,
+        buf.len,
+        0,
+        sockaddr_ptr,
+        addr_len,
+    );
+
+    if (rc < 0) {
+        switch (std.posix.errno(rc)) {
+            .AGAIN => return error.WouldBlock,
+            else => return error.SendFailed,
+        }
+    }
+
+    return @intCast(rc);
 }
 
 fn buildSockaddr(address: std.Io.net.IpAddress) SockAddrStorage {
@@ -171,7 +314,7 @@ fn setNonBlocking(fd: std.posix.fd_t) NonBlockingError!void {
 
 fn isSupportedPlatform() bool {
     return switch (builtin.os.tag) {
-        .macos, .freebsd, .netbsd, .openbsd, .dragonfly => true,
+        .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly => true,
         else => false,
     };
 }
@@ -181,7 +324,7 @@ fn parseAddress(address: []const u8, port: u16) ListenError!std.Io.net.IpAddress
     return std.Io.net.IpAddress.parse(address, port) catch error.UnsupportedAddress;
 }
 
-const SockAddrStorage = union(enum) {
+pub const SockAddrStorage = union(enum) {
     ip4: SockAddrIn,
     ip6: SockAddrIn6,
 };
