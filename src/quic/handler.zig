@@ -8,6 +8,7 @@ const stream = @import("stream.zig");
 const recovery = @import("recovery.zig");
 const congestion = @import("congestion.zig");
 const crypto = @import("crypto.zig");
+const http3 = @import("../protocol/http3.zig");
 
 /// QUIC packet handler
 ///
@@ -31,6 +32,8 @@ pub const ProcessResult = struct {
     new_connection: bool = false,
     /// Connection should be closed
     close_connection: bool = false,
+    /// HTTP/3 events generated (headers received, data received, etc.)
+    http3_events: []http3.Event = &.{},
 };
 
 /// Server-wide QUIC metrics
@@ -125,6 +128,9 @@ pub const Handler = struct {
                 };
 
                 try self.handleShortPacket(conn, short, data);
+
+                // Collect HTTP/3 events after processing
+                result.http3_events = getHttp3Events(conn);
             },
         }
 
@@ -141,17 +147,33 @@ pub const Handler = struct {
         data: []const u8,
     ) Error!void {
         _ = self;
-        _ = data;
 
         // Update peer's connection ID
         if (header.scid.len > 0) {
             conn.peer_cid = header.scid;
         }
 
-        // Process CRYPTO frames (would contain ClientHello)
-        // For now, just transition state
+        // Get Initial keys for decryption
+        const keys_opt: ?crypto.Keys = if (conn.is_server)
+            conn.crypto_ctx.initial.client // Decrypt with client's key
+        else
+            conn.crypto_ctx.initial.server; // Decrypt with server's key
+        const keys = keys_opt orelse return Error.HandshakeFailed;
+
+        // Decrypt and process Initial packet
+        try processEncryptedPacket(conn, &keys, header, data, types.PacketNumberSpace.initial);
+
+        // Transition state
         if (conn.state == .initial) {
             conn.state = .handshaking;
+        }
+
+        // Advance TLS handshake if session exists
+        if (conn.tls_session != null) {
+            const handshake_complete = conn.advanceTlsHandshake() catch false;
+            if (handshake_complete) {
+                conn.onHandshakeComplete();
+            }
         }
     }
 
@@ -162,15 +184,99 @@ pub const Handler = struct {
         data: []const u8,
     ) Error!void {
         _ = self;
-        _ = header;
-        _ = data;
 
-        // Process Handshake CRYPTO frames
-        // When complete, transition to connected
-        if (conn.state == .handshaking) {
-            // In a real implementation, this would happen after TLS handshake completes
-            // For now, simulate immediate completion
-            conn.onHandshakeComplete();
+        // Get Handshake keys for decryption
+        const keys_opt: ?crypto.Keys = if (conn.is_server)
+            conn.crypto_ctx.handshake.client
+        else
+            conn.crypto_ctx.handshake.server;
+        const keys = keys_opt orelse {
+            // No handshake keys yet - this is expected early in handshake
+            return Error.HandshakeFailed;
+        };
+
+        // Decrypt and process Handshake packet
+        try processEncryptedPacket(conn, &keys, header, data, types.PacketNumberSpace.handshake);
+
+        // Advance TLS handshake
+        if (conn.tls_session != null) {
+            const handshake_complete = conn.advanceTlsHandshake() catch false;
+            if (handshake_complete and conn.state == .handshaking) {
+                conn.onHandshakeComplete();
+            }
+        }
+    }
+
+    /// Process an encrypted long header packet (Initial or Handshake)
+    fn processEncryptedPacket(
+        conn: *connection.Connection,
+        keys: *const crypto.Keys,
+        header: packet.LongHeader,
+        data: []const u8,
+        pn_space: types.PacketNumberSpace,
+    ) Error!void {
+        // Calculate packet number offset for long header
+        // Long header: flags(1) + version(4) + dcid_len(1) + dcid + scid_len(1) + scid + [token_len + token] + length(2+)
+        var pn_offset: usize = 1 + 4 + 1 + header.dcid.len + 1 + header.scid.len;
+
+        // Token only in Initial packets
+        if (header.packet_type == .initial) {
+            // Skip token length varint and token data
+            // For simplicity, assume token was already parsed and skip based on header total length
+            pn_offset += 1; // token length byte (assuming single-byte varint for 0 length)
+        }
+
+        // Skip length field (2 bytes for typical lengths)
+        pn_offset += 2;
+
+        // Copy packet to mutable buffer for decryption
+        var decrypt_buf: [65536]u8 = undefined;
+        if (data.len > decrypt_buf.len) return Error.InvalidPacket;
+        @memcpy(decrypt_buf[0..data.len], data);
+
+        // Get largest PN for this space
+        const space = conn.getPacketSpace(pn_space);
+        const largest_pn = space.largest_received orelse 0;
+
+        // Unprotect the packet
+        const unprotect_result = crypto.unprotectPacket(
+            keys,
+            largest_pn,
+            pn_offset,
+            &decrypt_buf,
+            data.len,
+        ) catch return Error.InvalidPacket;
+
+        // Record packet received
+        space.onPacketReceived(unprotect_result.pn);
+
+        // Parse and process frames from decrypted payload
+        const payload = decrypt_buf[unprotect_result.header_len .. unprotect_result.header_len + unprotect_result.payload_len];
+        try processCryptoFrames(conn, payload);
+    }
+
+    /// Process CRYPTO frames from Initial/Handshake packets
+    fn processCryptoFrames(conn: *connection.Connection, payload: []const u8) Error!void {
+        var offset: usize = 0;
+
+        while (offset < payload.len) {
+            const result = frame.parseFrame(payload[offset..]) catch return Error.InvalidPacket;
+            offset += result.consumed;
+
+            switch (result.frame) {
+                .padding => {}, // Ignore padding
+                .ping => {}, // PING just triggers ACK
+                .ack => |ack| {
+                    // ACK in Initial uses initial space, in Handshake uses handshake space
+                    // For now just process as application (works for basic case)
+                    conn.processAckFrame(ack, types.PacketNumberSpace.initial);
+                },
+                .crypto => |crypto_frame| {
+                    // Feed CRYPTO data to TLS session
+                    conn.feedCryptoData(crypto_frame.data) catch {};
+                },
+                else => {}, // Ignore other frame types in Initial/Handshake
+            }
         }
     }
 
@@ -181,12 +287,156 @@ pub const Handler = struct {
         data: []const u8,
     ) Error!void {
         _ = self;
-        _ = header;
-        _ = data;
 
-        // Process 1-RTT packet with application data
-        // Would decrypt payload, parse frames, handle STREAM data
-        _ = conn;
+        // Connection must be in connected state
+        if (conn.state != .connected) {
+            return Error.ProtocolError;
+        }
+
+        // Get application keys for decryption
+        const keys_opt: ?crypto.Keys = if (conn.is_server)
+            conn.crypto_ctx.application.client // Decrypt with client's key
+        else
+            conn.crypto_ctx.application.server; // Decrypt with server's key
+        const keys = keys_opt orelse return Error.HandshakeFailed;
+
+        // Calculate packet number offset
+        // Short header: flags (1) + DCID (variable)
+        const pn_offset = 1 + header.dcid.len;
+
+        // Copy packet to mutable buffer for decryption
+        var decrypt_buf: [65536]u8 = undefined;
+        if (data.len > decrypt_buf.len) return Error.InvalidPacket;
+        @memcpy(decrypt_buf[0..data.len], data);
+
+        // Unprotect the packet (removes header protection and decrypts)
+        const largest_pn = conn.application_space.largest_received orelse 0;
+        const unprotect_result = crypto.unprotectPacket(
+            &keys,
+            largest_pn,
+            pn_offset,
+            &decrypt_buf,
+            data.len,
+        ) catch return Error.InvalidPacket;
+
+        // Record packet received
+        conn.application_space.onPacketReceived(unprotect_result.pn);
+
+        // Parse and process frames from decrypted payload
+        const payload = decrypt_buf[unprotect_result.header_len .. unprotect_result.header_len + unprotect_result.payload_len];
+        try processFrames(conn, payload);
+    }
+
+    /// Process all frames in a decrypted packet payload
+    fn processFrames(conn: *connection.Connection, payload: []const u8) Error!void {
+        var offset: usize = 0;
+
+        while (offset < payload.len) {
+            const result = frame.parseFrame(payload[offset..]) catch return Error.InvalidPacket;
+            offset += result.consumed;
+
+            switch (result.frame) {
+                .padding => {}, // Ignore padding
+                .ping => {}, // PING just triggers ACK
+                .ack => |ack| {
+                    conn.processAckFrame(ack, types.PacketNumberSpace.application);
+                },
+                .stream => |stream_frame| {
+                    try processStreamFrame(conn, stream_frame);
+                },
+                .max_data => |max_data| {
+                    conn.processMaxDataFrame(max_data.maximum_data);
+                },
+                .max_stream_data => |max_stream_data| {
+                    if (conn.getStream(max_stream_data.stream_id)) |s| {
+                        s.updateSendLimit(max_stream_data.maximum_stream_data);
+                    }
+                },
+                .max_streams => |max_streams| {
+                    // Update stream limits
+                    if (conn.stream_manager) |*mgr| {
+                        if (max_streams.bidirectional) {
+                            mgr.max_streams_bidi_local = max_streams.maximum_streams;
+                        } else {
+                            mgr.max_streams_uni_local = max_streams.maximum_streams;
+                        }
+                    }
+                },
+                .connection_close => |close_frame| {
+                    conn.processConnectionClose(close_frame.error_code, close_frame.reason_phrase);
+                },
+                .handshake_done => {
+                    // Server confirms handshake complete
+                    if (!conn.is_server) {
+                        conn.onHandshakeComplete();
+                    }
+                },
+                .reset_stream => |reset| {
+                    if (conn.getStream(reset.stream_id)) |s| {
+                        s.onReset(reset.final_size) catch {};
+                    }
+                },
+                .stop_sending => |stop| {
+                    if (conn.getStream(stop.stream_id)) |s| {
+                        s.reset(stop.application_error_code);
+                    }
+                },
+                .path_challenge => |challenge| {
+                    // Queue PATH_RESPONSE with same data
+                    conn.queuePathResponse(challenge.data);
+                },
+                .path_response => |response_frame| {
+                    // Validate path response against pending challenge
+                    conn.validatePathResponse(response_frame.data);
+                },
+                .new_connection_id => |new_cid| {
+                    conn.addPeerConnectionId(new_cid);
+                },
+                .retire_connection_id => |retire| {
+                    conn.retireConnectionId(retire.sequence_number);
+                },
+                else => {}, // Ignore other frame types for now
+            }
+        }
+    }
+
+    /// Process a STREAM frame
+    fn processStreamFrame(conn: *connection.Connection, stream_frame: frame.StreamFrame) Error!void {
+        // Get or create the stream
+        const s = conn.getOrCreateStream(stream_frame.stream_id) catch |err| {
+            return switch (err) {
+                error.OutOfMemory => Error.OutOfMemory,
+                error.StreamLimitExceeded => Error.ProtocolError,
+                error.InvalidState, error.ConnectionClosed => Error.ProtocolError,
+                else => Error.ProtocolError,
+            };
+        };
+
+        // Deliver data to stream
+        s.receive(stream_frame.offset, stream_frame.data, stream_frame.fin) catch |err| switch (err) {
+            stream.Error.FlowControlError => return Error.ProtocolError,
+            stream.Error.FinalSizeError => return Error.ProtocolError,
+            stream.Error.InvalidStreamState => return Error.ProtocolError,
+            stream.Error.OutOfMemory => return Error.OutOfMemory,
+            else => return Error.ProtocolError,
+        };
+
+        // Update connection-level flow control
+        conn.flow_control.onDataReceived(stream_frame.data.len) catch {
+            return Error.ProtocolError;
+        };
+
+        // Process through HTTP/3 stack
+        // The HTTP/3 events are stored in the stack and will be returned via getHttp3Events
+        _ = conn.processHttp3Stream(stream_frame.stream_id, stream_frame.data, stream_frame.fin) catch {};
+    }
+
+    /// Get pending HTTP/3 events from the connection
+    fn getHttp3Events(conn: *connection.Connection) []http3.Event {
+        if (conn.http3_stack) |*stack| {
+            return stack.events.items;
+        }
+        return &.{};
     }
 
     fn buildInitialResponse(self: *Handler, conn: *connection.Connection) Error![]const u8 {

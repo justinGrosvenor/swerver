@@ -250,6 +250,8 @@ pub const Encoder = struct {
     dynamic_table: DynamicTable,
     /// Whether to use dynamic table references
     use_dynamic: bool = false,
+    /// Last acknowledged insert count from decoder
+    acked_insert_count: u64 = 0,
 
     pub fn init(max_table_size: usize) Encoder {
         return .{
@@ -261,8 +263,9 @@ pub const Encoder = struct {
     pub fn encode(self: *Encoder, buf: []u8, headers: []const HeaderField) Error!usize {
         var offset: usize = 0;
 
-        // Required Insert Count (0 for static-only encoding)
-        offset += try encodeInteger(buf[offset..], 0, 8, 0);
+        // Required Insert Count (use dynamic table insert count if enabled)
+        const ric: u64 = if (self.use_dynamic) self.dynamic_table.insert_count else 0;
+        offset += try encodeInteger(buf[offset..], ric, 8, 0);
 
         // Delta Base (0)
         offset += try encodeInteger(buf[offset..], 0, 7, 0);
@@ -300,6 +303,128 @@ pub const Encoder = struct {
         // Literal with literal name
         return encodeLiteral(buf, header.name, header.value);
     }
+
+    // ---- Encoder Stream Instructions (RFC 9204 Section 4.3) ----
+
+    /// Build Set Dynamic Table Capacity instruction
+    pub fn buildSetCapacity(_: *Encoder, buf: []u8, capacity: u64) Error!usize {
+        // Format: 001xxxxx with 5-bit prefix
+        return encodeInteger(buf, capacity, 5, 0x20);
+    }
+
+    /// Build Insert With Name Reference instruction (static table)
+    pub fn buildInsertStaticNameRef(self: *Encoder, buf: []u8, static_idx: usize, value: []const u8) Error!usize {
+        var offset: usize = 0;
+
+        // Format: 1Tnnnnnn - T=1 for static
+        offset += try encodeInteger(buf[offset..], static_idx, 6, 0xc0);
+
+        // Value with H bit (not Huffman encoded)
+        offset += try encodeInteger(buf[offset..], value.len, 7, 0x00);
+        if (buf.len < offset + value.len) return error.BufferTooSmall;
+        @memcpy(buf[offset .. offset + value.len], value);
+        offset += value.len;
+
+        // Also insert into our own table
+        const static_entry = getStaticEntry(static_idx) orelse return error.InvalidIndex;
+        try self.dynamic_table.insert(static_entry.name, value);
+
+        return offset;
+    }
+
+    /// Build Insert Without Name Reference instruction
+    pub fn buildInsertLiteral(self: *Encoder, buf: []u8, name: []const u8, value: []const u8) Error!usize {
+        var offset: usize = 0;
+
+        // Format: 01Hnnnnn - H=0 (not Huffman)
+        offset += try encodeInteger(buf[offset..], name.len, 5, 0x40);
+        if (buf.len < offset + name.len) return error.BufferTooSmall;
+        @memcpy(buf[offset .. offset + name.len], name);
+        offset += name.len;
+
+        // Value
+        offset += try encodeInteger(buf[offset..], value.len, 7, 0x00);
+        if (buf.len < offset + value.len) return error.BufferTooSmall;
+        @memcpy(buf[offset .. offset + value.len], value);
+        offset += value.len;
+
+        // Also insert into our own table
+        try self.dynamic_table.insert(name, value);
+
+        return offset;
+    }
+
+    /// Build Duplicate instruction
+    pub fn buildDuplicate(self: *Encoder, buf: []u8, index: usize) Error!usize {
+        // Format: 000xxxxx with 5-bit prefix
+        const len = try encodeInteger(buf, index, 5, 0x00);
+
+        // Also duplicate in our own table
+        const entry = self.dynamic_table.get(index) orelse return error.InvalidIndex;
+        try self.dynamic_table.insert(entry.name, entry.value);
+
+        return len;
+    }
+
+    /// Process decoder stream instructions (acknowledgments from peer)
+    pub fn processDecoderStream(self: *Encoder, data: []const u8) Error!usize {
+        var offset: usize = 0;
+
+        while (offset < data.len) {
+            const first_byte = data[offset];
+
+            if ((first_byte & 0x80) != 0) {
+                // Section Acknowledgment: 1xxxxxxx
+                const result = try decodeInteger(data[offset..], 7);
+                offset += result.len;
+                // Stream ID acknowledged - could track per-stream state if needed
+            } else if ((first_byte & 0x40) != 0) {
+                // Stream Cancellation: 01xxxxxx
+                const result = try decodeInteger(data[offset..], 6);
+                offset += result.len;
+                // Stream cancelled - could clean up per-stream state
+            } else {
+                // Insert Count Increment: 00xxxxxx
+                const result = try decodeInteger(data[offset..], 6);
+                offset += result.len;
+                self.acked_insert_count += result.value;
+            }
+        }
+
+        return offset;
+    }
+};
+
+/// QPACK Encoder Stream Instruction Types (RFC 9204 Section 4.3)
+pub const EncoderInstruction = enum {
+    /// Set Dynamic Table Capacity
+    set_capacity,
+    /// Insert With Name Reference (static or dynamic)
+    insert_name_ref,
+    /// Insert Without Name Reference (literal name)
+    insert_literal,
+    /// Duplicate existing entry
+    duplicate,
+};
+
+/// QPACK Decoder Stream Instruction Types (RFC 9204 Section 4.4)
+pub const DecoderInstruction = enum {
+    /// Section Acknowledgment
+    section_ack,
+    /// Stream Cancellation
+    stream_cancel,
+    /// Insert Count Increment
+    insert_count_increment,
+};
+
+/// Result of processing encoder stream instructions
+pub const EncoderStreamResult = struct {
+    /// Bytes consumed
+    consumed: usize,
+    /// Number of instructions processed
+    instructions_processed: usize,
+    /// New insert count (for decoder stream acknowledgment)
+    insert_count: u64,
 };
 
 /// QPACK Decoder
@@ -312,11 +437,136 @@ pub const Decoder = struct {
     /// Value storage for literals
     value_storage: [64][MAX_HEADER_VALUE_LEN]u8 = undefined,
     header_count: usize = 0,
+    /// Known received count (for Insert Count Increment)
+    known_received_count: u64 = 0,
+    /// Temporary storage for encoder stream instruction strings
+    enc_name_buf: [MAX_HEADER_NAME_LEN]u8 = undefined,
+    enc_value_buf: [MAX_HEADER_VALUE_LEN]u8 = undefined,
 
     pub fn init(max_table_size: usize) Decoder {
         return .{
             .dynamic_table = DynamicTable.init(max_table_size),
         };
+    }
+
+    /// Process encoder stream instructions (RFC 9204 Section 4.3)
+    /// These instructions update the decoder's dynamic table
+    pub fn processEncoderStream(self: *Decoder, data: []const u8) Error!EncoderStreamResult {
+        var offset: usize = 0;
+        var instructions: usize = 0;
+
+        while (offset < data.len) {
+            const first_byte = data[offset];
+
+            if ((first_byte & 0x20) != 0) {
+                // 001xxxxx - Set Dynamic Table Capacity
+                const result = try decodeInteger(data[offset..], 5);
+                offset += result.len;
+                self.dynamic_table.max_size = @intCast(result.value);
+                instructions += 1;
+            } else if ((first_byte & 0x80) != 0) {
+                // 1xxxxxxx - Insert With Name Reference
+                const consumed = try self.processInsertNameRef(data[offset..]);
+                offset += consumed;
+                instructions += 1;
+            } else if ((first_byte & 0x40) != 0) {
+                // 01xxxxxx - Insert Without Name Reference (literal name)
+                const consumed = try self.processInsertLiteral(data[offset..]);
+                offset += consumed;
+                instructions += 1;
+            } else {
+                // 000xxxxx - Duplicate
+                const result = try decodeInteger(data[offset..], 5);
+                offset += result.len;
+                try self.processDuplicate(result.value);
+                instructions += 1;
+            }
+        }
+
+        return .{
+            .consumed = offset,
+            .instructions_processed = instructions,
+            .insert_count = self.dynamic_table.insert_count,
+        };
+    }
+
+    /// Process Insert With Name Reference instruction
+    fn processInsertNameRef(self: *Decoder, buf: []const u8) Error!usize {
+        var offset: usize = 0;
+        const first_byte = buf[0];
+
+        // Bit 6 indicates static (1) or dynamic (0) table
+        const is_static = (first_byte & 0x40) != 0;
+        const idx_result = try decodeInteger(buf, 6);
+        offset += idx_result.len;
+
+        // Get name from referenced entry
+        const name_entry = if (is_static)
+            getStaticEntry(idx_result.value)
+        else
+            self.dynamic_table.get(@intCast(idx_result.value));
+
+        const name = if (name_entry) |e| e.name else return error.InvalidIndex;
+
+        // Decode value
+        const value_result = try decodeStringInto(buf[offset..], &self.enc_value_buf);
+        offset += value_result.len;
+
+        // Insert into dynamic table
+        try self.dynamic_table.insert(name, self.enc_value_buf[0..value_result.str_len]);
+
+        return offset;
+    }
+
+    /// Process Insert Without Name Reference instruction
+    /// Format: 01Hnnnnn + name bytes + Hvvvvvvv + value bytes
+    fn processInsertLiteral(self: *Decoder, buf: []const u8) Error!usize {
+        var offset: usize = 0;
+
+        // First byte: 01Hnnnnn - name length is 5-bit integer (H is Huffman flag, ignored for now)
+        const name_len_result = try decodeInteger(buf, 5);
+        offset += name_len_result.len;
+        const name_len: usize = @intCast(name_len_result.value);
+
+        // Read name bytes
+        if (buf.len < offset + name_len) return error.UnexpectedEnd;
+        if (name_len > self.enc_name_buf.len) return error.StringTooLong;
+        @memcpy(self.enc_name_buf[0..name_len], buf[offset .. offset + name_len]);
+        offset += name_len;
+
+        // Decode value (7-bit length prefix)
+        const value_result = try decodeStringInto(buf[offset..], &self.enc_value_buf);
+        offset += value_result.len;
+
+        // Insert into dynamic table
+        try self.dynamic_table.insert(
+            self.enc_name_buf[0..name_len],
+            self.enc_value_buf[0..value_result.str_len],
+        );
+
+        return offset;
+    }
+
+    /// Process Duplicate instruction
+    fn processDuplicate(self: *Decoder, index: u64) Error!void {
+        const entry = self.dynamic_table.get(@intCast(index)) orelse return error.InvalidIndex;
+        try self.dynamic_table.insert(entry.name, entry.value);
+    }
+
+    /// Build Insert Count Increment instruction for decoder stream
+    pub fn buildInsertCountIncrement(self: *Decoder, buf: []u8) Error!usize {
+        const increment = self.dynamic_table.insert_count - self.known_received_count;
+        if (increment == 0) return 0;
+
+        self.known_received_count = self.dynamic_table.insert_count;
+        // Format: 00xxxxxx with 6-bit prefix
+        return encodeInteger(buf, increment, 6, 0x00);
+    }
+
+    /// Build Section Acknowledgment instruction for decoder stream
+    pub fn buildSectionAck(_: *Decoder, buf: []u8, stream_id: u64) Error!usize {
+        // Format: 1xxxxxxx with 7-bit prefix
+        return encodeInteger(buf, stream_id, 7, 0x80);
     }
 
     /// Decode an encoded header block
@@ -549,6 +799,30 @@ fn decodeString(buf: []const u8) Error!struct { str: []const u8, len: usize } {
     return .{ .str = str_data, .len = total_len };
 }
 
+/// Decode a string and copy into destination buffer
+fn decodeStringInto(buf: []const u8, dest: []u8) Error!struct { str_len: usize, len: usize } {
+    if (buf.len == 0) return error.UnexpectedEnd;
+
+    const huffman = (buf[0] & 0x80) != 0;
+    const len_result = try decodeInteger(buf, 7);
+    const str_len: usize = @intCast(len_result.value);
+
+    const total_len = len_result.len + str_len;
+    if (buf.len < total_len) return error.UnexpectedEnd;
+    if (str_len > dest.len) return error.StringTooLong;
+
+    const str_data = buf[len_result.len..total_len];
+
+    if (huffman) {
+        // Huffman decoding not implemented - copy as-is for now
+        @memcpy(dest[0..str_len], str_data);
+    } else {
+        @memcpy(dest[0..str_len], str_data);
+    }
+
+    return .{ .str_len = str_len, .len = total_len };
+}
+
 /// Encode an indexed field line
 fn encodeIndexed(buf: []u8, index: usize, static: bool) Error!usize {
     const s_bit: u8 = if (static) 0x40 else 0x00;
@@ -670,4 +944,119 @@ test "dynamic table eviction" {
     // First entry should be gone
     const found = table.findNameValue("h1", "v1");
     try std.testing.expect(found == null or table.count <= 2);
+}
+
+test "encoder stream - set capacity instruction" {
+    var decoder = Decoder.init(4096);
+
+    // Build a Set Capacity instruction: 001xxxxx with capacity = 2048
+    var buf: [16]u8 = undefined;
+    var encoder = Encoder.init(4096);
+    const len = try encoder.buildSetCapacity(&buf, 2048);
+
+    // Process on decoder side
+    const result = try decoder.processEncoderStream(buf[0..len]);
+    try std.testing.expectEqual(@as(usize, len), result.consumed);
+    try std.testing.expectEqual(@as(usize, 1), result.instructions_processed);
+    try std.testing.expectEqual(@as(usize, 2048), decoder.dynamic_table.max_size);
+}
+
+test "encoder stream - insert literal instruction" {
+    var encoder = Encoder.init(4096);
+    var decoder = Decoder.init(4096);
+
+    // Encoder builds an insert instruction
+    var buf: [256]u8 = undefined;
+    const len = try encoder.buildInsertLiteral(&buf, "x-custom", "test-value");
+
+    // Process on decoder side
+    const result = try decoder.processEncoderStream(buf[0..len]);
+    try std.testing.expectEqual(@as(usize, 1), result.instructions_processed);
+
+    // Decoder's dynamic table should now have the entry
+    const entry = decoder.dynamic_table.get(0);
+    try std.testing.expect(entry != null);
+    try std.testing.expectEqualStrings("x-custom", entry.?.name);
+    try std.testing.expectEqualStrings("test-value", entry.?.value);
+}
+
+test "encoder stream - insert with static name ref" {
+    var encoder = Encoder.init(4096);
+    var decoder = Decoder.init(4096);
+
+    // Insert using static table index 0 (:authority) with custom value
+    var buf: [256]u8 = undefined;
+    const len = try encoder.buildInsertStaticNameRef(&buf, 0, "example.com");
+
+    // Process on decoder side
+    const result = try decoder.processEncoderStream(buf[0..len]);
+    try std.testing.expectEqual(@as(usize, 1), result.instructions_processed);
+
+    // Decoder's dynamic table should have :authority = example.com
+    const entry = decoder.dynamic_table.get(0);
+    try std.testing.expect(entry != null);
+    try std.testing.expectEqualStrings(":authority", entry.?.name);
+    try std.testing.expectEqualStrings("example.com", entry.?.value);
+}
+
+test "encoder stream - duplicate instruction" {
+    var encoder = Encoder.init(4096);
+    var decoder = Decoder.init(4096);
+
+    // First, insert an entry
+    var buf: [256]u8 = undefined;
+    var offset: usize = 0;
+    offset += try encoder.buildInsertLiteral(buf[offset..], "x-header", "value1");
+
+    // Then duplicate it
+    offset += try encoder.buildDuplicate(buf[offset..], 0);
+
+    // Process both instructions on decoder side
+    const result = try decoder.processEncoderStream(buf[0..offset]);
+    try std.testing.expectEqual(@as(usize, 2), result.instructions_processed);
+    try std.testing.expectEqual(@as(usize, 2), decoder.dynamic_table.count);
+
+    // Both entries should have same name/value
+    const entry0 = decoder.dynamic_table.get(0);
+    const entry1 = decoder.dynamic_table.get(1);
+    try std.testing.expectEqualStrings(entry0.?.name, entry1.?.name);
+    try std.testing.expectEqualStrings(entry0.?.value, entry1.?.value);
+}
+
+test "decoder stream - insert count increment" {
+    var decoder = Decoder.init(4096);
+    var buf: [16]u8 = undefined;
+
+    // Manually insert to advance insert_count
+    try decoder.dynamic_table.insert("header", "value");
+
+    // Build Insert Count Increment
+    const len = try decoder.buildInsertCountIncrement(&buf);
+    try std.testing.expect(len > 0);
+
+    // First byte should have 00xxxxxx pattern
+    try std.testing.expect((buf[0] & 0xc0) == 0x00);
+}
+
+test "decoder stream - section ack" {
+    var decoder = Decoder.init(4096);
+    var buf: [16]u8 = undefined;
+
+    // Build Section Acknowledgment for stream 4
+    const len = try decoder.buildSectionAck(&buf, 4);
+    try std.testing.expect(len > 0);
+
+    // First byte should have 1xxxxxxx pattern
+    try std.testing.expect((buf[0] & 0x80) != 0);
+}
+
+test "encoder processes decoder stream" {
+    var encoder = Encoder.init(4096);
+
+    // Simulate Insert Count Increment of 5: 00000101
+    const data = [_]u8{0x05};
+    const consumed = try encoder.processDecoderStream(&data);
+
+    try std.testing.expectEqual(@as(usize, 1), consumed);
+    try std.testing.expectEqual(@as(u64, 5), encoder.acked_insert_count);
 }

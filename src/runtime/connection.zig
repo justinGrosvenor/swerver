@@ -3,6 +3,7 @@ const config = @import("../config.zig");
 const buffer_pool = @import("buffer_pool.zig");
 const request = @import("../protocol/request.zig");
 const http2 = @import("../protocol/http2.zig");
+const tls = @import("../tls/provider.zig");
 
 pub const State = enum {
     accept,
@@ -53,6 +54,10 @@ pub const Connection = struct {
     read_buffer: ?buffer_pool.BufferHandle,
     // Position in active list for O(1) removal
     active_list_pos: u32,
+    /// TLS session for encrypted connections
+    tls_session: ?tls.Session,
+    /// Whether this connection uses TLS
+    is_tls: bool,
 
     pub fn init(index: u32) Connection {
         return .{
@@ -80,6 +85,8 @@ pub const Connection = struct {
             .timeout_phase = .idle,
             .read_buffer = null,
             .active_list_pos = 0,
+            .tls_session = null,
+            .is_tls = false,
         };
     }
 
@@ -104,7 +111,18 @@ pub const Connection = struct {
         self.write_paused = false;
         self.timeout_phase = .idle;
         self.read_buffer = null;
+        // TLS session is cleaned up before reset
+        self.tls_session = null;
+        self.is_tls = false;
         // active_list_pos is set by ConnectionPool.acquire
+    }
+
+    /// Clean up TLS session if present
+    pub fn cleanupTls(self: *Connection) void {
+        if (self.tls_session) |*session| {
+            session.deinit();
+            self.tls_session = null;
+        }
     }
 
     pub fn transition(self: *Connection, next: State, now_ms: u64) TransitionError!void {

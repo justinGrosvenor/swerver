@@ -196,28 +196,31 @@ pub const x402 = @import("x402.zig");
 
 // Tests
 test "chain executes middleware in order" {
-    var count: u32 = 0;
-
     const middleware1 = struct {
         fn run(_: *Context, _: request.RequestView) Decision {
-            count += 1;
             return .allow;
         }
     }.run;
 
     const middleware2 = struct {
         fn run(_: *Context, _: request.RequestView) Decision {
-            count += 10;
             return .allow;
         }
     }.run;
 
-    _ = middleware1;
-    _ = middleware2;
+    const pre = [_]MiddlewareFn{ middleware1, middleware2 };
+    var chain = Chain.init(&pre, &.{});
 
-    // Note: Can't easily test with function pointers in test context
-    // but the logic is verified by the structure
-    try std.testing.expect(true);
+    var ctx = Context{};
+    const req = request.RequestView{
+        .method = .GET,
+        .path = "/test",
+        .headers = &.{},
+        .body = "",
+    };
+
+    const result = chain.executePre(&ctx, req);
+    try std.testing.expect(result == null); // No rejection
 }
 
 test "format buffer append" {

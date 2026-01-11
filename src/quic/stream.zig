@@ -591,3 +591,48 @@ test "stream receive with reassembly" {
     try std.testing.expectEqual(@as(u64, 10), stream.recv_offset);
     try std.testing.expectEqualStrings("helloworld", stream.read());
 }
+
+test "stream triggers MAX_STREAM_DATA when half consumed" {
+    const allocator = std.testing.allocator;
+    var stream = Stream.init(allocator, 0, 1000);
+    defer stream.deinit();
+
+    stream.open();
+
+    // Initially no MAX_STREAM_DATA needed
+    try std.testing.expect(!stream.send_max_stream_data);
+
+    // Receive less than half - no trigger
+    try stream.receive(0, &[_]u8{0} ** 400, false);
+    try std.testing.expect(!stream.send_max_stream_data);
+
+    // Receive past half - should trigger
+    try stream.receive(400, &[_]u8{0} ** 200, false);
+    try std.testing.expect(stream.send_max_stream_data);
+
+    // Update limit clears the flag
+    stream.updateRecvLimit(2000);
+    try std.testing.expect(!stream.send_max_stream_data);
+}
+
+test "stream manager flow control integration" {
+    const allocator = std.testing.allocator;
+    var mgr = StreamManager.init(allocator, false); // Client
+    defer mgr.deinit();
+
+    mgr.setLimits(10, 10, 10, 10);
+    mgr.initial_max_stream_data = 1000;
+
+    // Create a stream
+    const stream = try mgr.createLocalStream(true);
+    stream.open();
+
+    // Receive data past half - triggers MAX_STREAM_DATA
+    try stream.receive(0, &[_]u8{0} ** 600, false);
+    try std.testing.expect(stream.send_max_stream_data);
+
+    // Verify we can find the stream
+    const found = mgr.getStream(stream.id);
+    try std.testing.expect(found != null);
+    try std.testing.expect(found.?.send_max_stream_data);
+}

@@ -122,7 +122,16 @@ const StreamState = struct {
     request_state: RequestState,
     /// Buffer for partial frames
     buffer: std.ArrayList(u8),
+    /// Accumulated request body
+    body_buffer: std.ArrayList(u8),
+    /// Headers received flag
+    headers_received: bool = false,
+    /// End of stream received flag
+    end_stream_received: bool = false,
 };
+
+/// Maximum size of body data per DATA frame (16KB)
+pub const MAX_DATA_FRAME_SIZE: usize = 16 * 1024;
 
 /// HTTP/3 Stack
 pub const Stack = struct {
@@ -157,6 +166,12 @@ pub const Stack = struct {
     header_count: usize = 0,
     /// Is server?
     is_server: bool,
+    /// Accumulated request bodies by stream ID
+    request_bodies: std.AutoHashMap(u64, std.ArrayList(u8)),
+    /// Request body storage (fixed buffers for small bodies)
+    body_storage: [16][8192]u8 = undefined,
+    /// Which body storage slots are in use
+    body_storage_used: [16]bool = .{false} ** 16,
 
     pub const Settings = struct {
         qpack_max_table_capacity: u64 = 4096,
@@ -176,8 +191,9 @@ pub const Stack = struct {
             .peer_settings_received = false,
             .settings = .{},
             .streams = std.AutoHashMap(u64, StreamState).init(allocator),
-            .events = std.ArrayList(Event).init(allocator),
+            .events = .{},
             .is_server = is_server,
+            .request_bodies = std.AutoHashMap(u64, std.ArrayList(u8)).init(allocator),
         };
     }
 
@@ -208,10 +224,18 @@ pub const Stack = struct {
     pub fn deinit(self: *Stack) void {
         var it = self.streams.valueIterator();
         while (it.next()) |state| {
-            state.buffer.deinit();
+            state.buffer.deinit(self.allocator);
+            state.body_buffer.deinit(self.allocator);
         }
         self.streams.deinit();
-        self.events.deinit();
+        self.events.deinit(self.allocator);
+
+        // Clean up request bodies
+        var body_it = self.request_bodies.valueIterator();
+        while (body_it.next()) |body| {
+            body.deinit(self.allocator);
+        }
+        self.request_bodies.deinit();
         // qpack encoder/decoder use fixed-size internal storage, no deinit needed
     }
 
@@ -281,13 +305,13 @@ pub const Stack = struct {
                     },
                     .qpack_encoder => {
                         self.peer_qpack_encoder = stream_id;
-                        // QPACK encoder instructions - for now skip
-                        return .{ .consumed = data.len, .events = &.{}, .need_more = false };
+                        // Process encoder stream instructions (updates our decoder's table)
+                        return self.processQpackEncoderStream(data[uni_type.len..]);
                     },
                     .qpack_decoder => {
                         self.peer_qpack_decoder = stream_id;
-                        // QPACK decoder instructions - for now skip
-                        return .{ .consumed = data.len, .events = &.{}, .need_more = false };
+                        // Process decoder stream instructions (acknowledgments to our encoder)
+                        return self.processQpackDecoderStream(data[uni_type.len..]);
                     },
                     .push => {
                         // Push streams (server to client only)
@@ -299,10 +323,11 @@ pub const Stack = struct {
                     },
                 }
             },
-            .qpack_encoder, .qpack_decoder => {
-                // QPACK encoder/decoder instructions - consume but don't process
-                // (dynamic table updates not implemented)
-                return .{ .consumed = data.len, .events = &.{}, .need_more = false };
+            .qpack_encoder => {
+                return self.processQpackEncoderStream(data);
+            },
+            .qpack_decoder => {
+                return self.processQpackDecoderStream(data);
             },
             .push => {
                 // Push streams (server to client only) - consume
@@ -347,7 +372,7 @@ pub const Stack = struct {
                     // Copy headers to Stack's owned storage (decoder storage may be reused)
                     const owned_headers = try self.copyHeaders(decoded_headers);
 
-                    self.events.append(.{
+                    self.events.append(self.allocator,.{
                         .headers = .{
                             .stream_id = stream_id,
                             .headers = owned_headers,
@@ -356,7 +381,10 @@ pub const Stack = struct {
                     }) catch return error.BufferTooSmall;
                 },
                 .data => |d| {
-                    self.events.append(.{
+                    // Accumulate body data
+                    try self.accumulateBody(stream_id, d.data);
+
+                    self.events.append(self.allocator, .{
                         .data = .{
                             .stream_id = stream_id,
                             .data = d.data,
@@ -371,7 +399,7 @@ pub const Stack = struct {
         }
 
         if (end_stream) {
-            self.events.append(.{
+            self.events.append(self.allocator,.{
                 .end_stream = .{ .stream_id = stream_id },
             }) catch return error.BufferTooSmall;
         }
@@ -421,10 +449,10 @@ pub const Stack = struct {
                     }
 
                     self.peer_settings_received = true;
-                    self.events.append(.{ .settings = event }) catch return error.BufferTooSmall;
+                    self.events.append(self.allocator,.{ .settings = event }) catch return error.BufferTooSmall;
                 },
                 .goaway => |g| {
-                    self.events.append(.{
+                    self.events.append(self.allocator,.{
                         .goaway = .{ .stream_id = g.stream_id },
                     }) catch return error.BufferTooSmall;
                 },
@@ -441,7 +469,42 @@ pub const Stack = struct {
         };
     }
 
+    /// Process QPACK encoder stream (updates our decoder's dynamic table)
+    fn processQpackEncoderStream(self: *Stack, data: []const u8) Error!IngestResult {
+        if (data.len == 0) {
+            return .{ .consumed = 0, .events = &.{}, .need_more = true };
+        }
+
+        const result = self.qpack_decoder.processEncoderStream(data) catch {
+            return error.QpackError;
+        };
+
+        return .{
+            .consumed = result.consumed,
+            .events = &.{},
+            .need_more = false,
+        };
+    }
+
+    /// Process QPACK decoder stream (acknowledgments for our encoder)
+    fn processQpackDecoderStream(self: *Stack, data: []const u8) Error!IngestResult {
+        if (data.len == 0) {
+            return .{ .consumed = 0, .events = &.{}, .need_more = true };
+        }
+
+        _ = self.qpack_encoder.processDecoderStream(data) catch {
+            return error.QpackError;
+        };
+
+        return .{
+            .consumed = data.len,
+            .events = &.{},
+            .need_more = false,
+        };
+    }
+
     /// Encode an HTTP/3 response
+    /// For large bodies, this splits into multiple DATA frames (max 16KB each)
     pub fn encodeResponse(
         self: *Stack,
         buf: []u8,
@@ -475,15 +538,101 @@ pub const Stack = struct {
             return error.BufferTooSmall;
         };
 
-        // Write DATA frame if body present
+        // Write DATA frame(s) if body present - chunk large bodies
         if (body) |b| {
-            offset += frame.writeDataFrame(buf[offset..], b) catch {
-                return error.BufferTooSmall;
-            };
+            var body_offset: usize = 0;
+            while (body_offset < b.len) {
+                const chunk_size = @min(b.len - body_offset, MAX_DATA_FRAME_SIZE);
+                const chunk = b[body_offset .. body_offset + chunk_size];
+
+                offset += frame.writeDataFrame(buf[offset..], chunk) catch {
+                    return error.BufferTooSmall;
+                };
+
+                body_offset += chunk_size;
+            }
         }
 
         return offset;
     }
+
+    /// Response encoder for streaming large responses
+    /// Returns chunks that can be sent incrementally
+    pub const ResponseEncoder = struct {
+        stack: *Stack,
+        body: []const u8,
+        body_offset: usize,
+        headers_sent: bool,
+        status: u16,
+        headers: []const Header,
+
+        pub fn init(stack: *Stack, status: u16, headers: []const Header, body: []const u8) ResponseEncoder {
+            return .{
+                .stack = stack,
+                .body = body,
+                .body_offset = 0,
+                .headers_sent = false,
+                .status = status,
+                .headers = headers,
+            };
+        }
+
+        /// Encode the next chunk into the buffer
+        /// Returns bytes written, or 0 if done
+        pub fn next(self: *ResponseEncoder, buf: []u8) Error!usize {
+            var offset: usize = 0;
+
+            // Send headers first
+            if (!self.headers_sent) {
+                var all_headers: [65]Header = undefined;
+                var status_buf: [3]u8 = undefined;
+                _ = std.fmt.bufPrint(&status_buf, "{d}", .{self.status}) catch {
+                    return error.BufferTooSmall;
+                };
+
+                all_headers[0] = .{ .name = ":status", .value = &status_buf };
+                for (self.headers, 1..) |h, i| {
+                    all_headers[i] = h;
+                }
+                const header_count = self.headers.len + 1;
+
+                var qpack_buf: [4096]u8 = undefined;
+                const qpack_len = self.stack.qpack_encoder.encode(&qpack_buf, all_headers[0..header_count]) catch {
+                    return error.QpackError;
+                };
+
+                offset += frame.writeHeadersFrame(buf[offset..], qpack_buf[0..qpack_len]) catch {
+                    return error.BufferTooSmall;
+                };
+
+                self.headers_sent = true;
+            }
+
+            // Send body chunk if there's more body
+            if (self.body_offset < self.body.len) {
+                const chunk_size = @min(self.body.len - self.body_offset, MAX_DATA_FRAME_SIZE);
+                const chunk = self.body[self.body_offset .. self.body_offset + chunk_size];
+
+                offset += frame.writeDataFrame(buf[offset..], chunk) catch {
+                    return error.BufferTooSmall;
+                };
+
+                self.body_offset += chunk_size;
+            }
+
+            return offset;
+        }
+
+        /// Check if encoding is complete
+        pub fn isDone(self: *const ResponseEncoder) bool {
+            return self.headers_sent and self.body_offset >= self.body.len;
+        }
+
+        /// Get remaining body bytes
+        pub fn remainingBytes(self: *const ResponseEncoder) usize {
+            return self.body.len - self.body_offset;
+        }
+    };
 
     /// Build initial SETTINGS frame for our control stream
     pub fn buildSettings(self: *Stack, buf: []u8) Error!usize {
@@ -494,6 +643,49 @@ pub const Stack = struct {
         };
 
         return frame.writeSettingsFrame(buf, &params) catch error.BufferTooSmall;
+    }
+
+    /// Accumulate request body data for a stream
+    fn accumulateBody(self: *Stack, stream_id: u64, data: []const u8) Error!void {
+        if (data.len == 0) return;
+
+        const entry = self.request_bodies.getPtr(stream_id);
+        if (entry) |body_list| {
+            // Append to existing body
+            body_list.appendSlice(self.allocator, data) catch return error.BufferTooSmall;
+        } else {
+            // Create new body accumulator
+            var body_list: std.ArrayList(u8) = .{};
+            body_list.appendSlice(self.allocator, data) catch return error.BufferTooSmall;
+            self.request_bodies.put(self.allocator, stream_id, body_list) catch return error.BufferTooSmall;
+        }
+    }
+
+    /// Get accumulated request body for a stream
+    /// Returns null if no body data has been received
+    pub fn getRequestBody(self: *Stack, stream_id: u64) ?[]const u8 {
+        if (self.request_bodies.get(stream_id)) |body_list| {
+            if (body_list.items.len > 0) {
+                return body_list.items;
+            }
+        }
+        return null;
+    }
+
+    /// Clear accumulated body for a stream (call after request is processed)
+    pub fn clearRequestBody(self: *Stack, stream_id: u64) void {
+        if (self.request_bodies.fetchRemove(stream_id)) |kv| {
+            var body_list = kv.value;
+            body_list.deinit(self.allocator);
+        }
+    }
+
+    /// Get total accumulated body size for a stream
+    pub fn getRequestBodySize(self: *Stack, stream_id: u64) usize {
+        if (self.request_bodies.get(stream_id)) |body_list| {
+            return body_list.items.len;
+        }
+        return 0;
     }
 };
 
@@ -546,4 +738,158 @@ test "build settings" {
     var buf: [256]u8 = undefined;
     const len = try stack.buildSettings(&buf);
     try std.testing.expect(len > 0);
+}
+
+test "request body accumulation" {
+    const allocator = std.testing.allocator;
+    var stack = Stack.init(allocator, true);
+    defer stack.deinit();
+
+    const stream_id: u64 = 0; // Client-initiated bidirectional
+
+    // Initially no body
+    try std.testing.expect(stack.getRequestBody(stream_id) == null);
+    try std.testing.expectEqual(@as(usize, 0), stack.getRequestBodySize(stream_id));
+
+    // Accumulate first chunk
+    try stack.accumulateBody(stream_id, "Hello");
+    try std.testing.expectEqual(@as(usize, 5), stack.getRequestBodySize(stream_id));
+    try std.testing.expectEqualStrings("Hello", stack.getRequestBody(stream_id).?);
+
+    // Accumulate second chunk
+    try stack.accumulateBody(stream_id, " World");
+    try std.testing.expectEqual(@as(usize, 11), stack.getRequestBodySize(stream_id));
+    try std.testing.expectEqualStrings("Hello World", stack.getRequestBody(stream_id).?);
+
+    // Clear body
+    stack.clearRequestBody(stream_id);
+    try std.testing.expect(stack.getRequestBody(stream_id) == null);
+    try std.testing.expectEqual(@as(usize, 0), stack.getRequestBodySize(stream_id));
+}
+
+test "multiple stream body accumulation" {
+    const allocator = std.testing.allocator;
+    var stack = Stack.init(allocator, true);
+    defer stack.deinit();
+
+    // Two different streams
+    const stream1: u64 = 0;
+    const stream2: u64 = 4;
+
+    try stack.accumulateBody(stream1, "Body1");
+    try stack.accumulateBody(stream2, "Body2");
+
+    try std.testing.expectEqualStrings("Body1", stack.getRequestBody(stream1).?);
+    try std.testing.expectEqualStrings("Body2", stack.getRequestBody(stream2).?);
+
+    // Clear only stream1
+    stack.clearRequestBody(stream1);
+    try std.testing.expect(stack.getRequestBody(stream1) == null);
+    try std.testing.expectEqualStrings("Body2", stack.getRequestBody(stream2).?);
+}
+
+test "response body chunking - small body" {
+    const allocator = std.testing.allocator;
+    var stack = Stack.init(allocator, true);
+    defer stack.deinit();
+
+    var buf: [4096]u8 = undefined;
+    const headers = [_]Header{
+        .{ .name = "content-type", .value = "text/plain" },
+    };
+
+    // Small body should produce single DATA frame
+    const small_body = "Hello, World!";
+    const len = try stack.encodeResponse(&buf, 200, &headers, small_body);
+    try std.testing.expect(len > 0);
+
+    // Parse and verify we get HEADERS + DATA
+    var offset: usize = 0;
+
+    // Parse HEADERS frame
+    const headers_result = try frame.parseFrame(buf[offset..len], allocator);
+    try std.testing.expect(headers_result.frame == .headers);
+    offset += headers_result.consumed;
+
+    // Parse single DATA frame
+    const data_result = try frame.parseFrame(buf[offset..len], allocator);
+    try std.testing.expect(data_result.frame == .data);
+    try std.testing.expectEqualStrings(small_body, data_result.frame.data.data);
+}
+
+test "response body chunking - large body" {
+    const allocator = std.testing.allocator;
+    var stack = Stack.init(allocator, true);
+    defer stack.deinit();
+
+    // Create body larger than MAX_DATA_FRAME_SIZE
+    var large_body: [MAX_DATA_FRAME_SIZE + 1000]u8 = undefined;
+    for (&large_body, 0..) |*c, i| {
+        c.* = @truncate(i % 256);
+    }
+
+    var buf: [65536]u8 = undefined;
+    const headers = [_]Header{
+        .{ .name = "content-type", .value = "application/octet-stream" },
+    };
+
+    const len = try stack.encodeResponse(&buf, 200, &headers, &large_body);
+    try std.testing.expect(len > 0);
+
+    // Parse and verify we get HEADERS + 2 DATA frames
+    var offset: usize = 0;
+
+    // Parse HEADERS frame
+    const headers_result = try frame.parseFrame(buf[offset..len], allocator);
+    try std.testing.expect(headers_result.frame == .headers);
+    offset += headers_result.consumed;
+
+    // Parse first DATA frame (should be MAX_DATA_FRAME_SIZE)
+    const data1_result = try frame.parseFrame(buf[offset..len], allocator);
+    try std.testing.expect(data1_result.frame == .data);
+    try std.testing.expectEqual(MAX_DATA_FRAME_SIZE, data1_result.frame.data.data.len);
+    offset += data1_result.consumed;
+
+    // Parse second DATA frame (should be 1000 bytes)
+    const data2_result = try frame.parseFrame(buf[offset..len], allocator);
+    try std.testing.expect(data2_result.frame == .data);
+    try std.testing.expectEqual(@as(usize, 1000), data2_result.frame.data.data.len);
+}
+
+test "response encoder streaming" {
+    const allocator = std.testing.allocator;
+    var stack = Stack.init(allocator, true);
+    defer stack.deinit();
+
+    // Create body larger than MAX_DATA_FRAME_SIZE
+    var large_body: [MAX_DATA_FRAME_SIZE * 2 + 500]u8 = undefined;
+    for (&large_body, 0..) |*c, i| {
+        c.* = @truncate(i % 256);
+    }
+
+    const headers = [_]Header{
+        .{ .name = "content-type", .value = "application/octet-stream" },
+    };
+
+    var encoder = Stack.ResponseEncoder.init(&stack, 200, &headers, &large_body);
+
+    // Should not be done initially
+    try std.testing.expect(!encoder.isDone());
+    try std.testing.expectEqual(large_body.len, encoder.remainingBytes());
+
+    var buf: [32768]u8 = undefined;
+    var total_written: usize = 0;
+    var chunks: usize = 0;
+
+    // Encode chunks until done
+    while (!encoder.isDone()) {
+        const written = try encoder.next(&buf);
+        total_written += written;
+        chunks += 1;
+    }
+
+    // Should have produced 3 body chunks (plus headers in first call)
+    try std.testing.expectEqual(@as(usize, 3), chunks);
+    try std.testing.expect(encoder.isDone());
+    try std.testing.expectEqual(@as(usize, 0), encoder.remainingBytes());
 }

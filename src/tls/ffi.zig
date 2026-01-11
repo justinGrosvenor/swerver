@@ -109,6 +109,10 @@ extern fn BIO_ctrl_pending(bio: *BIO) usize;
 extern fn SSL_set_bio(ssl: *SSL, rbio: ?*BIO, wbio: ?*BIO) void;
 extern fn SSL_get_rbio(ssl: *const SSL) ?*BIO;
 extern fn SSL_get_wbio(ssl: *const SSL) ?*BIO;
+extern fn SSL_set_fd(ssl: *SSL, fd: c_int) c_int;
+extern fn SSL_accept(ssl: *SSL) c_int;
+extern fn SSL_connect(ssl: *SSL) c_int;
+extern fn SSL_shutdown(ssl: *SSL) c_int;
 
 extern fn ERR_get_error() c_ulong;
 extern fn ERR_error_string_n(e: c_ulong, buf: [*]u8, len: usize) void;
@@ -174,6 +178,70 @@ pub fn createSession(ctx: *SSL_CTX, is_server: bool) !*SSL {
 
 pub fn freeSession(ssl: *SSL) void {
     SSL_free(ssl);
+}
+
+/// Create a session for socket-based TLS (not memory BIO)
+pub fn createSocketSession(ctx: *SSL_CTX, fd: c_int, is_server: bool) !*SSL {
+    const ssl = SSL_new(ctx) orelse return error.SessionCreationFailed;
+    errdefer SSL_free(ssl);
+
+    if (SSL_set_fd(ssl, fd) != 1) {
+        return error.SessionCreationFailed;
+    }
+
+    if (is_server) {
+        SSL_set_accept_state(ssl);
+    } else {
+        SSL_set_connect_state(ssl);
+    }
+
+    return ssl;
+}
+
+/// Perform TLS accept handshake (for server)
+pub fn sslAccept(ssl: *SSL) HandshakeResult {
+    const ret = SSL_accept(ssl);
+    if (ret == 1) return .complete;
+
+    const err = SSL_get_error(ssl, ret);
+    return switch (err) {
+        SSL_ERROR_WANT_READ => .want_read,
+        SSL_ERROR_WANT_WRITE => .want_write,
+        else => .err,
+    };
+}
+
+/// Read decrypted data from TLS connection
+pub fn sslRead(ssl: *SSL, buf: []u8) !usize {
+    const ret = SSL_read(ssl, buf.ptr, @intCast(buf.len));
+    if (ret > 0) return @intCast(ret);
+    if (ret == 0) return 0; // Connection closed
+
+    const err = SSL_get_error(ssl, ret);
+    return switch (err) {
+        SSL_ERROR_WANT_READ => error.WouldBlock,
+        SSL_ERROR_WANT_WRITE => error.WouldBlock,
+        SSL_ERROR_ZERO_RETURN => error.ConnectionClosed,
+        else => error.TlsError,
+    };
+}
+
+/// Write data to TLS connection (encrypts automatically)
+pub fn sslWrite(ssl: *SSL, data: []const u8) !usize {
+    const ret = SSL_write(ssl, data.ptr, @intCast(data.len));
+    if (ret > 0) return @intCast(ret);
+
+    const err = SSL_get_error(ssl, ret);
+    return switch (err) {
+        SSL_ERROR_WANT_READ => error.WouldBlock,
+        SSL_ERROR_WANT_WRITE => error.WouldBlock,
+        else => error.TlsError,
+    };
+}
+
+/// Shutdown TLS connection
+pub fn sslShutdown(ssl: *SSL) void {
+    _ = SSL_shutdown(ssl);
 }
 
 pub const HandshakeResult = enum {

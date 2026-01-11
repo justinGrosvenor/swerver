@@ -94,9 +94,20 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
             .expect_continue = false,
         };
     };
-    const method = line[0..first_space];
+    const method_str = line[0..first_space];
     const request_target = line[first_space + 1 .. second_space];
     const version = line[second_space + 1 ..];
+    // Use extended parsing to accept any valid token method (RFC 7230 compliance)
+    const method = request.Method.fromStringExtended(method_str) orelse {
+        return .{
+            .state = .err,
+            .view = emptyView(),
+            .error_code = .invalid_method,
+            .consumed_bytes = 0,
+            .keep_alive = true,
+            .expect_continue = false,
+        };
+    };
     var keep_alive = true;
     if (std.mem.eql(u8, version, "HTTP/1.1")) {
         keep_alive = true;
@@ -122,16 +133,7 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
             .expect_continue = false,
         };
     }
-    if (!isToken(method)) {
-        return .{
-            .state = .err,
-            .view = emptyView(),
-            .error_code = .invalid_method,
-            .consumed_bytes = 0,
-            .keep_alive = true,
-            .expect_continue = false,
-        };
-    }
+    // Token validation is now done by Method.fromStringExtended
     if (request_target.len == 0) {
         return .{
             .state = .err,
@@ -147,7 +149,7 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
     if (request_target[0] == '/') {
         path = request_target;
     } else if (request_target[0] == '*') {
-        if (!std.mem.eql(u8, method, "OPTIONS")) {
+        if (method != .OPTIONS) {
             return .{
                 .state = .err,
                 .view = emptyView(),
@@ -187,7 +189,7 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
         } else {
             path = "/";
         }
-    } else if (std.mem.eql(u8, method, "CONNECT")) {
+    } else if (method == .CONNECT) {
         if (std.mem.indexOfScalar(u8, request_target, ':') == null) {
             return .{
                 .state = .err,
@@ -406,6 +408,7 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
             .state = .complete,
             .view = .{
                 .method = method,
+                .method_raw = method_str,
                 .path = path,
                 .headers = headers,
                 .body = body,
@@ -433,6 +436,7 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
         .state = .complete,
         .view = .{
             .method = method,
+            .method_raw = method_str,
             .path = path,
             .headers = headers,
             .body = body,
@@ -453,7 +457,7 @@ pub const Limits = struct {
 
 fn emptyView() request.RequestView {
     return .{
-        .method = "",
+        .method = .GET,
         .path = "",
         .headers = &[_]request.Header{},
         .body = "",

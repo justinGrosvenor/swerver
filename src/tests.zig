@@ -7,6 +7,36 @@ const http2 = @import("protocol/http2.zig");
 const request = @import("protocol/request.zig");
 const response = @import("response/response.zig");
 
+// QUIC and HTTP/3 modules (excluding those that depend on TLS FFI)
+const quic_types = @import("quic/types.zig");
+const quic_varint = @import("quic/varint.zig");
+const quic_packet = @import("quic/packet.zig");
+const quic_frame = @import("quic/frame.zig");
+const quic_crypto = @import("quic/crypto.zig");
+const quic_stream = @import("quic/stream.zig");
+const quic_recovery = @import("quic/recovery.zig");
+const quic_congestion = @import("quic/congestion.zig");
+const quic_metrics = @import("quic/metrics.zig");
+const http3_frame = @import("protocol/http3/frame.zig");
+const http3_qpack = @import("protocol/http3/qpack.zig");
+
+// Force tests in these modules to be included
+// Note: quic_connection, quic_handler, and http3 are excluded as they
+// transitively import TLS FFI which requires OpenSSL linking
+comptime {
+    _ = quic_types;
+    _ = quic_varint;
+    _ = quic_packet;
+    _ = quic_frame;
+    _ = quic_crypto;
+    _ = quic_stream;
+    _ = quic_recovery;
+    _ = quic_congestion;
+    _ = quic_metrics;
+    _ = http3_frame;
+    _ = http3_qpack;
+}
+
 const Parsed = struct {
     buf: []u8,
     result: http1.ParseResult,
@@ -467,7 +497,7 @@ test "http2 stack decodes headers event with hpack" {
     switch (events[0]) {
         .headers => |ev| {
             try std.testing.expectEqual(@as(u32, 1), ev.stream_id);
-            try std.testing.expectEqualStrings("GET", ev.request.method);
+            try std.testing.expectEqual(request.Method.GET, ev.request.method);
             try std.testing.expectEqualStrings("/", ev.request.path);
             try std.testing.expect(ev.end_stream);
         },
@@ -492,7 +522,7 @@ test "http2 stack handles continuation frames" {
     try std.testing.expectEqual(@as(usize, 1), res.event_count);
     switch (events[0]) {
         .headers => |ev| {
-            try std.testing.expectEqualStrings("GET", ev.request.method);
+            try std.testing.expectEqual(request.Method.GET, ev.request.method);
             try std.testing.expectEqualStrings("/", ev.request.path);
         },
         else => return error.UnexpectedEvent,
@@ -539,7 +569,7 @@ test "http2 hpack decodes huffman example" {
     const hex = "828684418cf1e3c2e5f23a6ba0ab90f4ff";
     const block = try hexToBytes(encoded_bytes[0..], hex);
     const result = try decoder.decodeRequestBlock(block, headers[0..], 4096);
-    try std.testing.expectEqualStrings("GET", result.method);
+    try std.testing.expectEqual(request.Method.GET, result.method);
     try std.testing.expectEqualStrings("/", result.path);
     try std.testing.expectEqualStrings("www.example.com", result.authority);
 }

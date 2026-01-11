@@ -16,6 +16,9 @@ pub const ParseError = error{
     InvalidLength,
 } || varint.Error;
 
+/// Errors that can occur when writing frames
+pub const WriteError = varint.Error;
+
 /// PADDING frame (type 0x00)
 pub const PaddingFrame = struct {
     /// Number of padding bytes (including the frame type byte)
@@ -285,6 +288,9 @@ fn parseStreamFrame(buf: []const u8, initial_offset: usize, frame_type: u64) Par
     };
 }
 
+/// Static buffer for ACK ranges (reused per parse)
+var ack_ranges_buf: [64]AckRange = undefined;
+
 fn parseAckFrame(buf: []const u8, initial_offset: usize, has_ecn: bool) ParseError!ParseResult {
     var offset = initial_offset;
 
@@ -300,9 +306,23 @@ fn parseAckFrame(buf: []const u8, initial_offset: usize, has_ecn: bool) ParseErr
     const first_ack_range = try varint.decode(buf[offset..]);
     offset += first_ack_range.len;
 
-    // Skip additional ACK ranges (we don't store them in this simple implementation)
-    var i: u64 = 0;
-    while (i < ack_range_count.value) : (i += 1) {
+    // Parse additional ACK ranges
+    const range_count = @min(ack_range_count.value, ack_ranges_buf.len);
+    var i: usize = 0;
+    while (i < range_count) : (i += 1) {
+        const gap = try varint.decode(buf[offset..]);
+        offset += gap.len;
+        const range_len = try varint.decode(buf[offset..]);
+        offset += range_len.len;
+        ack_ranges_buf[i] = .{
+            .gap = gap.value,
+            .length = range_len.value,
+        };
+    }
+
+    // Skip any remaining ranges that don't fit in buffer
+    var j: u64 = range_count;
+    while (j < ack_range_count.value) : (j += 1) {
         const gap = try varint.decode(buf[offset..]);
         offset += gap.len;
         const range_len = try varint.decode(buf[offset..]);
@@ -330,7 +350,7 @@ fn parseAckFrame(buf: []const u8, initial_offset: usize, has_ecn: bool) ParseErr
                 .largest_acked = largest_acked.value,
                 .ack_delay = ack_delay.value,
                 .first_ack_range = first_ack_range.value,
-                .ranges = &[_]AckRange{}, // Simplified - ranges skipped
+                .ranges = ack_ranges_buf[0..range_count],
                 .ecn = ecn,
             },
         },
@@ -627,6 +647,163 @@ fn parseConnectionCloseFrame(buf: []const u8, initial_offset: usize, app_error: 
     };
 }
 
+// === Frame Writing Functions ===
+
+/// Write a CONNECTION_CLOSE frame for transport/QUIC layer errors (type 0x1c)
+/// Returns bytes written
+pub fn writeConnectionClose(buf: []u8, error_code: u64, frame_type: ?u64, reason: []const u8) WriteError!usize {
+    var offset: usize = 0;
+
+    // Frame type 0x1c
+    offset += try varint.encode(buf[offset..], 0x1c);
+
+    // Error code
+    offset += try varint.encode(buf[offset..], error_code);
+
+    // Frame type that triggered the error (or 0 if not applicable)
+    offset += try varint.encode(buf[offset..], frame_type orelse 0);
+
+    // Reason phrase length + data
+    offset += try varint.encode(buf[offset..], reason.len);
+    if (buf.len < offset + reason.len) return error.BufferTooSmall;
+    @memcpy(buf[offset .. offset + reason.len], reason);
+    offset += reason.len;
+
+    return offset;
+}
+
+/// Write a CONNECTION_CLOSE frame for application layer errors (type 0x1d)
+/// Returns bytes written
+pub fn writeApplicationClose(buf: []u8, error_code: u64, reason: []const u8) WriteError!usize {
+    var offset: usize = 0;
+
+    // Frame type 0x1d
+    offset += try varint.encode(buf[offset..], 0x1d);
+
+    // Error code
+    offset += try varint.encode(buf[offset..], error_code);
+
+    // Reason phrase length + data
+    offset += try varint.encode(buf[offset..], reason.len);
+    if (buf.len < offset + reason.len) return error.BufferTooSmall;
+    @memcpy(buf[offset .. offset + reason.len], reason);
+    offset += reason.len;
+
+    return offset;
+}
+
+/// Write a CRYPTO frame
+/// Returns bytes written
+pub fn writeCrypto(buf: []u8, offset_val: u64, data: []const u8) WriteError!usize {
+    var off: usize = 0;
+
+    // Frame type 0x06
+    off += try varint.encode(buf[off..], 0x06);
+
+    // Offset
+    off += try varint.encode(buf[off..], offset_val);
+
+    // Length
+    off += try varint.encode(buf[off..], data.len);
+
+    // Data
+    if (buf.len < off + data.len) return error.BufferTooSmall;
+    @memcpy(buf[off .. off + data.len], data);
+    off += data.len;
+
+    return off;
+}
+
+/// Write a STREAM frame
+/// Returns bytes written
+pub fn writeStream(buf: []u8, stream_id: u64, offset_val: u64, data: []const u8, fin: bool) WriteError!usize {
+    var off: usize = 0;
+
+    // Frame type: 0x08 base + flags (OFF=0x04, LEN=0x02, FIN=0x01)
+    var frame_type: u8 = 0x08;
+    if (offset_val > 0) frame_type |= 0x04; // OFF bit
+    frame_type |= 0x02; // LEN bit (always include length for clarity)
+    if (fin) frame_type |= 0x01;
+
+    off += try varint.encode(buf[off..], frame_type);
+
+    // Stream ID
+    off += try varint.encode(buf[off..], stream_id);
+
+    // Offset (only if OFF bit set)
+    if (offset_val > 0) {
+        off += try varint.encode(buf[off..], offset_val);
+    }
+
+    // Length
+    off += try varint.encode(buf[off..], data.len);
+
+    // Data
+    if (buf.len < off + data.len) return error.BufferTooSmall;
+    @memcpy(buf[off .. off + data.len], data);
+    off += data.len;
+
+    return off;
+}
+
+/// Write an ACK frame
+/// Returns bytes written
+pub fn writeAck(buf: []u8, largest_acked: u64, ack_delay: u64) WriteError!usize {
+    var off: usize = 0;
+
+    // Frame type 0x02 (simple ACK without ECN)
+    off += try varint.encode(buf[off..], 0x02);
+
+    // Largest Acknowledged
+    off += try varint.encode(buf[off..], largest_acked);
+
+    // ACK Delay
+    off += try varint.encode(buf[off..], ack_delay);
+
+    // ACK Range Count (0 for simple case)
+    off += try varint.encode(buf[off..], 0);
+
+    // First ACK Range (0 means only largest_acked is being acked)
+    off += try varint.encode(buf[off..], 0);
+
+    return off;
+}
+
+/// Write a PING frame
+/// Returns bytes written
+pub fn writePing(buf: []u8) WriteError!usize {
+    if (buf.len < 1) return error.BufferTooSmall;
+    buf[0] = 0x01;
+    return 1;
+}
+
+/// Write a MAX_DATA frame
+/// Returns bytes written
+pub fn writeMaxData(buf: []u8, max_data: u64) WriteError!usize {
+    var off: usize = 0;
+    off += try varint.encode(buf[off..], 0x10); // Frame type
+    off += try varint.encode(buf[off..], max_data);
+    return off;
+}
+
+/// Write a MAX_STREAM_DATA frame
+/// Returns bytes written
+pub fn writeMaxStreamData(buf: []u8, stream_id: u64, max_data: u64) WriteError!usize {
+    var off: usize = 0;
+    off += try varint.encode(buf[off..], 0x11); // Frame type
+    off += try varint.encode(buf[off..], stream_id);
+    off += try varint.encode(buf[off..], max_data);
+    return off;
+}
+
+/// Write a HANDSHAKE_DONE frame
+/// Returns bytes written
+pub fn writeHandshakeDone(buf: []u8) WriteError!usize {
+    if (buf.len < 1) return error.BufferTooSmall;
+    buf[0] = 0x1e;
+    return 1;
+}
+
 // Tests
 test "parse PING frame" {
     const buf = [_]u8{0x01};
@@ -673,4 +850,116 @@ test "parse CONNECTION_CLOSE frame" {
     const close = result.frame.connection_close;
     try std.testing.expectEqual(@as(u64, 0), close.error_code);
     try std.testing.expect(!close.application_error);
+}
+
+// === Write/Parse Round-Trip Tests ===
+
+test "write and parse CONNECTION_CLOSE" {
+    var buf: [256]u8 = undefined;
+    const reason = "protocol violation";
+
+    const written = try writeConnectionClose(&buf, 0x0a, 0x06, reason);
+
+    const result = try parseFrame(buf[0..written]);
+    try std.testing.expect(result.frame == .connection_close);
+    const close = result.frame.connection_close;
+    try std.testing.expectEqual(@as(u64, 0x0a), close.error_code);
+    try std.testing.expectEqual(@as(?u64, 0x06), close.frame_type);
+    try std.testing.expectEqualStrings(reason, close.reason_phrase);
+    try std.testing.expect(!close.application_error);
+}
+
+test "write and parse APPLICATION_CLOSE" {
+    var buf: [256]u8 = undefined;
+    const reason = "app error";
+
+    const written = try writeApplicationClose(&buf, 0x100, reason);
+
+    const result = try parseFrame(buf[0..written]);
+    try std.testing.expect(result.frame == .connection_close);
+    const close = result.frame.connection_close;
+    try std.testing.expectEqual(@as(u64, 0x100), close.error_code);
+    try std.testing.expectEqualStrings(reason, close.reason_phrase);
+    try std.testing.expect(close.application_error);
+}
+
+test "write and parse CRYPTO frame" {
+    var buf: [256]u8 = undefined;
+    const data = "crypto data";
+
+    const written = try writeCrypto(&buf, 100, data);
+
+    const result = try parseFrame(buf[0..written]);
+    try std.testing.expect(result.frame == .crypto);
+    const crypto_frame = result.frame.crypto;
+    try std.testing.expectEqual(@as(u64, 100), crypto_frame.offset);
+    try std.testing.expectEqualStrings(data, crypto_frame.data);
+}
+
+test "write and parse STREAM frame" {
+    var buf: [256]u8 = undefined;
+    const data = "stream data";
+
+    const written = try writeStream(&buf, 4, 50, data, true);
+
+    const result = try parseFrame(buf[0..written]);
+    try std.testing.expect(result.frame == .stream);
+    const stream_frame = result.frame.stream;
+    try std.testing.expectEqual(@as(u64, 4), stream_frame.stream_id);
+    try std.testing.expectEqual(@as(u64, 50), stream_frame.offset);
+    try std.testing.expectEqualStrings(data, stream_frame.data);
+    try std.testing.expect(stream_frame.fin);
+}
+
+test "write and parse ACK frame" {
+    var buf: [256]u8 = undefined;
+
+    const written = try writeAck(&buf, 100, 500);
+
+    const result = try parseFrame(buf[0..written]);
+    try std.testing.expect(result.frame == .ack);
+    const ack = result.frame.ack;
+    try std.testing.expectEqual(@as(u64, 100), ack.largest_acked);
+    try std.testing.expectEqual(@as(u64, 500), ack.ack_delay);
+}
+
+test "write and parse PING frame" {
+    var buf: [256]u8 = undefined;
+
+    const written = try writePing(&buf);
+    try std.testing.expectEqual(@as(usize, 1), written);
+
+    const result = try parseFrame(buf[0..written]);
+    try std.testing.expect(result.frame == .ping);
+}
+
+test "write and parse MAX_DATA frame" {
+    var buf: [256]u8 = undefined;
+
+    const written = try writeMaxData(&buf, 1000000);
+
+    const result = try parseFrame(buf[0..written]);
+    try std.testing.expect(result.frame == .max_data);
+    try std.testing.expectEqual(@as(u64, 1000000), result.frame.max_data.maximum_data);
+}
+
+test "write and parse MAX_STREAM_DATA frame" {
+    var buf: [256]u8 = undefined;
+
+    const written = try writeMaxStreamData(&buf, 8, 500000);
+
+    const result = try parseFrame(buf[0..written]);
+    try std.testing.expect(result.frame == .max_stream_data);
+    try std.testing.expectEqual(@as(u64, 8), result.frame.max_stream_data.stream_id);
+    try std.testing.expectEqual(@as(u64, 500000), result.frame.max_stream_data.maximum_stream_data);
+}
+
+test "write and parse HANDSHAKE_DONE frame" {
+    var buf: [256]u8 = undefined;
+
+    const written = try writeHandshakeDone(&buf);
+    try std.testing.expectEqual(@as(usize, 1), written);
+
+    const result = try parseFrame(buf[0..written]);
+    try std.testing.expect(result.frame == .handshake_done);
 }

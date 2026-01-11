@@ -356,7 +356,8 @@ pub const HpackDecoder = struct {
         }
 
         if (method.len == 0) return error.MissingPseudo;
-        if (std.mem.eql(u8, method, "CONNECT")) {
+        const method_enum = request.Method.fromString(method) orelse return error.InvalidMethod;
+        if (method_enum == .CONNECT) {
             if (authority.len == 0) return error.MissingPseudo;
             if (path.len == 0) path = authority;
         } else if (path.len == 0) {
@@ -365,7 +366,7 @@ pub const HpackDecoder = struct {
 
         return .{
             .headers = out_headers[0..out_count],
-            .method = method,
+            .method = method_enum,
             .path = path,
             .authority = authority,
         };
@@ -642,7 +643,7 @@ fn buildHuffmanTree(nodes: *[MaxHuffmanNodes]HuffmanNode) usize {
 
 const HeaderBlockResult = struct {
     headers: []request.Header,
-    method: []const u8,
+    method: request.Method,
     path: []const u8,
     authority: []const u8,
 };
@@ -1402,7 +1403,10 @@ pub fn encodeResponseHeaders(
     const length_slice = try std.fmt.bufPrint(length_buf[0..], "{d}", .{content_length});
     idx += try encodeLiteralHeaderIndexed(buf[idx..], "content-length", length_slice);
     for (headers) |header| {
+        // Skip pseudo-headers (already handled)
         if (header.name.len > 0 and header.name[0] == ':') continue;
+        // Skip content-length (already added above to avoid duplicates)
+        if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
         idx += try encodeLiteralHeader(buf[idx..], header.name, header.value);
     }
     return idx;

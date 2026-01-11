@@ -45,17 +45,26 @@ pub const Provider = struct {
         ffi.freeContext(self.ctx);
     }
 
-    /// Create a new TLS session for a connection.
+    /// Create a new TLS session for a connection (memory BIO for QUIC).
     pub fn createSession(self: *Provider, is_server: bool) Error!Session {
         const ssl = ffi.createSession(self.ctx, is_server) catch return error.SessionCreationFailed;
-        return Session{ .ssl = ssl };
+        return Session{ .ssl = ssl, .is_socket = false };
+    }
+
+    /// Create a new TLS session for a TCP socket connection.
+    pub fn createSocketSession(self: *Provider, fd: std.posix.fd_t) Error!Session {
+        const ssl = ffi.createSocketSession(self.ctx, fd, true) catch return error.SessionCreationFailed;
+        return Session{ .ssl = ssl, .is_socket = true };
     }
 };
 
 /// Represents a TLS session for a single connection.
 /// For QUIC, this handles the TLS 1.3 handshake and key derivation.
+/// For TCP, this wraps socket read/write with encryption.
 pub const Session = struct {
     ssl: *ffi.SSL,
+    is_socket: bool = false,
+    handshake_complete: bool = false,
 
     pub const Error = error{
         HandshakeFailed,
@@ -63,6 +72,9 @@ pub const Session = struct {
         BioWriteFailed,
         BioReadFailed,
         NoBio,
+        WouldBlock,
+        ConnectionClosed,
+        TlsError,
     };
 
     pub const HandshakeState = enum {
@@ -72,7 +84,42 @@ pub const Session = struct {
     };
 
     pub fn deinit(self: *Session) void {
+        if (self.is_socket) {
+            ffi.sslShutdown(self.ssl);
+        }
         ffi.freeSession(self.ssl);
+    }
+
+    /// Accept TLS handshake on a socket connection (server-side).
+    /// Returns true if handshake complete, false if more I/O needed.
+    pub fn accept(self: *Session) Error!bool {
+        if (self.handshake_complete) return true;
+
+        switch (ffi.sslAccept(self.ssl)) {
+            .complete => {
+                self.handshake_complete = true;
+                return true;
+            },
+            .want_read, .want_write => return false,
+            .err => return error.HandshakeFailed,
+        }
+    }
+
+    /// Read decrypted data from TLS socket connection.
+    pub fn read(self: *Session, buf: []u8) Error!usize {
+        return ffi.sslRead(self.ssl, buf) catch |err| switch (err) {
+            error.WouldBlock => error.WouldBlock,
+            error.ConnectionClosed => error.ConnectionClosed,
+            error.TlsError => error.TlsError,
+        };
+    }
+
+    /// Write data to TLS socket connection (encrypts automatically).
+    pub fn write(self: *Session, data: []const u8) Error!usize {
+        return ffi.sslWrite(self.ssl, data) catch |err| switch (err) {
+            error.WouldBlock => error.WouldBlock,
+            error.TlsError => error.TlsError,
+        };
     }
 
     /// Feed incoming TLS handshake data (from CRYPTO frames).

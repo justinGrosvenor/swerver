@@ -12,6 +12,9 @@ const http3 = @import("protocol/http3.zig");
 const tls = @import("tls/provider.zig");
 const build_options = @import("build_options");
 const quic_handler = @import("quic/handler.zig");
+const quic_connection = @import("quic/connection.zig");
+const middleware = @import("middleware/middleware.zig");
+const request = @import("protocol/request.zig");
 
 pub const Server = struct {
     allocator: std.mem.Allocator,
@@ -188,11 +191,31 @@ pub const Server = struct {
             return;
         };
 
-        // Send response if any
-        if (result.response) |response| {
-            _ = net.sendto(udp_fd, response, recv_result.peer_addr) catch |err| {
+        // Send response if any (handshake responses)
+        if (result.response) |resp| {
+            _ = net.sendto(udp_fd, resp, recv_result.peer_addr) catch |err| {
                 std.log.debug("Failed to send QUIC response: {}", .{err});
             };
+        }
+
+        // Process HTTP/3 events (headers, data, end_stream)
+        if (result.conn) |conn| {
+            for (result.http3_events) |event| {
+                switch (event) {
+                    .headers => |hdrs| {
+                        // Process HTTP/3 request headers
+                        self.handleHttp3Request(udp_fd, conn, hdrs, recv_result.peer_addr);
+                    },
+                    .data => {
+                        // Data events are handled after headers complete
+                        // Body data would be accumulated in stream buffer
+                    },
+                    .end_stream => {
+                        // Request complete - response should already be sent
+                    },
+                    else => {},
+                }
+            }
         }
 
         // Handle connection state changes
@@ -201,6 +224,174 @@ pub const Server = struct {
                 quic.pool.removeConnection(conn);
             }
         }
+    }
+
+    /// Handle an HTTP/3 request and send response
+    fn handleHttp3Request(
+        self: *Server,
+        udp_fd: std.posix.fd_t,
+        conn: *quic_connection.Connection,
+        headers_event: http3.HeadersEvent,
+        peer_addr: std.posix.sockaddr,
+    ) void {
+        // Extract pseudo-headers (:method, :path, :scheme, :authority)
+        var method: ?[]const u8 = null;
+        var path: ?[]const u8 = null;
+        var regular_headers: [64]http3.Header = undefined;
+        var regular_count: usize = 0;
+
+        for (headers_event.headers) |hdr| {
+            if (std.mem.eql(u8, hdr.name, ":method")) {
+                method = hdr.value;
+            } else if (std.mem.eql(u8, hdr.name, ":path")) {
+                path = hdr.value;
+            } else if (hdr.name.len > 0 and hdr.name[0] != ':') {
+                // Regular header (not pseudo-header)
+                if (regular_count < regular_headers.len) {
+                    regular_headers[regular_count] = hdr;
+                    regular_count += 1;
+                }
+            }
+        }
+
+        // Validate required pseudo-headers
+        const method_str = method orelse return;
+        const path_str = path orelse return;
+
+        const parsed_method = request.Method.fromString(method_str) orelse return;
+
+        // Convert HTTP/3 headers to request headers
+        var req_headers: [64]request.Header = undefined;
+        for (regular_headers[0..regular_count], 0..) |hdr, i| {
+            req_headers[i] = .{ .name = hdr.name, .value = hdr.value };
+        }
+
+        // Build RequestView
+        const req_view = request.RequestView{
+            .method = parsed_method,
+            .path = path_str,
+            .headers = req_headers[0..regular_count],
+            .body = "", // Body comes in DATA frames
+        };
+
+        // Route the request
+        var mw_ctx = middleware.Context{ .protocol = .http3 };
+        const resp = self.app_router.handle(req_view, &mw_ctx);
+
+        // Encode HTTP/3 response
+        var response_buf: [16384]u8 = undefined;
+        const resp_len = conn.encodeHttp3Response(
+            &response_buf,
+            resp.status,
+            @ptrCast(resp.headers),
+            if (resp.body.len > 0) resp.body else null,
+        ) catch return;
+
+        // Build QUIC packet with STREAM frame containing response
+        var packet_buf: [2048]u8 = undefined;
+        const packet_len = self.buildStreamPacket(
+            conn,
+            headers_event.stream_id,
+            response_buf[0..resp_len],
+            true, // FIN - end of response
+            &packet_buf,
+        ) catch return;
+
+        // Send the response packet
+        _ = net.sendto(udp_fd, packet_buf[0..packet_len], peer_addr) catch {};
+    }
+
+    /// Build a QUIC short header packet containing a STREAM frame
+    fn buildStreamPacket(
+        self: *Server,
+        conn: *quic_connection.Connection,
+        stream_id: u64,
+        data: []const u8,
+        fin: bool,
+        out: []u8,
+    ) !usize {
+        _ = self;
+        const crypto = @import("quic/crypto.zig");
+        const varint = @import("quic/varint.zig");
+
+        // Get application keys
+        const keys = if (conn.is_server)
+            conn.crypto_ctx.application.server
+        else
+            conn.crypto_ctx.application.client
+        orelse return error.NoKeys;
+
+        var offset: usize = 0;
+
+        // Short header
+        // First byte: Fixed bit (0x40) + Spin bit (0) + Reserved (0) + Key Phase (0) + PN Length (0 = 1 byte)
+        out[offset] = 0x40;
+        offset += 1;
+
+        // Destination Connection ID (peer's CID)
+        @memcpy(out[offset .. offset + conn.peer_cid.len], conn.peer_cid.slice());
+        offset += conn.peer_cid.len;
+
+        // Packet number offset
+        const pn_offset = offset;
+
+        // Packet number (1 byte for simplicity)
+        const pn = conn.application_space.allocatePacketNumber();
+        out[offset] = @truncate(pn);
+        offset += 1;
+
+        const header_len = offset;
+
+        // Build STREAM frame
+        // Frame type: 0x08 + OFF (0x04) + LEN (0x02) + FIN (0x01)
+        var frame_type: u8 = 0x08;
+        frame_type |= 0x02; // Has length
+        if (fin) frame_type |= 0x01;
+
+        out[offset] = frame_type;
+        offset += 1;
+
+        // Stream ID (varint)
+        offset += varint.encode(stream_id, out[offset..]);
+
+        // Length (varint)
+        offset += varint.encode(data.len, out[offset..]);
+
+        // Stream data
+        @memcpy(out[offset .. offset + data.len], data);
+        offset += data.len;
+
+        const plaintext_len = offset - header_len;
+
+        // Encrypt payload
+        var ciphertext_buf: [16384]u8 = undefined;
+        const ciphertext_len = crypto.protectPayload(
+            &keys,
+            pn,
+            out[0..header_len],
+            out[header_len..offset],
+            &ciphertext_buf,
+        ) catch return error.EncryptionFailed;
+
+        // Copy ciphertext back
+        @memcpy(out[header_len .. header_len + ciphertext_len], ciphertext_buf[0..ciphertext_len]);
+        offset = header_len + ciphertext_len;
+
+        // Apply header protection
+        const sample_offset = pn_offset + 4;
+        if (sample_offset + 16 <= offset) {
+            const sample: *const [16]u8 = @ptrCast(out[sample_offset .. sample_offset + 16]);
+            crypto.applyHeaderProtection(
+                keys.hp[0..keys.hp_len],
+                sample,
+                &out[0],
+                out[pn_offset .. pn_offset + 1],
+            );
+        }
+
+        _ = plaintext_len;
+
+        return offset;
     }
 
     fn handleRead(self: *Server, index: u32) !void {
@@ -276,7 +467,8 @@ pub const Server = struct {
             }
             conn.header_count = parse.view.headers.len;
             if (!parse.keep_alive) conn.close_after_write = true;
-            const resp = self.app_router.handle(parse.view);
+            var mw_ctx = middleware.Context{ .protocol = .http1 };
+            const resp = self.app_router.handle(parse.view, &mw_ctx);
             self.io.onReadConsumed(conn, parse.consumed_bytes);
             try self.queueResponse(conn, resp);
             if (conn.read_buffered_bytes == 0) break;
@@ -303,7 +495,8 @@ pub const Server = struct {
             for (events[0..ingest.event_count]) |event| {
                 switch (event) {
                     .headers => |hdr| {
-                        const resp = if (hdr.end_stream) self.app_router.handle(hdr.request) else response_mod.Response{
+                        var mw_ctx = middleware.Context{ .protocol = .http2, .stream_id = hdr.stream_id };
+                        const resp = if (hdr.end_stream) self.app_router.handle(hdr.request, &mw_ctx) else response_mod.Response{
                             .status = 501,
                             .headers = &[_]response_mod.Header{},
                             .body = "Not Implemented\n",

@@ -25,6 +25,8 @@ pub const ConnectionMetrics = struct {
     packets_sent: u64 = 0,
     /// Packets received
     packets_received: u64 = 0,
+    /// Packets acknowledged by peer
+    packets_acked: u64 = 0,
     /// Packets lost (detected by loss recovery)
     packets_lost: u64 = 0,
     /// Packets retransmitted

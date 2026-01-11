@@ -125,17 +125,17 @@ pub const RateLimiter = struct {
     };
 
     pub fn init(config: Config) RateLimiter {
-        var limiter = RateLimiter{
+        var rl = RateLimiter{
             .entries = undefined,
             .count = 0,
             .config = config,
         };
 
-        for (&limiter.entries) |*entry| {
+        for (&rl.entries) |*entry| {
             entry.active = false;
         }
 
-        return limiter;
+        return rl;
     }
 
     /// Check if request is allowed, returns true if allowed
