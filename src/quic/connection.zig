@@ -937,7 +937,7 @@ pub const Connection = struct {
         for (&self.peer_cids) |*slot| {
             if (slot.* == null or (slot.*.?.retired and slot.*.?.sequence_number < new_cid_frame.sequence_number)) {
                 slot.* = PeerConnectionId{
-                    .cid = types.ConnectionId.init(new_cid_frame.connection_id),
+                    .cid = new_cid_frame.connection_id,
                     .sequence_number = new_cid_frame.sequence_number,
                     .stateless_reset_token = new_cid_frame.stateless_reset_token,
                     .retired = false,

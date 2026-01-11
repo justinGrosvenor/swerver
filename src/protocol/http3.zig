@@ -657,7 +657,7 @@ pub const Stack = struct {
             // Create new body accumulator
             var body_list: std.ArrayList(u8) = .{};
             body_list.appendSlice(self.allocator, data) catch return error.BufferTooSmall;
-            self.request_bodies.put(self.allocator, stream_id, body_list) catch return error.BufferTooSmall;
+            self.request_bodies.put(stream_id, body_list) catch return error.BufferTooSmall;
         }
     }
 

@@ -232,7 +232,7 @@ pub const Server = struct {
         udp_fd: std.posix.fd_t,
         conn: *quic_connection.Connection,
         headers_event: http3.HeadersEvent,
-        peer_addr: std.posix.sockaddr,
+        peer_addr: net.SockAddrStorage,
     ) void {
         // Extract pseudo-headers (:method, :path, :scheme, :authority)
         var method: ?[]const u8 = null;
@@ -315,11 +315,11 @@ pub const Server = struct {
         const varint = @import("quic/varint.zig");
 
         // Get application keys
-        const keys = if (conn.is_server)
+        const keys_opt: ?crypto.Keys = if (conn.is_server)
             conn.crypto_ctx.application.server
         else
-            conn.crypto_ctx.application.client
-        orelse return error.NoKeys;
+            conn.crypto_ctx.application.client;
+        const keys = keys_opt orelse return error.NoKeys;
 
         var offset: usize = 0;
 
@@ -352,10 +352,10 @@ pub const Server = struct {
         offset += 1;
 
         // Stream ID (varint)
-        offset += varint.encode(stream_id, out[offset..]);
+        offset += varint.encode(out[offset..], stream_id) catch return error.BufferTooSmall;
 
         // Length (varint)
-        offset += varint.encode(data.len, out[offset..]);
+        offset += varint.encode(out[offset..], data.len) catch return error.BufferTooSmall;
 
         // Stream data
         @memcpy(out[offset .. offset + data.len], data);
