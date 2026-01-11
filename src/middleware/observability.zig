@@ -181,12 +181,197 @@ pub const Config = struct {
     request_id_header: []const u8 = "X-Request-Id",
     /// Generate request ID if not present
     generate_request_id: bool = true,
+    /// Enable eBPF counters (requires kernel support)
+    enable_ebpf: bool = false,
 
     pub const Format = enum {
         json,
         logfmt,
     };
 };
+
+// =============================================================================
+// onExit Hooks - Callback registration for connection/request lifecycle events
+// =============================================================================
+
+/// Exit reason for onExit callbacks
+pub const ExitReason = enum {
+    normal,
+    timeout,
+    client_error,
+    server_error,
+    congestion,
+    rate_limited,
+    protocol_error,
+};
+
+/// Exit context passed to onExit callbacks
+pub const ExitContext = struct {
+    reason: ExitReason,
+    request_id: ?[]const u8,
+    protocol: middleware.Context.Protocol,
+    stream_id: u64,
+    latency_us: u64,
+    bytes_sent: u64,
+    bytes_received: u64,
+    status: u16,
+    error_msg: ?[]const u8,
+};
+
+/// onExit callback function type
+pub const OnExitFn = *const fn (ctx: *const ExitContext) void;
+
+/// Maximum registered onExit callbacks
+const MAX_EXIT_HOOKS = 16;
+
+/// Registered onExit callbacks
+var exit_hooks: [MAX_EXIT_HOOKS]?OnExitFn = [_]?OnExitFn{null} ** MAX_EXIT_HOOKS;
+var exit_hook_count: usize = 0;
+
+/// Register an onExit callback
+pub fn registerOnExit(callback: OnExitFn) bool {
+    if (exit_hook_count >= MAX_EXIT_HOOKS) return false;
+    exit_hooks[exit_hook_count] = callback;
+    exit_hook_count += 1;
+    return true;
+}
+
+/// Invoke all registered onExit callbacks
+pub fn invokeOnExit(ctx: *const ExitContext) void {
+    for (exit_hooks[0..exit_hook_count]) |maybe_hook| {
+        if (maybe_hook) |hook| {
+            hook(ctx);
+        }
+    }
+}
+
+/// Helper to determine exit reason from response status
+pub fn exitReasonFromStatus(status: u16) ExitReason {
+    if (status >= 500) return .server_error;
+    if (status == 429) return .rate_limited;
+    if (status >= 400) return .client_error;
+    return .normal;
+}
+
+// =============================================================================
+// eBPF Counter Interface - Stub for kernel-side instrumentation
+// =============================================================================
+
+/// eBPF counter types
+pub const EbpfCounter = enum {
+    requests_total,
+    responses_total,
+    bytes_sent,
+    bytes_received,
+    errors,
+    congestion_events,
+    rate_limit_hits,
+    connection_timeouts,
+};
+
+/// eBPF counter interface (stub - would use bpf syscalls in real impl)
+pub const EbpfCounters = struct {
+    enabled: bool = false,
+
+    // Counter values (in-memory fallback when eBPF not available)
+    requests: u64 = 0,
+    responses: u64 = 0,
+    bytes_sent: u64 = 0,
+    bytes_received: u64 = 0,
+    errors: u64 = 0,
+    congestion_events: u64 = 0,
+    rate_limit_hits: u64 = 0,
+    connection_timeouts: u64 = 0,
+
+    /// Initialize eBPF counters (would load BPF program in real impl)
+    pub fn init(enable: bool) EbpfCounters {
+        return .{ .enabled = enable };
+    }
+
+    /// Increment a counter
+    pub fn increment(self: *EbpfCounters, counter: EbpfCounter, value: u64) void {
+        if (!self.enabled) return;
+
+        // In a real implementation, this would use bpf_map_update_elem
+        // For now, use in-memory counters as fallback
+        switch (counter) {
+            .requests_total => self.requests +|= value,
+            .responses_total => self.responses +|= value,
+            .bytes_sent => self.bytes_sent +|= value,
+            .bytes_received => self.bytes_received +|= value,
+            .errors => self.errors +|= value,
+            .congestion_events => self.congestion_events +|= value,
+            .rate_limit_hits => self.rate_limit_hits +|= value,
+            .connection_timeouts => self.connection_timeouts +|= value,
+        }
+    }
+
+    /// Read a counter value
+    pub fn read(self: *const EbpfCounters, counter: EbpfCounter) u64 {
+        if (!self.enabled) return 0;
+
+        return switch (counter) {
+            .requests_total => self.requests,
+            .responses_total => self.responses,
+            .bytes_sent => self.bytes_sent,
+            .bytes_received => self.bytes_received,
+            .errors => self.errors,
+            .congestion_events => self.congestion_events,
+            .rate_limit_hits => self.rate_limit_hits,
+            .connection_timeouts => self.connection_timeouts,
+        };
+    }
+};
+
+/// Global eBPF counters instance
+var ebpf_counters: EbpfCounters = .{};
+
+/// Get eBPF counters
+pub fn getEbpfCounters() *EbpfCounters {
+    return &ebpf_counters;
+}
+
+// =============================================================================
+// Congestion Alert Hooks
+// =============================================================================
+
+/// Congestion level
+pub const CongestionLevel = enum {
+    none,
+    mild, // >50% capacity
+    moderate, // >75% capacity
+    severe, // >90% capacity
+    critical, // Dropping requests
+};
+
+/// Congestion alert callback
+pub const CongestionAlertFn = *const fn (level: CongestionLevel, queue_depth: u64, active_connections: u64) void;
+
+/// Registered congestion alert callbacks
+var congestion_hooks: [MAX_EXIT_HOOKS]?CongestionAlertFn = [_]?CongestionAlertFn{null} ** MAX_EXIT_HOOKS;
+var congestion_hook_count: usize = 0;
+
+/// Register a congestion alert callback
+pub fn registerCongestionAlert(callback: CongestionAlertFn) bool {
+    if (congestion_hook_count >= MAX_EXIT_HOOKS) return false;
+    congestion_hooks[congestion_hook_count] = callback;
+    congestion_hook_count += 1;
+    return true;
+}
+
+/// Invoke congestion alert callbacks
+pub fn invokeCongestionAlert(level: CongestionLevel, queue_depth: u64, active_connections: u64) void {
+    for (congestion_hooks[0..congestion_hook_count]) |maybe_hook| {
+        if (maybe_hook) |hook| {
+            hook(level, queue_depth, active_connections);
+        }
+    }
+
+    // Also increment eBPF counter if severe
+    if (level == .severe or level == .critical) {
+        ebpf_counters.increment(.congestion_events, 1);
+    }
+}
 
 /// Global logger config
 var config: Config = .{};
@@ -299,6 +484,8 @@ pub fn evaluate(ctx: *middleware.Context, req: request.RequestView) middleware.D
 
 /// Post-response logging hook
 pub fn postResponse(ctx: *middleware.Context, req: request.RequestView, resp: response.Response, elapsed_ns: u64) void {
+    const latency_us = elapsed_ns / 1000;
+
     const level: Level = if (resp.status >= 500)
         .err
     else if (resp.status >= 400)
@@ -315,7 +502,7 @@ pub fn postResponse(ctx: *middleware.Context, req: request.RequestView, resp: re
         .method = req.method,
         .path = req.path,
         .status = resp.status,
-        .latency_us = elapsed_ns / 1000,
+        .latency_us = latency_us,
         .client_ip = ctx.client_ip,
         .route = ctx.route,
         .message = null,
@@ -323,6 +510,30 @@ pub fn postResponse(ctx: *middleware.Context, req: request.RequestView, resp: re
     };
 
     log(entry);
+
+    // Update eBPF counters
+    ebpf_counters.increment(.responses_total, 1);
+    ebpf_counters.increment(.bytes_sent, resp.body.len);
+    if (resp.status >= 500) {
+        ebpf_counters.increment(.errors, 1);
+    }
+    if (resp.status == 429) {
+        ebpf_counters.increment(.rate_limit_hits, 1);
+    }
+
+    // Invoke onExit hooks
+    const exit_ctx = ExitContext{
+        .reason = exitReasonFromStatus(resp.status),
+        .request_id = ctx.request_id,
+        .protocol = ctx.protocol,
+        .stream_id = ctx.stream_id,
+        .latency_us = latency_us,
+        .bytes_sent = resp.body.len,
+        .bytes_received = 0, // Not tracked at this level
+        .status = resp.status,
+        .error_msg = null,
+    };
+    invokeOnExit(&exit_ctx);
 }
 
 /// Log a custom message

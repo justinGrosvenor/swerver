@@ -29,14 +29,26 @@ pub const Server = struct {
     quic: ?quic_handler.Handler,
     /// Buffer for receiving UDP datagrams
     udp_recv_buf: [2048]u8 = undefined,
+    /// Pre-computed Alt-Svc header value for HTTP/3 advertisement
+    alt_svc_value: [64]u8 = undefined,
+    alt_svc_len: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, cfg: config.ServerConfig) !Server {
         if (cfg.limits.max_header_count > connection.HeaderCapacity) return error.InvalidHeaderTable;
         const io_runtime = try runtime.IoRuntime.init(allocator, cfg);
-        const app_router = router.Router.init(.{
+        var app_router = router.Router.init(.{
             .require_payment = cfg.x402.enabled,
             .payment_required_b64 = cfg.x402.payment_required_b64,
         });
+
+        // Register built-in benchmark endpoints
+        app_router.get("/health", handleBenchHealth);
+        app_router.get("/echo", handleBenchEchoGet);
+        app_router.post("/echo", handleBenchEchoPost);
+        app_router.get("/blob", handleBenchBlob);
+        // TechEmpower Framework Benchmark endpoints
+        app_router.get("/plaintext", handleTfbPlaintext);
+        app_router.get("/json", handleTfbJson);
         const tls_provider: ?tls.Provider = if (build_options.enable_tls) tls.Provider.init() else null;
         const http2_stack: ?http2.Stack = if (build_options.enable_http2) http2.Stack.init() else null;
         const http3_stack: ?http3.Stack = if (build_options.enable_http3) http3.Stack.init() else null;
@@ -44,6 +56,14 @@ pub const Server = struct {
             quic_handler.Handler.init(allocator, true, cfg.quic.max_connections)
         else
             null;
+
+        // Pre-compute Alt-Svc header if QUIC is enabled
+        var alt_svc_value: [64]u8 = undefined;
+        var alt_svc_len: usize = 0;
+        if (cfg.quic.enabled) {
+            const alt_svc = cfg.quic.buildAltSvcHeader(&alt_svc_value) catch "";
+            alt_svc_len = alt_svc.len;
+        }
 
         return .{
             .allocator = allocator,
@@ -56,6 +76,8 @@ pub const Server = struct {
             .http2_stack = http2_stack,
             .http3_stack = http3_stack,
             .quic = quic,
+            .alt_svc_value = alt_svc_value,
+            .alt_svc_len = alt_svc_len,
         };
     }
 
@@ -276,15 +298,17 @@ pub const Server = struct {
 
         // Route the request
         var mw_ctx = middleware.Context{ .protocol = .http3 };
-        const resp = self.app_router.handle(req_view, &mw_ctx);
+        const result = self.app_router.handle(req_view, &mw_ctx);
+        // Note: QUIC backpressure is handled at the transport layer via flow control,
+        // not by pausing reads like TCP. The 429 response is sufficient.
 
         // Encode HTTP/3 response
         var response_buf: [16384]u8 = undefined;
         const resp_len = conn.encodeHttp3Response(
             &response_buf,
-            resp.status,
-            @ptrCast(resp.headers),
-            if (resp.body.len > 0) resp.body else null,
+            result.resp.status,
+            @ptrCast(result.resp.headers),
+            if (result.resp.body.len > 0) result.resp.body else null,
         ) catch return;
 
         // Build QUIC packet with STREAM frame containing response
@@ -468,9 +492,13 @@ pub const Server = struct {
             conn.header_count = parse.view.headers.len;
             if (!parse.keep_alive) conn.close_after_write = true;
             var mw_ctx = middleware.Context{ .protocol = .http1 };
-            const resp = self.app_router.handle(parse.view, &mw_ctx);
+            const result = self.app_router.handle(parse.view, &mw_ctx);
             self.io.onReadConsumed(conn, parse.consumed_bytes);
-            try self.queueResponse(conn, resp);
+            // Apply rate limit backpressure if signaled
+            if (result.pause_reads_ms) |pause_ms| {
+                conn.setRateLimitPause(self.io.nowMs(), pause_ms);
+            }
+            try self.queueResponse(conn, result.resp);
             if (conn.read_buffered_bytes == 0) break;
         }
     }
@@ -496,7 +524,14 @@ pub const Server = struct {
                 switch (event) {
                     .headers => |hdr| {
                         var mw_ctx = middleware.Context{ .protocol = .http2, .stream_id = hdr.stream_id };
-                        const resp = if (hdr.end_stream) self.app_router.handle(hdr.request, &mw_ctx) else response_mod.Response{
+                        const resp = if (hdr.end_stream) blk: {
+                            const result = self.app_router.handle(hdr.request, &mw_ctx);
+                            // Apply rate limit backpressure if signaled
+                            if (result.pause_reads_ms) |pause_ms| {
+                                conn.setRateLimitPause(self.io.nowMs(), pause_ms);
+                            }
+                            break :blk result.resp;
+                        } else response_mod.Response{
                             .status = 501,
                             .headers = &[_]response_mod.Header{},
                             .body = "Not Implemented\n",
@@ -555,7 +590,12 @@ pub const Server = struct {
             self.closeConnection(conn);
             return;
         };
-        const written = encodeResponse(buf.bytes, resp) catch {
+        // Include Alt-Svc header to advertise HTTP/3 when QUIC is enabled
+        const alt_svc: ?[]const u8 = if (self.alt_svc_len > 0)
+            self.alt_svc_value[0..self.alt_svc_len]
+        else
+            null;
+        const written = encodeResponse(buf.bytes, resp, alt_svc) catch {
             // Cannot encode response - close connection
             self.io.releaseBuffer(buf);
             self.closeConnection(conn);
@@ -576,7 +616,21 @@ pub const Server = struct {
             self.closeConnection(conn);
             return;
         };
-        const header_block_len = http2.encodeResponseHeaders(header_buf.bytes[9..], resp.status, resp.headers, resp.body.len) catch {
+        // Build headers array with Alt-Svc if enabled
+        var headers_with_alt_svc: [65]response_mod.Header = undefined;
+        var header_count = resp.headers.len;
+        for (resp.headers, 0..) |h, i| {
+            headers_with_alt_svc[i] = h;
+        }
+        // Add Alt-Svc header to advertise HTTP/3
+        if (self.alt_svc_len > 0 and header_count < headers_with_alt_svc.len) {
+            headers_with_alt_svc[header_count] = .{
+                .name = "alt-svc",
+                .value = self.alt_svc_value[0..self.alt_svc_len],
+            };
+            header_count += 1;
+        }
+        const header_block_len = http2.encodeResponseHeaders(header_buf.bytes[9..], resp.status, headers_with_alt_svc[0..header_count], resp.body.len) catch {
             self.io.releaseBuffer(header_buf);
             self.closeConnection(conn);
             return;
@@ -631,7 +685,7 @@ pub const Server = struct {
         }
     }
 
-    fn encodeResponse(buf: []u8, resp: response_mod.Response) !usize {
+    fn encodeResponse(buf: []u8, resp: response_mod.Response, alt_svc: ?[]const u8) !usize {
         var index: usize = 0;
         const reason = reasonPhrase(resp.status);
         const status_line = try std.fmt.bufPrint(buf[index..], "HTTP/1.1 {d} {s}\r\n", .{ resp.status, reason });
@@ -639,6 +693,13 @@ pub const Server = struct {
         for (resp.headers) |header| {
             const header_line = try std.fmt.bufPrint(buf[index..], "{s}: {s}\r\n", .{ header.name, header.value });
             index += header_line.len;
+        }
+        // Add Alt-Svc header to advertise HTTP/3 availability
+        if (alt_svc) |svc| {
+            if (svc.len > 0) {
+                const alt_svc_line = try std.fmt.bufPrint(buf[index..], "Alt-Svc: {s}\r\n", .{svc});
+                index += alt_svc_line.len;
+            }
         }
         if (resp.status == 100) {
             if (index + 2 > buf.len) return error.NoSpaceLeft;
@@ -720,3 +781,91 @@ pub const Server = struct {
         return std.mem.eql(u8, candidate[0..n], http2.Preface[0..n]);
     }
 };
+
+// ============================================================
+// Benchmark Handlers
+// Built-in endpoints for performance testing
+// ============================================================
+
+/// 1MB static blob for large response benchmarks
+const benchmark_blob: [1024 * 1024]u8 = [_]u8{0} ** (1024 * 1024);
+const benchmark_blob_size_str = "1048576";
+
+/// GET /health - minimal health check for benchmarks
+fn handleBenchHealth(_: *router.HandlerContext) response_mod.Response {
+    return .{
+        .status = 200,
+        .headers = &[_]response_mod.Header{
+            .{ .name = "Content-Length", .value = "0" },
+        },
+        .body = "",
+    };
+}
+
+/// GET /echo - return static JSON response
+fn handleBenchEchoGet(_: *router.HandlerContext) response_mod.Response {
+    return .{
+        .status = 200,
+        .headers = &[_]response_mod.Header{
+            .{ .name = "Content-Type", .value = "application/json" },
+            .{ .name = "Content-Length", .value = "15" },
+        },
+        .body = "{\"status\":\"ok\"}",
+    };
+}
+
+/// POST /echo - echo back request body
+fn handleBenchEchoPost(ctx: *router.HandlerContext) response_mod.Response {
+    const body = ctx.request.body;
+    if (body.len == 0) {
+        return handleBenchEchoGet(ctx);
+    }
+    return .{
+        .status = 200,
+        .headers = &[_]response_mod.Header{
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .body = body,
+    };
+}
+
+/// GET /blob - return 1MB response for throughput testing
+fn handleBenchBlob(_: *router.HandlerContext) response_mod.Response {
+    return .{
+        .status = 200,
+        .headers = &[_]response_mod.Header{
+            .{ .name = "Content-Type", .value = "application/octet-stream" },
+            .{ .name = "Content-Length", .value = benchmark_blob_size_str },
+        },
+        .body = &benchmark_blob,
+    };
+}
+
+// ============================================================
+// TechEmpower Framework Benchmark Handlers
+// https://www.techempower.com/benchmarks/
+// ============================================================
+
+/// GET /plaintext - TechEmpower plaintext test
+fn handleTfbPlaintext(_: *router.HandlerContext) response_mod.Response {
+    return .{
+        .status = 200,
+        .headers = &[_]response_mod.Header{
+            .{ .name = "Content-Type", .value = "text/plain" },
+            .{ .name = "Content-Length", .value = "13" },
+        },
+        .body = "Hello, World!",
+    };
+}
+
+/// GET /json - TechEmpower JSON serialization test
+fn handleTfbJson(_: *router.HandlerContext) response_mod.Response {
+    return .{
+        .status = 200,
+        .headers = &[_]response_mod.Header{
+            .{ .name = "Content-Type", .value = "application/json" },
+            .{ .name = "Content-Length", .value = "27" },
+        },
+        .body = "{\"message\":\"Hello, World!\"}",
+    };
+}

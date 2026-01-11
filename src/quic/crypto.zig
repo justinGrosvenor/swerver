@@ -60,13 +60,45 @@ pub const CryptoContext = struct {
     initial: KeySet,
     handshake: KeySet,
     application: KeySet,
+    /// 0-RTT keys derived from resumption secret (for early data)
+    early_data: KeySet,
+    /// Whether 0-RTT early data is accepted for this connection
+    early_data_accepted: bool,
 
     pub fn init() CryptoContext {
         return .{
             .initial = .{ .client = null, .server = null },
             .handshake = .{ .client = null, .server = null },
             .application = .{ .client = null, .server = null },
+            .early_data = .{ .client = null, .server = null },
+            .early_data_accepted = false,
         };
+    }
+
+    /// Derive 0-RTT keys from resumption secret
+    /// Called when TLS provides a resumption secret for early data
+    pub fn deriveEarlyDataKeys(self: *CryptoContext, resumption_secret: []const u8) void {
+        if (resumption_secret.len < 32) return;
+
+        // client_early_secret = HKDF-Expand-Label(resumption_secret, "c e traffic", "", 32)
+        var client_secret: [32]u8 = undefined;
+        hkdfExpandLabel(resumption_secret[0..32], "c e traffic", "", &client_secret);
+
+        // Only client sends early data, so we only derive client keys
+        self.early_data.client = deriveKeysFromSecret(&client_secret);
+        self.early_data_accepted = true;
+    }
+
+    /// Check if 0-RTT early data can be accepted
+    pub fn canAcceptEarlyData(self: *const CryptoContext) bool {
+        return self.early_data_accepted and self.early_data.client != null;
+    }
+
+    /// Discard 0-RTT keys (e.g., after handshake completes or early data rejected)
+    pub fn discardEarlyDataKeys(self: *CryptoContext) void {
+        self.early_data.client = null;
+        self.early_data.server = null;
+        self.early_data_accepted = false;
     }
 
     /// Derive initial keys from the Destination Connection ID.

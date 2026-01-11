@@ -9,6 +9,7 @@ const recovery = @import("recovery.zig");
 const congestion = @import("congestion.zig");
 const crypto = @import("crypto.zig");
 const http3 = @import("../protocol/http3.zig");
+const metrics_mw = @import("../middleware/metrics_mw.zig");
 
 /// QUIC packet handler
 ///
@@ -20,6 +21,7 @@ pub const Error = error{
     HandshakeFailed,
     ProtocolError,
     OutOfMemory,
+    DecryptionFailed,
 };
 
 /// Result of processing a packet
@@ -100,6 +102,8 @@ pub const Handler = struct {
                         };
                     };
                     result.new_connection = true;
+                    // Record new QUIC connection attempt
+                    metrics_mw.getStore().recordQuicConnectionAttempt();
                 } else {
                     return Error.ConnectionNotFound;
                 }
@@ -114,7 +118,12 @@ pub const Handler = struct {
                         try self.handleHandshakePacket(conn, long, data);
                     },
                     .zero_rtt => {
-                        // 0-RTT not supported yet
+                        // 0-RTT early data
+                        if (conn.crypto_ctx.canAcceptEarlyData()) {
+                            try self.handleZeroRttPacket(conn, long, data);
+                            result.http3_events = getHttp3Events(conn);
+                        }
+                        // If early data not accepted, packet is silently dropped
                     },
                     .retry => {
                         // Retry handling (client-side)
@@ -136,6 +145,9 @@ pub const Handler = struct {
 
         result.conn = conn;
         result.close_connection = !conn.isAlive();
+
+        // Record packet received
+        metrics_mw.getStore().recordQuicPackets(0, 1, 0);
 
         return result;
     }
@@ -173,6 +185,8 @@ pub const Handler = struct {
             const handshake_complete = conn.advanceTlsHandshake() catch false;
             if (handshake_complete) {
                 conn.onHandshakeComplete();
+                // Record handshake completion in global metrics
+                metrics_mw.getStore().recordQuicHandshakeComplete(conn.conn_metrics.handshakeLatencyMs());
             }
         }
     }
@@ -203,8 +217,32 @@ pub const Handler = struct {
             const handshake_complete = conn.advanceTlsHandshake() catch false;
             if (handshake_complete and conn.state == .handshaking) {
                 conn.onHandshakeComplete();
+                // Record handshake completion in global metrics
+                metrics_mw.getStore().recordQuicHandshakeComplete(conn.conn_metrics.handshakeLatencyMs());
             }
         }
+    }
+
+    /// Handle 0-RTT packet (early data)
+    fn handleZeroRttPacket(
+        self: *Handler,
+        conn: *connection.Connection,
+        header: packet.LongHeader,
+        data: []const u8,
+    ) Error!void {
+        _ = self;
+
+        // 0-RTT packets are only sent by clients, so server decrypts with client key
+        const keys = conn.crypto_ctx.early_data.client orelse {
+            return Error.DecryptionFailed;
+        };
+
+        // Decrypt and process 0-RTT packet
+        // 0-RTT uses the same packet number space as application data
+        try processEncryptedPacket(conn, &keys, header, data, types.PacketNumberSpace.application);
+
+        // Mark that we've accepted early data
+        conn.early_data_received = true;
     }
 
     /// Process an encrypted long header packet (Initial or Handshake)
@@ -565,7 +603,31 @@ pub const Handler = struct {
 
     /// Clean up closed connections
     pub fn cleanup(self: *Handler) void {
+        // Track how many connections we're closing
+        var it = self.pool.iterator();
+        while (it.next()) |conn| {
+            if (!conn.isAlive() or conn.isIdleTimedOut()) {
+                const is_error = conn.close_error != null and conn.close_error.? != .no_error;
+                const is_timeout = conn.isIdleTimedOut();
+                metrics_mw.getStore().recordQuicConnectionClose(is_error, is_timeout);
+            }
+        }
         self.pool.cleanup();
+    }
+
+    /// Record RTT sample from ACK processing
+    pub fn recordRttSample(rtt_us: u64) void {
+        metrics_mw.getStore().recordQuicRtt(rtt_us);
+    }
+
+    /// Record packet sent
+    pub fn recordPacketSent() void {
+        metrics_mw.getStore().recordQuicPackets(1, 0, 0);
+    }
+
+    /// Record packet lost
+    pub fn recordPacketLost() void {
+        metrics_mw.getStore().recordQuicPackets(0, 0, 1);
     }
 };
 

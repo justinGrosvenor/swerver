@@ -111,7 +111,7 @@ pub const IoRuntime = struct {
     }
 
     pub fn canRead(self: *IoRuntime, conn: *connection.Connection) bool {
-        return conn.canRead(self.cfg.backpressure);
+        return conn.canRead(self.cfg.backpressure, self.nowMs());
     }
 
     pub fn canWrite(self: *IoRuntime, conn: *connection.Connection) bool {

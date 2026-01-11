@@ -1073,3 +1073,116 @@ The check at line 36 validates `headers_storage.len < max_header_count` which ca
 ---
 
 *Last updated: 2026-01-10 (Bug fixes completed)*
+
+---
+
+## Feature Implementation: Reverse Proxy (5.0)
+
+**Design Doc:** [5.0-reverse-proxy.md](design/5.0-reverse-proxy.md)
+
+The reverse proxy is a major feature enabling swerver to act as a load balancer and gateway. Implementation should follow the design doc architecture.
+
+### Implementation Phases
+
+#### Phase 1: Core Infrastructure
+- [ ] Create `src/proxy/` directory structure
+- [ ] Implement `upstream.zig` - Upstream server definitions and configuration
+- [ ] Implement `pool.zig` - Upstream connection pool management
+- [ ] Implement `balancer.zig` - Load balancing algorithms (round_robin, least_conn, ip_hash, weighted)
+
+#### Phase 2: Request Forwarding
+- [ ] Implement `forward.zig` - Request/response forwarding logic
+- [ ] Add hop-by-hop header removal (Connection, Keep-Alive, etc.)
+- [ ] Add standard proxy headers (X-Forwarded-For, X-Real-IP, Via)
+- [ ] Implement header manipulation rules (set/remove request/response headers)
+- [ ] Support zero-copy body forwarding where possible
+
+#### Phase 3: Proxy Handler Integration
+- [ ] Implement `proxy.zig` - Main proxy handler
+- [ ] Add `ProxyRoute` matching (path prefix, host-based routing)
+- [ ] Integrate with router - add `router.proxy("/api/", upstream)` API
+- [ ] Add proxy-specific timeouts (connect, send, read, total)
+
+#### Phase 4: Health Checking
+- [ ] Implement `health.zig` - Health check logic
+- [ ] Add passive health checks (track failures per server)
+- [ ] Add active health checks (periodic HTTP probes)
+- [ ] Implement server availability state machine
+- [ ] Add circuit breaker pattern (optional)
+
+#### Phase 5: Advanced Features
+- [ ] Implement `websocket.zig` - WebSocket upgrade proxying
+- [ ] Add HTTP/2 upstream support (single multiplexed connection)
+- [ ] Add retry logic for idempotent requests
+- [ ] Add configurable retry on 502/503/504
+
+#### Phase 6: Observability
+- [ ] Add proxy-specific metrics (proxy_requests_total, upstream_connect_duration_ms, etc.)
+- [ ] Add access log fields (upstream_addr, upstream_status, upstream_response_time)
+- [ ] Add health status metrics per upstream
+
+### Build Integration
+- [ ] Add `-Denable-proxy` build flag
+- [ ] Ensure proxy code excluded when flag disabled
+- [ ] Add proxy configuration to `ServerConfig`
+
+### Testing
+- [ ] Unit tests for load balancing algorithms
+- [ ] Unit tests for header manipulation
+- [ ] Integration tests for request forwarding
+- [ ] Integration tests for failover behavior
+- [ ] Integration tests for WebSocket proxying
+- [ ] Load tests measuring proxy overhead
+
+### Key Files to Create
+| File | Responsibility |
+|------|----------------|
+| `src/proxy/proxy.zig` | Main proxy handler |
+| `src/proxy/upstream.zig` | Upstream definitions |
+| `src/proxy/pool.zig` | Connection pool management |
+| `src/proxy/balancer.zig` | Load balancing algorithms |
+| `src/proxy/health.zig` | Health check logic |
+| `src/proxy/forward.zig` | Request/response forwarding |
+| `src/proxy/websocket.zig` | WebSocket tunnel handling |
+
+### Invariants (from design doc)
+1. Upstream connections must be returned to pool or closed; never leaked
+2. Client must receive a response even if all upstreams fail
+3. Hop-by-hop headers must never be forwarded
+4. Health check failures must not block request handling
+5. Connection pool must respect configured limits
+6. Retry must not occur for non-idempotent methods unless explicitly configured
+7. WebSocket upgrade must be atomic (no partial state)
+
+---
+
+## Recently Completed (2026-01-11)
+
+### Spec Compliance Fixes
+- [x] Per-stream metrics for HTTP/2 with stream_id labels in `/metrics`
+- [x] onExit observability hooks with eBPF counter interface
+- [x] Rate limiter backpressure integration (pause reads when bucket empty)
+- [x] Connection-level `read_paused` with automatic resume timer
+
+### Benchmark Endpoints
+- [x] `/health` - minimal health check (empty 200)
+- [x] `/echo` GET - returns `{"status":"ok"}`
+- [x] `/echo` POST - echoes request body
+- [x] `/blob` - 1MB response for throughput testing
+- [x] `/plaintext` - TechEmpower plaintext test ("Hello, World!")
+- [x] `/json` - TechEmpower JSON test (`{"message":"Hello, World!"}`)
+
+### Backpressure Flow (implemented)
+```
+Rate limiter → middleware → router (RouteResult) → server
+    ↓
+conn.setRateLimitPause(now_ms, resume_after_ms)
+    ↓
+handleRead checks canRead() → skips read if paused
+    ↓
+checkRateLimitResume() clears pause when timer expires
+```
+
+---
+
+*Last updated: 2026-01-11 (Reverse proxy todo added, spec compliance fixes documented)*

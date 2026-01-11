@@ -4,6 +4,14 @@ const response = @import("../response/response.zig");
 const x402 = @import("../middleware/x402.zig");
 const middleware = @import("../middleware/middleware.zig");
 
+/// Result of routing a request
+pub const RouteResult = struct {
+    /// Response to send
+    resp: response.Response,
+    /// If non-null, pause reads for this many milliseconds (rate limiting)
+    pause_reads_ms: ?u64 = null,
+};
+
 /// Handler function type
 pub const HandlerFn = *const fn (ctx: *HandlerContext) response.Response;
 
@@ -184,16 +192,22 @@ pub const Router = struct {
     }
 
     /// Handle an incoming request
-    pub fn handle(self: *Router, req: request.RequestView, mw_ctx: *middleware.Context) response.Response {
+    /// Returns RouteResult with response and optional backpressure signal
+    pub fn handle(self: *Router, req: request.RequestView, mw_ctx: *middleware.Context) RouteResult {
         // Run x402 check first
         switch (x402.evaluate(req, self.x402_policy)) {
             .allow => {},
-            .reject => |resp| return resp,
+            .reject => |resp| return .{ .resp = resp },
         }
 
         // Run middleware chain
-        if (self.middleware_chain.executePre(mw_ctx, req)) |resp| {
-            return resp;
+        switch (self.middleware_chain.executePre(mw_ctx, req)) {
+            .allow => {},
+            .reject => |resp| return .{ .resp = resp },
+            .backpressure => |bp| return .{
+                .resp = bp.resp,
+                .pause_reads_ms = if (bp.pause_reads) bp.resume_after_ms else null,
+            },
         }
 
         // Find matching route
@@ -207,16 +221,16 @@ pub const Router = struct {
 
             if (self.matchRoute(&r, req.path, &ctx)) {
                 mw_ctx.route = r.pattern;
-                return r.handler(&ctx);
+                return .{ .resp = r.handler(&ctx) };
             }
         }
 
         // No route matched - 404
         if (self.not_found_handler) |handler| {
-            return handler(&ctx);
+            return .{ .resp = handler(&ctx) };
         }
 
-        return notFound();
+        return .{ .resp = notFound() };
     }
 
     fn matchRoute(self: *Router, r: *const Route, path: []const u8, ctx: *HandlerContext) bool {
@@ -313,8 +327,8 @@ test "route matching with params" {
         .body = "",
     };
 
-    const resp = router.handle(req, &mw_ctx);
-    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    const result = router.handle(req, &mw_ctx);
+    try std.testing.expectEqual(@as(u16, 200), result.resp.status);
 }
 
 test "route not found" {
@@ -328,8 +342,8 @@ test "route not found" {
         .body = "",
     };
 
-    const resp = router.handle(req, &mw_ctx);
-    try std.testing.expectEqual(@as(u16, 404), resp.status);
+    const result = router.handle(req, &mw_ctx);
+    try std.testing.expectEqual(@as(u16, 404), result.resp.status);
 }
 
 test "method mismatch" {
@@ -351,6 +365,6 @@ test "method mismatch" {
         .body = "",
     };
 
-    const resp = router.handle(req, &mw_ctx);
-    try std.testing.expectEqual(@as(u16, 404), resp.status);
+    const result = router.handle(req, &mw_ctx);
+    try std.testing.expectEqual(@as(u16, 404), result.resp.status);
 }

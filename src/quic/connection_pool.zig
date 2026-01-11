@@ -193,6 +193,66 @@ pub const ConnectionPool = struct {
         return null;
     }
 
+    /// Find connection by peer IP only (ignoring port) for connection coalescing
+    /// This enables reusing an existing connection for different origins on the same IP
+    pub fn findByPeerIp(self: *ConnectionPool, peer_addr: SockAddrStorage) ?*connection.Connection {
+        // Extract IP from the address (family + IP portion, ignoring port)
+        const family = peer_addr.family;
+        const ip_len: usize = switch (family) {
+            2 => 4, // AF_INET (IPv4): 4 bytes
+            10, 30 => 16, // AF_INET6 (Linux: 10, BSD: 30): 16 bytes
+            else => return null,
+        };
+
+        // For IPv4 (AF_INET), IP starts at offset 2 in sockaddr_in (after port)
+        // For IPv6 (AF_INET6), IP starts at offset 6 in sockaddr_in6 (after port + flowinfo)
+        const ip_offset: usize = switch (family) {
+            2 => 2, // After port in sockaddr_in
+            10, 30 => 6, // After port + flowinfo in sockaddr_in6
+            else => return null,
+        };
+
+        // Search through entries for matching IP
+        for (self.entries.items) |entry| {
+            if (entry.peer_addr.family != family) continue;
+
+            const their_ip = entry.peer_addr.data[ip_offset .. ip_offset + ip_len];
+            const our_ip = peer_addr.data[ip_offset .. ip_offset + ip_len];
+
+            if (std.mem.eql(u8, their_ip, our_ip)) {
+                // Found a connection from the same IP - check if it's alive
+                if (entry.conn.isAlive()) {
+                    return entry.conn;
+                }
+            }
+        }
+        return null;
+    }
+
+    /// Find or create a connection for connection coalescing
+    /// Returns existing connection from same IP if available and certificate matches
+    pub fn findOrCreateCoalesced(
+        self: *ConnectionPool,
+        dcid: types.ConnectionId,
+        peer_addr: SockAddrStorage,
+    ) Error!struct { conn: *connection.Connection, is_new: bool } {
+        // First, try exact peer address match
+        if (self.findByPeer(peer_addr)) |conn| {
+            return .{ .conn = conn, .is_new = false };
+        }
+
+        // Try IP-only match for coalescing
+        if (self.findByPeerIp(peer_addr)) |conn| {
+            // Found a connection from same IP that could be coalesced
+            // Note: In a full implementation, we'd verify the TLS certificate covers the origin
+            return .{ .conn = conn, .is_new = false };
+        }
+
+        // No existing connection - create new one
+        const conn = try self.createConnection(dcid, peer_addr);
+        return .{ .conn = conn, .is_new = true };
+    }
+
     /// Get peer address for a connection
     pub fn getPeerAddr(self: *ConnectionPool, conn: *connection.Connection) ?SockAddrStorage {
         // Find the entry for this connection

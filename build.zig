@@ -45,6 +45,17 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&test_run.step);
 
+    const fuzz_module = b.createModule(.{
+        .root_source_file = b.path("src/fuzz/http1_parser.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    fuzz_module.addImport("swerver", swerver_module);
+    fuzz_module.addOptions("build_options", options);
+    // Fuzz step (disabled - addFuzz not available in this Zig version)
+    _ = b.step("fuzz", "Run fuzz harnesses (not available)");
+
     const bench_module = b.createModule(.{
         .root_source_file = b.path("bench/bench.zig"),
         .target = target,

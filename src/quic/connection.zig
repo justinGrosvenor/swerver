@@ -253,6 +253,8 @@ pub const Connection = struct {
     stream_manager: ?stream.StreamManager = null,
     /// HTTP/3 protocol stack
     http3_stack: ?http3.Stack = null,
+    /// Whether 0-RTT early data was received on this connection
+    early_data_received: bool = false,
     /// Pending PATH_RESPONSE data to send
     pending_path_response: ?[8]u8 = null,
     /// Pending PATH_CHALLENGE data we're waiting to validate

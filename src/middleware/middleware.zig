@@ -18,6 +18,18 @@ pub const Decision = union(enum) {
     reject: response.Response,
     /// Skip remaining middleware and go directly to handler
     skip,
+    /// Rate limit with backpressure - pause reads until tokens available
+    rate_limit_backpressure: BackpressureInfo,
+};
+
+/// Backpressure information for rate limiting
+pub const BackpressureInfo = struct {
+    /// Response to send (429)
+    resp: response.Response,
+    /// Whether to pause reads on the connection
+    pause_reads: bool = true,
+    /// Time in milliseconds until reads should resume
+    resume_after_ms: u64 = 0,
 };
 
 /// Modifications that can be applied to requests/responses
@@ -95,6 +107,16 @@ pub const MiddlewareFn = *const fn (ctx: *Context, req: request.RequestView) Dec
 /// Post-response hook signature (for logging, metrics)
 pub const PostResponseFn = *const fn (ctx: *Context, req: request.RequestView, resp: response.Response, elapsed_ns: u64) void;
 
+/// Result from executing pre-request middleware chain
+pub const PreResult = union(enum) {
+    /// Request should continue to handler
+    allow,
+    /// Request rejected with response
+    reject: response.Response,
+    /// Request rate limited with backpressure
+    backpressure: BackpressureInfo,
+};
+
 /// Middleware chain that executes multiple middleware in order
 pub const Chain = struct {
     /// Pre-request middleware (run before handler)
@@ -115,9 +137,8 @@ pub const Chain = struct {
     }
 
     /// Execute pre-request middleware chain
-    /// Returns null if request should continue to handler
-    /// Returns Response if middleware rejected the request
-    pub fn executePre(self: *Chain, ctx: *Context, req: request.RequestView) ?response.Response {
+    /// Returns result indicating how to proceed
+    pub fn executePre(self: *Chain, ctx: *Context, req: request.RequestView) PreResult {
         self.response_header_count = 0;
 
         for (self.pre) |middleware| {
@@ -134,11 +155,12 @@ pub const Chain = struct {
                     }
                     if (!mod.continue_chain) break;
                 },
-                .reject => |resp| return resp,
+                .reject => |resp| return .{ .reject = resp },
                 .skip => break,
+                .rate_limit_backpressure => |bp| return .{ .backpressure = bp },
             }
         }
-        return null;
+        return .allow;
     }
 
     /// Execute post-response hooks
@@ -220,7 +242,7 @@ test "chain executes middleware in order" {
     };
 
     const result = chain.executePre(&ctx, req);
-    try std.testing.expect(result == null); // No rejection
+    try std.testing.expect(result == .allow); // No rejection
 }
 
 test "format buffer append" {

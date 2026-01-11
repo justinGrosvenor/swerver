@@ -50,6 +50,8 @@ pub const Connection = struct {
     header_count: usize,
     read_paused: bool,
     write_paused: bool,
+    /// Timestamp (ms) when reads should resume after rate limiting (0 = not rate limited)
+    resume_read_at_ms: u64,
     timeout_phase: TimeoutPhase,
     read_buffer: ?buffer_pool.BufferHandle,
     // Position in active list for O(1) removal
@@ -82,6 +84,7 @@ pub const Connection = struct {
             .header_count = 0,
             .read_paused = false,
             .write_paused = false,
+            .resume_read_at_ms = 0,
             .timeout_phase = .idle,
             .read_buffer = null,
             .active_list_pos = 0,
@@ -109,6 +112,7 @@ pub const Connection = struct {
         self.header_count = 0;
         self.read_paused = false;
         self.write_paused = false;
+        self.resume_read_at_ms = 0;
         self.timeout_phase = .idle;
         self.read_buffer = null;
         // TLS session is cleaned up before reset
@@ -150,9 +154,24 @@ pub const Connection = struct {
         };
     }
 
-    pub fn canRead(self: *Connection, backpressure: config.Backpressure) bool {
+    pub fn canRead(self: *Connection, backpressure: config.Backpressure, now_ms: u64) bool {
         self.updateReadBackpressure(backpressure);
+        self.checkRateLimitResume(now_ms);
         return !self.read_paused;
+    }
+
+    /// Pause reads due to rate limiting, resume after specified delay
+    pub fn setRateLimitPause(self: *Connection, now_ms: u64, resume_after_ms: u64) void {
+        self.read_paused = true;
+        self.resume_read_at_ms = now_ms + resume_after_ms;
+    }
+
+    /// Check if rate limit pause should be lifted
+    fn checkRateLimitResume(self: *Connection, now_ms: u64) void {
+        if (self.resume_read_at_ms > 0 and now_ms >= self.resume_read_at_ms) {
+            self.resume_read_at_ms = 0;
+            self.read_paused = false;
+        }
     }
 
     pub fn canWrite(self: *Connection, backpressure: config.Backpressure) bool {

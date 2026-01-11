@@ -208,6 +208,16 @@ pub const RateLimiter = struct {
         }
         return 1;
     }
+
+    /// Get time until next token is available in milliseconds (for backpressure)
+    pub fn getTimeUntilToken(self: *RateLimiter, ip: IpKey) u64 {
+        for (&self.entries) |*entry| {
+            if (entry.active and entry.key.eql(ip)) {
+                return entry.bucket.timeUntilToken();
+            }
+        }
+        return 1000; // Default 1 second
+    }
 };
 
 /// Global rate limiter
@@ -236,7 +246,17 @@ fn tooManyRequests(retry_after: u64) response.Response {
     };
 }
 
+/// Create backpressure info for rate limited request
+fn backpressure(retry_after_s: u64, resume_after_ms: u64) middleware.BackpressureInfo {
+    return .{
+        .resp = tooManyRequests(retry_after_s),
+        .pause_reads = true,
+        .resume_after_ms = resume_after_ms,
+    };
+}
+
 /// Rate limit middleware function
+/// Returns rate_limit_backpressure when bucket is empty to trigger read pausing
 pub fn evaluate(ctx: *middleware.Context, req: request.RequestView) middleware.Decision {
     if (!limiter.config.enabled) return .allow;
 
@@ -263,7 +283,37 @@ pub fn evaluate(ctx: *middleware.Context, req: request.RequestView) middleware.D
         return .allow;
     }
 
-    // Rate limited
+    // Rate limited - return backpressure decision to pause reads
+    const retry_after_s = limiter.getRetryAfter(ip);
+    const resume_ms = limiter.getTimeUntilToken(ip);
+    return .{ .rate_limit_backpressure = backpressure(retry_after_s, resume_ms) };
+}
+
+/// Evaluate without backpressure (for simple rejection scenarios)
+pub fn evaluateSimple(ctx: *middleware.Context, req: request.RequestView) middleware.Decision {
+    if (!limiter.config.enabled) return .allow;
+
+    // Check excluded paths
+    if (req.path) |path| {
+        for (limiter.config.exclude_paths) |excluded| {
+            if (std.mem.eql(u8, path, excluded)) {
+                return .allow;
+            }
+        }
+    }
+
+    // Get IP from context
+    const ip = if (ctx.client_ip) |ipv4|
+        IpKey.fromIpv4(ipv4)
+    else if (ctx.client_ip6) |ipv6|
+        IpKey.fromIpv6(ipv6)
+    else
+        return .allow;
+
+    if (limiter.check(ip)) {
+        return .allow;
+    }
+
     const retry_after = limiter.getRetryAfter(ip);
     return .{ .reject = tooManyRequests(retry_after) };
 }
