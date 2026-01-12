@@ -10,6 +10,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+
+    // Link the TLS runtime with OpenSSL/BoringSSL.
+    swerver_module.linkSystemLibrary("ssl", .{});
+    swerver_module.linkSystemLibrary("crypto", .{});
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -26,6 +30,7 @@ pub fn build(b: *std.Build) void {
     options.addOption(bool, "enable_tls", b.option(bool, "enable-tls", "Enable TLS support") orelse false);
     options.addOption(bool, "enable_http2", b.option(bool, "enable-http2", "Enable HTTP/2 support") orelse false);
     options.addOption(bool, "enable_http3", b.option(bool, "enable-http3", "Enable HTTP/3 support") orelse false);
+    options.addOption(bool, "enable_proxy", b.option(bool, "enable-proxy", "Enable reverse proxy support") orelse false);
     exe.root_module.addOptions("build_options", options);
 
     b.installArtifact(exe);

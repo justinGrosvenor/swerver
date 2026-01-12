@@ -135,9 +135,14 @@ pub fn accept(listener_fd: std.posix.fd_t) AcceptError!std.posix.fd_t {
     if (!isSupportedPlatform()) return error.AcceptFailed;
     const fd = std.posix.system.accept(listener_fd, null, null);
     if (fd < 0) {
-        switch (std.posix.errno(fd)) {
+        const errno = std.posix.errno(fd);
+        switch (errno) {
             .AGAIN => return error.WouldBlock,
-            else => return error.AcceptFailed,
+            .CONNABORTED => return error.WouldBlock, // Connection aborted before accept
+            else => {
+                std.log.debug("accept errno: {}", .{errno});
+                return error.AcceptFailed;
+            },
         }
     }
     errdefer std.posix.close(fd);
@@ -328,3 +333,109 @@ pub const SockAddrStorage = union(enum) {
     ip4: SockAddrIn,
     ip6: SockAddrIn6,
 };
+
+// ============================================================
+// sendfile() - Zero-copy file transfer to socket
+// ============================================================
+
+pub const SendfileError = error{
+    WouldBlock,
+    Closed,
+    Failed,
+};
+
+pub const SendfileResult = struct {
+    bytes_sent: usize,
+    done: bool,
+};
+
+/// Send file data directly to socket using zero-copy transfer.
+/// Returns number of bytes sent and whether EOF was reached.
+/// On WouldBlock, returns 0 bytes sent - caller should retry on write event.
+pub fn sendfile(socket_fd: std.posix.fd_t, file_fd: std.posix.fd_t, offset: *u64, count: usize) SendfileError!SendfileResult {
+    if (!isSupportedPlatform()) return error.Failed;
+
+    switch (builtin.os.tag) {
+        .macos, .freebsd, .dragonfly => {
+            return sendfileBsd(socket_fd, file_fd, offset, count);
+        },
+        .linux => {
+            return sendfileLinux(socket_fd, file_fd, offset, count);
+        },
+        else => return error.Failed,
+    }
+}
+
+fn sendfileBsd(socket_fd: std.posix.fd_t, file_fd: std.posix.fd_t, offset: *u64, count: usize) SendfileError!SendfileResult {
+    // BSD sendfile: sendfile(fd, s, offset, len, hdtr, flags)
+    // fd = file, s = socket, offset = start position, len = in/out bytes
+    var len: i64 = @intCast(count);
+    const file_offset: i64 = @intCast(offset.*);
+
+    const rc = darwin_sendfile(file_fd, socket_fd, file_offset, &len, null, 0);
+
+    if (rc == 0) {
+        // Success - len contains bytes sent
+        const sent: usize = @intCast(len);
+        offset.* += sent;
+        return .{ .bytes_sent = sent, .done = sent < count };
+    }
+
+    const errno = std.posix.errno(rc);
+    switch (errno) {
+        .AGAIN => {
+            // Partial write - len contains bytes sent before blocking
+            const sent: usize = if (len > 0) @intCast(len) else 0;
+            offset.* += sent;
+            return .{ .bytes_sent = sent, .done = false };
+        },
+        .PIPE, .NOTCONN => return error.Closed,
+        else => return error.Failed,
+    }
+}
+
+fn sendfileLinux(socket_fd: std.posix.fd_t, file_fd: std.posix.fd_t, offset: *u64, count: usize) SendfileError!SendfileResult {
+    // Linux sendfile: sendfile(out_fd, in_fd, offset, count)
+    var file_offset: i64 = @intCast(offset.*);
+    const rc = linux_sendfile(socket_fd, file_fd, &file_offset, count);
+
+    if (rc >= 0) {
+        const sent: usize = @intCast(rc);
+        offset.* = @intCast(file_offset);
+        return .{ .bytes_sent = sent, .done = sent == 0 };
+    }
+
+    const errno = std.posix.errno(rc);
+    switch (errno) {
+        .AGAIN => return .{ .bytes_sent = 0, .done = false },
+        .PIPE, .NOTCONN => return error.Closed,
+        else => return error.Failed,
+    }
+}
+
+// Platform-specific sendfile declarations
+const darwin_sendfile = if (builtin.os.tag == .macos or builtin.os.tag == .freebsd or builtin.os.tag == .dragonfly)
+    struct {
+        extern "c" fn sendfile(
+            fd: std.posix.fd_t,
+            s: std.posix.fd_t,
+            offset: i64,
+            len: *i64,
+            hdtr: ?*anyopaque,
+            flags: c_int,
+        ) c_int;
+    }.sendfile
+else
+    undefined;
+
+const linux_sendfile = if (builtin.os.tag == .linux)
+    struct {
+        extern "c" fn sendfile(
+            out_fd: std.posix.fd_t,
+            in_fd: std.posix.fd_t,
+            offset: ?*i64,
+            count: usize,
+        ) isize;
+    }.sendfile
+else
+    undefined;

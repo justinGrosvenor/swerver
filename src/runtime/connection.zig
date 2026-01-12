@@ -60,6 +60,14 @@ pub const Connection = struct {
     tls_session: ?tls.Session,
     /// Whether this connection uses TLS
     is_tls: bool,
+    /// Pending response body for streaming large responses
+    pending_body: []const u8,
+    /// File descriptor for sendfile-based response (null = no file pending)
+    pending_file_fd: ?std.posix.fd_t,
+    /// Current offset in pending file
+    pending_file_offset: u64,
+    /// Bytes remaining to send from file
+    pending_file_remaining: u64,
 
     pub fn init(index: u32) Connection {
         return .{
@@ -90,6 +98,10 @@ pub const Connection = struct {
             .active_list_pos = 0,
             .tls_session = null,
             .is_tls = false,
+            .pending_body = &[_]u8{},
+            .pending_file_fd = null,
+            .pending_file_offset = 0,
+            .pending_file_remaining = 0,
         };
     }
 
@@ -118,7 +130,24 @@ pub const Connection = struct {
         // TLS session is cleaned up before reset
         self.tls_session = null;
         self.is_tls = false;
+        self.pending_body = &[_]u8{};
+        self.cleanupPendingFile();
         // active_list_pos is set by ConnectionPool.acquire
+    }
+
+    /// Clean up pending file if present
+    pub fn cleanupPendingFile(self: *Connection) void {
+        if (self.pending_file_fd) |fd| {
+            std.posix.close(fd);
+            self.pending_file_fd = null;
+        }
+        self.pending_file_offset = 0;
+        self.pending_file_remaining = 0;
+    }
+
+    /// Returns true if there's a pending file to send
+    pub fn hasPendingFile(self: *Connection) bool {
+        return self.pending_file_fd != null and self.pending_file_remaining > 0;
     }
 
     /// Clean up TLS session if present
@@ -249,6 +278,16 @@ pub const Connection = struct {
         if (self.write_count == 0) return;
         self.write_head = nextIndex(self.write_head);
         self.write_count -= 1;
+    }
+
+    /// Returns number of available slots in write queue
+    pub fn writeQueueAvailable(self: *Connection) u8 {
+        return write_queue_capacity - self.write_count;
+    }
+
+    /// Returns true if there's pending body data to stream
+    pub fn hasPendingBody(self: *Connection) bool {
+        return self.pending_body.len > 0;
     }
 
     fn updateReadBackpressure(self: *Connection, backpressure: config.Backpressure) void {

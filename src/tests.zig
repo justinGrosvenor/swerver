@@ -21,6 +21,14 @@ const http3_frame = @import("protocol/http3/frame.zig");
 const http3_qpack = @import("protocol/http3/qpack.zig");
 const metrics_mw = @import("middleware/metrics_mw.zig");
 
+// Proxy modules
+const proxy_upstream = @import("proxy/upstream.zig");
+const proxy_pool = @import("proxy/pool.zig");
+const proxy_balancer = @import("proxy/balancer.zig");
+const proxy_forward = @import("proxy/forward.zig");
+const proxy_health = @import("proxy/health.zig");
+const proxy_handler = @import("proxy/proxy.zig");
+
 // Force tests in these modules to be included
 // Note: quic_connection, quic_handler, and http3 are excluded as they
 // transitively import TLS FFI which requires OpenSSL linking
@@ -37,6 +45,13 @@ comptime {
     _ = http3_frame;
     _ = http3_qpack;
     _ = metrics_mw;
+    // Proxy modules
+    _ = proxy_upstream;
+    _ = proxy_pool;
+    _ = proxy_balancer;
+    _ = proxy_forward;
+    _ = proxy_health;
+    _ = proxy_handler;
 }
 
 const Parsed = struct {

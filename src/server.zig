@@ -119,7 +119,13 @@ pub const Server = struct {
             const now_ms = self.io.nowMs();
             const timeout_ms = self.io.nextPollTimeoutMs(now_ms);
             const events = try self.io.pollWithTimeout(timeout_ms);
-            self.io.enforceTimeouts(self.io.nowMs());
+            // Enforce timeouts and close timed-out connections
+            const timeout_result = self.io.enforceTimeouts(self.io.nowMs());
+            for (timeout_result.to_close[0..timeout_result.count]) |conn_index| {
+                if (self.io.getConnection(conn_index)) |conn| {
+                    self.closeConnection(conn);
+                }
+            }
             // Periodic QUIC cleanup
             if (self.quic) |*q| {
                 q.cleanup();
@@ -130,7 +136,10 @@ pub const Server = struct {
                     .accept => {
                         // Use event.handle if provided (kqueue), otherwise use listener_fd (epoll)
                         const fd = event.handle orelse self.listener_fd orelse continue;
-                        try self.handleAccept(fd);
+                        self.handleAccept(fd) catch |err| {
+                            // Log accept errors but don't crash the server
+                            std.log.warn("Accept failed: {}", .{err});
+                        };
                     },
                     .datagram => {
                         // UDP datagram received - QUIC packet handling
@@ -141,9 +150,9 @@ pub const Server = struct {
                         if (event.conn_id > std.math.maxInt(u32)) continue;
                         const index: u32 = @intCast(event.conn_id);
                         switch (event.kind) {
-                            .read => try self.handleRead(index),
-                            .write => try self.handleWrite(index),
-                            .err => try self.handleError(index),
+                            .read => self.handleRead(index) catch {},
+                            .write => self.handleWrite(index) catch {},
+                            .err => self.handleError(index) catch {},
                             .accept, .datagram => unreachable,
                         }
                     },
@@ -185,6 +194,10 @@ pub const Server = struct {
             std.posix.close(client_fd);
             return err;
         };
+        // With edge-triggered epoll, we must try to read immediately after accept
+        // because data may have arrived before we registered the socket.
+        // If we don't do this, we'll miss the EPOLLIN notification.
+        try self.handleRead(conn.index);
     }
 
     fn handleDatagram(self: *Server) !void {
@@ -491,9 +504,19 @@ pub const Server = struct {
             }
             conn.header_count = parse.view.headers.len;
             if (!parse.keep_alive) conn.close_after_write = true;
+            self.io.onReadConsumed(conn, parse.consumed_bytes);
+
+            // Check for static file requests - use sendfile for zero-copy
+            if (std.mem.startsWith(u8, parse.view.path, "/static/")) {
+                const file_path = parse.view.path[8..]; // Skip "/static/"
+                const content_type = guessContentType(file_path);
+                try self.queueFileResponse(conn, file_path, content_type);
+                if (conn.read_buffered_bytes == 0) break;
+                continue;
+            }
+
             var mw_ctx = middleware.Context{ .protocol = .http1 };
             const result = self.app_router.handle(parse.view, &mw_ctx);
-            self.io.onReadConsumed(conn, parse.consumed_bytes);
             // Apply rate limit backpressure if signaled
             if (result.pause_reads_ms) |pause_ms| {
                 conn.setRateLimitPause(self.io.nowMs(), pause_ms);
@@ -551,29 +574,68 @@ pub const Server = struct {
 
     fn handleWrite(self: *Server, index: u32) !void {
         const conn = self.io.getConnection(index) orelse return;
-        const fd = conn.fd orelse return;
-        const entry = conn.peekWrite() orelse return;
-        const slice = entry.handle.bytes[entry.offset..entry.len];
-        const bytes_written = std.posix.system.write(fd, slice.ptr, slice.len);
-        if (bytes_written < 0) {
-            switch (std.posix.errno(bytes_written)) {
-                .AGAIN => return,
-                else => {
-                    self.closeConnection(conn);
-                    return;
-                },
+        const socket_fd = conn.fd orelse return;
+
+        // First, process buffer writes (headers must go out before file body)
+        if (conn.peekWrite()) |entry| {
+            const slice = entry.handle.bytes[entry.offset..entry.len];
+            const bytes_written = std.posix.system.write(socket_fd, slice.ptr, slice.len);
+            if (bytes_written < 0) {
+                switch (std.posix.errno(bytes_written)) {
+                    .AGAIN => return,
+                    else => {
+                        self.closeConnection(conn);
+                        return;
+                    },
+                }
+            }
+            if (bytes_written == 0) return;
+            const count: usize = @intCast(bytes_written);
+            entry.offset += count;
+            self.io.onWriteCompleted(conn, count);
+            conn.markActive(self.io.nowMs());
+            if (entry.offset >= entry.len) {
+                self.io.releaseBuffer(entry.handle);
+                conn.popWrite();
+
+                // Continue streaming pending body if there's more data
+                if (conn.hasPendingBody()) {
+                    self.streamBodyChunks(conn, conn.pending_body);
+                }
+            }
+
+            // If we just finished headers and have a file pending, try sendfile immediately
+            if (conn.write_count == 0 and conn.hasPendingFile()) {
+                // Fall through to sendfile handling below
+            } else {
+                return;
             }
         }
-        if (bytes_written == 0) return;
-        const count: usize = @intCast(bytes_written);
-        entry.offset += count;
-        self.io.onWriteCompleted(conn, count);
-        conn.markActive(self.io.nowMs());
-        if (entry.offset >= entry.len) {
-            self.io.releaseBuffer(entry.handle);
-            conn.popWrite();
+
+        if (conn.hasPendingFile()) {
+            // No buffer writes pending - use sendfile for file transfer
+            const file_fd = conn.pending_file_fd.?;
+            const result = net.sendfile(socket_fd, file_fd, &conn.pending_file_offset, conn.pending_file_remaining) catch |err| {
+                switch (err) {
+                    error.WouldBlock => return,
+                    error.Closed, error.Failed => {
+                        conn.cleanupPendingFile();
+                        self.closeConnection(conn);
+                        return;
+                    },
+                }
+            };
+            conn.pending_file_remaining -= result.bytes_sent;
+            conn.markActive(self.io.nowMs());
+
+            // Check if file transfer is complete
+            if (conn.pending_file_remaining == 0) {
+                conn.cleanupPendingFile();
+            }
         }
-        if (conn.write_count == 0) {
+
+        // Check if all writes are complete
+        if (conn.write_count == 0 and !conn.hasPendingBody() and !conn.hasPendingFile()) {
             self.io.setTimeoutPhase(conn, .idle);
             if (conn.close_after_write) self.closeConnection(conn);
         }
@@ -595,6 +657,30 @@ pub const Server = struct {
             self.alt_svc_value[0..self.alt_svc_len]
         else
             null;
+
+        // For large bodies that don't fit in a single buffer, write headers first then chunk body
+        const header_space = 512; // Reserve space for headers
+        if (resp.body.len > buf.bytes.len - header_space) {
+            // Write headers only first
+            const header_len = encodeResponseHeaders(buf.bytes, resp, alt_svc) catch {
+                self.io.releaseBuffer(buf);
+                self.closeConnection(conn);
+                return;
+            };
+            if (!conn.enqueueWrite(buf, header_len)) {
+                self.io.releaseBuffer(buf);
+                self.closeConnection(conn);
+                return;
+            }
+            self.io.onWriteBuffered(conn, header_len);
+
+            // Stream body in chunks - only enqueue what fits, store rest for later
+            self.streamBodyChunks(conn, resp.body);
+            self.io.setTimeoutPhase(conn, .write);
+            return;
+        }
+
+        // Small response - write everything in one buffer
         const written = encodeResponse(buf.bytes, resp, alt_svc) catch {
             // Cannot encode response - close connection
             self.io.releaseBuffer(buf);
@@ -607,6 +693,105 @@ pub const Server = struct {
             return;
         }
         self.io.onWriteBuffered(conn, written);
+        self.io.setTimeoutPhase(conn, .write);
+    }
+
+    /// Stream body data in chunks, enqueueing up to available queue slots.
+    /// Remaining data is stored in conn.pending_body for later streaming.
+    fn streamBodyChunks(self: *Server, conn: *connection.Connection, body: []const u8) void {
+        var remaining = body;
+
+        // Enqueue chunks while we have queue space (leave 1 slot for new requests)
+        while (remaining.len > 0 and conn.writeQueueAvailable() > 1) {
+            const body_buf = self.io.acquireBuffer() orelse {
+                // No buffers available - store remaining and wait
+                conn.pending_body = remaining;
+                return;
+            };
+            const chunk_len = @min(remaining.len, body_buf.bytes.len);
+            @memcpy(body_buf.bytes[0..chunk_len], remaining[0..chunk_len]);
+            if (!conn.enqueueWrite(body_buf, chunk_len)) {
+                self.io.releaseBuffer(body_buf);
+                conn.pending_body = remaining;
+                return;
+            }
+            self.io.onWriteBuffered(conn, chunk_len);
+            remaining = remaining[chunk_len..];
+        }
+
+        // Store any remaining data for continuation in handleWrite
+        conn.pending_body = remaining;
+    }
+
+    /// Queue a file response using sendfile for zero-copy transfer.
+    /// Sends HTTP headers first, then sets up the connection for sendfile.
+    fn queueFileResponse(self: *Server, conn: *connection.Connection, file_path: []const u8, content_type: []const u8) !void {
+        // Open the file using posix
+        // Need null-terminated path for open syscall
+        var path_buf: [4096]u8 = undefined;
+        if (file_path.len >= path_buf.len) {
+            try self.queueResponse(conn, notFoundResponse());
+            return;
+        }
+        @memcpy(path_buf[0..file_path.len], file_path);
+        path_buf[file_path.len] = 0;
+        const path_z: [*:0]const u8 = @ptrCast(&path_buf);
+
+        const file_fd = std.posix.system.open(path_z, .{ .ACCMODE = .RDONLY }, @as(std.posix.mode_t, 0));
+        if (file_fd < 0) {
+            try self.queueResponse(conn, notFoundResponse());
+            return;
+        }
+        errdefer std.posix.close(file_fd);
+
+        // Get file size using fstat
+        const stat = std.posix.fstat(file_fd) catch {
+            std.posix.close(file_fd);
+            try self.queueResponse(conn, notFoundResponse());
+            return;
+        };
+        const file_size: u64 = @intCast(stat.size);
+
+        // Build and send headers
+        const buf = self.io.acquireBuffer() orelse {
+            std.posix.close(file_fd);
+            self.closeConnection(conn);
+            return;
+        };
+
+        var size_buf: [20]u8 = undefined;
+        const size_str = std.fmt.bufPrint(&size_buf, "{d}", .{file_size}) catch {
+            self.io.releaseBuffer(buf);
+            std.posix.close(file_fd);
+            self.closeConnection(conn);
+            return;
+        };
+
+        const headers = [_]response_mod.Header{
+            .{ .name = "Content-Type", .value = content_type },
+            .{ .name = "Content-Length", .value = size_str },
+        };
+
+        const header_len = encodeFileHeaders(buf.bytes, 200, &headers) catch {
+            self.io.releaseBuffer(buf);
+            std.posix.close(file_fd);
+            self.closeConnection(conn);
+            return;
+        };
+
+        if (!conn.enqueueWrite(buf, header_len)) {
+            self.io.releaseBuffer(buf);
+            std.posix.close(file_fd);
+            self.closeConnection(conn);
+            return;
+        }
+        self.io.onWriteBuffered(conn, header_len);
+
+        // Set up sendfile - file body will be sent after headers
+        conn.pending_file_fd = file_fd;
+        conn.pending_file_offset = 0;
+        conn.pending_file_remaining = file_size;
+
         self.io.setTimeoutPhase(conn, .write);
     }
 
@@ -716,6 +901,45 @@ pub const Server = struct {
         return index;
     }
 
+    /// Encode response headers only (for large body responses that need chunking)
+    fn encodeResponseHeaders(buf: []u8, resp: response_mod.Response, alt_svc: ?[]const u8) !usize {
+        var index: usize = 0;
+        const reason = reasonPhrase(resp.status);
+        const status_line = try std.fmt.bufPrint(buf[index..], "HTTP/1.1 {d} {s}\r\n", .{ resp.status, reason });
+        index += status_line.len;
+        for (resp.headers) |header| {
+            const header_line = try std.fmt.bufPrint(buf[index..], "{s}: {s}\r\n", .{ header.name, header.value });
+            index += header_line.len;
+        }
+        if (alt_svc) |svc| {
+            if (svc.len > 0) {
+                const alt_svc_line = try std.fmt.bufPrint(buf[index..], "Alt-Svc: {s}\r\n", .{svc});
+                index += alt_svc_line.len;
+            }
+        }
+        const length_line = try std.fmt.bufPrint(buf[index..], "Content-Length: {d}\r\n\r\n", .{resp.body.len});
+        index += length_line.len;
+        return index;
+    }
+
+    /// Encode HTTP/1.1 response headers for file responses (doesn't add Content-Length)
+    fn encodeFileHeaders(buf: []u8, status: u16, headers: []const response_mod.Header) !usize {
+        var index: usize = 0;
+        const reason = reasonPhrase(status);
+        const status_line = try std.fmt.bufPrint(buf[index..], "HTTP/1.1 {d} {s}\r\n", .{ status, reason });
+        index += status_line.len;
+        for (headers) |header| {
+            const header_line = try std.fmt.bufPrint(buf[index..], "{s}: {s}\r\n", .{ header.name, header.value });
+            index += header_line.len;
+        }
+        // End headers
+        if (index + 2 > buf.len) return error.NoSpaceLeft;
+        buf[index] = '\r';
+        buf[index + 1] = '\n';
+        index += 2;
+        return index;
+    }
+
     fn reasonPhrase(status: u16) []const u8 {
         return switch (status) {
             100 => "Continue",
@@ -737,6 +961,43 @@ pub const Server = struct {
             .headers = &[_]response_mod.Header{},
             .body = "",
         };
+    }
+
+    fn notFoundResponse() response_mod.Response {
+        return .{
+            .status = 404,
+            .headers = &[_]response_mod.Header{},
+            .body = "Not Found\n",
+        };
+    }
+
+    /// Guess Content-Type from file extension
+    fn guessContentType(path: []const u8) []const u8 {
+        if (std.mem.endsWith(u8, path, ".html") or std.mem.endsWith(u8, path, ".htm")) {
+            return "text/html";
+        } else if (std.mem.endsWith(u8, path, ".css")) {
+            return "text/css";
+        } else if (std.mem.endsWith(u8, path, ".js")) {
+            return "application/javascript";
+        } else if (std.mem.endsWith(u8, path, ".json")) {
+            return "application/json";
+        } else if (std.mem.endsWith(u8, path, ".png")) {
+            return "image/png";
+        } else if (std.mem.endsWith(u8, path, ".jpg") or std.mem.endsWith(u8, path, ".jpeg")) {
+            return "image/jpeg";
+        } else if (std.mem.endsWith(u8, path, ".gif")) {
+            return "image/gif";
+        } else if (std.mem.endsWith(u8, path, ".svg")) {
+            return "image/svg+xml";
+        } else if (std.mem.endsWith(u8, path, ".txt")) {
+            return "text/plain";
+        } else if (std.mem.endsWith(u8, path, ".pdf")) {
+            return "application/pdf";
+        } else if (std.mem.endsWith(u8, path, ".wasm")) {
+            return "application/wasm";
+        } else {
+            return "application/octet-stream";
+        }
     }
 
     fn errorResponseFor(code: http1.ErrorCode) response_mod.Response {
@@ -788,6 +1049,7 @@ pub const Server = struct {
 // ============================================================
 
 /// 1MB static blob for large response benchmarks
+/// Tests streaming response capability
 const benchmark_blob: [1024 * 1024]u8 = [_]u8{0} ** (1024 * 1024);
 const benchmark_blob_size_str = "1048576";
 

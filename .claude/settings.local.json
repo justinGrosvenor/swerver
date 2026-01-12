@@ -6,7 +6,8 @@
       "Bash(find:*)",
       "Bash(zig test:*)",
       "Bash(grep:*)",
-      "Bash(chmod:*)"
+      "Bash(chmod:*)",
+      "Bash(zig version:*)"
     ]
   }
 }

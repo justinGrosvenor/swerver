@@ -75,12 +75,27 @@ pub const IoRuntime = struct {
 
     pub fn nextPollTimeoutMs(self: *IoRuntime, now_ms: u64) u32 {
         var min_timeout: u32 = 10;
+        var has_timeout_pending = false;
         // Iterate only active connections - O(active) instead of O(max)
         for (self.connections.activeConnections()) |index| {
             const conn = &self.connections.entries[index];
+            // Skip connections in error/draining state - they're being cleaned up
+            if (conn.state == .err or conn.state == .draining or conn.state == .closed) {
+                continue;
+            }
             const remaining = conn.remainingTimeoutMs(now_ms, self.cfg.timeouts);
-            if (remaining == 0) return 0;
+            if (remaining == 0) {
+                // Connection needs timeout enforcement, but don't busy-poll
+                // Just mark that we need a quick check
+                has_timeout_pending = true;
+                continue;
+            }
             if (remaining < min_timeout) min_timeout = remaining;
+        }
+        // If we have pending timeouts, use a short but non-zero timeout
+        // to avoid busy-waiting while still being responsive
+        if (has_timeout_pending and min_timeout > 1) {
+            min_timeout = 1;
         }
         return min_timeout;
     }
@@ -139,19 +154,42 @@ pub const IoRuntime = struct {
         conn.setTimeoutPhase(phase);
     }
 
-    pub fn enforceTimeouts(self: *IoRuntime, now_ms: u64) void {
+    /// Enforce timeouts and return indices of connections that should be closed.
+    /// The caller is responsible for closing these connections.
+    pub fn enforceTimeouts(self: *IoRuntime, now_ms: u64) TimeoutResult {
+        var result = TimeoutResult{};
         // Iterate only active connections - O(active) instead of O(max)
         for (self.connections.activeConnections()) |index| {
             const conn = &self.connections.entries[index];
-            if (conn.state == .err) continue;
+            // Collect already-errored connections for cleanup
+            if (conn.state == .err) {
+                if (result.count < result.to_close.len) {
+                    result.to_close[result.count] = index;
+                    result.count += 1;
+                }
+                continue;
+            }
             if (!conn.isTimedOut(now_ms, conn.timeout_phase, self.cfg.timeouts)) continue;
             const next_state: connection.State = switch (conn.timeout_phase) {
                 .idle => .draining,
                 .header, .body, .write => .err,
             };
             _ = conn.transition(next_state, now_ms) catch {};
+            // Mark for closure if transitioned to error
+            if (next_state == .err) {
+                if (result.count < result.to_close.len) {
+                    result.to_close[result.count] = index;
+                    result.count += 1;
+                }
+            }
         }
+        return result;
     }
+
+    pub const TimeoutResult = struct {
+        to_close: [64]u32 = undefined,
+        count: usize = 0,
+    };
 
     pub fn registerListener(self: *IoRuntime, fd: std.posix.fd_t) !void {
         return switch (self.backend_state) {
@@ -169,10 +207,14 @@ pub const IoRuntime = struct {
         };
     }
 
+    /// Register a connection with the event loop.
+    /// Note: conn_id is offset by 1 internally to avoid collision with listener (udata=0)
     pub fn registerConnection(self: *IoRuntime, conn_id: u64, fd: std.posix.fd_t) !void {
+        // Offset by 1 to avoid collision with listener socket (udata=0)
+        const offset_id = conn_id + 1;
         return switch (self.backend_state) {
-            .bsd_kqueue => |*kq| kq.registerConnection(conn_id, fd),
-            .linux_epoll => |*ep| ep.registerConnection(conn_id, fd),
+            .bsd_kqueue => |*kq| kq.registerConnection(offset_id, fd),
+            .linux_epoll => |*ep| ep.registerConnection(offset_id, fd),
             else => error.UnsupportedBackend,
         };
     }
@@ -252,9 +294,16 @@ fn translateKqueueEvents(events: []const kqueue_backend.Kevent, out: []Event) us
     for (events) |ev| {
         if (count >= out.len) break;
         if ((ev.flags & kqueue_backend.EV_ERROR) != 0) {
+            // Determine conn_id: listener=0, UDP=special, connections are offset by 1
+            const conn_id: u64 = if (ev.udata == 0)
+                0 // Listener error
+            else if (ev.udata == std.math.maxInt(usize) - 1)
+                UDP_SOCKET_ID // UDP error
+            else
+                @intCast(ev.udata - 1); // Connection error (subtract offset)
             out[count] = .{
                 .kind = .err,
-                .conn_id = @intCast(ev.udata),
+                .conn_id = conn_id,
                 .bytes = 0,
                 .handle = null,
             };
@@ -263,9 +312,15 @@ fn translateKqueueEvents(events: []const kqueue_backend.Kevent, out: []Event) us
         }
         // Handle negative ev.data (error condition) - treat as error event
         if (ev.data < 0) {
+            const conn_id: u64 = if (ev.udata == 0)
+                0
+            else if (ev.udata == std.math.maxInt(usize) - 1)
+                UDP_SOCKET_ID
+            else
+                @intCast(ev.udata - 1);
             out[count] = .{
                 .kind = .err,
-                .conn_id = @intCast(ev.udata),
+                .conn_id = conn_id,
                 .bytes = 0,
                 .handle = null,
             };
@@ -291,10 +346,10 @@ fn translateKqueueEvents(events: []const kqueue_backend.Kevent, out: []Event) us
                     .handle = @intCast(ev.ident),
                 };
             } else {
-                // Connection read event
+                // Connection read event - subtract 1 to reverse the offset
                 out[count] = .{
                     .kind = .read,
-                    .conn_id = @intCast(ev.udata),
+                    .conn_id = @intCast(ev.udata - 1),
                     .bytes = bytes,
                     .handle = null,
                 };
@@ -303,9 +358,10 @@ fn translateKqueueEvents(events: []const kqueue_backend.Kevent, out: []Event) us
             continue;
         }
         if (ev.filter == kqueue_backend.EVFILT_WRITE) {
+            // Write events are always for connections - subtract 1 to reverse offset
             out[count] = .{
                 .kind = .write,
-                .conn_id = @intCast(ev.udata),
+                .conn_id = @intCast(ev.udata - 1),
                 .bytes = bytes,
                 .handle = null,
             };
@@ -320,10 +376,17 @@ fn translateEpollEvents(events: []const epoll_backend.EpollEvent, out: []Event) 
     var count: usize = 0;
     for (events) |ev| {
         if (count >= out.len) break;
-        const conn_id = ev.data.u64;
+        const raw_id = ev.data.u64;
 
         // Check for error conditions
         if ((ev.events & epoll_backend.EPOLLERR) != 0 or (ev.events & epoll_backend.EPOLLHUP) != 0) {
+            // Determine conn_id: listener=0, UDP=special, connections are offset by 1
+            const conn_id: u64 = if (raw_id == 0)
+                0 // Listener error
+            else if (raw_id == UDP_SOCKET_ID)
+                UDP_SOCKET_ID // UDP error
+            else
+                raw_id - 1; // Connection error (subtract offset)
             out[count] = .{
                 .kind = .err,
                 .conn_id = conn_id,
@@ -334,11 +397,11 @@ fn translateEpollEvents(events: []const epoll_backend.EpollEvent, out: []Event) 
             continue;
         }
 
-        // Handle read events (including accept on listener where conn_id == 0)
+        // Handle read events (including accept on listener where raw_id == 0)
         if ((ev.events & epoll_backend.EPOLLIN) != 0) {
-            if (conn_id == 0) {
+            if (raw_id == 0) {
                 // TCP listener socket
-                // For epoll, we stored conn_id=0 for listener, but we need the fd
+                // For epoll, we stored raw_id=0 for listener, but we need the fd
                 // The server will use its stored listener_fd
                 out[count] = .{
                     .kind = .accept,
@@ -346,7 +409,7 @@ fn translateEpollEvents(events: []const epoll_backend.EpollEvent, out: []Event) 
                     .bytes = 0,
                     .handle = null, // Server uses its listener_fd
                 };
-            } else if (conn_id == UDP_SOCKET_ID) {
+            } else if (raw_id == UDP_SOCKET_ID) {
                 // UDP socket - datagram ready
                 out[count] = .{
                     .kind = .datagram,
@@ -355,10 +418,10 @@ fn translateEpollEvents(events: []const epoll_backend.EpollEvent, out: []Event) 
                     .handle = null, // Server uses its udp_fd
                 };
             } else {
-                // Connection read event
+                // Connection read event - subtract 1 to reverse the offset
                 out[count] = .{
                     .kind = .read,
-                    .conn_id = conn_id,
+                    .conn_id = raw_id - 1,
                     .bytes = 0, // epoll doesn't provide bytes available
                     .handle = null,
                 };
@@ -368,11 +431,12 @@ fn translateEpollEvents(events: []const epoll_backend.EpollEvent, out: []Event) 
         }
 
         // Handle write events
-        if ((ev.events & epoll_backend.EPOLLOUT) != 0 and conn_id != 0) {
+        if ((ev.events & epoll_backend.EPOLLOUT) != 0 and raw_id != 0) {
             if (count >= out.len) break;
+            // Write events are always for connections - subtract 1 to reverse offset
             out[count] = .{
                 .kind = .write,
-                .conn_id = conn_id,
+                .conn_id = raw_id - 1,
                 .bytes = 0,
                 .handle = null,
             };

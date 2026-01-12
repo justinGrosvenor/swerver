@@ -174,11 +174,15 @@ pub const Decision = union(enum) {
 
 ## Performance
 
-Buffer pool operations: ~15-25 ns/op
-Connection pool operations: ~20-30 ns/op
-HTTP/1.1 request parsing: ~200-400 ns
+Measured on a local Darwin/arm64 workstation with `zig 0.16.0-dev` using the built-in microbenchmarks.
+```
+zig build bench
+swerver microbench
+buffer_pool acquire/release: 21 ns/op
+connection_pool acquire/release: 30 ns/op
+```
 
-Run `zig build bench` for microbenchmarks.
+Micros are dominated by fixed-size pool helpers that power the zero-copy runtime; results may vary per platform and optimization level.
 
 ## License
 
