@@ -406,7 +406,7 @@ pub fn createErrorResponse(status: u16) response.Response {
         .headers = &[_]response.Header{
             .{ .name = "Content-Type", .value = "text/plain" },
         },
-        .body = body,
+        .body = .{ .bytes = body },
     };
 }
 

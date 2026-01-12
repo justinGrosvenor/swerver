@@ -1,6 +1,7 @@
 const std = @import("std");
 const request = @import("../protocol/request.zig");
 const response = @import("../response/response.zig");
+const buffer_pool = @import("../runtime/buffer_pool.zig");
 
 /// Middleware Framework
 ///
@@ -63,6 +64,8 @@ pub const Context = struct {
     request_id_len: u8 = 0,
     /// Route matched (if any)
     route: ?[]const u8 = null,
+    /// Buffer operations for managed response bodies
+    buffer_ops: ?BufferOps = null,
 
     /// Set request ID and update slice
     pub fn setRequestId(self: *Context, id: []const u8) void {
@@ -99,6 +102,29 @@ pub const Context = struct {
         }
     };
 };
+
+pub const BufferOps = struct {
+    ctx: *anyopaque,
+    acquire: *const fn (*anyopaque) ?buffer_pool.BufferHandle,
+    release: *const fn (*anyopaque, buffer_pool.BufferHandle) void,
+};
+
+pub fn respondManaged(ctx: *Context, status: u16, content_type: []const u8, body: []const u8) ?response.Response {
+    const ops = ctx.buffer_ops orelse return null;
+    const handle = ops.acquire(ops.ctx) orelse return null;
+    if (body.len > handle.bytes.len) {
+        ops.release(ops.ctx, handle);
+        return null;
+    }
+    @memcpy(handle.bytes[0..body.len], body);
+    return response.Response{
+        .status = status,
+        .headers = &[_]response.Header{
+            .{ .name = "Content-Type", .value = content_type },
+        },
+        .body = .{ .managed = .{ .handle = handle, .len = body.len } },
+    };
+}
 
 /// Middleware function signature
 /// Returns a Decision indicating how to proceed

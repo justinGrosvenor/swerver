@@ -3,6 +3,7 @@ const std = @import("std");
 const config = @import("config.zig");
 const runtime = @import("runtime/io.zig");
 const connection = @import("runtime/connection.zig");
+const buffer_pool = @import("runtime/buffer_pool.zig");
 const router = @import("router/router.zig");
 const net = @import("runtime/net.zig");
 const http1 = @import("protocol/http1.zig");
@@ -15,6 +16,7 @@ const quic_handler = @import("quic/handler.zig");
 const quic_connection = @import("quic/connection.zig");
 const middleware = @import("middleware/middleware.zig");
 const request = @import("protocol/request.zig");
+const metrics_mw = @import("middleware/metrics_mw.zig");
 
 pub const Server = struct {
     allocator: std.mem.Allocator,
@@ -41,19 +43,53 @@ pub const Server = struct {
             .payment_required_b64 = cfg.x402.payment_required_b64,
         });
 
-        // Register built-in benchmark endpoints
-        app_router.get("/health", handleBenchHealth);
-        app_router.get("/echo", handleBenchEchoGet);
-        app_router.post("/echo", handleBenchEchoPost);
-        app_router.get("/blob", handleBenchBlob);
-        // TechEmpower Framework Benchmark endpoints
-        app_router.get("/plaintext", handleTfbPlaintext);
-        app_router.get("/json", handleTfbJson);
-        const tls_provider: ?tls.Provider = if (build_options.enable_tls) tls.Provider.init() else null;
+        try registerDefaultRoutes(&app_router);
+        const tls_provider: ?tls.Provider = if (build_options.enable_tls and cfg.quic.enabled)
+            try tls.Provider.init(allocator, cfg.quic.cert_path, cfg.quic.key_path)
+        else
+            null;
         const http2_stack: ?http2.Stack = if (build_options.enable_http2) http2.Stack.init() else null;
-        const http3_stack: ?http3.Stack = if (build_options.enable_http3) http3.Stack.init() else null;
+        const http3_stack: ?http3.Stack = if (build_options.enable_http3) http3.Stack.init(allocator, true) else null;
         const quic: ?quic_handler.Handler = if (build_options.enable_http3 and cfg.quic.enabled)
-            quic_handler.Handler.init(allocator, true, cfg.quic.max_connections)
+            quic_handler.Handler.init(allocator, true, cfg.max_connections)
+        else
+            null;
+
+        // Pre-compute Alt-Svc header if QUIC is enabled
+        var alt_svc_value: [64]u8 = undefined;
+        var alt_svc_len: usize = 0;
+        if (cfg.quic.enabled) {
+            const alt_svc = cfg.quic.buildAltSvcHeader(&alt_svc_value) catch "";
+            alt_svc_len = alt_svc.len;
+        }
+
+        return .{
+            .allocator = allocator,
+            .cfg = cfg,
+            .io = io_runtime,
+            .app_router = app_router,
+            .listener_fd = null,
+            .udp_fd = null,
+            .tls_provider = tls_provider,
+            .http2_stack = http2_stack,
+            .http3_stack = http3_stack,
+            .quic = quic,
+            .alt_svc_value = alt_svc_value,
+            .alt_svc_len = alt_svc_len,
+        };
+    }
+
+    pub fn initWithRouter(allocator: std.mem.Allocator, cfg: config.ServerConfig, app_router: router.Router) !Server {
+        if (cfg.limits.max_header_count > connection.HeaderCapacity) return error.InvalidHeaderTable;
+        const io_runtime = try runtime.IoRuntime.init(allocator, cfg);
+        const tls_provider: ?tls.Provider = if (build_options.enable_tls and cfg.quic.enabled)
+            try tls.Provider.init(allocator, cfg.quic.cert_path, cfg.quic.key_path)
+        else
+            null;
+        const http2_stack: ?http2.Stack = if (build_options.enable_http2) http2.Stack.init() else null;
+        const http3_stack: ?http3.Stack = if (build_options.enable_http3) http3.Stack.init(allocator, true) else null;
+        const quic: ?quic_handler.Handler = if (build_options.enable_http3 and cfg.quic.enabled)
+            quic_handler.Handler.init(allocator, true, cfg.max_connections)
         else
             null;
 
@@ -159,6 +195,10 @@ pub const Server = struct {
                 }
             }
         }
+    }
+
+    pub fn runFor(self: *Server, run_for_ms: u64) !void {
+        try self.run(run_for_ms);
     }
 
     fn handleAccept(self: *Server, listener_fd: std.posix.fd_t) !void {
@@ -310,18 +350,47 @@ pub const Server = struct {
         };
 
         // Route the request
-        var mw_ctx = middleware.Context{ .protocol = .http3 };
-        const result = self.app_router.handle(req_view, &mw_ctx);
+        var mw_ctx = middleware.Context{
+            .protocol = .http3,
+            .buffer_ops = .{
+                .ctx = &self.io,
+                .acquire = acquireBufferOpaque,
+                .release = releaseBufferOpaque,
+            },
+        };
+        var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
+        var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
+        const arena_handle = self.io.acquireBuffer();
+        var empty_arena: [0]u8 = undefined;
+        const arena_buf = if (arena_handle) |handle| handle.bytes else empty_arena[0..];
+        var scratch = router.HandlerScratch{
+            .response_buf = response_buf[0..],
+            .response_headers = response_headers[0..],
+            .arena_buf = arena_buf,
+            .arena_handle = arena_handle,
+            .buffer_ops = mw_ctx.buffer_ops,
+        };
+        const result = self.app_router.handle(req_view, &mw_ctx, &scratch);
+        if (scratch.arena_handle) |handle| self.io.releaseBuffer(handle);
+        const body_bytes = result.resp.bodyBytes();
+        const body_len = result.resp.bodyLen();
+        const managed_body = switch (result.resp.body) {
+            .managed => |managed| managed,
+            else => null,
+        };
+        if (managed_body) |managed| {
+            defer self.io.releaseBuffer(managed.handle);
+        }
         // Note: QUIC backpressure is handled at the transport layer via flow control,
         // not by pausing reads like TCP. The 429 response is sufficient.
 
         // Encode HTTP/3 response
-        var response_buf: [16384]u8 = undefined;
+        var encoded_response_buf: [16384]u8 = undefined;
         const resp_len = conn.encodeHttp3Response(
-            &response_buf,
+            &encoded_response_buf,
             result.resp.status,
             @ptrCast(result.resp.headers),
-            if (result.resp.body.len > 0) result.resp.body else null,
+            if (body_len > 0) body_bytes else null,
         ) catch return;
 
         // Build QUIC packet with STREAM frame containing response
@@ -329,7 +398,7 @@ pub const Server = struct {
         const packet_len = self.buildStreamPacket(
             conn,
             headers_event.stream_id,
-            response_buf[0..resp_len],
+            encoded_response_buf[0..resp_len],
             true, // FIN - end of response
             &packet_buf,
         ) catch return;
@@ -507,16 +576,36 @@ pub const Server = struct {
             self.io.onReadConsumed(conn, parse.consumed_bytes);
 
             // Check for static file requests - use sendfile for zero-copy
-            if (std.mem.startsWith(u8, parse.view.path, "/static/")) {
+            if (self.cfg.static_root.len > 0 and std.mem.startsWith(u8, parse.view.path, "/static/")) {
                 const file_path = parse.view.path[8..]; // Skip "/static/"
                 const content_type = guessContentType(file_path);
-                try self.queueFileResponse(conn, file_path, content_type);
+                try self.queueFileResponse(conn, self.cfg.static_root, file_path, content_type);
                 if (conn.read_buffered_bytes == 0) break;
                 continue;
             }
 
-            var mw_ctx = middleware.Context{ .protocol = .http1 };
-            const result = self.app_router.handle(parse.view, &mw_ctx);
+            var mw_ctx = middleware.Context{
+                .protocol = .http1,
+                .buffer_ops = .{
+                    .ctx = &self.io,
+                    .acquire = acquireBufferOpaque,
+                    .release = releaseBufferOpaque,
+                },
+            };
+            var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
+            var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
+            const arena_handle = self.io.acquireBuffer();
+            var empty_arena: [0]u8 = undefined;
+            const arena_buf = if (arena_handle) |handle| handle.bytes else empty_arena[0..];
+            var scratch = router.HandlerScratch{
+                .response_buf = response_buf[0..],
+                .response_headers = response_headers[0..],
+                .arena_buf = arena_buf,
+                .arena_handle = arena_handle,
+                .buffer_ops = mw_ctx.buffer_ops,
+            };
+            const result = self.app_router.handle(parse.view, &mw_ctx, &scratch);
+            if (scratch.arena_handle) |handle| self.io.releaseBuffer(handle);
             // Apply rate limit backpressure if signaled
             if (result.pause_reads_ms) |pause_ms| {
                 conn.setRateLimitPause(self.io.nowMs(), pause_ms);
@@ -546,9 +635,29 @@ pub const Server = struct {
             for (events[0..ingest.event_count]) |event| {
                 switch (event) {
                     .headers => |hdr| {
-                        var mw_ctx = middleware.Context{ .protocol = .http2, .stream_id = hdr.stream_id };
+                        var mw_ctx = middleware.Context{
+                            .protocol = .http2,
+                            .stream_id = hdr.stream_id,
+                            .buffer_ops = .{
+                                .ctx = &self.io,
+                                .acquire = acquireBufferOpaque,
+                                .release = releaseBufferOpaque,
+                            },
+                        };
+                        var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
+                        var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
+                        const arena_handle = self.io.acquireBuffer();
+                        var empty_arena: [0]u8 = undefined;
+                        const arena_buf = if (arena_handle) |handle| handle.bytes else empty_arena[0..];
+                        var scratch = router.HandlerScratch{
+                            .response_buf = response_buf[0..],
+                            .response_headers = response_headers[0..],
+                            .arena_buf = arena_buf,
+                            .arena_handle = arena_handle,
+                            .buffer_ops = mw_ctx.buffer_ops,
+                        };
                         const resp = if (hdr.end_stream) blk: {
-                            const result = self.app_router.handle(hdr.request, &mw_ctx);
+                            const result = self.app_router.handle(hdr.request, &mw_ctx, &scratch);
                             // Apply rate limit backpressure if signaled
                             if (result.pause_reads_ms) |pause_ms| {
                                 conn.setRateLimitPause(self.io.nowMs(), pause_ms);
@@ -557,8 +666,9 @@ pub const Server = struct {
                         } else response_mod.Response{
                             .status = 501,
                             .headers = &[_]response_mod.Header{},
-                            .body = "Not Implemented\n",
+                            .body = .{ .bytes = "Not Implemented\n" },
                         };
+                        if (scratch.arena_handle) |handle| self.io.releaseBuffer(handle);
                         try self.queueHttp2Response(conn, hdr.stream_id, resp);
                     },
                     .data => |data| {
@@ -576,13 +686,13 @@ pub const Server = struct {
         const conn = self.io.getConnection(index) orelse return;
         const socket_fd = conn.fd orelse return;
 
-        // First, process buffer writes (headers must go out before file body)
-        if (conn.peekWrite()) |entry| {
+        // Process buffer writes in a loop (edge-triggered epoll requires draining until EAGAIN)
+        while (conn.peekWrite()) |entry| {
             const slice = entry.handle.bytes[entry.offset..entry.len];
             const bytes_written = std.posix.system.write(socket_fd, slice.ptr, slice.len);
             if (bytes_written < 0) {
                 switch (std.posix.errno(bytes_written)) {
-                    .AGAIN => return,
+                    .AGAIN => return, // Socket not ready, wait for next event
                     else => {
                         self.closeConnection(conn);
                         return;
@@ -603,17 +713,11 @@ pub const Server = struct {
                     self.streamBodyChunks(conn, conn.pending_body);
                 }
             }
-
-            // If we just finished headers and have a file pending, try sendfile immediately
-            if (conn.write_count == 0 and conn.hasPendingFile()) {
-                // Fall through to sendfile handling below
-            } else {
-                return;
-            }
         }
 
+        // All buffer writes done, try sendfile if file is pending
         if (conn.hasPendingFile()) {
-            // No buffer writes pending - use sendfile for file transfer
+            // Use sendfile for file transfer
             const file_fd = conn.pending_file_fd.?;
             const result = net.sendfile(socket_fd, file_fd, &conn.pending_file_offset, conn.pending_file_remaining) catch |err| {
                 switch (err) {
@@ -647,8 +751,15 @@ pub const Server = struct {
     }
 
     fn queueResponse(self: *Server, conn: *connection.Connection, resp: response_mod.Response) !void {
+        const body_len = resp.bodyLen();
+        const body_bytes = resp.bodyBytes();
+        const managed_body = switch (resp.body) {
+            .managed => |managed| managed,
+            else => null,
+        };
         const buf = self.io.acquireBuffer() orelse {
             // Cannot acquire buffer to send response - close connection
+            if (managed_body) |managed| self.io.releaseBuffer(managed.handle);
             self.closeConnection(conn);
             return;
         };
@@ -658,9 +769,45 @@ pub const Server = struct {
         else
             null;
 
+        if (managed_body) |managed| {
+            if (body_len > managed.handle.bytes.len) {
+                self.io.releaseBuffer(managed.handle);
+                self.io.releaseBuffer(buf);
+                self.closeConnection(conn);
+                return;
+            }
+            const header_len = encodeResponseHeaders(buf.bytes, resp, alt_svc) catch {
+                self.io.releaseBuffer(managed.handle);
+                self.io.releaseBuffer(buf);
+                self.closeConnection(conn);
+                return;
+            };
+            if (!conn.enqueueWrite(buf, header_len)) {
+                self.io.releaseBuffer(managed.handle);
+                self.io.releaseBuffer(buf);
+                self.closeConnection(conn);
+                return;
+            }
+            self.io.onWriteBuffered(conn, header_len);
+
+            if (body_len == 0) {
+                self.io.releaseBuffer(managed.handle);
+                self.io.setTimeoutPhase(conn, .write);
+                return;
+            }
+            if (!conn.enqueueWrite(managed.handle, body_len)) {
+                self.io.releaseBuffer(managed.handle);
+                self.closeConnection(conn);
+                return;
+            }
+            self.io.onWriteBuffered(conn, body_len);
+            self.io.setTimeoutPhase(conn, .write);
+            return;
+        }
+
         // For large bodies that don't fit in a single buffer, write headers first then chunk body
         const header_space = 512; // Reserve space for headers
-        if (resp.body.len > buf.bytes.len - header_space) {
+        if (body_len > buf.bytes.len - header_space) {
             // Write headers only first
             const header_len = encodeResponseHeaders(buf.bytes, resp, alt_svc) catch {
                 self.io.releaseBuffer(buf);
@@ -675,7 +822,7 @@ pub const Server = struct {
             self.io.onWriteBuffered(conn, header_len);
 
             // Stream body in chunks - only enqueue what fits, store rest for later
-            self.streamBodyChunks(conn, resp.body);
+            self.streamBodyChunks(conn, body_bytes);
             self.io.setTimeoutPhase(conn, .write);
             return;
         }
@@ -725,32 +872,46 @@ pub const Server = struct {
 
     /// Queue a file response using sendfile for zero-copy transfer.
     /// Sends HTTP headers first, then sets up the connection for sendfile.
-    fn queueFileResponse(self: *Server, conn: *connection.Connection, file_path: []const u8, content_type: []const u8) !void {
-        // Open the file using posix
-        // Need null-terminated path for open syscall
-        var path_buf: [4096]u8 = undefined;
-        if (file_path.len >= path_buf.len) {
+    fn queueFileResponse(self: *Server, conn: *connection.Connection, static_root: []const u8, file_path: []const u8, content_type: []const u8) !void {
+        // Prevent path traversal attacks
+        if (std.mem.indexOf(u8, file_path, "..") != null) {
             try self.queueResponse(conn, notFoundResponse());
             return;
         }
-        @memcpy(path_buf[0..file_path.len], file_path);
-        path_buf[file_path.len] = 0;
+
+        // Build full path: static_root + "/" + file_path
+        var path_buf: [4096]u8 = undefined;
+        const full_path_len = static_root.len + 1 + file_path.len;
+        if (full_path_len >= path_buf.len) {
+            try self.queueResponse(conn, notFoundResponse());
+            return;
+        }
+        @memcpy(path_buf[0..static_root.len], static_root);
+        path_buf[static_root.len] = '/';
+        @memcpy(path_buf[static_root.len + 1 ..][0..file_path.len], file_path);
+        path_buf[full_path_len] = 0;
         const path_z: [*:0]const u8 = @ptrCast(&path_buf);
 
-        const file_fd = std.posix.system.open(path_z, .{ .ACCMODE = .RDONLY }, @as(std.posix.mode_t, 0));
-        if (file_fd < 0) {
+        // Open file using C library for portability
+        const c = @cImport({
+            @cInclude("fcntl.h");
+            @cInclude("sys/stat.h");
+        });
+        const file_fd_c = c.open(path_z, c.O_RDONLY);
+        if (file_fd_c < 0) {
             try self.queueResponse(conn, notFoundResponse());
             return;
         }
-        errdefer std.posix.close(file_fd);
+        const file_fd: std.posix.fd_t = @intCast(file_fd_c);
 
-        // Get file size using fstat
-        const stat = std.posix.fstat(file_fd) catch {
+        // Get file size using C stat
+        var stat_buf: c.struct_stat = undefined;
+        if (c.fstat(file_fd_c, &stat_buf) != 0) {
             std.posix.close(file_fd);
             try self.queueResponse(conn, notFoundResponse());
             return;
-        };
-        const file_size: u64 = @intCast(stat.size);
+        }
+        const file_size: u64 = @intCast(stat_buf.st_size);
 
         // Build and send headers
         const buf = self.io.acquireBuffer() orelse {
@@ -797,6 +958,13 @@ pub const Server = struct {
 
     fn queueHttp2Response(self: *Server, conn: *connection.Connection, stream_id: u32, resp: response_mod.Response) !void {
         _ = stream_id;
+        const body_len = resp.bodyLen();
+        const body_bytes = resp.bodyBytes();
+        const managed_body = switch (resp.body) {
+            .managed => |managed| managed,
+            else => null,
+        };
+        defer if (managed_body) |managed| self.io.releaseBuffer(managed.handle);
         const header_buf = self.io.acquireBuffer() orelse {
             self.closeConnection(conn);
             return;
@@ -815,7 +983,7 @@ pub const Server = struct {
             };
             header_count += 1;
         }
-        const header_block_len = http2.encodeResponseHeaders(header_buf.bytes[9..], resp.status, headers_with_alt_svc[0..header_count], resp.body.len) catch {
+        const header_block_len = http2.encodeResponseHeaders(header_buf.bytes[9..], resp.status, headers_with_alt_svc[0..header_count], body_len) catch {
             self.io.releaseBuffer(header_buf);
             self.closeConnection(conn);
             return;
@@ -826,7 +994,7 @@ pub const Server = struct {
             self.closeConnection(conn);
             return;
         }
-        const headers_flags: u8 = if (resp.body.len == 0) 0x5 else 0x4;
+        const headers_flags: u8 = if (body_len == 0) 0x5 else 0x4;
         const resp_stream_id: u32 = if (conn.http2_stack) |stack| stack.last_stream_id else 1;
         http2.writeFrameHeader(header_buf.bytes, .headers, headers_flags, resp_stream_id, header_block_len) catch {
             self.io.releaseBuffer(header_buf);
@@ -842,8 +1010,8 @@ pub const Server = struct {
         self.io.onWriteBuffered(conn, header_frame_len);
         self.io.setTimeoutPhase(conn, .write);
 
-        if (resp.body.len == 0) return;
-        var remaining = resp.body;
+        if (body_len == 0) return;
+        var remaining = body_bytes;
         while (remaining.len > 0) {
             const data_buf = self.io.acquireBuffer() orelse {
                 // Cannot complete response - close connection
@@ -875,6 +1043,7 @@ pub const Server = struct {
         const reason = reasonPhrase(resp.status);
         const status_line = try std.fmt.bufPrint(buf[index..], "HTTP/1.1 {d} {s}\r\n", .{ resp.status, reason });
         index += status_line.len;
+        const body_bytes = resp.bodyBytes();
         for (resp.headers) |header| {
             const header_line = try std.fmt.bufPrint(buf[index..], "{s}: {s}\r\n", .{ header.name, header.value });
             index += header_line.len;
@@ -893,11 +1062,11 @@ pub const Server = struct {
             index += 2;
             return index;
         }
-        const length_line = try std.fmt.bufPrint(buf[index..], "Content-Length: {d}\r\n\r\n", .{resp.body.len});
+        const length_line = try std.fmt.bufPrint(buf[index..], "Content-Length: {d}\r\n\r\n", .{body_bytes.len});
         index += length_line.len;
-        if (index + resp.body.len > buf.len) return error.NoSpaceLeft;
-        @memcpy(buf[index .. index + resp.body.len], resp.body);
-        index += resp.body.len;
+        if (index + body_bytes.len > buf.len) return error.NoSpaceLeft;
+        @memcpy(buf[index .. index + body_bytes.len], body_bytes);
+        index += body_bytes.len;
         return index;
     }
 
@@ -907,6 +1076,7 @@ pub const Server = struct {
         const reason = reasonPhrase(resp.status);
         const status_line = try std.fmt.bufPrint(buf[index..], "HTTP/1.1 {d} {s}\r\n", .{ resp.status, reason });
         index += status_line.len;
+        const body_len = resp.bodyLen();
         for (resp.headers) |header| {
             const header_line = try std.fmt.bufPrint(buf[index..], "{s}: {s}\r\n", .{ header.name, header.value });
             index += header_line.len;
@@ -917,7 +1087,7 @@ pub const Server = struct {
                 index += alt_svc_line.len;
             }
         }
-        const length_line = try std.fmt.bufPrint(buf[index..], "Content-Length: {d}\r\n\r\n", .{resp.body.len});
+        const length_line = try std.fmt.bufPrint(buf[index..], "Content-Length: {d}\r\n\r\n", .{body_len});
         index += length_line.len;
         return index;
     }
@@ -959,7 +1129,7 @@ pub const Server = struct {
         return .{
             .status = 100,
             .headers = &[_]response_mod.Header{},
-            .body = "",
+            .body = .none,
         };
     }
 
@@ -967,7 +1137,7 @@ pub const Server = struct {
         return .{
             .status = 404,
             .headers = &[_]response_mod.Header{},
-            .body = "Not Found\n",
+            .body = .{ .bytes = "Not Found\n" },
         };
     }
 
@@ -1005,17 +1175,17 @@ pub const Server = struct {
             .body_too_large => .{
                 .status = 413,
                 .headers = &[_]response_mod.Header{},
-                .body = "Payload Too Large\n",
+                .body = .{ .bytes = "Payload Too Large\n" },
             },
             .header_too_large => .{
                 .status = 431,
                 .headers = &[_]response_mod.Header{},
-                .body = "Request Header Fields Too Large\n",
+                .body = .{ .bytes = "Request Header Fields Too Large\n" },
             },
             else => .{
                 .status = 400,
                 .headers = &[_]response_mod.Header{},
-                .body = "Bad Request\n",
+                .body = .{ .bytes = "Bad Request\n" },
             },
         };
     }
@@ -1043,6 +1213,514 @@ pub const Server = struct {
     }
 };
 
+test "metrics middleware response queued for http1" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var cfg = config.ServerConfig.default();
+    cfg.max_connections = 1;
+    cfg.pinned_buffers_per_conn = 1;
+    cfg.buffer_pool = .{
+        .buffer_size = 16 * 1024,
+        .buffer_count = 4,
+    };
+
+    var app_router = router.Router.init(.{
+        .require_payment = false,
+        .payment_required_b64 = "",
+    });
+    const chain = middleware.Chain.init(&.{metrics_mw.evaluate}, &.{});
+    app_router.setMiddleware(chain);
+
+    var server = try Server.initWithRouter(allocator, cfg, app_router);
+    defer server.deinit();
+
+    metrics_mw.getStore().* = .{};
+
+    const req = request.RequestView{
+        .method = .GET,
+        .path = "/metrics",
+        .headers = &[_]request.Header{},
+        .body = "",
+    };
+
+    var mw_ctx = middleware.Context{
+        .protocol = .http1,
+        .buffer_ops = .{
+            .ctx = &server.io,
+            .acquire = acquireBufferOpaque,
+            .release = releaseBufferOpaque,
+        },
+    };
+    var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
+    var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
+    const arena_handle = server.io.acquireBuffer();
+    var empty_arena: [0]u8 = undefined;
+    const arena_buf = if (arena_handle) |handle| handle.bytes else empty_arena[0..];
+    var scratch = router.HandlerScratch{
+        .response_buf = response_buf[0..],
+        .response_headers = response_headers[0..],
+        .arena_buf = arena_buf,
+        .arena_handle = arena_handle,
+        .buffer_ops = mw_ctx.buffer_ops,
+    };
+
+    const result = server.app_router.handle(req, &mw_ctx, &scratch);
+    if (scratch.arena_handle) |handle| server.io.releaseBuffer(handle);
+    try std.testing.expect(result.resp.bodyLen() > 0);
+
+    const managed = switch (result.resp.body) {
+        .managed => |m| m,
+        else => return error.UnexpectedBody,
+    };
+
+    const conn = server.io.acquireConnection(server.io.nowMs()) orelse return error.OutOfMemory;
+    defer if (conn.state != .closed) server.io.releaseConnection(conn);
+
+    try server.queueResponse(conn, result.resp);
+    try std.testing.expectEqual(@as(u8, 2), conn.write_count);
+
+    const header_entry = conn.peekWrite().?.*;
+    conn.popWrite();
+    const body_entry = conn.peekWrite().?.*;
+    conn.popWrite();
+
+    try std.testing.expectEqual(managed.handle.index, body_entry.handle.index);
+    try std.testing.expectEqualStrings(result.resp.bodyBytes(), body_entry.handle.bytes[0..body_entry.len]);
+
+    server.io.releaseBuffer(header_entry.handle);
+    server.io.releaseBuffer(body_entry.handle);
+}
+
+test "metrics middleware response queued for http2" {
+    if (!build_options.enable_http2) return;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var cfg = config.ServerConfig.default();
+    cfg.max_connections = 1;
+    cfg.pinned_buffers_per_conn = 1;
+    cfg.buffer_pool = .{
+        .buffer_size = 16 * 1024,
+        .buffer_count = 4,
+    };
+
+    var app_router = router.Router.init(.{
+        .require_payment = false,
+        .payment_required_b64 = "",
+    });
+    const chain = middleware.Chain.init(&.{metrics_mw.evaluate}, &.{});
+    app_router.setMiddleware(chain);
+
+    var server = try Server.initWithRouter(allocator, cfg, app_router);
+    defer server.deinit();
+
+    metrics_mw.getStore().* = .{};
+
+    const req = request.RequestView{
+        .method = .GET,
+        .path = "/metrics",
+        .headers = &[_]request.Header{},
+        .body = "",
+    };
+
+    var mw_ctx = middleware.Context{
+        .protocol = .http2,
+        .buffer_ops = .{
+            .ctx = &server.io,
+            .acquire = acquireBufferOpaque,
+            .release = releaseBufferOpaque,
+        },
+    };
+    var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
+    var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
+    const arena_handle = server.io.acquireBuffer();
+    var empty_arena: [0]u8 = undefined;
+    const arena_buf = if (arena_handle) |handle| handle.bytes else empty_arena[0..];
+    var scratch = router.HandlerScratch{
+        .response_buf = response_buf[0..],
+        .response_headers = response_headers[0..],
+        .arena_buf = arena_buf,
+        .arena_handle = arena_handle,
+        .buffer_ops = mw_ctx.buffer_ops,
+    };
+
+    const result = server.app_router.handle(req, &mw_ctx, &scratch);
+    if (scratch.arena_handle) |handle| server.io.releaseBuffer(handle);
+    try std.testing.expect(result.resp.bodyLen() > 0);
+
+    const managed = switch (result.resp.body) {
+        .managed => |m| m,
+        else => return error.UnexpectedBody,
+    };
+
+    const conn = server.io.acquireConnection(server.io.nowMs()) orelse return error.OutOfMemory;
+    defer if (conn.state != .closed) server.io.releaseConnection(conn);
+    conn.protocol = .http2;
+
+    try server.queueHttp2Response(conn, 1, result.resp);
+    try std.testing.expect(conn.write_count >= 2);
+
+    const expected = result.resp.bodyBytes();
+    var found_data = false;
+    var saw_managed_handle = false;
+
+    while (conn.peekWrite()) |entry_ptr| {
+        const entry = entry_ptr.*;
+        const frame_type = entry.handle.bytes[3];
+        if (entry.handle.index == managed.handle.index) {
+            saw_managed_handle = true;
+        }
+        if (frame_type == @intFromEnum(http2.FrameType.data)) {
+            const len = (@as(usize, entry.handle.bytes[0]) << 16) |
+                (@as(usize, entry.handle.bytes[1]) << 8) |
+                @as(usize, entry.handle.bytes[2]);
+            try std.testing.expectEqualStrings(expected, entry.handle.bytes[9 .. 9 + len]);
+            found_data = true;
+        }
+        server.io.releaseBuffer(entry.handle);
+        conn.popWrite();
+    }
+
+    try std.testing.expect(found_data);
+    try std.testing.expect(!saw_managed_handle);
+}
+
+test "metrics middleware end-to-end http1" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var cfg = config.ServerConfig.default();
+    cfg.max_connections = 1;
+    cfg.pinned_buffers_per_conn = 1;
+    cfg.buffer_pool = .{
+        .buffer_size = 16 * 1024,
+        .buffer_count = 4,
+    };
+
+    var app_router = router.Router.init(.{
+        .require_payment = false,
+        .payment_required_b64 = "",
+    });
+    const chain = middleware.Chain.init(&.{metrics_mw.evaluate}, &.{});
+    app_router.setMiddleware(chain);
+
+    var server = try Server.initWithRouter(allocator, cfg, app_router);
+    defer server.deinit();
+
+    metrics_mw.getStore().* = .{};
+
+    const raw = "GET /metrics HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    var headers: [8]request.Header = undefined;
+    var buf: [128]u8 = undefined;
+    @memcpy(buf[0..raw.len], raw);
+    const parse = http1.parse(buf[0..raw.len], .{
+        .max_header_bytes = 256,
+        .max_body_bytes = 1024,
+        .max_header_count = headers.len,
+        .headers_storage = headers[0..],
+    });
+    try std.testing.expectEqual(http1.ParseState.complete, parse.state);
+
+    var mw_ctx = middleware.Context{
+        .protocol = .http1,
+        .buffer_ops = .{
+            .ctx = &server.io,
+            .acquire = acquireBufferOpaque,
+            .release = releaseBufferOpaque,
+        },
+    };
+    var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
+    var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
+    const arena_handle = server.io.acquireBuffer();
+    var empty_arena: [0]u8 = undefined;
+    const arena_buf = if (arena_handle) |handle| handle.bytes else empty_arena[0..];
+    var scratch = router.HandlerScratch{
+        .response_buf = response_buf[0..],
+        .response_headers = response_headers[0..],
+        .arena_buf = arena_buf,
+        .arena_handle = arena_handle,
+        .buffer_ops = mw_ctx.buffer_ops,
+    };
+
+    const result = server.app_router.handle(parse.view, &mw_ctx, &scratch);
+    if (scratch.arena_handle) |handle| server.io.releaseBuffer(handle);
+    try std.testing.expect(result.resp.bodyLen() > 0);
+
+    const managed = switch (result.resp.body) {
+        .managed => |m| m,
+        else => return error.UnexpectedBody,
+    };
+
+    const conn = server.io.acquireConnection(server.io.nowMs()) orelse return error.OutOfMemory;
+    defer if (conn.state != .closed) server.io.releaseConnection(conn);
+
+    try server.queueResponse(conn, result.resp);
+    try std.testing.expectEqual(@as(u8, 2), conn.write_count);
+
+    const header_entry = conn.peekWrite().?.*;
+    conn.popWrite();
+    const body_entry = conn.peekWrite().?.*;
+    conn.popWrite();
+
+    try std.testing.expectEqual(managed.handle.index, body_entry.handle.index);
+    try std.testing.expectEqualStrings(result.resp.bodyBytes(), body_entry.handle.bytes[0..body_entry.len]);
+
+    server.io.releaseBuffer(header_entry.handle);
+    server.io.releaseBuffer(body_entry.handle);
+}
+
+test "metrics middleware end-to-end http2" {
+    if (!build_options.enable_http2) return;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var cfg = config.ServerConfig.default();
+    cfg.max_connections = 1;
+    cfg.pinned_buffers_per_conn = 1;
+    cfg.buffer_pool = .{
+        .buffer_size = 16 * 1024,
+        .buffer_count = 4,
+    };
+
+    var app_router = router.Router.init(.{
+        .require_payment = false,
+        .payment_required_b64 = "",
+    });
+    const chain = middleware.Chain.init(&.{metrics_mw.evaluate}, &.{});
+    app_router.setMiddleware(chain);
+
+    var server = try Server.initWithRouter(allocator, cfg, app_router);
+    defer server.deinit();
+
+    metrics_mw.getStore().* = .{};
+
+    var stack = http2.Stack.init();
+    var frames: [8]http2.Frame = undefined;
+    var events: [8]http2.Event = undefined;
+    var header_block_buf: [128]u8 = undefined;
+    const header_block = buildHeaderBlockAuthority(&header_block_buf, "example.com");
+
+    var input_buf: [256]u8 = undefined;
+    var idx: usize = 0;
+    @memcpy(input_buf[idx .. idx + http2.Preface.len], http2.Preface);
+    idx += http2.Preface.len;
+    http2.writeFrameHeader(input_buf[idx..], .headers, 0x5, 1, header_block.len) catch return error.BufferTooSmall;
+    idx += 9;
+    @memcpy(input_buf[idx .. idx + header_block.len], header_block);
+    idx += header_block.len;
+
+    const ingest = stack.ingest(input_buf[0..idx], frames[0..], events[0..]);
+    try std.testing.expectEqual(http2.ParseState.complete, ingest.state);
+    try std.testing.expect(ingest.event_count > 0);
+
+    var req_view: ?request.RequestView = null;
+    for (events[0..ingest.event_count]) |event| {
+        if (event == .headers) {
+            req_view = event.headers.request;
+        }
+    }
+    const view = req_view orelse return error.UnexpectedDecision;
+
+    var mw_ctx = middleware.Context{
+        .protocol = .http2,
+        .stream_id = 1,
+        .buffer_ops = .{
+            .ctx = &server.io,
+            .acquire = acquireBufferOpaque,
+            .release = releaseBufferOpaque,
+        },
+    };
+    var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
+    var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
+    const arena_handle = server.io.acquireBuffer();
+    var empty_arena: [0]u8 = undefined;
+    const arena_buf = if (arena_handle) |handle| handle.bytes else empty_arena[0..];
+    var scratch = router.HandlerScratch{
+        .response_buf = response_buf[0..],
+        .response_headers = response_headers[0..],
+        .arena_buf = arena_buf,
+        .arena_handle = arena_handle,
+        .buffer_ops = mw_ctx.buffer_ops,
+    };
+
+    const result = server.app_router.handle(view, &mw_ctx, &scratch);
+    if (scratch.arena_handle) |handle| server.io.releaseBuffer(handle);
+    try std.testing.expect(result.resp.bodyLen() > 0);
+
+    const conn = server.io.acquireConnection(server.io.nowMs()) orelse return error.OutOfMemory;
+    defer if (conn.state != .closed) server.io.releaseConnection(conn);
+    conn.protocol = .http2;
+    conn.http2_stack = &stack;
+
+    try server.queueHttp2Response(conn, 1, result.resp);
+    try std.testing.expect(conn.write_count >= 2);
+
+    const expected = result.resp.bodyBytes();
+    var collected = try std.testing.allocator.alloc(u8, expected.len);
+    defer std.testing.allocator.free(collected);
+    var collected_len: usize = 0;
+
+    while (conn.peekWrite()) |entry_ptr| {
+        const entry = entry_ptr.*;
+        const frame_type = entry.handle.bytes[3];
+        if (frame_type == @intFromEnum(http2.FrameType.data)) {
+            const len = (@as(usize, entry.handle.bytes[0]) << 16) |
+                (@as(usize, entry.handle.bytes[1]) << 8) |
+                @as(usize, entry.handle.bytes[2]);
+            @memcpy(collected[collected_len .. collected_len + len], entry.handle.bytes[9 .. 9 + len]);
+            collected_len += len;
+        }
+        server.io.releaseBuffer(entry.handle);
+        conn.popWrite();
+    }
+
+    try std.testing.expectEqual(expected.len, collected_len);
+    try std.testing.expectEqualStrings(expected, collected[0..collected_len]);
+}
+
+fn buildHeaderBlockAuthority(buffer: []u8, authority: []const u8) []u8 {
+    var idx: usize = 0;
+    buffer[idx] = 0x82; // :method GET
+    idx += 1;
+    buffer[idx] = 0x84; // :path /
+    idx += 1;
+    buffer[idx] = 0x01; // literal without indexing, indexed name :authority (index 1)
+    idx += 1;
+    buffer[idx] = @intCast(authority.len);
+    idx += 1;
+    @memcpy(buffer[idx .. idx + authority.len], authority);
+    idx += authority.len;
+    return buffer[0..idx];
+}
+
+test "http1 response bytes from write queue" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var cfg = config.ServerConfig.default();
+    cfg.max_connections = 1;
+    cfg.pinned_buffers_per_conn = 1;
+    cfg.buffer_pool = .{
+        .buffer_size = 16 * 1024,
+        .buffer_count = 4,
+    };
+
+    const app_router = router.Router.init(.{
+        .require_payment = false,
+        .payment_required_b64 = "",
+    });
+    var server = try Server.initWithRouter(allocator, cfg, app_router);
+    defer server.deinit();
+
+    const conn = server.io.acquireConnection(server.io.nowMs()) orelse return error.OutOfMemory;
+    defer if (conn.state != .closed) server.io.releaseConnection(conn);
+
+    const resp = response_mod.Response{
+        .status = 200,
+        .headers = &[_]response_mod.Header{
+            .{ .name = "Content-Type", .value = "text/plain" },
+        },
+        .body = .{ .bytes = "hi" },
+    };
+
+    try server.queueResponse(conn, resp);
+    const bytes = try drainWriteQueue(&server.io, conn, allocator);
+    defer allocator.free(bytes);
+
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nhi",
+        bytes,
+    );
+}
+
+test "http1 managed response bytes from write queue" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var cfg = config.ServerConfig.default();
+    cfg.max_connections = 1;
+    cfg.pinned_buffers_per_conn = 1;
+    cfg.buffer_pool = .{
+        .buffer_size = 16 * 1024,
+        .buffer_count = 4,
+    };
+
+    const app_router = router.Router.init(.{
+        .require_payment = false,
+        .payment_required_b64 = "",
+    });
+    var server = try Server.initWithRouter(allocator, cfg, app_router);
+    defer server.deinit();
+
+    const handle = server.io.acquireBuffer() orelse return error.OutOfMemory;
+    const body = "hello";
+    @memcpy(handle.bytes[0..body.len], body);
+
+    const resp = response_mod.Response{
+        .status = 200,
+        .headers = &[_]response_mod.Header{
+            .{ .name = "Content-Type", .value = "text/plain" },
+        },
+        .body = .{ .managed = .{ .handle = handle, .len = body.len } },
+    };
+
+    const conn = server.io.acquireConnection(server.io.nowMs()) orelse return error.OutOfMemory;
+    defer if (conn.state != .closed) server.io.releaseConnection(conn);
+
+    try server.queueResponse(conn, resp);
+    const bytes = try drainWriteQueue(&server.io, conn, allocator);
+    defer allocator.free(bytes);
+
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello",
+        bytes,
+    );
+}
+
+fn drainWriteQueue(io: *runtime.IoRuntime, conn: *connection.Connection, allocator: std.mem.Allocator) ![]u8 {
+    var list = std.ArrayList(u8).empty;
+    defer list.deinit(allocator);
+
+    while (conn.peekWrite()) |entry_ptr| {
+        const entry = entry_ptr.*;
+        try list.appendSlice(allocator, entry.handle.bytes[entry.offset..entry.len]);
+        io.releaseBuffer(entry.handle);
+        conn.popWrite();
+    }
+
+    return list.toOwnedSlice(allocator);
+}
+
+fn acquireBufferOpaque(ctx: *anyopaque) ?buffer_pool.BufferHandle {
+    const io: *runtime.IoRuntime = @ptrCast(@alignCast(ctx));
+    return io.acquireBuffer();
+}
+
+fn releaseBufferOpaque(ctx: *anyopaque, handle: buffer_pool.BufferHandle) void {
+    const io: *runtime.IoRuntime = @ptrCast(@alignCast(ctx));
+    io.releaseBuffer(handle);
+}
+
+pub fn registerDefaultRoutes(app_router: *router.Router) !void {
+    // Register built-in benchmark endpoints
+    try app_router.get("/health", handleBenchHealth);
+    try app_router.get("/echo", handleBenchEchoGet);
+    try app_router.post("/echo", handleBenchEchoPost);
+    try app_router.get("/blob", handleBenchBlob);
+    // TechEmpower Framework Benchmark endpoints
+    try app_router.get("/plaintext", handleTfbPlaintext);
+    try app_router.get("/json", handleTfbJson);
+}
+
 // ============================================================
 // Benchmark Handlers
 // Built-in endpoints for performance testing
@@ -1054,27 +1732,27 @@ const benchmark_blob: [1024 * 1024]u8 = [_]u8{0} ** (1024 * 1024);
 const benchmark_blob_size_str = "1048576";
 
 /// GET /health - minimal health check for benchmarks
-fn handleBenchHealth(_: *router.HandlerContext) response_mod.Response {
-    return .{
-        .status = 200,
-        .headers = &[_]response_mod.Header{
-            .{ .name = "Content-Length", .value = "0" },
-        },
-        .body = "",
-    };
-}
+    fn handleBenchHealth(_: *router.HandlerContext) response_mod.Response {
+        return .{
+            .status = 200,
+            .headers = &[_]response_mod.Header{
+                .{ .name = "Content-Length", .value = "0" },
+            },
+            .body = .none,
+        };
+    }
 
 /// GET /echo - return static JSON response
-fn handleBenchEchoGet(_: *router.HandlerContext) response_mod.Response {
-    return .{
-        .status = 200,
-        .headers = &[_]response_mod.Header{
-            .{ .name = "Content-Type", .value = "application/json" },
-            .{ .name = "Content-Length", .value = "15" },
-        },
-        .body = "{\"status\":\"ok\"}",
-    };
-}
+    fn handleBenchEchoGet(_: *router.HandlerContext) response_mod.Response {
+        return .{
+            .status = 200,
+            .headers = &[_]response_mod.Header{
+                .{ .name = "Content-Type", .value = "application/json" },
+                .{ .name = "Content-Length", .value = "15" },
+            },
+            .body = .{ .bytes = "{\"status\":\"ok\"}" },
+        };
+    }
 
 /// POST /echo - echo back request body
 fn handleBenchEchoPost(ctx: *router.HandlerContext) response_mod.Response {
@@ -1082,26 +1760,30 @@ fn handleBenchEchoPost(ctx: *router.HandlerContext) response_mod.Response {
     if (body.len == 0) {
         return handleBenchEchoGet(ctx);
     }
-    return .{
-        .status = 200,
-        .headers = &[_]response_mod.Header{
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-        .body = body,
+    var builder = ctx.respond() catch return .{
+        .status = 503,
+        .headers = &[_]response_mod.Header{},
+        .body = .{ .bytes = "No buffers available\n" },
+    };
+    defer ctx.releaseBuilder(&builder);
+    return builder.json(200, body) catch .{
+        .status = 413,
+        .headers = &[_]response_mod.Header{},
+        .body = .{ .bytes = "Payload Too Large\n" },
     };
 }
 
 /// GET /blob - return 1MB response for throughput testing
-fn handleBenchBlob(_: *router.HandlerContext) response_mod.Response {
-    return .{
-        .status = 200,
-        .headers = &[_]response_mod.Header{
-            .{ .name = "Content-Type", .value = "application/octet-stream" },
-            .{ .name = "Content-Length", .value = benchmark_blob_size_str },
-        },
-        .body = &benchmark_blob,
-    };
-}
+    fn handleBenchBlob(_: *router.HandlerContext) response_mod.Response {
+        return .{
+            .status = 200,
+            .headers = &[_]response_mod.Header{
+                .{ .name = "Content-Type", .value = "application/octet-stream" },
+                .{ .name = "Content-Length", .value = benchmark_blob_size_str },
+            },
+            .body = .{ .bytes = &benchmark_blob },
+        };
+    }
 
 // ============================================================
 // TechEmpower Framework Benchmark Handlers
@@ -1109,25 +1791,25 @@ fn handleBenchBlob(_: *router.HandlerContext) response_mod.Response {
 // ============================================================
 
 /// GET /plaintext - TechEmpower plaintext test
-fn handleTfbPlaintext(_: *router.HandlerContext) response_mod.Response {
-    return .{
-        .status = 200,
-        .headers = &[_]response_mod.Header{
-            .{ .name = "Content-Type", .value = "text/plain" },
-            .{ .name = "Content-Length", .value = "13" },
-        },
-        .body = "Hello, World!",
-    };
-}
+    fn handleTfbPlaintext(_: *router.HandlerContext) response_mod.Response {
+        return .{
+            .status = 200,
+            .headers = &[_]response_mod.Header{
+                .{ .name = "Content-Type", .value = "text/plain" },
+                .{ .name = "Content-Length", .value = "13" },
+            },
+            .body = .{ .bytes = "Hello, World!" },
+        };
+    }
 
 /// GET /json - TechEmpower JSON serialization test
-fn handleTfbJson(_: *router.HandlerContext) response_mod.Response {
-    return .{
-        .status = 200,
-        .headers = &[_]response_mod.Header{
-            .{ .name = "Content-Type", .value = "application/json" },
-            .{ .name = "Content-Length", .value = "27" },
-        },
-        .body = "{\"message\":\"Hello, World!\"}",
-    };
-}
+    fn handleTfbJson(_: *router.HandlerContext) response_mod.Response {
+        return .{
+            .status = 200,
+            .headers = &[_]response_mod.Header{
+                .{ .name = "Content-Type", .value = "application/json" },
+                .{ .name = "Content-Length", .value = "27" },
+            },
+            .body = .{ .bytes = "{\"message\":\"Hello, World!\"}" },
+        };
+    }

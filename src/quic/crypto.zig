@@ -423,21 +423,21 @@ pub fn protectPacket(
     header_len: usize,
     pn_offset: usize,
     pn_len: u8,
-    packet: []u8,
+    packet_bytes: []u8,
     packet_len: usize,
 ) Error!usize {
     if (packet_len < header_len) return error.BufferTooSmall;
 
-    const header = packet[0..header_len];
-    const plaintext = packet[header_len..packet_len];
+    const header = packet_bytes[0..header_len];
+    const plaintext = packet_bytes[header_len..packet_len];
 
     // Encrypt payload in-place (need temp buffer for tag)
     var ciphertext_buf: [65536]u8 = undefined;
     const ciphertext_len = try protectPayload(keys, packet_number, header, plaintext, &ciphertext_buf);
 
     // Copy ciphertext back
-    if (header_len + ciphertext_len > packet.len) return error.BufferTooSmall;
-    @memcpy(packet[header_len .. header_len + ciphertext_len], ciphertext_buf[0..ciphertext_len]);
+    if (header_len + ciphertext_len > packet_bytes.len) return error.BufferTooSmall;
+    @memcpy(packet_bytes[header_len .. header_len + ciphertext_len], ciphertext_buf[0..ciphertext_len]);
 
     // Apply header protection
     const sample_offset = getSampleOffset(pn_offset);
@@ -446,8 +446,8 @@ pub fn protectPacket(
         return error.BufferTooSmall;
     }
 
-    const sample: *const [16]u8 = @ptrCast(packet[sample_offset .. sample_offset + 16]);
-    applyHeaderProtection(keys.hp[0..keys.hp_len], sample, &packet[0], packet[pn_offset .. pn_offset + pn_len]);
+    const sample: *const [16]u8 = @ptrCast(packet_bytes[sample_offset .. sample_offset + 16]);
+    applyHeaderProtection(keys.hp[0..keys.hp_len], sample, &packet_bytes[0], packet_bytes[pn_offset .. pn_offset + pn_len]);
 
     return header_len + ciphertext_len;
 }
@@ -459,7 +459,7 @@ pub fn unprotectPacket(
     keys: *const Keys,
     largest_pn: u64,
     pn_offset: usize,
-    packet: []u8,
+    packet_bytes: []u8,
     packet_len: usize,
 ) Error!struct { pn: u64, header_len: usize, payload_len: usize } {
     if (packet_len < pn_offset + 4 + AEAD_TAG_LEN) return error.DecryptionFailed;
@@ -468,12 +468,12 @@ pub fn unprotectPacket(
     const sample_offset = getSampleOffset(pn_offset);
     if (sample_offset + 16 > packet_len) return error.DecryptionFailed;
 
-    const sample: *const [16]u8 = @ptrCast(packet[sample_offset .. sample_offset + 16]);
+    const sample: *const [16]u8 = @ptrCast(packet_bytes[sample_offset .. sample_offset + 16]);
 
     // Temporarily copy first byte and pn bytes to remove protection
-    var first_byte = packet[0];
+    var first_byte = packet_bytes[0];
     var pn_bytes: [4]u8 = undefined;
-    @memcpy(&pn_bytes, packet[pn_offset .. pn_offset + 4]);
+    @memcpy(&pn_bytes, packet_bytes[pn_offset .. pn_offset + 4]);
 
     // Remove header protection to get packet number length
     applyHeaderProtection(keys.hp[0..keys.hp_len], sample, &first_byte, &pn_bytes);
@@ -482,25 +482,25 @@ pub fn unprotectPacket(
     const pn_len: u8 = (first_byte & 0x03) + 1;
 
     // Apply protection removal to actual packet
-    applyHeaderProtection(keys.hp[0..keys.hp_len], sample, &packet[0], packet[pn_offset .. pn_offset + pn_len]);
+    applyHeaderProtection(keys.hp[0..keys.hp_len], sample, &packet_bytes[0], packet_bytes[pn_offset .. pn_offset + pn_len]);
 
     // Decode packet number
     var truncated_pn: u64 = 0;
     for (0..pn_len) |i| {
-        truncated_pn = (truncated_pn << 8) | packet[pn_offset + i];
+        truncated_pn = (truncated_pn << 8) | packet_bytes[pn_offset + i];
     }
     const full_pn = decodePacketNumber(truncated_pn, pn_len, largest_pn);
 
     // Header ends after packet number
     const header_len = pn_offset + pn_len;
-    const ciphertext = packet[header_len..packet_len];
+    const ciphertext = packet_bytes[header_len..packet_len];
 
     // Decrypt payload
     var plaintext_buf: [65536]u8 = undefined;
-    const payload_len = try unprotectPayload(keys, full_pn, packet[0..header_len], ciphertext, &plaintext_buf);
+    const payload_len = try unprotectPayload(keys, full_pn, packet_bytes[0..header_len], ciphertext, &plaintext_buf);
 
     // Copy plaintext back
-    @memcpy(packet[header_len .. header_len + payload_len], plaintext_buf[0..payload_len]);
+    @memcpy(packet_bytes[header_len .. header_len + payload_len], plaintext_buf[0..payload_len]);
 
     return .{
         .pn = full_pn,
@@ -508,6 +508,7 @@ pub fn unprotectPacket(
         .payload_len = payload_len,
     };
 }
+
 
 // Tests
 test "HKDF-Extract" {

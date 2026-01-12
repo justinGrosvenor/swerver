@@ -49,6 +49,9 @@ zig build -Denable-http3=true -Denable-tls=true run
 # Test
 zig build test
 
+# Test matrix (runs tests under multiple feature flag combinations)
+zig build test-matrix
+
 # Benchmark
 zig build bench
 ```
@@ -165,6 +168,15 @@ pub const Decision = union(enum) {
 | `-Denable-http2=true` | Enable HTTP/2 support |
 | `-Denable-http3=true` | Enable HTTP/3 over QUIC |
 | `-Doptimize=ReleaseFast` | Maximum performance |
+
+### CI note
+
+Some environments restrict access to Zig's global cache. If tests fail with `PermissionDenied`, set:
+
+```bash
+export ZIG_GLOBAL_CACHE_DIR="$(pwd)/.zig-cache-global"
+export ZIG_LOCAL_CACHE_DIR="$(pwd)/.zig-cache"
+```
 
 ## Requirements
 

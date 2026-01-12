@@ -12,3 +12,4 @@
 - [design/1.3-invariants.md](../design/1.3-invariants.md)
 - [design/1.4-contracts.md](../design/1.4-contracts.md)
 - [design/2.0-architecture.md](../design/2.0-architecture.md)
+- [embedded-api.md](../embedded-api.md)

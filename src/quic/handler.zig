@@ -10,6 +10,8 @@ const congestion = @import("congestion.zig");
 const crypto = @import("crypto.zig");
 const http3 = @import("../protocol/http3.zig");
 const metrics_mw = @import("../middleware/metrics_mw.zig");
+const build_options = @import("build_options");
+const test_utils = @import("test_utils.zig");
 
 /// QUIC packet handler
 ///
@@ -253,19 +255,7 @@ pub const Handler = struct {
         data: []const u8,
         pn_space: types.PacketNumberSpace,
     ) Error!void {
-        // Calculate packet number offset for long header
-        // Long header: flags(1) + version(4) + dcid_len(1) + dcid + scid_len(1) + scid + [token_len + token] + length(2+)
-        var pn_offset: usize = 1 + 4 + 1 + header.dcid.len + 1 + header.scid.len;
-
-        // Token only in Initial packets
-        if (header.packet_type == .initial) {
-            // Skip token length varint and token data
-            // For simplicity, assume token was already parsed and skip based on header total length
-            pn_offset += 1; // token length byte (assuming single-byte varint for 0 length)
-        }
-
-        // Skip length field (2 bytes for typical lengths)
-        pn_offset += 2;
+        const pn_offset = header.packet_number_offset;
 
         // Copy packet to mutable buffer for decryption
         var decrypt_buf: [65536]u8 = undefined;
@@ -633,6 +623,7 @@ pub const Handler = struct {
 
 // Tests
 test "handler initialization" {
+    if (!build_options.enable_http3) return;
     const allocator = std.testing.allocator;
     var handler = Handler.init(allocator, true, 100);
     defer handler.deinit();
@@ -641,57 +632,22 @@ test "handler initialization" {
 }
 
 test "handler processes Initial packet" {
+    if (!build_options.enable_http3) return;
     const allocator = std.testing.allocator;
-    var handler = Handler.init(allocator, true, 100);
-    defer handler.deinit();
+    var server_handler = Handler.init(allocator, true, 100);
+    defer server_handler.deinit();
 
-    // Build a minimal Initial packet
-    var pkt: [1200]u8 = undefined;
-    var offset: usize = 0;
-
-    // First byte: Long header | Fixed | Initial
-    pkt[offset] = 0xc0;
-    offset += 1;
-
-    // Version (QUIC v1)
-    pkt[offset] = 0x00;
-    pkt[offset + 1] = 0x00;
-    pkt[offset + 2] = 0x00;
-    pkt[offset + 3] = 0x01;
-    offset += 4;
-
-    // DCID length = 8
-    pkt[offset] = 0x08;
-    offset += 1;
-    @memset(pkt[offset .. offset + 8], 0xaa);
-    offset += 8;
-
-    // SCID length = 4
-    pkt[offset] = 0x04;
-    offset += 1;
-    @memset(pkt[offset .. offset + 4], 0xbb);
-    offset += 4;
-
-    // Token length = 0
-    pkt[offset] = 0x00;
-    offset += 1;
-
-    // Length = remaining (varint)
-    const remaining = 1200 - offset - 2;
-    pkt[offset] = @intCast(0x40 | ((remaining >> 8) & 0x3f));
-    pkt[offset + 1] = @intCast(remaining & 0xff);
-    offset += 2;
-
-    // Fill rest with padding
-    @memset(pkt[offset..], 0x00);
+    const dcid_bytes = [_]u8{0xaa} ** 8;
+    const scid_bytes = [_]u8{0xbb} ** 4;
+    var pkt_buf: [types.Constants.min_initial_packet_size]u8 = undefined;
+    const packet_bytes = try test_utils.buildClientInitialPacket(&pkt_buf, &dcid_bytes, &scid_bytes, 256);
 
     var peer_addr: connection_pool.SockAddrStorage = undefined;
     @memset(std.mem.asBytes(&peer_addr), 0);
 
-    const result = try handler.processPacket(&pkt, peer_addr);
-
+    const result = try server_handler.processPacket(packet_bytes, peer_addr);
     try std.testing.expect(result.new_connection);
     try std.testing.expect(result.conn != null);
     try std.testing.expect(result.response != null);
-    try std.testing.expectEqual(@as(usize, 1), handler.connectionCount());
+    try std.testing.expectEqual(@as(usize, 1), server_handler.connectionCount());
 }

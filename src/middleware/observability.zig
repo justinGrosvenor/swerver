@@ -513,7 +513,7 @@ pub fn postResponse(ctx: *middleware.Context, req: request.RequestView, resp: re
 
     // Update eBPF counters
     ebpf_counters.increment(.responses_total, 1);
-    ebpf_counters.increment(.bytes_sent, resp.body.len);
+    ebpf_counters.increment(.bytes_sent, resp.bodyLen());
     if (resp.status >= 500) {
         ebpf_counters.increment(.errors, 1);
     }
@@ -528,7 +528,7 @@ pub fn postResponse(ctx: *middleware.Context, req: request.RequestView, resp: re
         .protocol = ctx.protocol,
         .stream_id = ctx.stream_id,
         .latency_us = latency_us,
-        .bytes_sent = resp.body.len,
+        .bytes_sent = resp.bodyLen(),
         .bytes_received = 0, // Not tracked at this level
         .status = resp.status,
         .error_msg = null,
@@ -548,6 +548,39 @@ pub fn logMessage(level: Level, ctx: *const middleware.Context, message: []const
     };
 
     log(entry);
+}
+
+test "observability postResponse updates ebpf counters" {
+    init(.{ .log_stderr = false });
+    getEbpfCounters().* = EbpfCounters.init(true);
+
+    var ctx = middleware.Context{ .protocol = .http1 };
+    const req = request.RequestView{
+        .method = .GET,
+        .path = "/",
+        .headers = &[_]request.Header{},
+        .body = "",
+    };
+
+    const resp_err = response.Response{
+        .status = 500,
+        .headers = &[_]response.Header{},
+        .body = .{ .bytes = "nope" },
+    };
+    postResponse(&ctx, req, resp_err, 50_000);
+
+    const resp_rate = response.Response{
+        .status = 429,
+        .headers = &[_]response.Header{},
+        .body = .{ .bytes = "slow" },
+    };
+    postResponse(&ctx, req, resp_rate, 75_000);
+
+    const counters = getEbpfCounters();
+    try std.testing.expectEqual(@as(u64, 2), counters.read(.responses_total));
+    try std.testing.expectEqual(@as(u64, 8), counters.read(.bytes_sent));
+    try std.testing.expectEqual(@as(u64, 1), counters.read(.errors));
+    try std.testing.expectEqual(@as(u64, 1), counters.read(.rate_limit_hits));
 }
 
 // Tests

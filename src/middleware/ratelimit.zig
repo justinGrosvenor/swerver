@@ -242,7 +242,7 @@ fn tooManyRequests(retry_after: u64) response.Response {
             .{ .name = "Retry-After", .value = retry_str },
             .{ .name = "Content-Length", .value = "0" },
         },
-        .body = "",
+        .body = .none,
     };
 }
 

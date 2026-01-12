@@ -196,7 +196,7 @@ fn corsPreflightResponse() response.Response {
             .{ .name = "Access-Control-Max-Age", .value = "86400" },
             .{ .name = "Content-Length", .value = "0" },
         },
-        .body = "",
+        .body = .none,
     };
 }
 
@@ -206,7 +206,7 @@ fn badRequestResponse() response.Response {
         .headers = &[_]response.Header{
             .{ .name = "Content-Length", .value = "0" },
         },
-        .body = "",
+        .body = .none,
     };
 }
 

@@ -1,7 +1,19 @@
 const std = @import("std");
 const request = @import("../protocol/request.zig");
+const buffer_pool = @import("../runtime/buffer_pool.zig");
 
 pub const Header = request.Header;
+
+pub const ManagedBody = struct {
+    handle: buffer_pool.BufferHandle,
+    len: usize,
+};
+
+pub const Body = union(enum) {
+    none,
+    bytes: []const u8,
+    managed: ManagedBody,
+};
 
 /// Response body type
 pub const BodyType = enum {
@@ -17,14 +29,14 @@ pub const BodyType = enum {
 pub const Response = struct {
     status: u16,
     headers: []const Header,
-    body: []const u8,
+    body: Body = .none,
     body_type: BodyType = .fixed,
 
     pub fn ok() Response {
         return .{
             .status = 200,
             .headers = &[_]Header{},
-            .body = "",
+            .body = .none,
         };
     }
 
@@ -32,7 +44,7 @@ pub const Response = struct {
         return .{
             .status = 204,
             .headers = &[_]Header{},
-            .body = "",
+            .body = .none,
             .body_type = .none,
         };
     }
@@ -41,8 +53,24 @@ pub const Response = struct {
         return .{
             .status = 304,
             .headers = &[_]Header{},
-            .body = "",
+            .body = .none,
             .body_type = .none,
+        };
+    }
+
+    pub fn bodyLen(self: Response) usize {
+        return switch (self.body) {
+            .none => 0,
+            .bytes => |bytes| bytes.len,
+            .managed => |managed| managed.len,
+        };
+    }
+
+    pub fn bodyBytes(self: Response) []const u8 {
+        return switch (self.body) {
+            .none => "",
+            .bytes => |bytes| bytes,
+            .managed => |managed| managed.handle.bytes[0..managed.len],
         };
     }
 };
@@ -192,19 +220,20 @@ pub const ResponseWriter = struct {
             try self.writeHeader(hdr.name, hdr.value);
         }
 
+        const body = resp.bodyBytes();
         switch (resp.body_type) {
             .fixed => {
-                try self.writeContentLength(resp.body.len);
+                try self.writeContentLength(body.len);
                 try self.endHeaders();
-                if (resp.body.len > 0) {
-                    try self.writeBody(resp.body);
+                if (body.len > 0) {
+                    try self.writeBody(body);
                 }
             },
             .chunked => {
                 try self.startChunked();
                 try self.endHeaders();
-                if (resp.body.len > 0) {
-                    try self.writeChunk(resp.body);
+                if (body.len > 0) {
+                    try self.writeChunk(body);
                 }
                 try self.endChunked();
             },
@@ -266,7 +295,7 @@ test "response writer complete response" {
         .headers = &[_]Header{
             .{ .name = "Content-Type", .value = "text/plain" },
         },
-        .body = "Not Found",
+        .body = .{ .bytes = "Not Found" },
     };
 
     try writer.writeResponse(resp);

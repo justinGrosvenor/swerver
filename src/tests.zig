@@ -20,6 +20,7 @@ const quic_metrics = @import("quic/metrics.zig");
 const http3_frame = @import("protocol/http3/frame.zig");
 const http3_qpack = @import("protocol/http3/qpack.zig");
 const metrics_mw = @import("middleware/metrics_mw.zig");
+const server = @import("server.zig");
 
 // Proxy modules
 const proxy_upstream = @import("proxy/upstream.zig");
@@ -45,6 +46,7 @@ comptime {
     _ = http3_frame;
     _ = http3_qpack;
     _ = metrics_mw;
+    _ = server;
     // Proxy modules
     _ = proxy_upstream;
     _ = proxy_pool;

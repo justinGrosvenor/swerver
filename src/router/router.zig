@@ -3,6 +3,16 @@ const request = @import("../protocol/request.zig");
 const response = @import("../response/response.zig");
 const x402 = @import("../middleware/x402.zig");
 const middleware = @import("../middleware/middleware.zig");
+const buffer_pool = @import("../runtime/buffer_pool.zig");
+
+pub const RouterError = error{
+    RouteLimitExceeded,
+    SegmentLimitExceeded,
+    ParamLimitExceeded,
+    PatternTooLong,
+    NoBufferOps,
+    NoBuffers,
+};
 
 /// Result of routing a request
 pub const RouteResult = struct {
@@ -19,18 +29,133 @@ pub const HandlerFn = *const fn (ctx: *HandlerContext) response.Response;
 pub const HandlerContext = struct {
     request: request.RequestView,
     middleware_ctx: *middleware.Context,
+    app_state: ?*anyopaque = null,
+    app_services: ?*anyopaque = null,
+    app_services_get: ?ServiceGetter = null,
+    buffer_ops: ?middleware.BufferOps = null,
     /// Path parameters extracted from route (e.g., /users/:id)
-    params: [8]Param = undefined,
+    params: [MAX_PARAMS]Param = undefined,
     param_count: u8 = 0,
     /// Response buffer for building dynamic responses
-    response_buf: [RESPONSE_BUF_SIZE]u8 = undefined,
-
-    const RESPONSE_BUF_SIZE = 8192;
+    response_buf: []u8,
+    /// Response headers built for default responses
+    response_headers: []response.Header,
+    response_header_count: usize = 0,
+    /// Request-scoped arena allocator
+    arena: std.heap.FixedBufferAllocator,
 
     pub const Param = struct {
         name: []const u8,
         value: []const u8,
     };
+
+    pub const ResponseBuilder = struct {
+        handle: buffer_pool.BufferHandle,
+        len: usize = 0,
+        used: bool = false,
+
+        pub const BuildError = error{BufferFull};
+
+        pub fn init(handle: buffer_pool.BufferHandle) ResponseBuilder {
+            return .{ .handle = handle };
+        }
+
+        pub fn reset(self: *ResponseBuilder) void {
+            self.len = 0;
+        }
+
+        pub fn append(self: *ResponseBuilder, data: []const u8) BuildError!void {
+            if (self.len + data.len > self.handle.bytes.len) return error.BufferFull;
+            @memcpy(self.handle.bytes[self.len .. self.len + data.len], data);
+            self.len += data.len;
+        }
+
+        pub fn bytes(self: *const ResponseBuilder) []const u8 {
+            return self.handle.bytes[0..self.len];
+        }
+
+        pub fn text(self: *ResponseBuilder, status: u16, body: []const u8) BuildError!response.Response {
+            self.reset();
+            try self.append(body);
+            self.used = true;
+            return .{
+                .status = status,
+                .headers = &[_]response.Header{
+                    .{ .name = "Content-Type", .value = "text/plain" },
+                },
+                .body = .{ .managed = .{ .handle = self.handle, .len = self.len } },
+            };
+        }
+
+        pub fn json(self: *ResponseBuilder, status: u16, body: []const u8) BuildError!response.Response {
+            self.reset();
+            try self.append(body);
+            self.used = true;
+            return .{
+                .status = status,
+                .headers = &[_]response.Header{
+                    .{ .name = "Content-Type", .value = "application/json" },
+                },
+                .body = .{ .managed = .{ .handle = self.handle, .len = self.len } },
+            };
+        }
+
+        pub fn html(self: *ResponseBuilder, status: u16, body: []const u8) BuildError!response.Response {
+            self.reset();
+            try self.append(body);
+            self.used = true;
+            return .{
+                .status = status,
+                .headers = &[_]response.Header{
+                    .{ .name = "Content-Type", .value = "text/html; charset=utf-8" },
+                },
+                .body = .{ .managed = .{ .handle = self.handle, .len = self.len } },
+            };
+        }
+
+        pub fn release(self: *ResponseBuilder, ops: middleware.BufferOps) void {
+            if (!self.used) {
+                ops.release(ops.ctx, self.handle);
+            }
+        }
+    };
+
+    /// Start building a response in the request-scoped buffer.
+    pub fn respond(self: *HandlerContext) RouterError!ResponseBuilder {
+        const ops = self.buffer_ops orelse return error.NoBufferOps;
+        const handle = ops.acquire(ops.ctx) orelse return error.NoBuffers;
+        return ResponseBuilder.init(handle);
+    }
+
+    pub fn releaseBuilder(self: *HandlerContext, builder: *ResponseBuilder) void {
+        const ops = self.buffer_ops orelse return;
+        builder.release(ops);
+    }
+
+    /// Access app state (set via ServerBuilder.withState).
+    pub fn state(self: *const HandlerContext, comptime T: type) *T {
+        std.debug.assert(self.app_state != null);
+        return @ptrCast(@alignCast(self.app_state.?));
+    }
+
+    /// Access typed services (set via ServerBuilder.withServices).
+    pub fn services(self: *const HandlerContext, comptime T: type) *T {
+        std.debug.assert(self.app_services != null);
+        return @ptrCast(@alignCast(self.app_services.?));
+    }
+
+    /// Typed lookup from services (optional sugar).
+    pub fn get(self: *const HandlerContext, comptime T: type) *T {
+        std.debug.assert(self.app_services != null);
+        std.debug.assert(self.app_services_get != null);
+        const raw = self.app_services_get.?(self.app_services.?, @typeName(T));
+        return @ptrCast(@alignCast(raw));
+    }
+
+    /// Request-scoped allocator (valid only during handler execution).
+    pub fn arenaAllocator(self: *HandlerContext) std.mem.Allocator {
+        return self.arena.allocator();
+    }
 
     /// Get path parameter by name
     pub fn getParam(self: *const HandlerContext, name: []const u8) ?[]const u8 {
@@ -49,7 +174,7 @@ pub const HandlerContext = struct {
             .headers = &[_]response.Header{
                 .{ .name = "Content-Type", .value = "application/json" },
             },
-            .body = body,
+            .body = .{ .bytes = body },
         };
     }
 
@@ -61,7 +186,7 @@ pub const HandlerContext = struct {
             .headers = &[_]response.Header{
                 .{ .name = "Content-Type", .value = "text/plain" },
             },
-            .body = body,
+            .body = .{ .bytes = body },
         };
     }
 
@@ -73,9 +198,71 @@ pub const HandlerContext = struct {
             .headers = &[_]response.Header{
                 .{ .name = "Content-Type", .value = "text/html; charset=utf-8" },
             },
-            .body = body,
+            .body = .{ .bytes = body },
         };
     }
+};
+
+pub const RouteBuilder = struct {
+    router: *Router,
+    method: request.Method,
+    pattern: []const u8,
+    handler: HandlerFn,
+    middleware_chain: ?*middleware.Chain = null,
+
+    pub fn withMiddleware(self: *RouteBuilder, chain: *middleware.Chain) *RouteBuilder {
+        self.middleware_chain = chain;
+        return self;
+    }
+
+    pub fn register(self: *RouteBuilder) RouterError!void {
+        return self.router.routeWithChain(self.method, self.pattern, self.handler, self.middleware_chain);
+    }
+};
+
+pub const GroupBuilder = struct {
+    router: *Router,
+    prefix: []const u8,
+    middleware_chain: ?*middleware.Chain = null,
+
+    pub fn withMiddleware(self: *GroupBuilder, chain: *middleware.Chain) *GroupBuilder {
+        self.middleware_chain = chain;
+        return self;
+    }
+
+    pub fn get(self: *GroupBuilder, pattern: []const u8, handler: HandlerFn) RouterError!void {
+        return self.router.routeWithPrefix(.GET, self.prefix, pattern, handler, self.middleware_chain);
+    }
+
+    pub fn post(self: *GroupBuilder, pattern: []const u8, handler: HandlerFn) RouterError!void {
+        return self.router.routeWithPrefix(.POST, self.prefix, pattern, handler, self.middleware_chain);
+    }
+
+    pub fn put(self: *GroupBuilder, pattern: []const u8, handler: HandlerFn) RouterError!void {
+        return self.router.routeWithPrefix(.PUT, self.prefix, pattern, handler, self.middleware_chain);
+    }
+
+    pub fn delete(self: *GroupBuilder, pattern: []const u8, handler: HandlerFn) RouterError!void {
+        return self.router.routeWithPrefix(.DELETE, self.prefix, pattern, handler, self.middleware_chain);
+    }
+
+    pub fn patch(self: *GroupBuilder, pattern: []const u8, handler: HandlerFn) RouterError!void {
+        return self.router.routeWithPrefix(.PATCH, self.prefix, pattern, handler, self.middleware_chain);
+    }
+};
+
+pub const HandlerScratch = struct {
+    response_buf: []u8,
+    response_headers: []response.Header,
+    arena_buf: []u8,
+    arena_handle: ?buffer_pool.BufferHandle = null,
+    buffer_ops: ?middleware.BufferOps = null,
+};
+
+pub const RouterLimits = struct {
+    max_routes: usize = MAX_ROUTES,
+    max_segments: u8 = MAX_SEGMENTS,
+    max_params: u8 = MAX_PARAMS,
 };
 
 /// Route entry
@@ -83,6 +270,10 @@ pub const Route = struct {
     method: request.Method,
     pattern: []const u8,
     handler: HandlerFn,
+    middleware_chain: ?*middleware.Chain = null,
+    pattern_buf: [MAX_PATTERN_LEN]u8 = undefined,
+    pattern_len: usize = 0,
+    param_count: u8 = 0,
     /// Pre-parsed pattern segments for matching
     segments: [16]Segment = undefined,
     segment_count: u8 = 0,
@@ -93,7 +284,7 @@ pub const Route = struct {
         wildcard, // matches rest of path (*)
     };
 
-    fn compile(pattern: []const u8) Route {
+    fn compile(pattern: []const u8, limits: RouterLimits) RouterError!Route {
         var route = Route{
             .method = .GET,
             .pattern = pattern,
@@ -103,10 +294,12 @@ pub const Route = struct {
         var it = std.mem.splitScalar(u8, pattern, '/');
         while (it.next()) |seg| {
             if (seg.len == 0) continue;
-            if (route.segment_count >= 16) break;
+            if (route.segment_count >= limits.max_segments) return error.SegmentLimitExceeded;
 
             if (seg[0] == ':') {
+                if (route.param_count >= limits.max_params) return error.ParamLimitExceeded;
                 route.segments[route.segment_count] = .{ .param = seg[1..] };
+                route.param_count += 1;
             } else if (seg[0] == '*') {
                 route.segments[route.segment_count] = .wildcard;
             } else {
@@ -117,10 +310,50 @@ pub const Route = struct {
 
         return route;
     }
+
+    fn compileWithPrefix(prefix: []const u8, pattern: []const u8, limits: RouterLimits) RouterError!Route {
+        var route = Route{
+            .method = .GET,
+            .pattern = pattern,
+            .handler = undefined,
+        };
+
+        try appendSegments(&route, prefix, limits);
+        try appendSegments(&route, pattern, limits);
+        return route;
+    }
+
+    fn appendSegments(route: *Route, value: []const u8, limits: RouterLimits) RouterError!void {
+        var it = std.mem.splitScalar(u8, value, '/');
+        while (it.next()) |seg| {
+            if (seg.len == 0) continue;
+            if (route.segment_count >= limits.max_segments) return error.SegmentLimitExceeded;
+
+            if (seg[0] == ':') {
+                if (route.param_count >= limits.max_params) return error.ParamLimitExceeded;
+                route.segments[route.segment_count] = .{ .param = seg[1..] };
+                route.param_count += 1;
+            } else if (seg[0] == '*') {
+                route.segments[route.segment_count] = .wildcard;
+            } else {
+                route.segments[route.segment_count] = .{ .literal = seg };
+            }
+            route.segment_count += 1;
+        }
+    }
 };
 
 /// Maximum number of routes
 const MAX_ROUTES = 128;
+const MAX_SEGMENTS = 16;
+const MAX_PARAMS = 8;
+const MAX_PATTERN_LEN = 256;
+
+pub const RESPONSE_BUF_SIZE = 8192;
+pub const MAX_RESPONSE_HEADERS = 4;
+pub const ARENA_BUF_SIZE = 16 * 1024;
+
+pub const ServiceGetter = *const fn (*anyopaque, []const u8) *anyopaque;
 
 /// Router with route registration and matching
 pub const Router = struct {
@@ -128,8 +361,14 @@ pub const Router = struct {
     route_count: usize = 0,
     x402_policy: x402.Policy,
     middleware_chain: middleware.Chain,
+    limits: RouterLimits = .{},
+    app_state: ?*anyopaque = null,
+    app_services: ?*anyopaque = null,
+    app_services_get: ?ServiceGetter = null,
     /// Default 404 handler
     not_found_handler: ?HandlerFn = null,
+    /// Default 405 handler
+    method_not_allowed_handler: ?HandlerFn = null,
     /// Default 500 handler
     error_handler: ?HandlerFn = null,
 
@@ -140,43 +379,103 @@ pub const Router = struct {
         };
     }
 
+    pub fn initWithLimits(policy: x402.Policy, limits: RouterLimits) Router {
+        std.debug.assert(limits.max_routes <= MAX_ROUTES);
+        std.debug.assert(limits.max_segments <= MAX_SEGMENTS);
+        std.debug.assert(limits.max_params <= MAX_PARAMS);
+        return .{
+            .x402_policy = policy,
+            .middleware_chain = middleware.Chain.init(&.{}, &.{}),
+            .limits = limits,
+        };
+    }
+
     /// Set middleware chain
     pub fn setMiddleware(self: *Router, chain: middleware.Chain) void {
         self.middleware_chain = chain;
     }
 
+    /// Set app state pointer (for HandlerContext.state).
+    pub fn setState(self: *Router, state: ?*anyopaque) void {
+        self.app_state = state;
+    }
+
+    /// Set services pointer (for HandlerContext.services).
+    pub fn setServices(self: *Router, services: ?*anyopaque) void {
+        self.app_services = services;
+    }
+
+    pub fn setServicesWithGetter(self: *Router, services: ?*anyopaque, getter: ?ServiceGetter) void {
+        self.app_services = services;
+        self.app_services_get = getter;
+    }
+
+    /// Create a grouped router with a path prefix.
+    pub fn group(self: *Router, prefix: []const u8) GroupBuilder {
+        return .{ .router = self, .prefix = prefix };
+    }
+
+    /// Register a GET route builder.
+    pub fn routeBuilder(self: *Router, method: request.Method, pattern: []const u8, handler: HandlerFn) RouteBuilder {
+        return .{
+            .router = self,
+            .method = method,
+            .pattern = pattern,
+            .handler = handler,
+        };
+    }
+
     /// Register a GET route
-    pub fn get(self: *Router, pattern: []const u8, handler: HandlerFn) void {
-        self.route(.GET, pattern, handler);
+    pub fn get(self: *Router, pattern: []const u8, handler: HandlerFn) RouterError!void {
+        try self.route(.GET, pattern, handler);
     }
 
     /// Register a POST route
-    pub fn post(self: *Router, pattern: []const u8, handler: HandlerFn) void {
-        self.route(.POST, pattern, handler);
+    pub fn post(self: *Router, pattern: []const u8, handler: HandlerFn) RouterError!void {
+        try self.route(.POST, pattern, handler);
     }
 
     /// Register a PUT route
-    pub fn put(self: *Router, pattern: []const u8, handler: HandlerFn) void {
-        self.route(.PUT, pattern, handler);
+    pub fn put(self: *Router, pattern: []const u8, handler: HandlerFn) RouterError!void {
+        try self.route(.PUT, pattern, handler);
     }
 
     /// Register a DELETE route
-    pub fn delete(self: *Router, pattern: []const u8, handler: HandlerFn) void {
-        self.route(.DELETE, pattern, handler);
+    pub fn delete(self: *Router, pattern: []const u8, handler: HandlerFn) RouterError!void {
+        try self.route(.DELETE, pattern, handler);
     }
 
     /// Register a PATCH route
-    pub fn patch(self: *Router, pattern: []const u8, handler: HandlerFn) void {
-        self.route(.PATCH, pattern, handler);
+    pub fn patch(self: *Router, pattern: []const u8, handler: HandlerFn) RouterError!void {
+        try self.route(.PATCH, pattern, handler);
     }
 
     /// Register a route with any method
-    pub fn route(self: *Router, method: request.Method, pattern: []const u8, handler: HandlerFn) void {
-        if (self.route_count >= MAX_ROUTES) return;
+    pub fn route(self: *Router, method: request.Method, pattern: []const u8, handler: HandlerFn) RouterError!void {
+        return self.routeWithChain(method, pattern, handler, null);
+    }
 
-        var r = Route.compile(pattern);
+    /// Register a route with a custom middleware chain.
+    pub fn routeWithChain(self: *Router, method: request.Method, pattern: []const u8, handler: HandlerFn, chain: ?*middleware.Chain) RouterError!void {
+        if (self.route_count >= self.limits.max_routes) return error.RouteLimitExceeded;
+
+        var r = try Route.compile(pattern, self.limits);
+        try self.storePattern(&r, pattern);
         r.method = method;
         r.handler = handler;
+        r.middleware_chain = chain;
+        self.routes[self.route_count] = r;
+        self.route_count += 1;
+    }
+
+    pub fn routeWithPrefix(self: *Router, method: request.Method, prefix: []const u8, pattern: []const u8, handler: HandlerFn, chain: ?*middleware.Chain) RouterError!void {
+        if (self.route_count >= self.limits.max_routes) return error.RouteLimitExceeded;
+
+        var r = try Route.compileWithPrefix(prefix, pattern, self.limits);
+        try self.storePatternWithPrefix(&r, prefix, pattern);
+        r.method = method;
+        r.handler = handler;
+        r.middleware_chain = chain;
         self.routes[self.route_count] = r;
         self.route_count += 1;
     }
@@ -186,6 +485,16 @@ pub const Router = struct {
         self.not_found_handler = handler;
     }
 
+    /// Set custom 404 handler (alias).
+    pub fn fallback(self: *Router, handler: HandlerFn) void {
+        self.setNotFound(handler);
+    }
+
+    /// Set custom 405 handler.
+    pub fn methodNotAllowed(self: *Router, handler: HandlerFn) void {
+        self.method_not_allowed_handler = handler;
+    }
+
     /// Set custom error handler
     pub fn setErrorHandler(self: *Router, handler: HandlerFn) void {
         self.error_handler = handler;
@@ -193,7 +502,7 @@ pub const Router = struct {
 
     /// Handle an incoming request
     /// Returns RouteResult with response and optional backpressure signal
-    pub fn handle(self: *Router, req: request.RequestView, mw_ctx: *middleware.Context) RouteResult {
+    pub fn handle(self: *Router, req: request.RequestView, mw_ctx: *middleware.Context, scratch: *HandlerScratch) RouteResult {
         // Run x402 check first
         switch (x402.evaluate(req, self.x402_policy)) {
             .allow => {},
@@ -214,18 +523,46 @@ pub const Router = struct {
         var ctx = HandlerContext{
             .request = req,
             .middleware_ctx = mw_ctx,
+            .app_state = self.app_state,
+            .app_services = self.app_services,
+            .app_services_get = self.app_services_get,
+            .buffer_ops = scratch.buffer_ops,
+            .params = undefined,
+            .param_count = 0,
+            .response_buf = scratch.response_buf,
+            .response_headers = scratch.response_headers,
+            .response_header_count = 0,
+            .arena = std.heap.FixedBufferAllocator.init(scratch.arena_buf),
         };
 
+        var path_matched = false;
         for (self.routes[0..self.route_count]) |r| {
-            if (r.method != req.method) continue;
-
-            if (self.matchRoute(&r, req.path, &ctx)) {
-                mw_ctx.route = r.pattern;
-                return .{ .resp = r.handler(&ctx) };
+            if (!self.matchRoute(&r, req.path, &ctx)) continue;
+            if (r.method != req.method) {
+                path_matched = true;
+                continue;
             }
+            mw_ctx.route = r.pattern;
+            if (r.middleware_chain) |chain| {
+                switch (chain.executePre(mw_ctx, req)) {
+                    .allow => {},
+                    .reject => |resp| return .{ .resp = resp },
+                    .backpressure => |bp| return .{
+                        .resp = bp.resp,
+                        .pause_reads_ms = if (bp.pause_reads) bp.resume_after_ms else null,
+                    },
+                }
+            }
+            return .{ .resp = r.handler(&ctx) };
         }
 
         // No route matched - 404
+        if (path_matched) {
+            if (self.method_not_allowed_handler) |handler| {
+                return .{ .resp = handler(&ctx) };
+            }
+            return .{ .resp = self.defaultMethodNotAllowed(&ctx) };
+        }
         if (self.not_found_handler) |handler| {
             return .{ .resp = handler(&ctx) };
         }
@@ -255,7 +592,7 @@ pub const Router = struct {
                     }
                 },
                 .param => |name| {
-                    if (ctx.param_count < 8) {
+                    if (ctx.param_count < MAX_PARAMS) {
                         ctx.params[ctx.param_count] = .{
                             .name = name,
                             .value = path_seg,
@@ -274,6 +611,115 @@ pub const Router = struct {
         // All path segments consumed - check we matched all pattern segments
         return seg_idx == r.segment_count;
     }
+
+    fn defaultMethodNotAllowed(self: *Router, ctx: *HandlerContext) response.Response {
+        ctx.response_header_count = 0;
+        const allow_value = self.buildAllowHeader(ctx.request.path, ctx);
+        if (allow_value.len > 0 and ctx.response_headers.len > 0) {
+            ctx.response_headers[0] = .{ .name = "Allow", .value = allow_value };
+            ctx.response_header_count = 1;
+        }
+        return .{
+            .status = 405,
+            .headers = ctx.response_headers[0..ctx.response_header_count],
+            .body = .{ .bytes = "Method Not Allowed" },
+        };
+    }
+
+    fn buildAllowHeader(self: *Router, path: []const u8, ctx: *HandlerContext) []const u8 {
+        const method_count = @typeInfo(request.Method).@"enum".fields.len;
+        var allowed: [method_count]bool = [_]bool{false} ** method_count;
+        var temp_ctx = HandlerContext{
+            .request = ctx.request,
+            .middleware_ctx = ctx.middleware_ctx,
+            .app_state = ctx.app_state,
+            .app_services = ctx.app_services,
+            .app_services_get = ctx.app_services_get,
+            .buffer_ops = null,
+            .params = undefined,
+            .param_count = 0,
+            .response_buf = ctx.response_buf,
+            .response_headers = ctx.response_headers,
+            .response_header_count = 0,
+            .arena = std.heap.FixedBufferAllocator.init(&[_]u8{}),
+        };
+
+        for (self.routes[0..self.route_count]) |r| {
+            if (self.matchRoute(&r, path, &temp_ctx)) {
+                const idx = @intFromEnum(r.method);
+                allowed[idx] = true;
+            }
+        }
+
+        var out = ctx.response_buf[0..];
+        var pos: usize = 0;
+        var first = true;
+        for (allowed, 0..) |is_allowed, idx| {
+            if (!is_allowed) continue;
+            const method = @as(request.Method, @enumFromInt(idx));
+            const name = method.toString();
+            const extra: usize = if (first) 0 else 2;
+            if (pos + extra + name.len > out.len) break;
+            if (!first) {
+                out[pos] = ',';
+                out[pos + 1] = ' ';
+                pos += 2;
+            }
+            @memcpy(out[pos .. pos + name.len], name);
+            pos += name.len;
+            first = false;
+        }
+
+        return out[0..pos];
+    }
+
+    fn storePattern(self: *Router, r: *Route, pattern: []const u8) RouterError!void {
+        _ = self;
+        if (pattern.len > MAX_PATTERN_LEN) return error.PatternTooLong;
+        @memcpy(r.pattern_buf[0..pattern.len], pattern);
+        r.pattern_len = pattern.len;
+        r.pattern = r.pattern_buf[0..r.pattern_len];
+    }
+
+    fn storePatternWithPrefix(self: *Router, r: *Route, prefix: []const u8, pattern: []const u8) RouterError!void {
+        _ = self;
+        var full_len = prefix.len + pattern.len;
+        var needs_slash = false;
+        if (prefix.len > 0 and pattern.len > 0) {
+            const prefix_slash = prefix[prefix.len - 1] == '/';
+            const pattern_slash = pattern[0] == '/';
+            if (!prefix_slash and !pattern_slash) {
+                needs_slash = true;
+                full_len += 1;
+            }
+            if (prefix_slash and pattern_slash) {
+                full_len -= 1;
+            }
+        }
+
+        if (full_len > MAX_PATTERN_LEN) return error.PatternTooLong;
+
+        var pos: usize = 0;
+        @memcpy(r.pattern_buf[pos .. pos + prefix.len], prefix);
+        pos += prefix.len;
+        if (needs_slash) {
+            r.pattern_buf[pos] = '/';
+            pos += 1;
+        } else if (prefix.len > 0 and pattern.len > 0 and prefix[prefix.len - 1] == '/' and pattern[0] == '/') {
+            // Skip the leading slash in pattern
+        }
+
+        if (prefix.len > 0 and pattern.len > 0 and prefix[prefix.len - 1] == '/' and pattern[0] == '/') {
+            @memcpy(r.pattern_buf[pos .. pos + pattern.len - 1], pattern[1..]);
+            pos += pattern.len - 1;
+        } else {
+            @memcpy(r.pattern_buf[pos .. pos + pattern.len], pattern);
+            pos += pattern.len;
+        }
+
+        r.pattern_len = pos;
+        r.pattern = r.pattern_buf[0..r.pattern_len];
+    }
 };
 
 /// Default 404 response
@@ -283,10 +729,11 @@ fn notFound() response.Response {
         .headers = &[_]response.Header{
             .{ .name = "Content-Type", .value = "text/plain" },
         },
-        .body = "Not Found",
+        .body = .{ .bytes = "Not Found" },
     };
 }
 
+/// Default 405 response
 /// Default 500 response
 pub fn internalError() response.Response {
     return .{
@@ -294,13 +741,13 @@ pub fn internalError() response.Response {
         .headers = &[_]response.Header{
             .{ .name = "Content-Type", .value = "text/plain" },
         },
-        .body = "Internal Server Error",
+        .body = .{ .bytes = "Internal Server Error" },
     };
 }
 
 // Tests
 test "route compilation" {
-    const r = Route.compile("/users/:id/posts/:post_id");
+    const r = try Route.compile("/users/:id/posts/:post_id", .{});
     try std.testing.expectEqual(@as(u8, 4), r.segment_count);
     try std.testing.expectEqualStrings("users", r.segments[0].literal);
     try std.testing.expectEqualStrings("id", r.segments[1].param);
@@ -309,7 +756,10 @@ test "route compilation" {
 }
 
 test "route matching with params" {
-    var router = Router.init(.{ .require_payment = false });
+    var router = Router.init(.{
+        .require_payment = false,
+        .payment_required_b64 = "",
+    });
 
     const handler = struct {
         fn h(_: *HandlerContext) response.Response {
@@ -317,7 +767,7 @@ test "route matching with params" {
         }
     }.h;
 
-    router.get("/users/:id", handler);
+    try router.get("/users/:id", handler);
 
     var mw_ctx = middleware.Context{};
     const req = request.RequestView{
@@ -326,13 +776,24 @@ test "route matching with params" {
         .headers = &.{},
         .body = "",
     };
+    var response_buf: [RESPONSE_BUF_SIZE]u8 = undefined;
+    var response_headers: [MAX_RESPONSE_HEADERS]response.Header = undefined;
+    var arena_buf: [ARENA_BUF_SIZE]u8 = undefined;
+    var scratch = HandlerScratch{
+        .response_buf = response_buf[0..],
+        .response_headers = response_headers[0..],
+        .arena_buf = arena_buf[0..],
+    };
 
-    const result = router.handle(req, &mw_ctx);
+    const result = router.handle(req, &mw_ctx, &scratch);
     try std.testing.expectEqual(@as(u16, 200), result.resp.status);
 }
 
 test "route not found" {
-    var router = Router.init(.{ .require_payment = false });
+    var router = Router.init(.{
+        .require_payment = false,
+        .payment_required_b64 = "",
+    });
 
     var mw_ctx = middleware.Context{};
     const req = request.RequestView{
@@ -341,13 +802,24 @@ test "route not found" {
         .headers = &.{},
         .body = "",
     };
+    var response_buf: [RESPONSE_BUF_SIZE]u8 = undefined;
+    var response_headers: [MAX_RESPONSE_HEADERS]response.Header = undefined;
+    var arena_buf: [ARENA_BUF_SIZE]u8 = undefined;
+    var scratch = HandlerScratch{
+        .response_buf = response_buf[0..],
+        .response_headers = response_headers[0..],
+        .arena_buf = arena_buf[0..],
+    };
 
-    const result = router.handle(req, &mw_ctx);
+    const result = router.handle(req, &mw_ctx, &scratch);
     try std.testing.expectEqual(@as(u16, 404), result.resp.status);
 }
 
 test "method mismatch" {
-    var router = Router.init(.{ .require_payment = false });
+    var router = Router.init(.{
+        .require_payment = false,
+        .payment_required_b64 = "",
+    });
 
     const handler = struct {
         fn h(_: *HandlerContext) response.Response {
@@ -355,7 +827,7 @@ test "method mismatch" {
         }
     }.h;
 
-    router.get("/users", handler);
+    try router.get("/users", handler);
 
     var mw_ctx = middleware.Context{};
     const req = request.RequestView{
@@ -364,7 +836,15 @@ test "method mismatch" {
         .headers = &.{},
         .body = "",
     };
+    var response_buf: [RESPONSE_BUF_SIZE]u8 = undefined;
+    var response_headers: [MAX_RESPONSE_HEADERS]response.Header = undefined;
+    var arena_buf: [ARENA_BUF_SIZE]u8 = undefined;
+    var scratch = HandlerScratch{
+        .response_buf = response_buf[0..],
+        .response_headers = response_headers[0..],
+        .arena_buf = arena_buf[0..],
+    };
 
-    const result = router.handle(req, &mw_ctx);
-    try std.testing.expectEqual(@as(u16, 404), result.resp.status);
+    const result = router.handle(req, &mw_ctx, &scratch);
+    try std.testing.expectEqual(@as(u16, 405), result.resp.status);
 }

@@ -284,7 +284,7 @@ pub const Proxy = struct {
                     .resp = .{
                         .status = 200,
                         .headers = &[_]response.Header{},
-                        .body = "Proxy response placeholder",
+                        .body = .{ .bytes = "Proxy response placeholder" },
                     },
                 };
             }
@@ -387,7 +387,7 @@ pub fn createProxyHandler(proxy: *Proxy) router.HandlerFn {
             return .{
                 .status = 502,
                 .headers = &[_]response.Header{},
-                .body = "Proxy not configured",
+                .body = .{ .bytes = "Proxy not configured" },
             };
         }
     }.handler;

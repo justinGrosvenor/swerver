@@ -7,7 +7,11 @@
       "Bash(zig test:*)",
       "Bash(grep:*)",
       "Bash(chmod:*)",
-      "Bash(zig version:*)"
+      "Bash(zig version:*)",
+      "Bash(./scripts/run-benchmark.sh:*)",
+      "Bash(docker compose run:*)",
+      "Bash(docker compose:*)",
+      "Bash(./scripts/run-all.sh:*)"
     ]
   }
 }

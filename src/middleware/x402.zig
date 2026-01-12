@@ -91,6 +91,6 @@ fn paymentRequired(payload_b64: []const u8) response.Response {
         .headers = &[_]response.Header{
             .{ .name = "PAYMENT-REQUIRED", .value = payload_b64 },
         },
-        .body = "Payment required",
+        .body = .{ .bytes = "Payment required" },
     };
 }

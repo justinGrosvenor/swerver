@@ -11,6 +11,8 @@ pub const ServerConfig = struct {
     pinned_buffers_per_conn: u8,
     x402: X402Config,
     quic: QuicConfig,
+    /// Root directory for static file serving. Empty means disabled.
+    static_root: []const u8,
 
     pub fn default() ServerConfig {
         return .{
@@ -24,6 +26,7 @@ pub const ServerConfig = struct {
             .pinned_buffers_per_conn = 2,
             .x402 = .{},
             .quic = .{},
+            .static_root = "",
         };
     }
 

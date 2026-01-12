@@ -2,6 +2,7 @@ const std = @import("std");
 const request = @import("../protocol/request.zig");
 const response = @import("../response/response.zig");
 const middleware = @import("middleware.zig");
+const buffer_pool = @import("../runtime/buffer_pool.zig");
 
 /// Metrics Exporter Middleware
 ///
@@ -533,9 +534,6 @@ pub const MetricsStore = struct {
 /// Global metrics store
 var store: MetricsStore = .{};
 
-/// Thread-local format buffer (avoids stack pointer escape)
-threadlocal var metrics_buf: [16384]u8 = undefined;
-
 /// Get the global metrics store
 pub fn getStore() *MetricsStore {
     return &store;
@@ -543,31 +541,33 @@ pub fn getStore() *MetricsStore {
 
 /// Metrics endpoint middleware
 pub fn evaluate(ctx: *middleware.Context, req: request.RequestView) middleware.Decision {
-    _ = ctx;
-
     // Only handle GET /metrics
     if (req.method != .GET) return .allow;
 
-    const path = req.path orelse return .allow;
+    const path = req.path;
     if (!std.mem.eql(u8, path, "/metrics")) return .allow;
 
-    // Format metrics - use thread-local buffer (safe across function return)
-    const body = store.format(&metrics_buf) catch {
+    var buffer: [16384]u8 = undefined;
+    const body = store.format(&buffer) catch {
         return .{ .reject = response.Response{
             .status = 500,
             .headers = &.{},
-            .body = "Failed to format metrics",
+            .body = .{ .bytes = "Failed to format metrics" },
         } };
     };
 
-    // Create response with metrics body (threadlocal buffer is safe)
-    return .{ .reject = response.Response{
-        .status = 200,
-        .headers = &[_]response.Header{
-            .{ .name = "Content-Type", .value = "text/plain; version=0.0.4; charset=utf-8" },
-        },
-        .body = body,
-    } };
+    const resp = middleware.respondManaged(
+        ctx,
+        200,
+        "text/plain; version=0.0.4; charset=utf-8",
+        body,
+    ) orelse response.Response{
+        .status = 503,
+        .headers = &.{},
+        .body = .{ .bytes = "Metrics temporarily unavailable" },
+    };
+
+    return .{ .reject = resp };
 }
 
 /// Post-response hook to record metrics
@@ -583,12 +583,12 @@ pub fn postResponse(ctx: *middleware.Context, req: request.RequestView, resp: re
         store.recordError();
     }
 
-    store.recordBytes(resp.body.len, 0);
+    store.recordBytes(resp.bodyLen(), 0);
 
     // Record per-stream metrics for HTTP/2 and HTTP/3
     if (ctx.stream_id != 0) {
         store.recordStreamRequest(ctx.stream_id, ctx.protocol);
-        store.recordStreamResponse(ctx.stream_id, ctx.protocol, latency_us, resp.body.len);
+        store.recordStreamResponse(ctx.stream_id, ctx.protocol, latency_us, resp.bodyLen());
     }
 }
 
@@ -677,4 +677,153 @@ test "quic metrics prometheus format" {
     try std.testing.expect(std.mem.indexOf(u8, output, "swerver_quic_handshake_duration_seconds") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "swerver_quic_rtt_seconds") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "swerver_quic_packet_loss_rate") != null);
+}
+
+test "metrics middleware handles buffer exhaustion" {
+    const TestBufferOps = struct {
+        storage: [16]u8 = undefined,
+        size: usize = 16,
+        acquired: bool = false,
+        released: bool = false,
+        fail_acquire: bool = false,
+
+        fn acquire(ctx: *anyopaque) ?buffer_pool.BufferHandle {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.fail_acquire or self.acquired) return null;
+            self.acquired = true;
+            return .{ .index = 0, .bytes = self.storage[0..self.size] };
+        }
+
+        fn release(ctx: *anyopaque, handle: buffer_pool.BufferHandle) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = handle;
+            self.released = true;
+            self.acquired = false;
+        }
+    };
+
+    const req = request.RequestView{
+        .method = .GET,
+        .path = "/metrics",
+        .headers = &[_]request.Header{},
+        .body = "",
+    };
+
+    var no_buffers = TestBufferOps{ .fail_acquire = true };
+    var ctx = middleware.Context{
+        .protocol = .http1,
+        .buffer_ops = .{
+            .ctx = &no_buffers,
+            .acquire = TestBufferOps.acquire,
+            .release = TestBufferOps.release,
+        },
+    };
+    const decision = evaluate(&ctx, req);
+    switch (decision) {
+        .reject => |resp| {
+            try std.testing.expectEqual(@as(u16, 503), resp.status);
+            try std.testing.expectEqualStrings("Metrics temporarily unavailable", resp.bodyBytes());
+        },
+        else => return error.UnexpectedDecision,
+    }
+
+    var too_small = TestBufferOps{ .size = 1 };
+    ctx.buffer_ops = .{
+        .ctx = &too_small,
+        .acquire = TestBufferOps.acquire,
+        .release = TestBufferOps.release,
+    };
+    const decision_small = evaluate(&ctx, req);
+    switch (decision_small) {
+        .reject => |resp| {
+            try std.testing.expectEqual(@as(u16, 503), resp.status);
+            try std.testing.expectEqualStrings("Metrics temporarily unavailable", resp.bodyBytes());
+            try std.testing.expect(too_small.released);
+        },
+        else => return error.UnexpectedDecision,
+    }
+}
+
+test "metrics middleware returns managed body" {
+    const TestBufferOps = struct {
+        storage: [16384]u8 = undefined,
+        acquired: bool = false,
+        released: bool = false,
+
+        fn acquire(ctx: *anyopaque) ?buffer_pool.BufferHandle {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.acquired) return null;
+            self.acquired = true;
+            return .{ .index = 0, .bytes = self.storage[0..] };
+        }
+
+        fn release(ctx: *anyopaque, handle: buffer_pool.BufferHandle) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = handle;
+            self.released = true;
+            self.acquired = false;
+        }
+    };
+
+    store = MetricsStore{};
+
+    var buffer: [16384]u8 = undefined;
+    const expected = try store.format(&buffer);
+
+    var ops = TestBufferOps{};
+    var ctx = middleware.Context{
+        .protocol = .http1,
+        .buffer_ops = .{
+            .ctx = &ops,
+            .acquire = TestBufferOps.acquire,
+            .release = TestBufferOps.release,
+        },
+    };
+    const req = request.RequestView{
+        .method = .GET,
+        .path = "/metrics",
+        .headers = &[_]request.Header{},
+        .body = "",
+    };
+    const decision = evaluate(&ctx, req);
+    switch (decision) {
+        .reject => |resp| {
+            try std.testing.expectEqual(@as(u16, 200), resp.status);
+            switch (resp.body) {
+                .managed => |managed| {
+                    try std.testing.expectEqual(expected.len, managed.len);
+                    try std.testing.expectEqualStrings(expected, managed.handle.bytes[0..managed.len]);
+                    ctx.buffer_ops.?.release(ctx.buffer_ops.?.ctx, managed.handle);
+                    try std.testing.expect(ops.released);
+                },
+                else => return error.UnexpectedBody,
+            }
+        },
+        else => return error.UnexpectedDecision,
+    }
+}
+
+test "metrics postResponse updates counters" {
+    getStore().* = .{};
+    var ctx = middleware.Context{ .protocol = .http1 };
+    const req = request.RequestView{
+        .method = .GET,
+        .path = "/metrics",
+        .headers = &[_]request.Header{},
+        .body = "",
+    };
+    const resp = response.Response{
+        .status = 500,
+        .headers = &[_]response.Header{},
+        .body = .{ .bytes = "hello" },
+    };
+
+    postResponse(&ctx, req, resp, 100_000);
+
+    const store_ptr = getStore();
+    try std.testing.expectEqual(@as(u64, 1), store_ptr.responses_total);
+    try std.testing.expectEqual(@as(u64, 1), store_ptr.status_5xx);
+    try std.testing.expectEqual(@as(u64, 1), store_ptr.errors_total);
+    try std.testing.expectEqual(@as(u64, resp.bodyLen()), store_ptr.bytes_sent);
+    try std.testing.expectEqual(@as(u64, 0), store_ptr.bytes_received);
 }

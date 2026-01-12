@@ -78,7 +78,7 @@ const health_ok_response = response.Response{
         .{ .name = "Content-Length", .value = "0" },
         .{ .name = "Cache-Control", .value = "no-cache" },
     },
-    .body = "",
+    .body = .none,
 };
 
 /// Pre-allocated readiness OK response
@@ -88,7 +88,7 @@ const ready_ok_response = response.Response{
         .{ .name = "Content-Length", .value = "0" },
         .{ .name = "Cache-Control", .value = "no-cache" },
     },
-    .body = "",
+    .body = .none,
 };
 
 /// Pre-allocated not ready response
@@ -99,7 +99,7 @@ const not_ready_response = response.Response{
         .{ .name = "Cache-Control", .value = "no-cache" },
         .{ .name = "Retry-After", .value = "5" },
     },
-    .body = "",
+    .body = .none,
 };
 
 /// Health check middleware function

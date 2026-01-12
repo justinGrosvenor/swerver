@@ -2,6 +2,46 @@
 
 This document summarizes the surface exposed by the Swerver runtime and middleware to downstream applications or operators. Everything is served over HTTP/1.1, HTTP/2, and HTTP/3 (QUIC) with unified parsing + routing (`request.RequestView`).
 
+## Embedded API surface
+
+Swerver is designed to embed as a library with a public server/router API. The primary entry point is a builder that wires config, router, middleware, and optional DI.
+
+### Server + builder
+
+- `ServerBuilder.config(ServerConfig)` or `ServerBuilder.configDefault()`
+- `ServerBuilder.router(Router)`
+- `ServerBuilder.middleware(MiddlewareChain)`
+- `ServerBuilder.withState(*AppState)` for app-wide state
+- `ServerBuilder.withServices(*Services)` for typed dependencies
+- `ServerBuilder.build()` -> `Server`
+- `Server.run()` and `Server.runFor(ms)`
+
+### Router + handlers
+
+- `Router.get/post/put/delete/patch/route` to register routes
+- `Router.initWithLimits(policy, limits)` to configure route/segment/param limits
+- `Router.group(prefix)` for scoped route registration
+- `RouteBuilder.withMiddleware(...)` for route-scoped middleware
+- `Router.fallback(handler)` for 404 and `Router.methodNotAllowed(handler)` for 405
+- Handlers take `*HandlerContext` and return `response.Response`
+
+### Request + response
+
+- `RequestView` is zero-copy: `method`, `path`, `headers`, `body`
+- `HandlerContext.json/text/html` helper methods build safe responses without heap allocation
+- `HandlerContext.respond()` provides a request-scoped `ResponseBuilder` backed by the buffer pool (may fail if no buffers are available; use `releaseBuilder` if unused)
+- `HandlerContext.arenaAllocator()` provides a request-scoped allocator (valid during handler execution)
+- `middleware.respondManaged(ctx, status, content_type, body)` copies into a managed buffer for middleware-generated responses (returns null if no buffers available)
+
+### Dependency injection (DI)
+
+- `HandlerContext.state(AppState)` -> `*AppState`
+- `HandlerContext.services(Services)` -> `*Services`
+- Optional `HandlerContext.get(T)` for typed lookup from services
+  If multiple service fields share the same type, `get(T)` resolves to the first match.
+
+The DI story favors explicit, typed dependencies while keeping the runtime allocation-free.
+
 ## Core endpoints
 
 | Path/result | Protocols | Description |
@@ -21,7 +61,9 @@ This document summarizes the surface exposed by the Swerver runtime and middlewa
 
 ## Router contract
 
-Routers consume `request.RequestView` and emit `response.Response`. Responses should include only non-pseudo headers; the HTTP/2 encoder adds `:status` + `content-length` automatically. Routes can call `middleware.Context.inject()` to customize header injection or streaming behavior.
+Routers consume `request.RequestView` and emit `response.Response`. Responses should include only non-pseudo headers; the HTTP/2 encoder adds `:status` + `content-length` automatically. Route handlers can attach route-scoped middleware and use `HandlerContext` to access request-scoped state, services, and response builders.
+
+Route registration returns errors on capacity issues (route/segment/param limits) rather than failing silently.
 
 ## HTTP/2 / HTTP/3 translation
 
