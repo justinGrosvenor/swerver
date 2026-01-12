@@ -1729,15 +1729,12 @@ pub fn registerDefaultRoutes(app_router: *router.Router) !void {
 /// 1MB static blob for large response benchmarks
 /// Tests streaming response capability
 const benchmark_blob: [1024 * 1024]u8 = [_]u8{0} ** (1024 * 1024);
-const benchmark_blob_size_str = "1048576";
 
 /// GET /health - minimal health check for benchmarks
     fn handleBenchHealth(_: *router.HandlerContext) response_mod.Response {
         return .{
             .status = 200,
-            .headers = &[_]response_mod.Header{
-                .{ .name = "Content-Length", .value = "0" },
-            },
+            .headers = &[_]response_mod.Header{},
             .body = .none,
         };
     }
@@ -1748,7 +1745,6 @@ const benchmark_blob_size_str = "1048576";
             .status = 200,
             .headers = &[_]response_mod.Header{
                 .{ .name = "Content-Type", .value = "application/json" },
-                .{ .name = "Content-Length", .value = "15" },
             },
             .body = .{ .bytes = "{\"status\":\"ok\"}" },
         };
@@ -1779,7 +1775,6 @@ fn handleBenchEchoPost(ctx: *router.HandlerContext) response_mod.Response {
             .status = 200,
             .headers = &[_]response_mod.Header{
                 .{ .name = "Content-Type", .value = "application/octet-stream" },
-                .{ .name = "Content-Length", .value = benchmark_blob_size_str },
             },
             .body = .{ .bytes = &benchmark_blob },
         };
@@ -1796,7 +1791,6 @@ fn handleBenchEchoPost(ctx: *router.HandlerContext) response_mod.Response {
             .status = 200,
             .headers = &[_]response_mod.Header{
                 .{ .name = "Content-Type", .value = "text/plain" },
-                .{ .name = "Content-Length", .value = "13" },
             },
             .body = .{ .bytes = "Hello, World!" },
         };
@@ -1808,7 +1802,6 @@ fn handleBenchEchoPost(ctx: *router.HandlerContext) response_mod.Response {
             .status = 200,
             .headers = &[_]response_mod.Header{
                 .{ .name = "Content-Type", .value = "application/json" },
-                .{ .name = "Content-Length", .value = "27" },
             },
             .body = .{ .bytes = "{\"message\":\"Hello, World!\"}" },
         };

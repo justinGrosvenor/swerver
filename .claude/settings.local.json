@@ -11,7 +11,8 @@
       "Bash(./scripts/run-benchmark.sh:*)",
       "Bash(docker compose run:*)",
       "Bash(docker compose:*)",
-      "Bash(./scripts/run-all.sh:*)"
+      "Bash(./scripts/run-all.sh:*)",
+      "Bash(wrk:*)"
     ]
   }
 }
