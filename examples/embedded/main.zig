@@ -15,8 +15,8 @@ fn hello(ctx: *swerver.router.HandlerContext) swerver.response.Response {
 }
 
 fn build(ctx: *swerver.router.HandlerContext) swerver.response.Response {
-    const build_sha = ctx.get([]const u8).*;
-    return ctx.text(200, build_sha);
+    const ptr = ctx.get([]const u8) orelse return ctx.text(500, "service not found");
+    return ctx.text(200, ptr.*);
 }
 
 fn echo(ctx: *swerver.router.HandlerContext) swerver.response.Response {

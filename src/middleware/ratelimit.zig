@@ -69,26 +69,29 @@ pub const TokenBucket = struct {
     }
 };
 
-/// IP address key for bucket lookup
+/// IP address key for bucket lookup — supports both IPv4 and full IPv6
 pub const IpKey = struct {
-    /// IPv4 address (or last 4 bytes of IPv6)
-    addr: [4]u8,
+    /// Full address bytes (4 for IPv4, 16 for IPv6)
+    addr: [16]u8,
+    len: u8,
 
     pub fn fromIpv4(ip: [4]u8) IpKey {
-        return .{ .addr = ip };
+        var key = IpKey{ .addr = undefined, .len = 4 };
+        @memcpy(key.addr[0..4], &ip);
+        @memset(key.addr[4..], 0);
+        return key;
     }
 
     pub fn fromIpv6(ip: [16]u8) IpKey {
-        // Use last 4 bytes of IPv6 for simplicity
-        return .{ .addr = ip[12..16].* };
+        return .{ .addr = ip, .len = 16 };
     }
 
     pub fn hash(self: IpKey) u64 {
-        return std.hash.Wyhash.hash(0, &self.addr);
+        return std.hash.Wyhash.hash(0, self.addr[0..self.len]);
     }
 
     pub fn eql(a: IpKey, b: IpKey) bool {
-        return std.mem.eql(u8, &a.addr, &b.addr);
+        return a.len == b.len and std.mem.eql(u8, a.addr[0..a.len], b.addr[0..b.len]);
     }
 };
 
@@ -102,7 +105,8 @@ const BucketEntry = struct {
     active: bool,
 };
 
-/// Rate limiter with fixed-size bucket storage
+/// Rate limiter with fixed-size bucket storage.
+/// Thread-safe via mutex for concurrent access from multiple event loops.
 pub const RateLimiter = struct {
     /// Bucket entries (fixed size, LRU eviction)
     entries: [MAX_TRACKED_IPS]BucketEntry,
@@ -110,6 +114,8 @@ pub const RateLimiter = struct {
     count: usize,
     /// Configuration
     config: Config,
+    /// Mutex for thread-safe access
+    mutex: std.Thread.Mutex = .{},
 
     pub const Config = struct {
         /// Maximum requests per second per IP
@@ -142,7 +148,8 @@ pub const RateLimiter = struct {
     pub fn check(self: *RateLimiter, ip: IpKey) bool {
         if (!self.config.enabled) return true;
 
-        // Find or create bucket for this IP
+        self.mutex.lock();
+        defer self.mutex.unlock();
         const entry = self.getOrCreateBucket(ip);
         return entry.bucket.tryConsume(1);
     }
@@ -151,6 +158,8 @@ pub const RateLimiter = struct {
     pub fn checkWeighted(self: *RateLimiter, ip: IpKey, weight: u32) bool {
         if (!self.config.enabled) return true;
 
+        self.mutex.lock();
+        defer self.mutex.unlock();
         const entry = self.getOrCreateBucket(ip);
         return entry.bucket.tryConsume(weight);
     }
@@ -201,6 +210,8 @@ pub const RateLimiter = struct {
 
     /// Get retry-after header value in seconds
     pub fn getRetryAfter(self: *RateLimiter, ip: IpKey) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         for (&self.entries) |*entry| {
             if (entry.active and entry.key.eql(ip)) {
                 return (entry.bucket.timeUntilToken() + 999) / 1000; // Round up to seconds
@@ -211,6 +222,8 @@ pub const RateLimiter = struct {
 
     /// Get time until next token is available in milliseconds (for backpressure)
     pub fn getTimeUntilToken(self: *RateLimiter, ip: IpKey) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         for (&self.entries) |*entry| {
             if (entry.active and entry.key.eql(ip)) {
                 return entry.bucket.timeUntilToken();
@@ -228,13 +241,23 @@ pub fn init(config: RateLimiter.Config) void {
     limiter = RateLimiter.init(config);
 }
 
-/// Thread-local buffer for Retry-After header value
-threadlocal var retry_after_buf: [20]u8 = undefined;
+/// Pre-computed Retry-After header values for common retry durations (0-60 seconds).
+/// Avoids threadlocal buffer lifetime hazards — all values are comptime string literals.
+const retry_after_strings = blk: {
+    var strs: [61][]const u8 = undefined;
+    for (0..61) |i| {
+        strs[i] = std.fmt.comptimePrint("{d}", .{i});
+    }
+    break :blk strs;
+};
 
-/// 429 response with computed Retry-After
+/// 429 response with Retry-After header
 fn tooManyRequests(retry_after: u64) response.Response {
-    // Format retry_after into threadlocal buffer
-    const retry_str = std.fmt.bufPrint(&retry_after_buf, "{d}", .{retry_after}) catch "1";
+    // Use pre-computed string table for common values (0-60s)
+    const retry_str = if (retry_after < retry_after_strings.len)
+        retry_after_strings[retry_after]
+    else
+        "60";
 
     return .{
         .status = 429,

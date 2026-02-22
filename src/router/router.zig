@@ -133,22 +133,28 @@ pub const HandlerContext = struct {
     }
 
     /// Access app state (set via ServerBuilder.withState).
+    /// NOTE: T must match the type originally passed to withState(). The pointer
+    /// must be naturally aligned for T — misaligned pointers cause a safety
+    /// check panic in Debug/ReleaseSafe modes and UB in ReleaseFast.
     pub fn state(self: *const HandlerContext, comptime T: type) *T {
         std.debug.assert(self.app_state != null);
         return @ptrCast(@alignCast(self.app_state.?));
     }
 
     /// Access typed services (set via ServerBuilder.withServices).
+    /// NOTE: T must match the type originally passed to withServices(). The pointer
+    /// must be naturally aligned for T.
     pub fn services(self: *const HandlerContext, comptime T: type) *T {
         std.debug.assert(self.app_services != null);
         return @ptrCast(@alignCast(self.app_services.?));
     }
 
     /// Typed lookup from services (optional sugar).
-    pub fn get(self: *const HandlerContext, comptime T: type) *T {
-        std.debug.assert(self.app_services != null);
-        std.debug.assert(self.app_services_get != null);
-        const raw = self.app_services_get.?(self.app_services.?, @typeName(T));
+    /// Returns null if the service type is not registered.
+    pub fn get(self: *const HandlerContext, comptime T: type) ?*T {
+        const services_ptr = self.app_services orelse return null;
+        const getter = self.app_services_get orelse return null;
+        const raw = getter(services_ptr, @typeName(T)) orelse return null;
         return @ptrCast(@alignCast(raw));
     }
 
@@ -353,7 +359,7 @@ pub const RESPONSE_BUF_SIZE = 8192;
 pub const MAX_RESPONSE_HEADERS = 4;
 pub const ARENA_BUF_SIZE = 16 * 1024;
 
-pub const ServiceGetter = *const fn (*anyopaque, []const u8) *anyopaque;
+pub const ServiceGetter = *const fn (*anyopaque, []const u8) ?*anyopaque;
 
 /// Router with route registration and matching
 pub const Router = struct {

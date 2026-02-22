@@ -174,7 +174,9 @@ pub const IoRuntime = struct {
                 .idle => .draining,
                 .header, .body, .write => .err,
             };
-            _ = conn.transition(next_state, now_ms) catch {};
+            _ = conn.transition(next_state, now_ms) catch |err| {
+                std.log.debug("Timeout transition conn={} to {s} failed: {}", .{ index, @tagName(next_state), err });
+            };
             // Mark for closure if transitioned to error
             if (next_state == .err) {
                 if (result.count < result.to_close.len) {

@@ -53,8 +53,13 @@ pub const Config = struct {
 /// Global security config
 var config: Config = .{};
 
-/// Initialize with configuration
+/// Initialize with configuration.
+/// Logs a warning if CORS is misconfigured (credentials + wildcard origin).
 pub fn init(cfg: Config) void {
+    if (cfg.cors_enabled and cfg.cors_allow_credentials and std.mem.eql(u8, cfg.cors_allow_origin, "*")) {
+        std.log.warn("CORS misconfiguration: credentials with wildcard origin is invalid per spec. " ++
+            "Browsers will reject credentialed requests. Set a specific origin instead of '*'.", .{});
+    }
     config = cfg;
 }
 
@@ -85,7 +90,11 @@ const HeaderCache = struct {
 
 var header_cache: HeaderCache = .{};
 
-/// Thread-local header buffer (avoids stack pointer escape)
+/// Per-thread header buffer for security headers.
+/// SAFETY: The returned slice from evaluate() must be consumed (copied into the
+/// response write buffer) before the next call to evaluate() on the same thread.
+/// This is guaranteed by the request processing pipeline which serializes
+/// middleware evaluation and response writing per-thread.
 threadlocal var tls_headers: [8]response.Header = undefined;
 
 /// Build header cache (call during init)
@@ -95,9 +104,14 @@ pub fn buildCache() void {
 
 /// Security headers middleware - adds headers to response
 pub fn evaluate(ctx: *middleware.Context, req: request.RequestView) middleware.Decision {
-    // Handle CORS preflight
+    // Handle CORS preflight — only respond to actual preflight requests
+    // (must have Access-Control-Request-Method header per CORS spec)
     if (config.cors_enabled and req.method == .OPTIONS) {
-        return .{ .reject = corsPreflightResponse() };
+        for (req.headers) |hdr| {
+            if (std.ascii.eqlIgnoreCase(hdr.name, "access-control-request-method")) {
+                return .{ .reject = corsPreflightResponse() };
+            }
+        }
     }
 
     // Check for missing Host header (security requirement)
@@ -111,8 +125,9 @@ pub fn evaluate(ctx: *middleware.Context, req: request.RequestView) middleware.D
         }
     }
 
-    if (!has_host and ctx.protocol != .http1) {
-        // HTTP/2 and HTTP/3 require :authority
+    if (!has_host) {
+        // RFC 7230 Section 5.4: Host header required for HTTP/1.1
+        // HTTP/2 and HTTP/3 require :authority pseudo-header
         return .{ .reject = badRequestResponse() };
     }
 
@@ -174,6 +189,15 @@ pub fn evaluate(ctx: *middleware.Context, req: request.RequestView) middleware.D
             .value = config.cors_allow_origin,
         };
         count += 1;
+
+        // Add credentials header only when origin is not wildcard (per CORS spec)
+        if (config.cors_allow_credentials and !std.mem.eql(u8, config.cors_allow_origin, "*")) {
+            tls_headers[count] = .{
+                .name = "Access-Control-Allow-Credentials",
+                .value = "true",
+            };
+            count += 1;
+        }
     }
 
     if (count > 0) {

@@ -8,6 +8,11 @@ const varint = @import("varint.zig");
 /// - Long Header: Used for Initial, 0-RTT, Handshake, and Retry packets
 /// - Short Header: Used for 1-RTT packets after handshake completion
 
+/// Maximum acceptable length field value to prevent DoS via huge varint values.
+/// QUIC datagrams are limited to path MTU (typically <=1500 bytes), so any
+/// length field claiming more than 65535 bytes is invalid.
+const MAX_LENGTH_FIELD: u64 = 65535;
+
 pub const ParseError = error{
     BufferTooSmall,
     InvalidHeader,
@@ -262,7 +267,17 @@ fn parseLongHeader(buf: []const u8) ParseResult {
         };
         offset += token_result.len;
 
-        if (buf.len < offset + token_result.value) {
+        // Cap token length to prevent DoS via absurdly large varint values
+        if (token_result.value > MAX_LENGTH_FIELD) {
+            return .{
+                .state = .err,
+                .header = null,
+                .consumed = 0,
+                .error_detail = "token length exceeds maximum",
+            };
+        }
+        // Guard against overflow: ensure token_result.value fits in remaining buffer
+        if (token_result.value > buf.len - offset) {
             return .{
                 .state = .partial,
                 .header = null,
@@ -288,8 +303,18 @@ fn parseLongHeader(buf: []const u8) ParseResult {
 
     const payload_length = length_result.value;
 
-    // Check we have enough data for the full packet
-    if (buf.len < offset + payload_length) {
+    // Cap payload length to prevent DoS via absurdly large varint values
+    if (payload_length > MAX_LENGTH_FIELD) {
+        return .{
+            .state = .err,
+            .header = null,
+            .consumed = 0,
+            .error_detail = "payload length exceeds maximum",
+        };
+    }
+
+    // Check we have enough data for the full packet (overflow-safe)
+    if (payload_length > buf.len - offset) {
         return .{
             .state = .partial,
             .header = null,

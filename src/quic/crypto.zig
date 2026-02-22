@@ -22,6 +22,7 @@ pub const Error = error{
     InvalidNonceLength,
     AuthenticationFailed,
     BufferTooSmall,
+    PacketNumberLimitReached,
 };
 
 /// Cryptographic keys for a single encryption level
@@ -179,6 +180,18 @@ fn hkdfExpandLabel(secret: *const [32]u8, label: []const u8, context: []const u8
     // } HkdfLabel;
 
     var info: [512]u8 = undefined;
+
+    const tls13_prefix = "tls13 ";
+    const full_label_len = tls13_prefix.len + label.len;
+
+    // Bounds check: 2 (length) + 1 (label len) + full_label_len + 1 (context len) + context.len
+    const total_len = 2 + 1 + full_label_len + 1 + context.len;
+    if (total_len > info.len) {
+        // Label+context too large for info buffer — should never happen with
+        // well-formed TLS 1.3 labels, but guard against it.
+        @panic("hkdfExpandLabel: label + context exceeds info buffer");
+    }
+
     var info_len: usize = 0;
 
     // Length (2 bytes, big-endian)
@@ -187,8 +200,6 @@ fn hkdfExpandLabel(secret: *const [32]u8, label: []const u8, context: []const u8
     info_len = 2;
 
     // Label length + "tls13 " + label
-    const tls13_prefix = "tls13 ";
-    const full_label_len = tls13_prefix.len + label.len;
     info[info_len] = @intCast(full_label_len);
     info_len += 1;
     @memcpy(info[info_len .. info_len + tls13_prefix.len], tls13_prefix);
@@ -282,26 +293,27 @@ pub fn encodePacketNumber(full_pn: u64, largest_acked: u64) struct { bytes: [4]u
     const len: u8 = if (range < 0x80) 1 else if (range < 0x4000) 2 else if (range < 0x200000) 3 else 4;
 
     var bytes: [4]u8 = undefined;
-    const truncated: u32 = @truncate(full_pn);
 
+    // Truncate directly from full_pn based on encoding length (not to u32 first),
+    // so packet numbers > 2^32 encode correctly for 1-3 byte encodings.
     switch (len) {
         1 => {
-            bytes[0] = @truncate(truncated);
+            bytes[0] = @truncate(full_pn);
         },
         2 => {
-            bytes[0] = @truncate(truncated >> 8);
-            bytes[1] = @truncate(truncated);
+            bytes[0] = @truncate(full_pn >> 8);
+            bytes[1] = @truncate(full_pn);
         },
         3 => {
-            bytes[0] = @truncate(truncated >> 16);
-            bytes[1] = @truncate(truncated >> 8);
-            bytes[2] = @truncate(truncated);
+            bytes[0] = @truncate(full_pn >> 16);
+            bytes[1] = @truncate(full_pn >> 8);
+            bytes[2] = @truncate(full_pn);
         },
         4 => {
-            bytes[0] = @truncate(truncated >> 24);
-            bytes[1] = @truncate(truncated >> 16);
-            bytes[2] = @truncate(truncated >> 8);
-            bytes[3] = @truncate(truncated);
+            bytes[0] = @truncate(full_pn >> 24);
+            bytes[1] = @truncate(full_pn >> 16);
+            bytes[2] = @truncate(full_pn >> 8);
+            bytes[3] = @truncate(full_pn);
         },
         else => unreachable,
     }
@@ -312,7 +324,10 @@ pub fn encodePacketNumber(full_pn: u64, largest_acked: u64) struct { bytes: [4]u
 /// Decode a packet number from truncated form.
 /// Per RFC 9000 Appendix A.
 pub fn decodePacketNumber(truncated: u64, pn_len: u8, largest_pn: u64) u64 {
-    const expected_pn = largest_pn + 1;
+    // RFC 9000 limits packet numbers to 62 bits
+    const max_pn = (@as(u64, 1) << 62) - 1;
+    // Saturate to prevent overflow on expected_pn = largest_pn + 1
+    const expected_pn = if (largest_pn >= max_pn) max_pn else largest_pn + 1;
     const pn_win: u64 = @as(u64, 1) << @intCast(pn_len * 8);
     const pn_half = pn_win / 2;
     const pn_mask = pn_win - 1;
@@ -341,6 +356,11 @@ const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 /// Tag length for AEAD (16 bytes)
 pub const AEAD_TAG_LEN: usize = Aes128Gcm.tag_length;
 
+/// Maximum packet number to prevent nonce reuse.
+/// RFC 9001 Section 6.6: endpoints MUST treat a packet number space as
+/// exhausted and close the connection when the packet number reaches 2^62-1.
+pub const MAX_PACKET_NUMBER: u64 = (1 << 62) - 1;
+
 /// Encrypt a QUIC packet payload using AES-128-GCM.
 /// Returns the ciphertext with authentication tag appended.
 /// Associated data is the packet header (including packet number).
@@ -351,6 +371,9 @@ pub fn protectPayload(
     plaintext: []const u8,
     out: []u8,
 ) Error!usize {
+    if (packet_number > MAX_PACKET_NUMBER) {
+        return error.PacketNumberLimitReached;
+    }
     if (out.len < plaintext.len + AEAD_TAG_LEN) {
         return error.BufferTooSmall;
     }

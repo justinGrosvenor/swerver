@@ -26,6 +26,7 @@ pub const ErrorCode = enum {
     header_list_too_large,
     stream_closed,
     flow_control_error,
+    enhance_your_calm,
 };
 
 pub const ParseState = enum {
@@ -224,10 +225,25 @@ const HeaderScratchBytes = 4096;
 const HeaderBlockBytes = 8192;
 const MaxDynamicEntries = 64;
 const MaxDynamicBytes = 4096;
-const MaxStreams = 128;
-const DefaultMaxHeaderListSize = 8192;
-const DefaultInitialWindow = 65535;
-const DefaultMaxFrameSize = 16384;
+/// Default values used when no config is provided.
+/// These can be overridden via StackConfig / ServerConfig.http2.
+pub const DefaultMaxStreams: usize = 128;
+pub const DefaultMaxHeaderListSize: usize = 8192;
+pub const DefaultInitialWindow: u32 = 65535;
+pub const DefaultMaxFrameSize: u32 = 16384;
+pub const DefaultMaxDynamicTableSize: usize = 4096;
+
+/// Configuration for the HTTP/2 stack, mapping from ServerConfig.Http2Config.
+pub const StackConfig = struct {
+    max_streams: usize = DefaultMaxStreams,
+    max_header_list_size: usize = DefaultMaxHeaderListSize,
+    initial_window_size: u32 = DefaultInitialWindow,
+    max_frame_size: u32 = DefaultMaxFrameSize,
+    max_dynamic_table_size: usize = DefaultMaxDynamicTableSize,
+};
+
+// Internal alias so existing code using MaxStreams still works
+const MaxStreams = DefaultMaxStreams;
 
 const StreamState = enum {
     idle,
@@ -242,6 +258,8 @@ const Stream = struct {
     recv_window: i32,
     header_block_len: usize,
     header_block_in_progress: bool,
+    /// END_STREAM flag from HEADERS, deferred until header block completes via CONTINUATION
+    end_stream_pending: bool,
     saw_headers: bool,
     saw_data: bool,
 
@@ -251,6 +269,7 @@ const Stream = struct {
         self.recv_window = initial_window;
         self.header_block_len = 0;
         self.header_block_in_progress = false;
+        self.end_stream_pending = false;
         self.saw_headers = false;
         self.saw_data = false;
     }
@@ -356,7 +375,7 @@ pub const HpackDecoder = struct {
         }
 
         if (method.len == 0) return error.MissingPseudo;
-        const method_enum = request.Method.fromString(method) orelse return error.InvalidMethod;
+        const method_enum = request.Method.fromStringExtended(method) orelse return error.InvalidMethod;
         if (method_enum == .CONNECT) {
             if (authority.len == 0) return error.MissingPseudo;
             if (path.len == 0) path = authority;
@@ -458,7 +477,16 @@ pub const HpackDecoder = struct {
     }
 
     fn ensureStorage(self: *HpackDecoder, needed: usize) void {
+        // If the entry is larger than total storage, evict everything and bail out.
+        // The caller must handle the case where storage is still insufficient.
+        if (needed > self.storage.len) {
+            while (self.entry_count > 0) self.evictOldest();
+            self.storage_head = 0;
+            self.storage_tail = 0;
+            return;
+        }
         while (self.storage.len - self.storage_used < needed) {
+            if (self.entry_count == 0) break;
             self.evictOldest();
         }
         if (self.storage_used == 0) {
@@ -475,7 +503,7 @@ pub const HpackDecoder = struct {
         } else {
             if (needed <= self.storage_head - self.storage_tail) return;
         }
-        while (true) {
+        while (self.entry_count > 0) {
             self.evictOldest();
             if (self.storage_used == 0) {
                 self.storage_head = 0;
@@ -670,27 +698,39 @@ pub const Stack = struct {
     // Cache for last accessed stream to optimize repeated lookups
     cached_stream_id: u32,
     cached_stream_index: usize,
+    /// Counter for SETTINGS frames received on this connection (DoS protection)
+    settings_frame_count: u32,
+    /// Stream ID expecting CONTINUATION frames (RFC 7540 Section 6.2).
+    /// When set, only CONTINUATION frames for this stream are allowed.
+    expecting_continuation: u32,
 
     pub fn init() Stack {
+        return initWithConfig(.{});
+    }
+
+    pub fn initWithConfig(cfg: StackConfig) Stack {
+        const initial_window: i32 = @intCast(@min(cfg.initial_window_size, 0x7FFFFFFF));
         var stack = Stack{
             .parser = Parser.init(),
             .decoder = HpackDecoder.init(),
             .streams = undefined,
             .stream_count = 0,
             .last_stream_id = 0,
-            .conn_recv_window = DefaultInitialWindow,
-            .initial_stream_window = DefaultInitialWindow,
-            .max_frame_size = DefaultMaxFrameSize,
-            .max_header_list_size = DefaultMaxHeaderListSize,
+            .conn_recv_window = initial_window,
+            .initial_stream_window = initial_window,
+            .max_frame_size = cfg.max_frame_size,
+            .max_header_list_size = cfg.max_header_list_size,
             .header_block = undefined,
             .headers_storage = undefined,
             .goaway_received = false,
             .goaway_last_stream_id = 0,
             .cached_stream_id = 0,
             .cached_stream_index = 0,
+            .settings_frame_count = 0,
+            .expecting_continuation = 0,
         };
         for (&stack.streams, 0..) |*stream, i| {
-            stream.reset(@intCast(i), DefaultInitialWindow);
+            stream.reset(@intCast(i), initial_window);
             stream.state = .closed;
         }
         return stack;
@@ -743,6 +783,13 @@ pub const Stack = struct {
     }
 
     fn handleFrame(self: *Stack, frame: Frame, events: []Event) FrameHandle {
+        // RFC 7540 Section 6.2: When a header block is in progress (HEADERS without
+        // END_HEADERS), only CONTINUATION frames for that stream are allowed.
+        if (self.expecting_continuation != 0) {
+            if (frame.header.typ != .continuation or frame.header.stream_id != self.expecting_continuation) {
+                return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
+            }
+        }
         return switch (frame.header.typ) {
             .settings => self.handleSettings(frame, events),
             .headers => self.handleHeaders(frame, events),
@@ -757,7 +804,15 @@ pub const Stack = struct {
         };
     }
 
+    /// Maximum SETTINGS frames allowed per connection before triggering ENHANCE_YOUR_CALM
+    const max_settings_frames: u32 = 100;
+
     fn handleSettings(self: *Stack, frame: Frame, events: []Event) FrameHandle {
+        // Rate-limit SETTINGS frames to prevent DoS via SETTINGS flood
+        self.settings_frame_count += 1;
+        if (self.settings_frame_count > max_settings_frames) {
+            return .{ .state = .err, .error_code = .enhance_your_calm, .event_count = 0 };
+        }
         const ack = (frame.header.flags & 0x1) != 0;
         if (ack and frame.payload.len != 0) {
             return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
@@ -784,6 +839,20 @@ pub const Stack = struct {
 
     fn handleHeaders(self: *Stack, frame: Frame, events: []Event) FrameHandle {
         if (frame.header.stream_id == 0) return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
+        // RFC 7540 Section 5.3.1: validate priority self-dependency if PRIORITY flag set
+        if ((frame.header.flags & 0x20) != 0) {
+            const prio_offset: usize = if ((frame.header.flags & 0x8) != 0) 1 else 0; // skip pad length byte
+            if (frame.payload.len >= prio_offset + 4) {
+                const dep_raw = (@as(u32, frame.payload[prio_offset]) << 24) |
+                    (@as(u32, frame.payload[prio_offset + 1]) << 16) |
+                    (@as(u32, frame.payload[prio_offset + 2]) << 8) |
+                    @as(u32, frame.payload[prio_offset + 3]);
+                const stream_dependency = dep_raw & 0x7FFF_FFFF;
+                if (stream_dependency == frame.header.stream_id) {
+                    return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
+                }
+            }
+        }
         const stream = self.getOrCreateStream(frame.header.stream_id) orelse return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
         if (stream.state == .closed or stream.state == .half_closed_remote) {
             return .{ .state = .err, .error_code = .stream_closed, .event_count = 0 };
@@ -797,7 +866,11 @@ pub const Stack = struct {
         @memcpy(self.header_block[stream.header_block_len .. stream.header_block_len + header_block.len], header_block);
         stream.header_block_len += header_block.len;
         stream.header_block_in_progress = (frame.header.flags & 0x4) == 0;
+        // Track connection-level CONTINUATION expectation (RFC 7540 Section 6.2)
+        self.expecting_continuation = if (stream.header_block_in_progress) frame.header.stream_id else 0;
         const end_stream = (frame.header.flags & 0x1) != 0;
+        // Persist END_STREAM for deferred use when CONTINUATION completes the header block
+        stream.end_stream_pending = end_stream;
         if (!stream.header_block_in_progress) {
             const decoded = self.decodeHeaders(stream) catch |err| return mapHeaderError(err);
             if (events.len == 0) return .{ .state = .complete, .error_code = .none, .event_count = 0 };
@@ -828,6 +901,8 @@ pub const Stack = struct {
         @memcpy(self.header_block[stream.header_block_len .. stream.header_block_len + frame.payload.len], frame.payload);
         stream.header_block_len += frame.payload.len;
         stream.header_block_in_progress = (frame.header.flags & 0x4) == 0;
+        // Clear connection-level CONTINUATION expectation when header block completes
+        self.expecting_continuation = if (stream.header_block_in_progress) frame.header.stream_id else 0;
         if (!stream.header_block_in_progress) {
             const decoded = self.decodeHeaders(stream) catch |err| return mapHeaderError(err);
             if (events.len == 0) return .{ .state = .complete, .error_code = .none, .event_count = 0 };
@@ -839,8 +914,10 @@ pub const Stack = struct {
                     .headers = decoded.headers,
                     .body = "",
                 },
-                .end_stream = false,
+                .end_stream = stream.end_stream_pending,
             } };
+            if (stream.end_stream_pending) stream.state = .half_closed_remote;
+            stream.end_stream_pending = false;
             return .{ .state = .complete, .error_code = .none, .event_count = 1 };
         }
         return .{ .state = .complete, .error_code = .none, .event_count = 0 };
@@ -855,11 +932,20 @@ pub const Stack = struct {
         const data = parseDataPayload(frame.payload, frame.header.flags) catch {
             return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
         };
-        // Check for non-positive window first to avoid @intCast panic on negative values
-        if (self.conn_recv_window <= 0 or data.len > @as(usize, @intCast(self.conn_recv_window))) {
+        // Validate flow control windows before cast — reject if window is non-positive
+        // or if data exceeds remaining window capacity
+        if (self.conn_recv_window <= 0) {
             return .{ .state = .err, .error_code = .flow_control_error, .event_count = 0 };
         }
-        if (stream.recv_window <= 0 or data.len > @as(usize, @intCast(stream.recv_window))) {
+        const conn_window: usize = @intCast(self.conn_recv_window);
+        if (data.len > conn_window) {
+            return .{ .state = .err, .error_code = .flow_control_error, .event_count = 0 };
+        }
+        if (stream.recv_window <= 0) {
+            return .{ .state = .err, .error_code = .flow_control_error, .event_count = 0 };
+        }
+        const stream_window: usize = @intCast(stream.recv_window);
+        if (data.len > stream_window) {
             return .{ .state = .err, .error_code = .flow_control_error, .event_count = 0 };
         }
         self.conn_recv_window -= @intCast(data.len);
@@ -1202,10 +1288,11 @@ fn decodeInt(buf: []const u8, idx: *usize, prefix: u8) !usize {
     while (idx.* < buf.len) {
         const b = buf[idx.*];
         idx.* += 1;
+        // Guard against overflow BEFORE the shift+add operation
+        if (m >= 28) return error.InvalidInt;
         value += (@as(usize, b & 0x7f) << m);
         if ((b & 0x80) == 0) return value;
         m += 7;
-        if (m >= 28) return error.InvalidInt;
     }
     return error.Truncated;
 }

@@ -273,7 +273,9 @@ fn parseStreamFrame(buf: []const u8, initial_offset: usize, frame_type: u64) Par
         data_len = buf.len - offset;
     }
 
-    if (buf.len < offset + data_len) return error.UnexpectedEnd;
+    // Overflow-safe bounds check: data_len could be up to 2^62 from varint,
+    // so `offset + data_len` could wrap. Compare against remaining space instead.
+    if (data_len > buf.len - offset) return error.UnexpectedEnd;
 
     return .{
         .frame = .{
@@ -367,7 +369,7 @@ fn parseCryptoFrame(buf: []const u8, initial_offset: usize) ParseError!ParseResu
     const length = try varint.decode(buf[offset..]);
     offset += length.len;
 
-    if (buf.len < offset + length.value) return error.UnexpectedEnd;
+    if (length.value > buf.len - offset) return error.UnexpectedEnd;
 
     return .{
         .frame = .{
@@ -430,7 +432,7 @@ fn parseNewTokenFrame(buf: []const u8, initial_offset: usize) ParseError!ParseRe
     const length = try varint.decode(buf[offset..]);
     offset += length.len;
 
-    if (buf.len < offset + length.value) return error.UnexpectedEnd;
+    if (length.value > buf.len - offset) return error.UnexpectedEnd;
 
     return .{
         .frame = .{
@@ -632,7 +634,7 @@ fn parseConnectionCloseFrame(buf: []const u8, initial_offset: usize, app_error: 
     const reason_len = try varint.decode(buf[offset..]);
     offset += reason_len.len;
 
-    if (buf.len < offset + reason_len.value) return error.UnexpectedEnd;
+    if (reason_len.value > buf.len - offset) return error.UnexpectedEnd;
 
     return .{
         .frame = .{

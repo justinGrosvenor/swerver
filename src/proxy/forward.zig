@@ -130,21 +130,40 @@ pub fn buildUpstreamRequest(
     return pos;
 }
 
+/// Validate that a string contains no control characters (CR, LF, null)
+/// to prevent header injection attacks.
+fn isSafeHeaderValue(value: []const u8) bool {
+    for (value) |ch| {
+        if (ch == '\r' or ch == '\n' or ch == 0) return false;
+    }
+    return true;
+}
+
 /// Add standard proxy headers (X-Forwarded-For, X-Real-IP, etc.)
 fn addProxyHeaders(buf: []u8, start_pos: usize, ctx: *const ForwardContext) !usize {
     var pos = start_pos;
 
-    // X-Real-IP
+    // X-Real-IP (only if IP is safe for header injection)
     if (ctx.client_ip) |ip| {
-        pos += (std.fmt.bufPrint(buf[pos..], "X-Real-IP: {s}\r\n", .{ip}) catch return error.BufferFull).len;
+        if (isSafeHeaderValue(ip)) {
+            pos += (std.fmt.bufPrint(buf[pos..], "X-Real-IP: {s}\r\n", .{ip}) catch return error.BufferFull).len;
+        }
     }
 
-    // X-Forwarded-For (append to existing if present)
+    // X-Forwarded-For (append to existing if present, cap total length at 8KB)
+    const max_xff_len = 8192;
     if (ctx.client_ip) |ip| {
-        if (ctx.client_request.getHeader("X-Forwarded-For")) |existing| {
-            pos += (std.fmt.bufPrint(buf[pos..], "X-Forwarded-For: {s}, {s}\r\n", .{ existing, ip }) catch return error.BufferFull).len;
-        } else {
-            pos += (std.fmt.bufPrint(buf[pos..], "X-Forwarded-For: {s}\r\n", .{ip}) catch return error.BufferFull).len;
+        if (isSafeHeaderValue(ip)) {
+            if (ctx.client_request.getHeader("X-Forwarded-For")) |existing| {
+                if (isSafeHeaderValue(existing) and existing.len + ip.len + 2 <= max_xff_len) {
+                    pos += (std.fmt.bufPrint(buf[pos..], "X-Forwarded-For: {s}, {s}\r\n", .{ existing, ip }) catch return error.BufferFull).len;
+                } else {
+                    // Existing header too large or unsafe — start fresh
+                    pos += (std.fmt.bufPrint(buf[pos..], "X-Forwarded-For: {s}\r\n", .{ip}) catch return error.BufferFull).len;
+                }
+            } else {
+                pos += (std.fmt.bufPrint(buf[pos..], "X-Forwarded-For: {s}\r\n", .{ip}) catch return error.BufferFull).len;
+            }
         }
     }
 
@@ -154,7 +173,9 @@ fn addProxyHeaders(buf: []u8, start_pos: usize, ctx: *const ForwardContext) !usi
 
     // X-Forwarded-Host
     if (ctx.client_request.getHeader("Host")) |host| {
-        pos += (std.fmt.bufPrint(buf[pos..], "X-Forwarded-Host: {s}\r\n", .{host}) catch return error.BufferFull).len;
+        if (isSafeHeaderValue(host)) {
+            pos += (std.fmt.bufPrint(buf[pos..], "X-Forwarded-Host: {s}\r\n", .{host}) catch return error.BufferFull).len;
+        }
     }
 
     // Via header
@@ -163,16 +184,20 @@ fn addProxyHeaders(buf: []u8, start_pos: usize, ctx: *const ForwardContext) !usi
     return pos;
 }
 
-/// Apply path rewrite rule
+/// Scratch buffer for path rewriting (threadlocal to avoid data races on concurrent requests)
+threadlocal var rewrite_buf: [4096]u8 = undefined;
+
+/// Apply path rewrite rule, preserving the path suffix after the matched prefix.
+/// E.g., pattern="/api", replacement="/backend", path="/api/v1/users" → "/backend/v1/users"
 fn rewritePath(path: []const u8, rewrite: ?upstream.RewriteRule) []const u8 {
     if (rewrite) |rule| {
-        // Simple prefix replacement
         if (std.mem.startsWith(u8, path, rule.pattern)) {
-            // Note: In production, we'd allocate a new string.
-            // For now, just return the original path if no match,
-            // or the replacement pattern as a simple case.
-            // Full implementation would need an allocator.
-            return rule.replacement;
+            const suffix = path[rule.pattern.len..];
+            const total = rule.replacement.len + suffix.len;
+            if (total > rewrite_buf.len) return path;
+            @memcpy(rewrite_buf[0..rule.replacement.len], rule.replacement);
+            @memcpy(rewrite_buf[rule.replacement.len..][0..suffix.len], suffix);
+            return rewrite_buf[0..total];
         }
     }
     return path;

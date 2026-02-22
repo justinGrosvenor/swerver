@@ -152,8 +152,13 @@ pub const Proxy = struct {
         self.allocator.free(self.response_bufs);
     }
 
-    /// Find a matching proxy route for a request
+    /// Find a matching proxy route for a request.
+    /// Rejects paths containing percent-encoded sequences to prevent URL-encoding
+    /// bypasses of prefix-based access controls.
     pub fn matchRoute(self: *const Proxy, req: *const request.RequestView) ?*const upstream.ProxyRoute {
+        // Reject paths with percent-encoding to prevent bypass of prefix matching
+        if (std.mem.indexOfScalar(u8, req.path, '%') != null) return null;
+
         for (self.config.routes) |*route| {
             // Check host match if configured
             if (route.host) |expected_host| {

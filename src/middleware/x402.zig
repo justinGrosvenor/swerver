@@ -40,9 +40,33 @@ pub const Extra = struct {
     version: []const u8,
 };
 
+/// Evaluate x402 payment policy for a request.
+///
+/// NOTE: This is currently a stub implementation. When `require_payment` is true,
+/// ALL requests are rejected with 402 regardless of whether they include valid
+/// payment headers. A full implementation should:
+/// - Parse the `X-PAYMENT` or `PAYMENT-SIGNATURE` request header
+/// - Verify the payment signature against the configured payTo address
+/// - Validate payment amount and asset match the policy
+/// - Check payment expiry / replay protection
 pub fn evaluate(req: request.RequestView, policy: Policy) Decision {
-    _ = req;
     if (!policy.require_payment) return .allow;
+
+    // Check if client provided a payment header (basic gate — signature
+    // validation is not yet implemented)
+    for (req.headers) |hdr| {
+        if (std.ascii.eqlIgnoreCase(hdr.name, "x-payment") or
+            std.ascii.eqlIgnoreCase(hdr.name, "payment-signature"))
+        {
+            if (hdr.value.len > 0) {
+                // TODO: Validate payment signature, amount, and asset.
+                // For now, accept any non-empty payment header as a pass-through.
+                std.log.warn("x402: accepting unverified payment header from client — signature validation not implemented", .{});
+                return .allow;
+            }
+        }
+    }
+
     return .{ .reject = paymentRequired(policy.payment_required_b64) };
 }
 

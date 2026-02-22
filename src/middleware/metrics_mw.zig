@@ -521,7 +521,15 @@ pub const MetricsStore = struct {
                         entry.bytes_sent,
                         entry.stream_id,
                         entry.bytes_received,
-                    }) catch break;
+                    }) catch {
+                        // Buffer full — add truncation indicator
+                        const trunc_msg = "# WARN swerver_metrics_truncated 1\n";
+                        if (offset2 + trunc_msg.len <= buf.len) {
+                            @memcpy(buf[offset2..][0..trunc_msg.len], trunc_msg);
+                            offset2 += trunc_msg.len;
+                        }
+                        return buf[0..offset2];
+                    };
                     offset2 += line.len;
                 }
             }

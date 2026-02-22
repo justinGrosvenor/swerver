@@ -64,7 +64,7 @@ pub const AlpnSelectCallback = *const fn (
     in: [*]const u8,
     inlen: c_uint,
     arg: ?*anyopaque,
-) callconv(.C) c_int;
+) callconv(.c) c_int;
 
 // External C functions - these are resolved at link time
 extern fn SSL_CTX_new(method: *const SSL_METHOD) ?*SSL_CTX;

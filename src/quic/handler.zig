@@ -301,7 +301,9 @@ pub const Handler = struct {
                 },
                 .crypto => |crypto_frame| {
                     // Feed CRYPTO data to TLS session
-                    conn.feedCryptoData(crypto_frame.data) catch {};
+                    conn.feedCryptoData(crypto_frame.data) catch |err| {
+                        std.log.debug("QUIC crypto data processing failed: {}", .{err});
+                    };
                 },
                 else => {}, // Ignore other frame types in Initial/Handshake
             }
@@ -401,7 +403,9 @@ pub const Handler = struct {
                 },
                 .reset_stream => |reset| {
                     if (conn.getStream(reset.stream_id)) |s| {
-                        s.onReset(reset.final_size) catch {};
+                        s.onReset(reset.final_size) catch |err| {
+                            std.log.debug("QUIC stream reset failed: {}", .{err});
+                        };
                     }
                 },
                 .stop_sending => |stop| {
@@ -456,7 +460,9 @@ pub const Handler = struct {
 
         // Process through HTTP/3 stack
         // The HTTP/3 events are stored in the stack and will be returned via getHttp3Events
-        _ = conn.processHttp3Stream(stream_frame.stream_id, stream_frame.data, stream_frame.fin) catch {};
+        _ = conn.processHttp3Stream(stream_frame.stream_id, stream_frame.data, stream_frame.fin) catch |err| {
+            std.log.debug("HTTP/3 stream processing failed: stream={} err={}", .{ stream_frame.stream_id, err });
+        };
     }
 
     /// Get pending HTTP/3 events from the connection

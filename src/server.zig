@@ -18,6 +18,13 @@ const middleware = @import("middleware/middleware.zig");
 const request = @import("protocol/request.zig");
 const metrics_mw = @import("middleware/metrics_mw.zig");
 
+/// Global shutdown flag set by signal handler (atomic for signal safety)
+var shutdown_requested = std.atomic.Value(bool).init(false);
+
+fn handleShutdownSignal(_: std.posix.SIG) callconv(.c) void {
+    shutdown_requested.store(true, .release);
+}
+
 pub const Server = struct {
     allocator: std.mem.Allocator,
     cfg: config.ServerConfig,
@@ -48,7 +55,13 @@ pub const Server = struct {
             try tls.Provider.init(allocator, cfg.quic.cert_path, cfg.quic.key_path)
         else
             null;
-        const http2_stack: ?http2.Stack = if (build_options.enable_http2) http2.Stack.init() else null;
+        const http2_stack: ?http2.Stack = if (build_options.enable_http2) http2.Stack.initWithConfig(.{
+            .max_streams = cfg.http2.max_streams,
+            .max_header_list_size = cfg.http2.max_header_list_size,
+            .initial_window_size = cfg.http2.initial_window_size,
+            .max_frame_size = cfg.http2.max_frame_size,
+            .max_dynamic_table_size = cfg.http2.max_dynamic_table_size,
+        }) else null;
         const http3_stack: ?http3.Stack = if (build_options.enable_http3) http3.Stack.init(allocator, true) else null;
         const quic: ?quic_handler.Handler = if (build_options.enable_http3 and cfg.quic.enabled)
             quic_handler.Handler.init(allocator, true, cfg.max_connections)
@@ -86,7 +99,13 @@ pub const Server = struct {
             try tls.Provider.init(allocator, cfg.quic.cert_path, cfg.quic.key_path)
         else
             null;
-        const http2_stack: ?http2.Stack = if (build_options.enable_http2) http2.Stack.init() else null;
+        const http2_stack: ?http2.Stack = if (build_options.enable_http2) http2.Stack.initWithConfig(.{
+            .max_streams = cfg.http2.max_streams,
+            .max_header_list_size = cfg.http2.max_header_list_size,
+            .initial_window_size = cfg.http2.initial_window_size,
+            .max_frame_size = cfg.http2.max_frame_size,
+            .max_dynamic_table_size = cfg.http2.max_dynamic_table_size,
+        }) else null;
         const http3_stack: ?http3.Stack = if (build_options.enable_http3) http3.Stack.init(allocator, true) else null;
         const quic: ?quic_handler.Handler = if (build_options.enable_http3 and cfg.quic.enabled)
             quic_handler.Handler.init(allocator, true, cfg.max_connections)
@@ -124,7 +143,22 @@ pub const Server = struct {
         self.io.deinit();
     }
 
+    /// Request a graceful shutdown. The event loop will stop accepting new connections
+    /// and exit after draining in-flight responses.
+    pub fn shutdown(_: *Server) void {
+        shutdown_requested.store(true, .release);
+    }
+
     pub fn run(self: *Server, run_for_ms: ?u64) !void {
+        // Install signal handlers for graceful shutdown
+        const sa = std.posix.Sigaction{
+            .handler = .{ .handler = handleShutdownSignal },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
+        std.posix.sigaction(std.posix.SIG.INT, &sa, null);
+
         try self.io.start();
         if (self.listener_fd == null) {
             const fd = try net.listen(self.cfg.address, self.cfg.port, 1024);
@@ -149,6 +183,10 @@ pub const Server = struct {
         }
         const deadline = if (run_for_ms) |ms| self.io.nowMs() + ms else null;
         while (true) {
+            if (shutdown_requested.load(.acquire)) {
+                std.log.info("Shutdown requested, stopping server", .{});
+                return;
+            }
             if (deadline) |limit| {
                 if (self.io.nowMs() >= limit) return;
             }
@@ -185,10 +223,21 @@ pub const Server = struct {
                         // Validate conn_id fits in u32 before casting
                         if (event.conn_id > std.math.maxInt(u32)) continue;
                         const index: u32 = @intCast(event.conn_id);
+                        // Guard against stale events: if the connection slot was freed
+                        // and reused between event generation and dispatch, the fd will
+                        // be null (freed) or the connection state will be closed/accept.
+                        const conn = self.io.getConnection(index) orelse continue;
+                        if (conn.fd == null or conn.state == .closed or conn.state == .accept) continue;
                         switch (event.kind) {
-                            .read => self.handleRead(index) catch {},
-                            .write => self.handleWrite(index) catch {},
-                            .err => self.handleError(index) catch {},
+                            .read => self.handleRead(index) catch |err| {
+                                std.log.debug("handleRead conn={} failed: {}", .{ index, err });
+                            },
+                            .write => self.handleWrite(index) catch |err| {
+                                std.log.debug("handleWrite conn={} failed: {}", .{ index, err });
+                            },
+                            .err => self.handleError(index) catch |err| {
+                                std.log.debug("handleError conn={} failed: {}", .{ index, err });
+                            },
                             .accept, .datagram => unreachable,
                         }
                     },
@@ -404,19 +453,20 @@ pub const Server = struct {
         ) catch return;
 
         // Send the response packet
-        _ = net.sendto(udp_fd, packet_buf[0..packet_len], peer_addr) catch {};
+        _ = net.sendto(udp_fd, packet_buf[0..packet_len], peer_addr) catch |err| {
+            std.log.debug("Failed to send HTTP/3 response: {}", .{err});
+        };
     }
 
     /// Build a QUIC short header packet containing a STREAM frame
     fn buildStreamPacket(
-        self: *Server,
+        _: *Server,
         conn: *quic_connection.Connection,
         stream_id: u64,
         data: []const u8,
         fin: bool,
         out: []u8,
     ) !usize {
-        _ = self;
         const crypto = @import("quic/crypto.zig");
         const varint = @import("quic/varint.zig");
 
@@ -535,7 +585,13 @@ pub const Server = struct {
                     if (candidate.len < http2.Preface.len) return;
                     if (conn.http2_stack == null) {
                         const stack_ptr = try self.allocator.create(http2.Stack);
-                        stack_ptr.* = http2.Stack.init();
+                        stack_ptr.* = http2.Stack.initWithConfig(.{
+                            .max_streams = self.cfg.http2.max_streams,
+                            .max_header_list_size = self.cfg.http2.max_header_list_size,
+                            .initial_window_size = self.cfg.http2.initial_window_size,
+                            .max_frame_size = self.cfg.http2.max_frame_size,
+                            .max_dynamic_table_size = self.cfg.http2.max_dynamic_table_size,
+                        });
                         conn.http2_stack = stack_ptr;
                     }
                     conn.protocol = .http2;
@@ -575,6 +631,28 @@ pub const Server = struct {
             if (!parse.keep_alive) conn.close_after_write = true;
             self.io.onReadConsumed(conn, parse.consumed_bytes);
 
+            // Validate Host header against allowed_hosts if configured
+            if (self.cfg.allowed_hosts.len > 0) {
+                const host_value = parse.view.getHeader("Host") orelse "";
+                // Strip port from host for comparison
+                const host_name = if (std.mem.indexOfScalar(u8, host_value, ':')) |colon|
+                    host_value[0..colon]
+                else
+                    host_value;
+                var host_allowed = false;
+                for (self.cfg.allowed_hosts) |allowed| {
+                    if (std.ascii.eqlIgnoreCase(host_name, allowed)) {
+                        host_allowed = true;
+                        break;
+                    }
+                }
+                if (!host_allowed) {
+                    conn.close_after_write = true;
+                    try self.queueResponse(conn, badRequestResponse());
+                    return;
+                }
+            }
+
             // Check for static file requests - use sendfile for zero-copy
             if (self.cfg.static_root.len > 0 and std.mem.startsWith(u8, parse.view.path, "/static/")) {
                 const file_path = parse.view.path[8..]; // Skip "/static/"
@@ -592,6 +670,14 @@ pub const Server = struct {
                     .release = releaseBufferOpaque,
                 },
             };
+            // Extract client IP from socket for rate limiting and logging
+            if (net.getPeerAddress(fd)) |peer| {
+                if (peer.getIp4Bytes()) |ip4| {
+                    mw_ctx.client_ip = ip4;
+                } else if (peer.getIp6Bytes()) |ip6| {
+                    mw_ctx.client_ip6 = ip6;
+                }
+            }
             var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
             var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
             const arena_handle = self.io.acquireBuffer();
@@ -644,6 +730,16 @@ pub const Server = struct {
                                 .release = releaseBufferOpaque,
                             },
                         };
+                        // Extract client IP from socket for rate limiting and logging
+                        if (conn.fd) |conn_fd| {
+                            if (net.getPeerAddress(conn_fd)) |peer| {
+                                if (peer.getIp4Bytes()) |ip4| {
+                                    mw_ctx.client_ip = ip4;
+                                } else if (peer.getIp6Bytes()) |ip6| {
+                                    mw_ctx.client_ip6 = ip6;
+                                }
+                            }
+                        }
                         var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
                         var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
                         const arena_handle = self.io.acquireBuffer();
@@ -845,6 +941,13 @@ pub const Server = struct {
 
     /// Stream body data in chunks, enqueueing up to available queue slots.
     /// Remaining data is stored in conn.pending_body for later streaming.
+    ///
+    /// LIFETIME CONTRACT: `body` (and thus `conn.pending_body`) must point to
+    /// memory that outlives the connection — typically compile-time string literals
+    /// from handler responses (e.g., `body = .{ .bytes = "Hello" }`). The slice is
+    /// never freed by the server; it is only read and copied into write buffers.
+    /// Managed bodies (.managed) are written inline in queueResponse and never
+    /// stored in pending_body.
     fn streamBodyChunks(self: *Server, conn: *connection.Connection, body: []const u8) void {
         var remaining = body;
 
@@ -873,8 +976,19 @@ pub const Server = struct {
     /// Queue a file response using sendfile for zero-copy transfer.
     /// Sends HTTP headers first, then sets up the connection for sendfile.
     fn queueFileResponse(self: *Server, conn: *connection.Connection, static_root: []const u8, file_path: []const u8, content_type: []const u8) !void {
-        // Prevent path traversal attacks
+        // Reject paths containing percent-encoded sequences to prevent URL-encoded
+        // path traversal (e.g., %2e%2e bypassing the ".." check below)
+        if (std.mem.indexOfScalar(u8, file_path, '%') != null) {
+            try self.queueResponse(conn, notFoundResponse());
+            return;
+        }
+        // Prevent path traversal attacks — reject ".." components
         if (std.mem.indexOf(u8, file_path, "..") != null) {
+            try self.queueResponse(conn, notFoundResponse());
+            return;
+        }
+        // Reject paths with null bytes
+        if (std.mem.indexOfScalar(u8, file_path, 0) != null) {
             try self.queueResponse(conn, notFoundResponse());
             return;
         }
@@ -892,26 +1006,27 @@ pub const Server = struct {
         path_buf[full_path_len] = 0;
         const path_z: [*:0]const u8 = @ptrCast(&path_buf);
 
-        // Open file using C library for portability
+        // Open file using C library for portability — use O_NOFOLLOW to prevent symlink traversal
         const c = @cImport({
             @cInclude("fcntl.h");
             @cInclude("sys/stat.h");
         });
-        const file_fd_c = c.open(path_z, c.O_RDONLY);
+        const file_fd_c = c.open(path_z, c.O_RDONLY | c.O_NOFOLLOW);
         if (file_fd_c < 0) {
             try self.queueResponse(conn, notFoundResponse());
             return;
         }
         const file_fd: std.posix.fd_t = @intCast(file_fd_c);
 
-        // Get file size using C stat
-        var stat_buf: c.struct_stat = undefined;
-        if (c.fstat(file_fd_c, &stat_buf) != 0) {
+        // Verify the resolved file is still under static_root using fstat to check it's a regular file
+        var stat_buf_check: c.struct_stat = undefined;
+        if (c.fstat(file_fd_c, &stat_buf_check) != 0 or (stat_buf_check.st_mode & c.S_IFMT) != c.S_IFREG) {
             std.posix.close(file_fd);
             try self.queueResponse(conn, notFoundResponse());
             return;
         }
-        const file_size: u64 = @intCast(stat_buf.st_size);
+
+        const file_size: u64 = @intCast(stat_buf_check.st_size);
 
         // Build and send headers
         const buf = self.io.acquireBuffer() orelse {
@@ -1141,6 +1256,14 @@ pub const Server = struct {
         };
     }
 
+    fn badRequestResponse() response_mod.Response {
+        return .{
+            .status = 400,
+            .headers = &[_]response_mod.Header{},
+            .body = .{ .bytes = "Bad Request\n" },
+        };
+    }
+
     /// Guess Content-Type from file extension
     fn guessContentType(path: []const u8) []const u8 {
         if (std.mem.endsWith(u8, path, ".html") or std.mem.endsWith(u8, path, ".htm")) {
@@ -1194,16 +1317,25 @@ pub const Server = struct {
         if (conn.fd) |fd| {
             _ = self.io.unregister(fd) catch {};
             std.posix.close(fd);
+            conn.fd = null;
         }
         if (conn.http2_stack) |stack| {
             self.allocator.destroy(stack);
             conn.http2_stack = null;
         }
-        if (conn.read_buffer) |buf| self.io.releaseBuffer(buf);
+        // Drain write queue before releasing read buffer to avoid double-free
+        // if a buffer handle appears in both places
         while (conn.peekWrite()) |entry| {
             self.io.releaseBuffer(entry.handle);
             conn.popWrite();
         }
+        if (conn.read_buffer) |buf| {
+            self.io.releaseBuffer(buf);
+            conn.read_buffer = null;
+        }
+        // Clean up pending file descriptor and body reference
+        conn.cleanupPendingFile();
+        conn.pending_body = &[_]u8{};
         self.io.releaseConnection(conn);
     }
 
@@ -1220,7 +1352,7 @@ test "metrics middleware response queued for http1" {
 
     var cfg = config.ServerConfig.default();
     cfg.max_connections = 1;
-    cfg.pinned_buffers_per_conn = 1;
+
     cfg.buffer_pool = .{
         .buffer_size = 16 * 1024,
         .buffer_count = 4,
@@ -1302,7 +1434,7 @@ test "metrics middleware response queued for http2" {
 
     var cfg = config.ServerConfig.default();
     cfg.max_connections = 1;
-    cfg.pinned_buffers_per_conn = 1;
+
     cfg.buffer_pool = .{
         .buffer_size = 16 * 1024,
         .buffer_count = 4,
@@ -1396,7 +1528,7 @@ test "metrics middleware end-to-end http1" {
 
     var cfg = config.ServerConfig.default();
     cfg.max_connections = 1;
-    cfg.pinned_buffers_per_conn = 1;
+
     cfg.buffer_pool = .{
         .buffer_size = 16 * 1024,
         .buffer_count = 4,
@@ -1483,7 +1615,7 @@ test "metrics middleware end-to-end http2" {
 
     var cfg = config.ServerConfig.default();
     cfg.max_connections = 1;
-    cfg.pinned_buffers_per_conn = 1;
+
     cfg.buffer_pool = .{
         .buffer_size = 16 * 1024,
         .buffer_count = 4,
@@ -1607,7 +1739,7 @@ test "http1 response bytes from write queue" {
 
     var cfg = config.ServerConfig.default();
     cfg.max_connections = 1;
-    cfg.pinned_buffers_per_conn = 1;
+
     cfg.buffer_pool = .{
         .buffer_size = 16 * 1024,
         .buffer_count = 4,
@@ -1648,7 +1780,7 @@ test "http1 managed response bytes from write queue" {
 
     var cfg = config.ServerConfig.default();
     cfg.max_connections = 1;
-    cfg.pinned_buffers_per_conn = 1;
+
     cfg.buffer_pool = .{
         .buffer_size = 16 * 1024,
         .buffer_count = 4,

@@ -274,7 +274,41 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
             host_present = value.len != 0;
         }
         if (std.ascii.eqlIgnoreCase(name, "content-length")) {
-            const parsed_len = std.fmt.parseInt(usize, value, 10) catch {
+            // Reject values with leading zeros, signs, or whitespace to prevent smuggling
+            if (value.len == 0) {
+                return .{
+                    .state = .err,
+                    .view = emptyView(),
+                    .error_code = .invalid_content_length,
+                    .consumed_bytes = 0,
+                    .keep_alive = true,
+                    .expect_continue = false,
+                };
+            }
+            for (value) |ch| {
+                if (ch < '0' or ch > '9') {
+                    return .{
+                        .state = .err,
+                        .view = emptyView(),
+                        .error_code = .invalid_content_length,
+                        .consumed_bytes = 0,
+                        .keep_alive = true,
+                        .expect_continue = false,
+                    };
+                }
+            }
+            // Reject unreasonably long digit strings to prevent overflow in parseInt
+            if (value.len > 19) {
+                return .{
+                    .state = .err,
+                    .view = emptyView(),
+                    .error_code = .body_too_large,
+                    .consumed_bytes = 0,
+                    .keep_alive = true,
+                    .expect_continue = false,
+                };
+            }
+            const parsed_len = std.fmt.parseUnsigned(usize, value, 10) catch {
                 return .{
                     .state = .err,
                     .view = emptyView(),
@@ -284,6 +318,16 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
                     .expect_continue = false,
                 };
             };
+            if (parsed_len > _limits.max_body_bytes) {
+                return .{
+                    .state = .err,
+                    .view = emptyView(),
+                    .error_code = .body_too_large,
+                    .consumed_bytes = 0,
+                    .keep_alive = true,
+                    .expect_continue = false,
+                };
+            }
             if (has_content_length and content_length != parsed_len) {
                 return .{
                     .state = .err,
@@ -296,16 +340,6 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
             }
             content_length = parsed_len;
             has_content_length = true;
-            if (content_length > _limits.max_body_bytes) {
-                return .{
-                    .state = .err,
-                    .view = emptyView(),
-                    .error_code = .body_too_large,
-                    .consumed_bytes = 0,
-                    .keep_alive = true,
-                    .expect_continue = false,
-                };
-            }
         }
         if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
             if (std.ascii.indexOfIgnoreCase(value, "chunked") != null) {
@@ -541,6 +575,8 @@ fn decodeChunkedInPlace(buf: []u8, body_start: usize) !ChunkedResult {
         if (dst != src) std.mem.copyForwards(u8, buf[dst..dst + size], buf[src..src + size]);
         dst += size;
         src += size;
+        // Bounds check before accessing CRLF after chunk data
+        if (src + 2 > buf.len) return error.InvalidChunk;
         if (buf[src] != '\r' or buf[src + 1] != '\n') return error.InvalidChunk;
         src += 2;
         total += size;

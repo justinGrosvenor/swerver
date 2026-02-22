@@ -133,8 +133,16 @@ pub const ResponseWriter = struct {
         self.pos += result.len;
     }
 
-    /// Write a single header
+    /// Write a single header, rejecting values containing control characters
+    /// to prevent header injection attacks.
     pub fn writeHeader(self: *ResponseWriter, name: []const u8, value: []const u8) !void {
+        // Reject header names/values with CR, LF, or null bytes
+        for (name) |ch| {
+            if (ch == '\r' or ch == '\n' or ch == 0) return error.InvalidHeader;
+        }
+        for (value) |ch| {
+            if (ch == '\r' or ch == '\n' or ch == 0) return error.InvalidHeader;
+        }
         const result = std.fmt.bufPrint(
             self.buf[self.pos..],
             "{s}: {s}\r\n",

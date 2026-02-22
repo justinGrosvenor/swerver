@@ -317,6 +317,20 @@ fn setNonBlocking(fd: std.posix.fd_t) NonBlockingError!void {
     _ = std.posix.fcntl(fd, std.posix.F.SETFL, flags) catch return error.NonBlockingFailed;
 }
 
+/// Extract the peer IP address from a connected socket via getpeername.
+pub fn getPeerAddress(fd: std.posix.fd_t) ?PeerAddress {
+    var storage: SockAddrIn6 = undefined;
+    var addr_len: std.posix.socklen_t = @sizeOf(SockAddrIn6);
+    const sockaddr_ptr: *std.posix.sockaddr = @ptrCast(&storage);
+    const rc = std.posix.system.getpeername(fd, sockaddr_ptr, &addr_len);
+    if (rc != 0) return null;
+    if (addr_len == @sizeOf(SockAddrIn)) {
+        const ip4_ptr: *SockAddrIn = @ptrCast(&storage);
+        return .{ .storage = .{ .ip4 = ip4_ptr.* } };
+    }
+    return .{ .storage = .{ .ip6 = storage } };
+}
+
 fn isSupportedPlatform() bool {
     return switch (builtin.os.tag) {
         .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly => true,

@@ -209,7 +209,7 @@ pub const Connection = struct {
     }
 
     pub fn onReadBuffered(self: *Connection, bytes: usize, backpressure: config.Backpressure) void {
-        self.read_buffered_bytes += bytes;
+        self.read_buffered_bytes = self.read_buffered_bytes +| bytes;
         self.updateReadBackpressure(backpressure);
     }
 
@@ -225,7 +225,7 @@ pub const Connection = struct {
     }
 
     pub fn onWriteBuffered(self: *Connection, bytes: usize, backpressure: config.Backpressure) void {
-        self.write_buffered_bytes += bytes;
+        self.write_buffered_bytes = self.write_buffered_bytes +| bytes;
         self.updateWriteBackpressure(backpressure);
     }
 
@@ -406,7 +406,7 @@ fn isValidTransition(from: State, to: State) bool {
     };
 }
 
-const write_queue_capacity: u8 = 8;
+const write_queue_capacity: u8 = 32;
 pub const HeaderCapacity: usize = 128;
 
 const WriteEntry = struct {

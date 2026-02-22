@@ -86,7 +86,7 @@ fn toAnyopaquePtr(value: anytype) *anyopaque {
 
 fn makeServiceGetter(comptime Services: type) router_mod.ServiceGetter {
     return struct {
-        fn get(ptr: *anyopaque, type_name: []const u8) *anyopaque {
+        fn get(ptr: *anyopaque, type_name: []const u8) ?*anyopaque {
             const services: *Services = @ptrCast(@alignCast(ptr));
             inline for (@typeInfo(Services).@"struct".fields) |field| {
                 if (std.mem.eql(u8, type_name, @typeName(field.type))) {
@@ -101,7 +101,8 @@ fn makeServiceGetter(comptime Services: type) router_mod.ServiceGetter {
                     else => {},
                 }
             }
-            @panic("service not found");
+            std.log.err("service not found: {s}", .{type_name});
+            return null;
         }
     }.get;
 }
