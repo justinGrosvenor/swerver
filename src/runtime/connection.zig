@@ -60,6 +60,8 @@ pub const Connection = struct {
     tls_session: ?tls.Session,
     /// Whether this connection uses TLS
     is_tls: bool,
+    /// Whether current request is HEAD (body suppressed in response per RFC 9110 §9.3.2)
+    is_head_request: bool,
     /// Pending response body for streaming large responses
     pending_body: []const u8,
     /// File descriptor for sendfile-based response (null = no file pending)
@@ -98,6 +100,7 @@ pub const Connection = struct {
             .active_list_pos = 0,
             .tls_session = null,
             .is_tls = false,
+            .is_head_request = false,
             .pending_body = &[_]u8{},
             .pending_file_fd = null,
             .pending_file_offset = 0,
@@ -130,6 +133,7 @@ pub const Connection = struct {
         // TLS session is cleaned up before reset
         self.tls_session = null;
         self.is_tls = false;
+        self.is_head_request = false;
         self.pending_body = &[_]u8{};
         self.cleanupPendingFile();
         // active_list_pos is set by ConnectionPool.acquire

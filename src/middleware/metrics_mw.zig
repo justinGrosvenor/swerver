@@ -86,6 +86,14 @@ pub const MetricsStore = struct {
     stream_metrics: [MAX_TRACKED_STREAMS]StreamMetrics = [_]StreamMetrics{.{ .stream_id = 0 }} ** MAX_TRACKED_STREAMS,
     stream_metrics_count: u64 = 0,
 
+    // Upstream proxy metrics
+    upstream_requests_total: u64 = 0,
+    upstream_responses_total: u64 = 0,
+    upstream_errors_total: u64 = 0,
+    upstream_latency_sum_us: u64 = 0,
+    upstream_latency_count: u64 = 0,
+    connections_total: u64 = 0,
+
     // Gauges
     active_connections: u64 = 0,
     active_streams: u64 = 0,
@@ -186,6 +194,43 @@ pub const MetricsStore = struct {
         @atomicStore(u64, &self.active_connections, count, .monotonic);
     }
 
+    /// Record a new TCP connection opened
+    pub fn recordConnectionOpened(self: *MetricsStore) void {
+        _ = @atomicRmw(u64, &self.connections_total, .Add, 1, .monotonic);
+        _ = @atomicRmw(u64, &self.active_connections, .Add, 1, .monotonic);
+    }
+
+    /// Record a TCP connection closed
+    pub fn recordConnectionClosed(self: *MetricsStore) void {
+        // Use compare-exchange loop for saturating subtraction to prevent underflow
+        var current = @atomicLoad(u64, &self.active_connections, .monotonic);
+        while (current > 0) {
+            const result = @cmpxchgWeak(u64, &self.active_connections, current, current - 1, .monotonic, .monotonic);
+            if (result) |r| {
+                current = r;
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Record an upstream proxy request
+    pub fn recordUpstreamRequest(self: *MetricsStore) void {
+        _ = @atomicRmw(u64, &self.upstream_requests_total, .Add, 1, .monotonic);
+    }
+
+    /// Record an upstream proxy response
+    pub fn recordUpstreamResponse(self: *MetricsStore, latency_us: u64) void {
+        _ = @atomicRmw(u64, &self.upstream_responses_total, .Add, 1, .monotonic);
+        _ = @atomicRmw(u64, &self.upstream_latency_sum_us, .Add, latency_us, .monotonic);
+        _ = @atomicRmw(u64, &self.upstream_latency_count, .Add, 1, .monotonic);
+    }
+
+    /// Record an upstream proxy error
+    pub fn recordUpstreamError(self: *MetricsStore) void {
+        _ = @atomicRmw(u64, &self.upstream_errors_total, .Add, 1, .monotonic);
+    }
+
     // QUIC metrics methods
 
     /// Record QUIC connection attempt
@@ -203,7 +248,16 @@ pub const MetricsStore = struct {
 
     /// Record QUIC connection close
     pub fn recordQuicConnectionClose(self: *MetricsStore, is_error: bool, is_timeout: bool) void {
-        _ = @atomicRmw(u64, &self.quic_connections_active, .Sub, 1, .monotonic);
+        // Saturating subtraction to prevent underflow
+        var current = @atomicLoad(u64, &self.quic_connections_active, .monotonic);
+        while (current > 0) {
+            const result = @cmpxchgWeak(u64, &self.quic_connections_active, current, current - 1, .monotonic, .monotonic);
+            if (result) |r| {
+                current = r;
+            } else {
+                break;
+            }
+        }
         if (is_timeout) {
             _ = @atomicRmw(u64, &self.quic_connections_timeout, .Add, 1, .monotonic);
         } else if (is_error) {
@@ -484,6 +538,38 @@ pub const MetricsStore = struct {
         }) catch return error.BufferTooSmall;
 
         var offset2 = offset1 + part2.len;
+
+        // Part 2b: Upstream proxy metrics
+        const upstream_latency_us = @atomicLoad(u64, &self.upstream_latency_sum_us, .monotonic);
+        const upstream_latency_s: f64 = @as(f64, @floatFromInt(upstream_latency_us)) / 1_000_000.0;
+        const part2b = std.fmt.bufPrint(buf[offset2..],
+            \\# HELP swerver_upstream_requests_total Total upstream proxy requests
+            \\# TYPE swerver_upstream_requests_total counter
+            \\swerver_upstream_requests_total {d}
+            \\# HELP swerver_upstream_responses_total Total upstream proxy responses
+            \\# TYPE swerver_upstream_responses_total counter
+            \\swerver_upstream_responses_total {d}
+            \\# HELP swerver_upstream_errors_total Total upstream proxy errors
+            \\# TYPE swerver_upstream_errors_total counter
+            \\swerver_upstream_errors_total {d}
+            \\# HELP swerver_upstream_latency_seconds Upstream proxy latency
+            \\# TYPE swerver_upstream_latency_seconds summary
+            \\swerver_upstream_latency_seconds_sum {d:.6}
+            \\swerver_upstream_latency_seconds_count {d}
+            \\# HELP swerver_connections_total Total TCP connections
+            \\# TYPE swerver_connections_total counter
+            \\swerver_connections_total {d}
+            \\
+        , .{
+            @atomicLoad(u64, &self.upstream_requests_total, .monotonic),
+            @atomicLoad(u64, &self.upstream_responses_total, .monotonic),
+            @atomicLoad(u64, &self.upstream_errors_total, .monotonic),
+            upstream_latency_s,
+            @atomicLoad(u64, &self.upstream_latency_count, .monotonic),
+            @atomicLoad(u64, &self.connections_total, .monotonic),
+        }) catch return buf[0..offset2];
+
+        offset2 += part2b.len;
 
         // Part 3: Per-stream metrics (for HTTP/2 and HTTP/3)
         // Format active streams with labels

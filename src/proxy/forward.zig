@@ -80,13 +80,39 @@ pub fn buildUpstreamRequest(
         pos += (std.fmt.bufPrint(buf[pos..], "Host: {s}:{d}\r\n", .{ ctx.server.address, ctx.server.port }) catch return error.BufferFull).len;
     }
 
+    // RFC 9110 §7.6.1: Parse Connection header to find dynamic hop-by-hop headers
+    var dynamic_hop_by_hop: [16][]const u8 = undefined;
+    var dynamic_hop_count: usize = 0;
+    if (ctx.client_request.getHeader("Connection")) |conn_value| {
+        var it = std.mem.splitScalar(u8, conn_value, ',');
+        while (it.next()) |token| {
+            const trimmed = std.mem.trim(u8, token, " \t");
+            if (trimmed.len > 0 and dynamic_hop_count < dynamic_hop_by_hop.len) {
+                dynamic_hop_by_hop[dynamic_hop_count] = trimmed;
+                dynamic_hop_count += 1;
+            }
+        }
+    }
+
     // Forward non-hop-by-hop headers
     for (ctx.client_request.headers) |hdr| {
-        // Skip hop-by-hop headers
+        // Skip static hop-by-hop headers
         if (upstream.isHopByHop(hdr.name)) continue;
+
+        // Skip dynamic hop-by-hop headers from Connection header
+        var is_dynamic_hop = false;
+        for (dynamic_hop_by_hop[0..dynamic_hop_count]) |dh| {
+            if (std.ascii.eqlIgnoreCase(hdr.name, dh)) {
+                is_dynamic_hop = true;
+                break;
+            }
+        }
+        if (is_dynamic_hop) continue;
 
         // Skip Host (handled above)
         if (std.ascii.eqlIgnoreCase(hdr.name, "host")) continue;
+        // Skip Via (handled separately in addProxyHeaders chaining logic)
+        if (std.ascii.eqlIgnoreCase(hdr.name, "via")) continue;
 
         // Check if header should be removed
         var should_remove = false;
@@ -109,6 +135,11 @@ pub fn buildUpstreamRequest(
     // Add proxy headers if enabled
     if (ctx.route.headers.add_proxy_headers) {
         pos = try addProxyHeaders(buf, pos, ctx);
+    }
+
+    // Ensure Content-Length is present when forwarding a body (e.g., after stripping Transfer-Encoding)
+    if (ctx.client_request.body.len > 0 and ctx.client_request.getHeader("Content-Length") == null) {
+        pos += (std.fmt.bufPrint(buf[pos..], "Content-Length: {d}\r\n", .{ctx.client_request.body.len}) catch return error.BufferFull).len;
     }
 
     // Connection header for keep-alive
@@ -178,8 +209,16 @@ fn addProxyHeaders(buf: []u8, start_pos: usize, ctx: *const ForwardContext) !usi
         }
     }
 
-    // Via header
-    pos += (std.fmt.bufPrint(buf[pos..], "Via: 1.1 swerver\r\n", .{}) catch return error.BufferFull).len;
+    // Via header (RFC 9110 §7.6.3: append to existing Via chain)
+    if (ctx.client_request.getHeader("Via")) |existing_via| {
+        if (isSafeHeaderValue(existing_via) and existing_via.len < 4096) {
+            pos += (std.fmt.bufPrint(buf[pos..], "Via: {s}, 1.1 swerver\r\n", .{existing_via}) catch return error.BufferFull).len;
+        } else {
+            pos += (std.fmt.bufPrint(buf[pos..], "Via: 1.1 swerver\r\n", .{}) catch return error.BufferFull).len;
+        }
+    } else {
+        pos += (std.fmt.bufPrint(buf[pos..], "Via: 1.1 swerver\r\n", .{}) catch return error.BufferFull).len;
+    }
 
     return pos;
 }
@@ -246,7 +285,8 @@ const ResponseParser = struct {
         var headers: [64]response.Header = undefined;
         var content_length: ?usize = null;
         var is_chunked = false;
-        var keep_alive = true; // HTTP/1.1 default
+        // RFC 9112: HTTP/1.1 defaults to keep-alive, HTTP/1.0 defaults to close
+        var keep_alive = status_line.len >= 8 and std.mem.eql(u8, status_line[0..8], "HTTP/1.1");
 
         var header_iter = std.mem.splitSequence(u8, headers_section, "\r\n");
         while (header_iter.next()) |line| {
@@ -333,10 +373,43 @@ pub fn buildClientResponse(
         response.statusPhrase(upstream_response.status),
     }) catch return error.BufferFull).len;
 
-    // Forward non-hop-by-hop headers
+    // RFC 9110 §7.6.1: Parse upstream Connection header for dynamic hop-by-hop headers
+    var upstream_dynamic_hop: [16][]const u8 = undefined;
+    var upstream_dynamic_count: usize = 0;
     for (upstream_response.headers()) |hdr| {
-        // Skip hop-by-hop headers
+        if (std.ascii.eqlIgnoreCase(hdr.name, "connection")) {
+            var it = std.mem.splitScalar(u8, hdr.value, ',');
+            while (it.next()) |token| {
+                const trimmed = std.mem.trim(u8, token, " \t");
+                if (trimmed.len > 0 and upstream_dynamic_count < upstream_dynamic_hop.len) {
+                    upstream_dynamic_hop[upstream_dynamic_count] = trimmed;
+                    upstream_dynamic_count += 1;
+                }
+            }
+        }
+    }
+
+    // RFC 9110 §6.3: 204/304 MUST NOT have a message body or Content-Length
+    const suppress_body = upstream_response.status == 204 or upstream_response.status == 304;
+
+    // Forward non-hop-by-hop headers from upstream response
+    for (upstream_response.headers()) |hdr| {
+        // Skip static hop-by-hop headers
         if (upstream.isHopByHop(hdr.name)) continue;
+        // Skip Via (handled separately in chaining logic below)
+        if (std.ascii.eqlIgnoreCase(hdr.name, "via")) continue;
+        // Skip Content-Length for 204/304
+        if (suppress_body and std.ascii.eqlIgnoreCase(hdr.name, "content-length")) continue;
+
+        // Skip dynamic hop-by-hop headers listed in upstream Connection header
+        var is_dynamic_hop = false;
+        for (upstream_dynamic_hop[0..upstream_dynamic_count]) |dh| {
+            if (std.ascii.eqlIgnoreCase(hdr.name, dh)) {
+                is_dynamic_hop = true;
+                break;
+            }
+        }
+        if (is_dynamic_hop) continue;
 
         // Check if header should be removed
         var should_remove = false;
@@ -356,19 +429,113 @@ pub fn buildClientResponse(
         pos += (std.fmt.bufPrint(buf[pos..], "{s}: {s}\r\n", .{ hdr.name, hdr.value }) catch return error.BufferFull).len;
     }
 
-    // End of headers
-    if (pos + 2 > buf.len) return error.BufferFull;
-    buf[pos] = '\r';
-    buf[pos + 1] = '\n';
-    pos += 2;
+    // RFC 9110 §7.6.3: MUST add Via header (append to existing chain from upstream)
+    var upstream_via: ?[]const u8 = null;
+    for (upstream_response.headers()) |hdr| {
+        if (std.ascii.eqlIgnoreCase(hdr.name, "via")) {
+            upstream_via = hdr.value;
+            break;
+        }
+    }
+    if (upstream_via) |existing_via| {
+        if (isSafeHeaderValue(existing_via) and existing_via.len < 4096) {
+            pos += (std.fmt.bufPrint(buf[pos..], "Via: {s}, 1.1 swerver\r\n", .{existing_via}) catch return error.BufferFull).len;
+        } else {
+            pos += (std.fmt.bufPrint(buf[pos..], "Via: 1.1 swerver\r\n", .{}) catch return error.BufferFull).len;
+        }
+    } else {
+        pos += (std.fmt.bufPrint(buf[pos..], "Via: 1.1 swerver\r\n", .{}) catch return error.BufferFull).len;
+    }
 
-    // Body
-    const body = upstream_buf[upstream_response.body_start..upstream_response.body_end];
-    if (pos + body.len > buf.len) return error.BufferFull;
-    @memcpy(buf[pos .. pos + body.len], body);
-    pos += body.len;
+    // RFC 9110 §6.3: 204/304 responses MUST NOT contain a message body
+    if (suppress_body) {
+        if (pos + 2 > buf.len) return error.BufferFull;
+        buf[pos] = '\r';
+        buf[pos + 1] = '\n';
+        pos += 2;
+        return pos;
+    }
+
+    const raw_body = upstream_buf[upstream_response.body_start..upstream_response.body_end];
+
+    if (upstream_response.is_chunked) {
+        // Decode chunked body: calculate decoded size for Content-Length
+        const decoded_size = chunkedDecodedSize(raw_body) orelse raw_body.len;
+        pos += (std.fmt.bufPrint(buf[pos..], "Content-Length: {d}\r\n", .{decoded_size}) catch return error.BufferFull).len;
+
+        // End of headers
+        if (pos + 2 > buf.len) return error.BufferFull;
+        buf[pos] = '\r';
+        buf[pos + 1] = '\n';
+        pos += 2;
+
+        // Decode chunked body directly into output buffer
+        if (decodeChunkedInto(raw_body, buf[pos..])) |written| {
+            pos += written;
+        } else {
+            // Fallback: copy raw data if decode fails
+            if (pos + raw_body.len > buf.len) return error.BufferFull;
+            @memcpy(buf[pos .. pos + raw_body.len], raw_body);
+            pos += raw_body.len;
+        }
+    } else {
+        // Non-chunked: add Content-Length and copy body directly
+        pos += (std.fmt.bufPrint(buf[pos..], "Content-Length: {d}\r\n", .{raw_body.len}) catch return error.BufferFull).len;
+
+        // End of headers
+        if (pos + 2 > buf.len) return error.BufferFull;
+        buf[pos] = '\r';
+        buf[pos + 1] = '\n';
+        pos += 2;
+
+        if (pos + raw_body.len > buf.len) return error.BufferFull;
+        @memcpy(buf[pos .. pos + raw_body.len], raw_body);
+        pos += raw_body.len;
+    }
 
     return pos;
+}
+
+/// Calculate the decoded size of a chunked body (sum of all chunk sizes).
+/// Returns null if parsing fails.
+fn chunkedDecodedSize(data: []const u8) ?usize {
+    var src: usize = 0;
+    var total: usize = 0;
+    while (src < data.len) {
+        const line_end = std.mem.indexOfPos(u8, data, src, "\r\n") orelse return null;
+        const size_str = data[src..line_end];
+        if (size_str.len == 0) return null;
+        const semi = std.mem.indexOfScalar(u8, size_str, ';') orelse size_str.len;
+        const chunk_size = std.fmt.parseInt(usize, size_str[0..semi], 16) catch return null;
+        src = line_end + 2;
+        if (chunk_size == 0) break;
+        if (src + chunk_size + 2 > data.len) return null;
+        total += chunk_size;
+        src += chunk_size + 2;
+    }
+    return total;
+}
+
+/// Copy decoded chunked body into output buffer, stripping chunk framing.
+/// Returns bytes written, or null on parse failure.
+fn decodeChunkedInto(data: []const u8, out: []u8) ?usize {
+    var src: usize = 0;
+    var dst: usize = 0;
+    while (src < data.len) {
+        const line_end = std.mem.indexOfPos(u8, data, src, "\r\n") orelse return null;
+        const size_str = data[src..line_end];
+        if (size_str.len == 0) return null;
+        const semi = std.mem.indexOfScalar(u8, size_str, ';') orelse size_str.len;
+        const chunk_size = std.fmt.parseInt(usize, size_str[0..semi], 16) catch return null;
+        src = line_end + 2;
+        if (chunk_size == 0) break;
+        if (src + chunk_size + 2 > data.len) return null;
+        if (dst + chunk_size > out.len) return null;
+        @memcpy(out[dst .. dst + chunk_size], data[src .. src + chunk_size]);
+        dst += chunk_size;
+        src += chunk_size + 2;
+    }
+    return dst;
 }
 
 /// Check if a request method is idempotent (safe to retry)

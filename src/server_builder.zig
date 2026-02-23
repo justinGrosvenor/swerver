@@ -4,6 +4,7 @@ const config_mod = @import("config.zig");
 const middleware_mod = @import("middleware/middleware.zig");
 const router_mod = @import("router/router.zig");
 const server = @import("server.zig");
+const proxy_mod = @import("proxy/proxy.zig");
 
 pub const ServerBuilder = struct {
     cfg: config_mod.ServerConfig,
@@ -12,6 +13,7 @@ pub const ServerBuilder = struct {
     app_state: ?*anyopaque = null,
     app_services: ?*anyopaque = null,
     app_services_get: ?router_mod.ServiceGetter = null,
+    proxy_instance: ?*proxy_mod.Proxy = null,
 
     pub fn configDefault() ServerBuilder {
         return .{ .cfg = config_mod.ServerConfig.default() };
@@ -46,7 +48,17 @@ pub const ServerBuilder = struct {
         return next;
     }
 
-    pub fn build(self: ServerBuilder, allocator: std.mem.Allocator) !server.Server {
+    /// Attach a reverse proxy instance to the server.
+    /// The proxy will intercept matching requests before the router.
+    pub fn withProxy(self: ServerBuilder, proxy: *proxy_mod.Proxy) ServerBuilder {
+        var next = self;
+        next.proxy_instance = proxy;
+        return next;
+    }
+
+    /// Build a heap-allocated Server. Caller must call srv.deinit() and
+    /// allocator.destroy(srv) when done.
+    pub fn build(self: ServerBuilder, allocator: std.mem.Allocator) !*server.Server {
         try self.cfg.validate();
 
         var app_router = self.router_opt orelse router_mod.Router.init(.{
@@ -64,7 +76,11 @@ pub const ServerBuilder = struct {
             app_router.setServicesWithGetter(services, self.app_services_get);
         }
 
-        return server.Server.initWithRouter(allocator, self.cfg, app_router);
+        const srv = try allocator.create(server.Server);
+        errdefer allocator.destroy(srv);
+        try srv.initInPlace(allocator, self.cfg, app_router);
+        srv.proxy = self.proxy_instance;
+        return srv;
     }
 };
 

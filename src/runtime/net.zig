@@ -137,7 +137,7 @@ pub fn accept(listener_fd: std.posix.fd_t) AcceptError!std.posix.fd_t {
     if (fd < 0) {
         const errno = std.posix.errno(fd);
         switch (errno) {
-            .AGAIN => return error.WouldBlock,
+            .AGAIN, .INTR => return error.WouldBlock,
             .CONNABORTED => return error.WouldBlock, // Connection aborted before accept
             else => {
                 std.log.debug("accept errno: {}", .{errno});
@@ -202,7 +202,7 @@ pub fn recvfrom(fd: std.posix.fd_t, buf: []u8) UdpError!RecvFromResult {
 
     if (rc < 0) {
         switch (std.posix.errno(rc)) {
-            .AGAIN => return error.WouldBlock,
+            .AGAIN, .INTR => return error.WouldBlock,
             else => return error.RecvFailed,
         }
     }
@@ -243,7 +243,7 @@ pub fn sendto(fd: std.posix.fd_t, buf: []const u8, peer: SockAddrStorage) UdpErr
 
     if (rc < 0) {
         switch (std.posix.errno(rc)) {
-            .AGAIN => return error.WouldBlock,
+            .AGAIN, .INTR => return error.WouldBlock,
             else => return error.SendFailed,
         }
     }
@@ -397,8 +397,8 @@ fn sendfileBsd(socket_fd: std.posix.fd_t, file_fd: std.posix.fd_t, offset: *u64,
 
     const errno = std.posix.errno(rc);
     switch (errno) {
-        .AGAIN => {
-            // Partial write - len contains bytes sent before blocking
+        .AGAIN, .INTR => {
+            // Partial write or interrupted - len contains bytes sent before blocking
             const sent: usize = if (len > 0) @intCast(len) else 0;
             offset.* += sent;
             return .{ .bytes_sent = sent, .done = false };
@@ -421,7 +421,7 @@ fn sendfileLinux(socket_fd: std.posix.fd_t, file_fd: std.posix.fd_t, offset: *u6
 
     const errno = std.posix.errno(rc);
     switch (errno) {
-        .AGAIN => return .{ .bytes_sent = 0, .done = false },
+        .AGAIN, .INTR => return .{ .bytes_sent = 0, .done = false },
         .PIPE, .NOTCONN => return error.Closed,
         else => return error.Failed,
     }
@@ -453,3 +453,132 @@ const linux_sendfile = if (builtin.os.tag == .linux)
     }.sendfile
 else
     undefined;
+
+// ============================================================
+// Blocking TCP connect for proxy upstream connections
+// ============================================================
+
+pub const ConnectError = error{
+    UnsupportedPlatform,
+    UnsupportedAddress,
+    SocketFailed,
+    ConnectFailed,
+    Timeout,
+};
+
+/// Connect to a TCP server with a timeout (blocking).
+/// Returns a connected, blocking socket fd.
+pub fn connectBlocking(address: []const u8, port: u16, timeout_ms: u32) ConnectError!std.posix.fd_t {
+    if (!isSupportedPlatform()) return error.UnsupportedPlatform;
+
+    const addr = parseAddress(address, port) catch return error.UnsupportedAddress;
+    const domain: c_uint = switch (addr) {
+        .ip4 => @intCast(std.posix.AF.INET),
+        .ip6 => @intCast(std.posix.AF.INET6),
+    };
+    const fd = std.posix.system.socket(domain, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
+    if (fd < 0) return error.SocketFailed;
+    errdefer std.posix.close(fd);
+
+    // Set non-blocking for connect with timeout
+    setNonBlocking(fd) catch return error.SocketFailed;
+
+    var storage = buildSockaddr(addr);
+    const sockaddr_ptr: *const std.posix.sockaddr = switch (storage) {
+        .ip4 => |*sa| @ptrCast(sa),
+        .ip6 => |*sa| @ptrCast(sa),
+    };
+    const addr_len: std.posix.socklen_t = switch (storage) {
+        .ip4 => @intCast(@sizeOf(SockAddrIn)),
+        .ip6 => @intCast(@sizeOf(SockAddrIn6)),
+    };
+
+    const rc = std.posix.system.connect(fd, sockaddr_ptr, addr_len);
+    if (rc == 0) {
+        // Connected immediately — switch back to blocking
+        clearNonBlocking(fd) catch return error.SocketFailed;
+        return fd;
+    }
+
+    const errno = std.posix.errno(rc);
+    if (errno != .INPROGRESS) return error.ConnectFailed;
+
+    // Wait for connect to complete using poll
+    if (!pollWriteReady(fd, timeout_ms)) return error.Timeout;
+
+    // Check connect result via SO_ERROR
+    var err_val: c_int = 0;
+    var err_len: std.posix.socklen_t = @sizeOf(c_int);
+    const gso_rc = std.posix.system.getsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.ERROR, @ptrCast(&err_val), &err_len);
+    if (gso_rc != 0 or err_val != 0) return error.ConnectFailed;
+
+    // Switch back to blocking for simple send/recv
+    clearNonBlocking(fd) catch return error.SocketFailed;
+    return fd;
+}
+
+/// Set send/recv timeouts on a blocking socket.
+pub fn setSocketTimeouts(fd: std.posix.fd_t, send_ms: u32, recv_ms: u32) void {
+    const send_tv = msToTimeval(send_ms);
+    std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&send_tv)) catch |err| {
+        std.log.warn("setsockopt SO_SNDTIMEO failed: {}", .{err});
+    };
+
+    const recv_tv = msToTimeval(recv_ms);
+    std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_tv)) catch |err| {
+        std.log.warn("setsockopt SO_RCVTIMEO failed: {}", .{err});
+    };
+}
+
+fn msToTimeval(ms: u32) std.posix.timeval {
+    return .{
+        .sec = @intCast(ms / 1000),
+        .usec = @intCast((ms % 1000) * 1000),
+    };
+}
+
+fn clearNonBlocking(fd: std.posix.fd_t) NonBlockingError!void {
+    var flags = std.posix.fcntl(fd, std.posix.F.GETFL, 0) catch return error.NonBlockingFailed;
+    flags &= ~(@as(@TypeOf(flags), 1) << @bitOffsetOf(std.posix.O, "NONBLOCK"));
+    _ = std.posix.fcntl(fd, std.posix.F.SETFL, flags) catch return error.NonBlockingFailed;
+}
+
+fn pollWriteReady(fd: std.posix.fd_t, timeout_ms: u32) bool {
+    var pfd = [1]std.posix.pollfd{.{
+        .fd = fd,
+        .events = std.posix.POLL.OUT,
+        .revents = 0,
+    }};
+    const rc = std.posix.system.poll(&pfd, 1, @intCast(timeout_ms));
+    if (rc <= 0) return false;
+    return (pfd[0].revents & std.posix.POLL.OUT) != 0;
+}
+
+/// Send all bytes to a socket (blocking, handles partial writes and EINTR).
+pub fn sendAll(fd: std.posix.fd_t, data: []const u8) error{SendFailed}!void {
+    var sent: usize = 0;
+    while (sent < data.len) {
+        const rc = std.posix.system.write(fd, data[sent..].ptr, data[sent..].len);
+        if (rc < 0) {
+            // Retry on EINTR (interrupted by signal handler)
+            if (std.posix.errno(rc) == .INTR) continue;
+            return error.SendFailed;
+        }
+        if (rc == 0) return error.SendFailed;
+        sent += @intCast(rc);
+    }
+}
+
+/// Receive up to buf.len bytes from a socket (blocking, handles EINTR).
+/// Returns 0 on EOF.
+pub fn recvBlocking(fd: std.posix.fd_t, buf: []u8) error{RecvFailed}!usize {
+    while (true) {
+        const rc = std.posix.system.read(fd, buf.ptr, buf.len);
+        if (rc < 0) {
+            // Retry on EINTR (interrupted by signal handler)
+            if (std.posix.errno(rc) == .INTR) continue;
+            return error.RecvFailed;
+        }
+        return @intCast(rc);
+    }
+}

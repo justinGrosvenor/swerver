@@ -8,6 +8,7 @@ const request = @import("../protocol/request.zig");
 const response = @import("../response/response.zig");
 const middleware = @import("../middleware/middleware.zig");
 const router = @import("../router/router.zig");
+const net = @import("../runtime/net.zig");
 
 /// Reverse Proxy Handler
 ///
@@ -26,6 +27,9 @@ pub const ProxyConfig = struct {
     /// Default timeouts
     default_timeouts: upstream.ProxyTimeouts = .{},
 };
+
+/// Scratch buffer for percent-decoding paths during route matching
+threadlocal var decode_scratch: [4096]u8 = undefined;
 
 /// Proxy handler state
 pub const Proxy = struct {
@@ -153,11 +157,14 @@ pub const Proxy = struct {
     }
 
     /// Find a matching proxy route for a request.
-    /// Rejects paths containing percent-encoded sequences to prevent URL-encoding
-    /// bypasses of prefix-based access controls.
+    /// Decodes percent-encoded paths for prefix matching to prevent URL-encoding
+    /// bypasses while still allowing legitimate encoded paths.
     pub fn matchRoute(self: *const Proxy, req: *const request.RequestView) ?*const upstream.ProxyRoute {
-        // Reject paths with percent-encoding to prevent bypass of prefix matching
-        if (std.mem.indexOfScalar(u8, req.path, '%') != null) return null;
+        // If path contains percent-encoding, decode it for matching
+        const match_path = if (std.mem.indexOfScalar(u8, req.path, '%') != null) blk: {
+            const decoded = percentDecodePath(req.path) orelse return null;
+            break :blk decoded;
+        } else req.path;
 
         for (self.config.routes) |*route| {
             // Check host match if configured
@@ -166,15 +173,54 @@ pub const Proxy = struct {
                 if (!std.mem.eql(u8, req_host, expected_host)) continue;
             }
 
-            // Check path prefix
-            if (std.mem.startsWith(u8, req.path, route.path_prefix)) {
+            // Check path prefix against decoded path
+            if (std.mem.startsWith(u8, match_path, route.path_prefix)) {
                 return route;
             }
         }
         return null;
     }
 
-    /// Handle a proxy request
+    /// Decode percent-encoded path for safe prefix matching.
+    /// Returns null if path contains %00 (null byte) or invalid encoding.
+    fn percentDecodePath(path: []const u8) ?[]const u8 {
+        const buf = &decode_scratch;
+        var src: usize = 0;
+        var dst: usize = 0;
+        while (src < path.len) {
+            if (dst >= buf.len) return null;
+            if (path[src] == '%') {
+                if (src + 2 >= path.len) return null; // truncated encoding
+                const hi = hexDigit(path[src + 1]) orelse return null;
+                const lo = hexDigit(path[src + 2]) orelse return null;
+                const byte = (hi << 4) | lo;
+                if (byte == 0) return null; // reject null bytes
+                buf[dst] = byte;
+                src += 3;
+            } else {
+                buf[dst] = path[src];
+                src += 1;
+            }
+            dst += 1;
+        }
+        return buf[0..dst];
+    }
+
+    fn hexDigit(c: u8) ?u8 {
+        return switch (c) {
+            '0'...'9' => c - '0',
+            'A'...'F' => c - 'A' + 10,
+            'a'...'f' => c - 'a' + 10,
+            else => null,
+        };
+    }
+
+    /// Handle a proxy request with real upstream I/O.
+    /// Connects to the selected backend, sends the request, reads the response,
+    /// and returns it to the client. Supports connection reuse and retry.
+    ///
+    /// The caller MUST call `result.release()` after the response has been
+    /// fully consumed (e.g., after queueResponse).
     pub fn handle(
         self: *Proxy,
         req: request.RequestView,
@@ -182,38 +228,42 @@ pub const Proxy = struct {
         client_ip: ?[]const u8,
         client_tls: bool,
         now_ms: u64,
-    ) router.RouteResult {
+    ) ProxyResult {
+        _ = mw_ctx;
+
         // Find matching route
         const route = self.matchRoute(&req) orelse {
-            return .{ .resp = forward.createErrorResponse(502) };
+            return .{ .resp = forward.createErrorResponse(502), .proxy = self };
         };
 
         // Get upstream configuration
         const upstream_def = self.upstreams_by_name.get(route.upstream) orelse {
-            return .{ .resp = forward.createErrorResponse(502) };
+            return .{ .resp = forward.createErrorResponse(502), .proxy = self };
         };
+        _ = upstream_def;
 
         // Get balancer and pool
         const bal = self.balancers.get(route.upstream) orelse {
-            return .{ .resp = forward.createErrorResponse(502) };
+            return .{ .resp = forward.createErrorResponse(502), .proxy = self };
         };
 
         const pool = self.pool_manager.getPool(route.upstream) orelse {
-            return .{ .resp = forward.createErrorResponse(502) };
+            return .{ .resp = forward.createErrorResponse(502), .proxy = self };
         };
 
         // Acquire buffers
         const req_buf_idx = self.acquireRequestBuffer() orelse {
-            return .{ .resp = forward.createErrorResponse(503) };
+            return .{ .resp = forward.createErrorResponse(503), .proxy = self };
         };
         defer self.releaseRequestBuffer(req_buf_idx);
 
         const resp_buf_idx = self.acquireResponseBuffer() orelse {
-            return .{ .resp = forward.createErrorResponse(503) };
+            return .{ .resp = forward.createErrorResponse(503), .proxy = self };
         };
-        defer self.releaseResponseBuffer(resp_buf_idx);
+        // NOTE: response buffer is NOT released here on success path.
+        // The caller releases it via ProxyResult.release().
 
-        // Get client IP as u32 for IP hash (simplified)
+        // Get client IP as u32 for IP hash
         const client_ip_u32: ?u32 = if (client_ip) |ip| parseIpToU32(ip) else null;
 
         // Retry loop
@@ -226,36 +276,64 @@ pub const Proxy = struct {
 
             // Select upstream server
             const selection = bal.select(client_ip_u32, now_ms) orelse {
-                // No healthy servers available
-                return .{ .resp = forward.createErrorResponse(502) };
+                self.releaseResponseBuffer(resp_buf_idx);
+                return .{ .resp = forward.createErrorResponse(502), .proxy = self };
             };
 
-            // Try to get an existing connection or create a new one
+            // Try to get an existing idle connection
             var conn = pool.acquireForServer(selection.server_index, now_ms);
+            var created_new = false;
 
             if (conn == null) {
-                // Need to create new connection
+                // Need to create a new TCP connection
                 const slot = pool.reserveSlot() orelse {
-                    // Pool is full, try another server or fail
                     if (attempts < max_attempts) continue;
-                    return .{ .resp = forward.createErrorResponse(503) };
+                    self.releaseResponseBuffer(resp_buf_idx);
+                    return .{ .resp = forward.createErrorResponse(503), .proxy = self };
                 };
 
-                // In production, we would actually connect here.
-                // For now, simulate by creating a placeholder connection.
-                // Real implementation would integrate with the event loop.
-                const new_conn = pool_mod.UpstreamConnection.init(
-                    -1, // Placeholder fd
-                    selection.server_index,
-                    now_ms,
-                    slot,
-                );
+                const fd = net.connectBlocking(
+                    selection.server.address,
+                    selection.server.port,
+                    route.timeouts.connect_ms,
+                ) catch {
+                    // Connect failed — mark server failure
+                    if (selection.server_index < pool.server_failures.len) {
+                        pool.server_failures[selection.server_index].consecutive_failures += 1;
+                        pool.server_failures[selection.server_index].last_failure_ms = now_ms;
+                        if (pool.server_failures[selection.server_index].consecutive_failures >= selection.server.max_fails) {
+                            pool.server_failures[selection.server_index].available = false;
+                        }
+                    }
+                    continue;
+                };
+
+                // Set send/recv timeouts
+                net.setSocketTimeouts(fd, route.timeouts.send_ms, route.timeouts.read_ms);
+
+                var new_conn = pool_mod.UpstreamConnection.init(fd, selection.server_index, now_ms, slot);
+                new_conn.state = .idle;
                 pool.addConnection(slot, new_conn);
                 conn = pool.acquireForServer(selection.server_index, now_ms);
+                created_new = true;
             }
 
             if (conn) |c| {
-                // Build forward context
+                // Verify existing connection is still alive (not newly created)
+                if (!created_new and c.fd >= 0) {
+                    var pfd = [1]std.posix.pollfd{.{
+                        .fd = c.fd,
+                        .events = std.posix.POLL.IN,
+                        .revents = 0,
+                    }};
+                    const poll_rc = std.posix.system.poll(&pfd, 1, 0);
+                    if (poll_rc > 0 and (pfd[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0) {
+                        pool.removeConnection(c);
+                        continue;
+                    }
+                }
+
+                // Build upstream request
                 const ctx = forward.ForwardContext{
                     .client_request = req,
                     .client_ip = client_ip,
@@ -267,36 +345,92 @@ pub const Proxy = struct {
                     .response_buf = &self.response_bufs[resp_buf_idx],
                 };
 
-                // Build upstream request
                 const request_len = forward.buildUpstreamRequest(&self.request_bufs[req_buf_idx], &ctx) catch {
                     pool.markConnectionFailed(c, now_ms, selection.server.max_fails);
                     continue;
                 };
 
-                // In production: send request, receive response
-                // For now, simulate success
-                _ = request_len;
-                _ = mw_ctx;
-                _ = upstream_def;
+                // Send request to upstream
+                const body_sent = req.body.len > 0;
+                net.sendAll(c.fd, self.request_bufs[req_buf_idx][0..request_len]) catch {
+                    pool.markConnectionFailed(c, now_ms, selection.server.max_fails);
+                    // RFC 9110 §9.2.2: Only retry if method is idempotent or body not sent
+                    if (body_sent and !forward.isIdempotent(req.method)) {
+                        self.releaseResponseBuffer(resp_buf_idx);
+                        return .{ .resp = forward.createErrorResponse(502), .proxy = self };
+                    }
+                    continue;
+                };
 
-                // Record success
+                // Read response from upstream
+                var total_read: usize = 0;
+                var read_failed = false;
+                while (total_read < RESPONSE_BUF_SIZE) {
+                    const n = net.recvBlocking(c.fd, self.response_bufs[resp_buf_idx][total_read..]) catch {
+                        pool.markConnectionFailed(c, now_ms, selection.server.max_fails);
+                        read_failed = true;
+                        break;
+                    };
+                    if (n == 0) break; // EOF
+                    total_read += n;
+
+                    // Try to parse — if we have a complete response, stop reading
+                    if (forward.parseUpstreamResponse(self.response_bufs[resp_buf_idx][0..total_read])) |_| {
+                        break;
+                    } else |_| {}
+                }
+
+                if (read_failed) {
+                    // RFC 9110 §9.2.2: Don't retry non-idempotent after body sent
+                    if (body_sent and !forward.isIdempotent(req.method)) {
+                        self.releaseResponseBuffer(resp_buf_idx);
+                        return .{ .resp = forward.createErrorResponse(502), .proxy = self };
+                    }
+                    continue;
+                }
+
+                if (total_read == 0) {
+                    pool.markConnectionFailed(c, now_ms, selection.server.max_fails);
+                    continue;
+                }
+
+                // Parse the upstream response
+                const parsed = forward.parseUpstreamResponse(self.response_bufs[resp_buf_idx][0..total_read]) catch {
+                    pool.markConnectionFailed(c, now_ms, selection.server.max_fails);
+                    continue;
+                };
+
+                // Check if we should retry on this status code
+                if (forward.shouldRetry(parsed.status, &retry_config) and
+                    forward.isMethodRetryable(req.method, &retry_config) and
+                    attempts < max_attempts)
+                {
+                    pool.release(c, now_ms, parsed.keep_alive);
+                    continue;
+                }
+
+                // Success — return the body from the upstream response buffer.
+                // The response body lives in self.response_bufs[resp_buf_idx].
                 pool.markServerSuccess(selection.server_index);
-                pool.release(c, now_ms, true);
+                pool.release(c, now_ms, parsed.keep_alive);
 
-                // Return simulated success response
-                // In production, this would be the parsed upstream response
+                const body = self.response_bufs[resp_buf_idx][parsed.body_start..parsed.body_end];
+
                 return .{
                     .resp = .{
-                        .status = 200,
-                        .headers = &[_]response.Header{},
-                        .body = .{ .bytes = "Proxy response placeholder" },
+                        .status = parsed.status,
+                        .headers = parsed.headers(),
+                        .body = .{ .bytes = body },
                     },
+                    .proxy = self,
+                    .resp_buf_idx = resp_buf_idx,
                 };
             }
         }
 
         // All retries exhausted
-        return .{ .resp = forward.createErrorResponse(502) };
+        self.releaseResponseBuffer(resp_buf_idx);
+        return .{ .resp = forward.createErrorResponse(502), .proxy = self };
     }
 
     /// Run periodic maintenance tasks
@@ -344,6 +478,22 @@ pub const Proxy = struct {
         if (self.free_response_count < BUFFER_POOL_SIZE) {
             self.free_response_stack[self.free_response_count] = idx;
             self.free_response_count += 1;
+        }
+    }
+};
+
+/// Result of a proxy request. Caller must call `release()` after
+/// the response has been fully consumed (e.g., after queueResponse).
+pub const ProxyResult = struct {
+    resp: response.Response,
+    proxy: *Proxy,
+    /// Response buffer index to release, or null if none held.
+    resp_buf_idx: ?usize = null,
+
+    pub fn release(self: *ProxyResult) void {
+        if (self.resp_buf_idx) |idx| {
+            self.proxy.releaseResponseBuffer(idx);
+            self.resp_buf_idx = null;
         }
     }
 };
@@ -480,4 +630,58 @@ test "Proxy route matching" {
     const match2 = proxy.matchRoute(&req2);
     try std.testing.expect(match2 != null);
     try std.testing.expectEqualStrings("api_v2", match2.?.upstream);
+
+    // Test percent-encoded path matches after decoding
+    const req_encoded = request.RequestView{
+        .method = .GET,
+        .path = "/api/v1/users%2Fjohn%20smith",
+        .headers = &.{},
+        .body = "",
+    };
+    const match_enc = proxy.matchRoute(&req_encoded);
+    try std.testing.expect(match_enc != null);
+    try std.testing.expectEqualStrings("api_v1", match_enc.?.upstream);
+
+    // Test percent-encoded null byte rejected
+    const req_null = request.RequestView{
+        .method = .GET,
+        .path = "/api/v1/%00admin",
+        .headers = &.{},
+        .body = "",
+    };
+    const match_null = proxy.matchRoute(&req_null);
+    try std.testing.expect(match_null == null);
+
+    // Test invalid percent encoding rejected
+    const req_bad = request.RequestView{
+        .method = .GET,
+        .path = "/api/v1/%GG",
+        .headers = &.{},
+        .body = "",
+    };
+    const match_bad = proxy.matchRoute(&req_bad);
+    try std.testing.expect(match_bad == null);
+}
+
+test "percentDecodePath" {
+    // Normal path without encoding passes through
+    const plain = Proxy.percentDecodePath("/api/v1/users").?;
+    try std.testing.expectEqualStrings("/api/v1/users", plain);
+
+    // Space encoding
+    const space = Proxy.percentDecodePath("/hello%20world").?;
+    try std.testing.expectEqualStrings("/hello world", space);
+
+    // Slash encoding
+    const slash = Proxy.percentDecodePath("/a%2Fb").?;
+    try std.testing.expectEqualStrings("/a/b", slash);
+
+    // Null byte rejected
+    try std.testing.expect(Proxy.percentDecodePath("/bad%00path") == null);
+
+    // Truncated encoding rejected
+    try std.testing.expect(Proxy.percentDecodePath("/bad%2") == null);
+
+    // Invalid hex digits rejected
+    try std.testing.expect(Proxy.percentDecodePath("/bad%GG") == null);
 }

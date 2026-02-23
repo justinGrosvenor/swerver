@@ -4,6 +4,7 @@ const buffer_pool = @import("buffer_pool.zig");
 const connection = @import("connection.zig");
 const kqueue_backend = @import("backend/kqueue.zig");
 const epoll_backend = @import("backend/epoll.zig");
+const io_uring_backend = @import("backend/io_uring.zig");
 
 pub const IoRuntime = struct {
     allocator: std.mem.Allocator,
@@ -62,6 +63,11 @@ pub const IoRuntime = struct {
             .linux_epoll => |*ep| {
                 const epev = try ep.poll(timeout_ms);
                 const count = translateEpollEvents(epev, self.events);
+                return self.events[0..count];
+            },
+            .linux_io_uring => |*ur| {
+                const urev = try ur.poll(timeout_ms);
+                const count = translateIoUringEvents(urev, self.events);
                 return self.events[0..count];
             },
             else => {
@@ -197,6 +203,7 @@ pub const IoRuntime = struct {
         return switch (self.backend_state) {
             .bsd_kqueue => |*kq| kq.registerListener(fd),
             .linux_epoll => |*ep| ep.registerListener(fd),
+            .linux_io_uring => |*ur| ur.registerListener(fd),
             else => error.UnsupportedBackend,
         };
     }
@@ -205,6 +212,7 @@ pub const IoRuntime = struct {
         return switch (self.backend_state) {
             .bsd_kqueue => |*kq| kq.registerUdpSocket(fd),
             .linux_epoll => |*ep| ep.registerUdpSocket(fd),
+            .linux_io_uring => |*ur| ur.registerUdpSocket(fd),
             else => error.UnsupportedBackend,
         };
     }
@@ -217,6 +225,7 @@ pub const IoRuntime = struct {
         return switch (self.backend_state) {
             .bsd_kqueue => |*kq| kq.registerConnection(offset_id, fd),
             .linux_epoll => |*ep| ep.registerConnection(offset_id, fd),
+            .linux_io_uring => |*ur| ur.registerConnection(offset_id, fd),
             else => error.UnsupportedBackend,
         };
     }
@@ -225,6 +234,7 @@ pub const IoRuntime = struct {
         return switch (self.backend_state) {
             .bsd_kqueue => |*kq| kq.unregister(fd),
             .linux_epoll => |*ep| ep.unregister(fd),
+            .linux_io_uring => |*ur| ur.unregister(fd),
             else => error.UnsupportedBackend,
         };
     }
@@ -258,7 +268,7 @@ pub const UDP_SOCKET_ID: u64 = std.math.maxInt(u64) - 1;
 
 fn pickBackend() Backend {
     return switch (@import("builtin").os.tag) {
-        .linux => .linux_epoll,
+        .linux => if (io_uring_backend.probeIoUring()) .linux_io_uring else .linux_epoll,
         .macos, .freebsd, .netbsd, .openbsd, .dragonfly => .bsd_kqueue,
         .windows => .windows_iocp,
         else => .unknown,
@@ -266,7 +276,7 @@ fn pickBackend() Backend {
 }
 
 pub const BackendState = union(Backend) {
-    linux_io_uring: void,
+    linux_io_uring: io_uring_backend.IoUringBackend,
     linux_epoll: epoll_backend.EpollBackend,
     bsd_kqueue: kqueue_backend.KqueueBackend,
     windows_iocp: void,
@@ -277,7 +287,7 @@ fn initBackend(allocator: std.mem.Allocator, backend: Backend, max_events: usize
     return switch (backend) {
         .bsd_kqueue => .{ .bsd_kqueue = try kqueue_backend.KqueueBackend.init(allocator, max_events) },
         .linux_epoll => .{ .linux_epoll = try epoll_backend.EpollBackend.init(allocator, max_events) },
-        .linux_io_uring => .{ .linux_io_uring = {} },
+        .linux_io_uring => .{ .linux_io_uring = try io_uring_backend.IoUringBackend.init(allocator, max_events) },
         .windows_iocp => .{ .windows_iocp = {} },
         .unknown => .{ .unknown = {} },
     };
@@ -287,6 +297,7 @@ fn deinitBackend(state: *BackendState, allocator: std.mem.Allocator) void {
     switch (state.*) {
         .bsd_kqueue => |*kq| kq.deinit(allocator),
         .linux_epoll => |*ep| ep.deinit(allocator),
+        .linux_io_uring => |*ur| ur.deinit(allocator),
         else => {},
     }
 }
@@ -436,6 +447,72 @@ fn translateEpollEvents(events: []const epoll_backend.EpollEvent, out: []Event) 
         if ((ev.events & epoll_backend.EPOLLOUT) != 0 and raw_id != 0) {
             if (count >= out.len) break;
             // Write events are always for connections - subtract 1 to reverse offset
+            out[count] = .{
+                .kind = .write,
+                .conn_id = raw_id - 1,
+                .bytes = 0,
+                .handle = null,
+            };
+            count += 1;
+        }
+    }
+    return count;
+}
+
+fn translateIoUringEvents(events: []const io_uring_backend.IoUringEvent, out: []Event) usize {
+    var count: usize = 0;
+    for (events) |ev| {
+        if (count >= out.len) break;
+        const raw_id = ev.data.u64;
+
+        // Check for error conditions
+        if ((ev.events & 0x008) != 0 or (ev.events & 0x010) != 0) { // POLLERR | POLLHUP
+            const conn_id: u64 = if (raw_id == 0)
+                0
+            else if (raw_id == UDP_SOCKET_ID)
+                UDP_SOCKET_ID
+            else
+                raw_id - 1;
+            out[count] = .{
+                .kind = .err,
+                .conn_id = conn_id,
+                .bytes = 0,
+                .handle = null,
+            };
+            count += 1;
+            continue;
+        }
+
+        // Handle read events (POLLIN)
+        if ((ev.events & 0x001) != 0) {
+            if (raw_id == 0) {
+                out[count] = .{
+                    .kind = .accept,
+                    .conn_id = 0,
+                    .bytes = 0,
+                    .handle = null,
+                };
+            } else if (raw_id == UDP_SOCKET_ID) {
+                out[count] = .{
+                    .kind = .datagram,
+                    .conn_id = UDP_SOCKET_ID,
+                    .bytes = 0,
+                    .handle = null,
+                };
+            } else {
+                out[count] = .{
+                    .kind = .read,
+                    .conn_id = raw_id - 1,
+                    .bytes = 0,
+                    .handle = null,
+                };
+            }
+            count += 1;
+        }
+
+        // Handle write events (POLLOUT)
+        if ((ev.events & 0x004) != 0 and raw_id != 0) {
+            if (count >= out.len) break;
             out[count] = .{
                 .kind = .write,
                 .conn_id = raw_id - 1,

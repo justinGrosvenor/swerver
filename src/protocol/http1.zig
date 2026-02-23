@@ -30,6 +30,8 @@ pub const ErrorCode = enum {
     invalid_chunked_body,
     body_too_large,
     header_too_large,
+    /// RFC 9110 §10.1.1: Expect header with unsupported expectation → 417
+    expectation_failed,
 };
 
 pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
@@ -149,7 +151,8 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
     if (request_target[0] == '/') {
         path = request_target;
     } else if (request_target[0] == '*') {
-        if (method != .OPTIONS) {
+        // RFC 9112 §3.2.4: asterisk-form is exactly "*", only for OPTIONS
+        if (request_target.len != 1 or method != .OPTIONS) {
             return .{
                 .state = .err,
                 .view = emptyView(),
@@ -215,7 +218,7 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
     var header_count: usize = 0;
     var content_length: usize = 0;
     var has_content_length = false;
-    var host_present = false;
+    var host_count: u8 = 0;
     var is_chunked = false;
     var expect_continue = false;
     var pos = line_end + 2;
@@ -268,10 +271,32 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
                 .expect_continue = false,
             };
         }
+        // RFC 9110 §5.5: Reject header values containing NUL or bare CR/LF
+        if (!isValidFieldValue(value)) {
+            return .{
+                .state = .err,
+                .view = emptyView(),
+                .error_code = .invalid_header_value,
+                .consumed_bytes = 0,
+                .keep_alive = true,
+                .expect_continue = false,
+            };
+        }
         _limits.headers_storage[header_count] = .{ .name = name, .value = value };
         header_count += 1;
         if (std.ascii.eqlIgnoreCase(name, "host")) {
-            host_present = value.len != 0;
+            host_count += 1;
+            // RFC 9112 §3.2: A server MUST respond with 400 if multiple Host headers
+            if (host_count > 1) {
+                return .{
+                    .state = .err,
+                    .view = emptyView(),
+                    .error_code = .invalid_header,
+                    .consumed_bytes = 0,
+                    .keep_alive = true,
+                    .expect_continue = false,
+                };
+            }
         }
         if (std.ascii.eqlIgnoreCase(name, "content-length")) {
             // Reject values with leading zeros, signs, or whitespace to prevent smuggling
@@ -296,6 +321,17 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
                         .expect_continue = false,
                     };
                 }
+            }
+            // RFC 9112 §6.3: Reject leading zeros to prevent smuggling
+            if (value.len > 1 and value[0] == '0') {
+                return .{
+                    .state = .err,
+                    .view = emptyView(),
+                    .error_code = .invalid_content_length,
+                    .consumed_bytes = 0,
+                    .keep_alive = true,
+                    .expect_continue = false,
+                };
             }
             // Reject unreasonably long digit strings to prevent overflow in parseInt
             if (value.len > 19) {
@@ -342,7 +378,8 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
             has_content_length = true;
         }
         if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
-            if (std.ascii.indexOfIgnoreCase(value, "chunked") != null) {
+            // RFC 9112 §6.1: TE value is a comma-separated list of tokens
+            if (containsToken(value, "chunked")) {
                 is_chunked = true;
             } else {
                 return .{
@@ -356,13 +393,14 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
             }
         }
         if (std.ascii.eqlIgnoreCase(name, "expect")) {
-            if (std.ascii.indexOfIgnoreCase(value, "100-continue") != null) {
+            if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t"), "100-continue")) {
                 expect_continue = true;
             } else {
+                // RFC 9110 §10.1.1: If expectation cannot be met, respond with 417
                 return .{
                     .state = .err,
                     .view = emptyView(),
-                    .error_code = .invalid_header_value,
+                    .error_code = .expectation_failed,
                     .consumed_bytes = 0,
                     .keep_alive = true,
                     .expect_continue = false,
@@ -379,7 +417,7 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
         }
         pos = next + 2;
     }
-    if (std.mem.eql(u8, version, "HTTP/1.1") and !host_present and !host_in_target) {
+    if (std.mem.eql(u8, version, "HTTP/1.1") and host_count == 0 and !host_in_target) {
         return .{
             .state = .err,
             .view = emptyView(),
@@ -525,6 +563,16 @@ fn isTchar(ch: u8) bool {
         '~' => true,
         else => std.ascii.isAlphanumeric(ch),
     };
+}
+
+/// RFC 9110 §5.5: Validate field value — reject NUL bytes and bare CR/LF.
+/// Allowed: HTAB, SP, VCHAR (0x21-0x7E), obs-text (0x80-0xFF)
+fn isValidFieldValue(value: []const u8) bool {
+    for (value) |ch| {
+        if (ch == 0) return false; // NUL
+        if (ch == '\r' or ch == '\n') return false; // bare CR/LF (already split on CRLF)
+    }
+    return true;
 }
 
 const ChunkedResult = struct {

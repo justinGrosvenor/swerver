@@ -2,6 +2,7 @@ const std = @import("std");
 const upstream = @import("upstream.zig");
 const pool_mod = @import("pool.zig");
 const forward = @import("forward.zig");
+const net = @import("../runtime/net.zig");
 
 /// Health Check System
 ///
@@ -151,34 +152,72 @@ pub const HealthChecker = struct {
         }
     }
 
-    /// Check a single server's health
+    /// Check a single server's health via a real TCP connection.
     fn checkServer(self: *HealthChecker, server: *const upstream.Server, index: usize, now_ms: u64) bool {
-        const health = &self.server_health[index];
+        const health_state = &self.server_health[index];
         const start_ms = now_ms;
 
         // Build health check request
         const request_len = self.buildHealthRequest(server) catch {
-            health.recordFailure(now_ms, &self.config);
+            health_state.recordFailure(now_ms, &self.config);
             return false;
         };
 
-        // In a real implementation, we would:
-        // 1. Open a connection to the server
-        // 2. Send the request
-        // 3. Wait for response (with timeout)
-        // 4. Parse and validate the response
-        //
-        // For now, this is a skeleton that tracks state.
-        // The actual network I/O would be integrated with the event loop.
+        // Connect to the server
+        const fd = net.connectBlocking(server.address, server.port, self.config.timeout_ms) catch {
+            health_state.recordFailure(now_ms, &self.config);
+            return false;
+        };
+        defer std.posix.close(fd);
 
-        _ = request_len;
+        // Set socket timeouts
+        net.setSocketTimeouts(fd, self.config.timeout_ms, self.config.timeout_ms);
 
-        // Simulated check - in production this would do actual I/O
-        // For now, assume success if server is configured
-        const response_time_ms: u32 = @intCast(now_ms - start_ms);
-        health.recordSuccess(now_ms, response_time_ms, &self.config);
+        // Send health check request
+        net.sendAll(fd, self.request_buf[0..request_len]) catch {
+            health_state.recordFailure(now_ms, &self.config);
+            return false;
+        };
 
+        // Read response
+        var total_read: usize = 0;
+        while (total_read < self.response_buf.len) {
+            const n = net.recvBlocking(fd, self.response_buf[total_read..]) catch break;
+            if (n == 0) break;
+            total_read += n;
+
+            // Try to parse — stop if complete
+            if (forward.parseUpstreamResponse(self.response_buf[0..total_read])) |_| {
+                break;
+            } else |_| {}
+        }
+
+        if (total_read == 0) {
+            health_state.recordFailure(now_ms, &self.config);
+            return false;
+        }
+
+        // Validate the response
+        if (!self.validateResponse(self.response_buf[0..total_read])) {
+            health_state.recordFailure(now_ms, &self.config);
+            return false;
+        }
+
+        // Calculate response time using monotonic clock
+        const end_ms = getMonotonicMs();
+        const response_time_ms: u32 = if (end_ms > start_ms)
+            @intCast(@min(end_ms - start_ms, std.math.maxInt(u32)))
+        else
+            0;
+        health_state.recordSuccess(now_ms, response_time_ms, &self.config);
         return true;
+    }
+
+    fn getMonotonicMs() u64 {
+        const ts = std.posix.clock_gettime(.MONOTONIC) catch return 0;
+        const sec_ms: u64 = @intCast(ts.sec * std.time.ms_per_s);
+        const nsec_ms: u64 = @intCast(@divTrunc(ts.nsec, std.time.ns_per_ms));
+        return sec_ms + nsec_ms;
     }
 
     /// Build HTTP health check request

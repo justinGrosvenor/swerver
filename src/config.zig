@@ -16,6 +16,8 @@ pub const ServerConfig = struct {
     /// Allowed Host header values. Empty slice means all hosts are accepted.
     /// When non-empty, requests with a Host header not in this list are rejected with 400.
     allowed_hosts: []const []const u8 = &.{},
+    /// Number of worker processes. 1 = single-process (no fork). 0 = auto-detect CPU count.
+    workers: u16 = 1,
 
     pub fn default() ServerConfig {
         return .{
@@ -31,6 +33,7 @@ pub const ServerConfig = struct {
             .quic = .{},
             .static_root = "",
             .allowed_hosts = &.{},
+            .workers = 1,
         };
     }
 
@@ -67,6 +70,7 @@ pub const ServerConfig = struct {
             if (self.quic.max_idle_timeout_ms == 0) return error.InvalidQuicConfig;
             if (self.quic.max_streams_bidi == 0 and self.quic.max_streams_uni == 0) return error.InvalidQuicConfig;
         }
+        if (self.workers > 256) return error.InvalidWorkerCount;
         if (self.static_root.len > 0) {
             // Reject paths containing null bytes
             for (self.static_root) |ch| {
@@ -157,4 +161,5 @@ pub const ConfigError = error{
     InvalidX402Config,
     InvalidQuicConfig,
     InvalidStaticRoot,
+    InvalidWorkerCount,
 };

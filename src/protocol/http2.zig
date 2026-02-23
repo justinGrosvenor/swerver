@@ -136,14 +136,7 @@ pub const Parser = struct {
                 (@as(u32, buf[offset + 6]) << 16) |
                 (@as(u32, buf[offset + 7]) << 8) |
                 (@as(u32, buf[offset + 8]));
-            if ((raw_stream_id & 0x8000_0000) != 0) {
-                return .{
-                    .state = .err,
-                    .error_code = .protocol_error,
-                    .consumed_bytes = offset,
-                    .frame_count = out_count,
-                };
-            }
+            // RFC 9113 §4.1: Reserved bit MUST be ignored by receiver
             const stream_id = raw_stream_id & 0x7fff_ffff;
             const payload_start = offset + 9;
             const payload_end = payload_start + len;
@@ -190,6 +183,8 @@ pub const Event = union(enum) {
     data: DataEvent,
     err: ErrorEvent,
     settings: SettingsEvent,
+    ping: PingEvent,
+    window_update_needed: WindowUpdateEvent,
 };
 
 pub const HeadersEvent = struct {
@@ -211,6 +206,18 @@ pub const ErrorEvent = struct {
 
 pub const SettingsEvent = struct {
     ack: bool,
+};
+
+pub const PingEvent = struct {
+    /// Opaque data from the PING frame (8 bytes) — must be echoed in ACK
+    opaque_data: [8]u8,
+};
+
+pub const WindowUpdateEvent = struct {
+    /// Stream ID (0 = connection level)
+    stream_id: u32,
+    /// Window increment to send
+    increment: u32,
 };
 
 pub const IngestResult = struct {
@@ -344,20 +351,21 @@ pub const HpackDecoder = struct {
         var method: []const u8 = "";
         var path: []const u8 = "";
         var authority: []const u8 = "";
+        var scheme: []const u8 = "";
 
         while (idx < block.len) {
             const b = block[idx];
             if ((b & 0x80) != 0) {
                 const index = try decodeInt(block, &idx, 7);
                 const field = self.lookup(index) orelse return error.InvalidIndex;
-                try appendHeader(.request, field.name, field.value, out_headers, &out_count, &total_size, max_header_list_size, &saw_regular, &method, &path, &authority, null);
+                try appendHeader(.request, field.name, field.value, out_headers, &out_count, &total_size, max_header_list_size, &saw_regular, &method, &path, &authority, null, &scheme);
                 continue;
             }
             if ((b & 0x40) != 0) {
                 const name_index = try decodeInt(block, &idx, 6);
                 const name = if (name_index == 0) try decodeString(self, block, &idx) else (self.lookup(name_index) orelse return error.InvalidIndex).name;
                 const value = try decodeString(self, block, &idx);
-                try appendHeader(.request, name, value, out_headers, &out_count, &total_size, max_header_list_size, &saw_regular, &method, &path, &authority, null);
+                try appendHeader(.request, name, value, out_headers, &out_count, &total_size, max_header_list_size, &saw_regular, &method, &path, &authority, null, &scheme);
                 self.addEntry(name, value);
                 continue;
             }
@@ -371,7 +379,7 @@ pub const HpackDecoder = struct {
             const name_index = try decodeInt(block, &idx, 4);
             const name = if (name_index == 0) try decodeString(self, block, &idx) else (self.lookup(name_index) orelse return error.InvalidIndex).name;
             const value = try decodeString(self, block, &idx);
-            try appendHeader(.request, name, value, out_headers, &out_count, &total_size, max_header_list_size, &saw_regular, &method, &path, &authority, null);
+            try appendHeader(.request, name, value, out_headers, &out_count, &total_size, max_header_list_size, &saw_regular, &method, &path, &authority, null, &scheme);
         }
 
         if (method.len == 0) return error.MissingPseudo;
@@ -379,8 +387,10 @@ pub const HpackDecoder = struct {
         if (method_enum == .CONNECT) {
             if (authority.len == 0) return error.MissingPseudo;
             if (path.len == 0) path = authority;
-        } else if (path.len == 0) {
-            return error.MissingPseudo;
+        } else {
+            // RFC 9113 §8.3.1: :scheme and :path MUST be present for non-CONNECT
+            if (scheme.len == 0) return error.MissingPseudo;
+            if (path.len == 0) return error.MissingPseudo;
         }
 
         return .{
@@ -404,14 +414,14 @@ pub const HpackDecoder = struct {
             if ((b & 0x80) != 0) {
                 const index = try decodeInt(block, &idx, 7);
                 const field = self.lookup(index) orelse return error.InvalidIndex;
-                try appendHeader(.response, field.name, field.value, out_headers, &out_count, &total_size, max_header_list_size, &saw_regular, null, null, null, &status);
+                try appendHeader(.response, field.name, field.value, out_headers, &out_count, &total_size, max_header_list_size, &saw_regular, null, null, null, &status, null);
                 continue;
             }
             if ((b & 0x40) != 0) {
                 const name_index = try decodeInt(block, &idx, 6);
                 const name = if (name_index == 0) try decodeString(self, block, &idx) else (self.lookup(name_index) orelse return error.InvalidIndex).name;
                 const value = try decodeString(self, block, &idx);
-                try appendHeader(.response, name, value, out_headers, &out_count, &total_size, max_header_list_size, &saw_regular, null, null, null, &status);
+                try appendHeader(.response, name, value, out_headers, &out_count, &total_size, max_header_list_size, &saw_regular, null, null, null, &status, null);
                 self.addEntry(name, value);
                 continue;
             }
@@ -423,7 +433,7 @@ pub const HpackDecoder = struct {
             const name_index = try decodeInt(block, &idx, 4);
             const name = if (name_index == 0) try decodeString(self, block, &idx) else (self.lookup(name_index) orelse return error.InvalidIndex).name;
             const value = try decodeString(self, block, &idx);
-            try appendHeader(.response, name, value, out_headers, &out_count, &total_size, max_header_list_size, &saw_regular, null, null, null, &status);
+            try appendHeader(.response, name, value, out_headers, &out_count, &total_size, max_header_list_size, &saw_regular, null, null, null, &status, null);
         }
 
         if (status.len == 0) return error.MissingPseudo;
@@ -783,6 +793,10 @@ pub const Stack = struct {
     }
 
     fn handleFrame(self: *Stack, frame: Frame, events: []Event) FrameHandle {
+        // RFC 9113 §5.4.2: After receiving GOAWAY, ignore frames on streams > last-stream-id
+        if (self.goaway_received and frame.header.stream_id > self.goaway_last_stream_id and frame.header.stream_id != 0) {
+            return .{ .state = .complete, .error_code = .none, .event_count = 0 };
+        }
         // RFC 7540 Section 6.2: When a header block is in progress (HEADERS without
         // END_HEADERS), only CONTINUATION frames for that stream are allowed.
         if (self.expecting_continuation != 0) {
@@ -800,7 +814,8 @@ pub const Stack = struct {
             .ping => self.handlePing(frame, events),
             .goaway => self.handleGoaway(frame, events),
             .priority => self.handlePriority(frame, events),
-            else => .{ .state = .complete, .error_code = .none, .event_count = 0 },
+            // RFC 9113 §6.6: A server MUST NOT send PUSH_PROMISE; receiving one is a PROTOCOL_ERROR
+            .push_promise => .{ .state = .err, .error_code = .protocol_error, .event_count = 0 },
         };
     }
 
@@ -954,12 +969,34 @@ pub const Stack = struct {
         stream.saw_data = true;
         if (end_stream) stream.state = .half_closed_remote else stream.state = .open;
         if (events.len == 0) return .{ .state = .complete, .error_code = .none, .event_count = 0 };
-        events[0] = .{ .data = .{
+        var event_count: usize = 0;
+        events[event_count] = .{ .data = .{
             .stream_id = frame.header.stream_id,
             .data = data,
             .end_stream = end_stream,
         } };
-        return .{ .state = .complete, .error_code = .none, .event_count = 1 };
+        event_count += 1;
+        // RFC 9113 §5.2.1: Send WINDOW_UPDATE when half the initial window is consumed
+        const half_window = @divTrunc(self.initial_stream_window, 2);
+        if (self.conn_recv_window < half_window and event_count < events.len) {
+            const increment: u32 = @intCast(self.initial_stream_window - self.conn_recv_window);
+            self.conn_recv_window = self.initial_stream_window;
+            events[event_count] = .{ .window_update_needed = .{
+                .stream_id = 0,
+                .increment = increment,
+            } };
+            event_count += 1;
+        }
+        if (!end_stream and stream.recv_window < half_window and event_count < events.len) {
+            const s_increment: u32 = @intCast(self.initial_stream_window - stream.recv_window);
+            stream.recv_window = self.initial_stream_window;
+            events[event_count] = .{ .window_update_needed = .{
+                .stream_id = frame.header.stream_id,
+                .increment = s_increment,
+            } };
+            event_count += 1;
+        }
+        return .{ .state = .complete, .error_code = .none, .event_count = event_count };
     }
 
     fn handleWindowUpdate(self: *Stack, frame: Frame, events: []Event) FrameHandle {
@@ -996,10 +1033,19 @@ pub const Stack = struct {
 
     fn handlePing(self: *Stack, frame: Frame, events: []Event) FrameHandle {
         _ = self;
-        _ = events;
         if (frame.payload.len != 8) return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
         if (frame.header.stream_id != 0) return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
-        return .{ .state = .complete, .error_code = .none, .event_count = 0 };
+        const ack = (frame.header.flags & 0x1) != 0;
+        if (ack) {
+            // PING ACK received — no response needed
+            return .{ .state = .complete, .error_code = .none, .event_count = 0 };
+        }
+        // RFC 9113 §6.7: MUST send PING ACK with identical opaque data
+        if (events.len == 0) return .{ .state = .complete, .error_code = .none, .event_count = 0 };
+        var opaque_data: [8]u8 = undefined;
+        @memcpy(&opaque_data, frame.payload[0..8]);
+        events[0] = .{ .ping = .{ .opaque_data = opaque_data } };
+        return .{ .state = .complete, .error_code = .none, .event_count = 1 };
     }
 
     fn handlePriority(self: *Stack, frame: Frame, events: []Event) FrameHandle {
@@ -1055,7 +1101,17 @@ pub const Stack = struct {
             // SETTINGS_INITIAL_WINDOW_SIZE (0x4) - must be <= 2^31-1
             0x4 => {
                 if (value > 0x7fff_ffff) return error.InvalidSetting;
-                self.initial_stream_window = @intCast(value);
+                const new_window: i32 = @intCast(value);
+                const delta: i64 = @as(i64, new_window) - @as(i64, self.initial_stream_window);
+                // RFC 9113 §6.5.2: Adjust existing stream windows by the delta
+                for (self.streams[0..self.stream_count]) |*stream| {
+                    if (stream.state == .closed) continue;
+                    const adjusted = @as(i64, stream.recv_window) + delta;
+                    // RFC 9113 §6.5.2: flow-control error if window exceeds 2^31-1
+                    if (adjusted > 0x7fff_ffff) return error.InvalidSetting;
+                    stream.recv_window = @intCast(adjusted);
+                }
+                self.initial_stream_window = new_window;
             },
             // SETTINGS_MAX_FRAME_SIZE (0x5) - must be between 2^14 and 2^24-1
             0x5 => {
@@ -1117,6 +1173,14 @@ pub const Stack = struct {
             }
         }
         return null;
+    }
+
+    /// Mark a stream as closed after sending a complete response (END_STREAM on our side).
+    /// RFC 9113 §5.1: After both sides send END_STREAM, the stream is closed.
+    pub fn closeStream(self: *Stack, stream_id: u32) void {
+        if (self.findStream(stream_id)) |stream| {
+            stream.state = .closed;
+        }
     }
 
     fn decodeHeaders(self: *Stack, stream: *Stream) !HeaderBlockResult {
@@ -1217,6 +1281,23 @@ const HeaderMode = enum {
     response,
 };
 
+/// RFC 9113 §8.2: Connection-specific headers MUST NOT appear in HTTP/2
+fn isConnectionSpecificHeader(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "connection") or
+        std.ascii.eqlIgnoreCase(name, "keep-alive") or
+        std.ascii.eqlIgnoreCase(name, "proxy-connection") or
+        std.ascii.eqlIgnoreCase(name, "upgrade");
+    // Note: transfer-encoding is allowed in HTTP/2 for request bodies
+}
+
+/// RFC 9113 §8.2: Header field names MUST be lowercase
+fn hasUppercaseChar(name: []const u8) bool {
+    for (name) |ch| {
+        if (ch >= 'A' and ch <= 'Z') return true;
+    }
+    return false;
+}
+
 fn appendHeader(
     mode: HeaderMode,
     name: []const u8,
@@ -1230,10 +1311,23 @@ fn appendHeader(
     path: ?*[]const u8,
     authority: ?*[]const u8,
     status: ?*[]const u8,
+    scheme: ?*[]const u8,
 ) !void {
     const is_pseudo = name.len != 0 and name[0] == ':';
     if (is_pseudo and saw_regular.*) return error.Protocol;
-    if (!is_pseudo) saw_regular.* = true;
+    if (!is_pseudo) {
+        saw_regular.* = true;
+        // RFC 9113 §8.2: Header names MUST be lowercase
+        if (hasUppercaseChar(name)) return error.Protocol;
+        // RFC 9113 §8.2.2: Connection-specific headers MUST NOT appear
+        if (isConnectionSpecificHeader(name)) return error.Protocol;
+        // RFC 9113 §8.2.2: transfer-encoding MUST NOT appear in HTTP/2
+        if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) return error.Protocol;
+        // RFC 9113 §8.4.2: TE header is only valid with value "trailers"
+        if (std.ascii.eqlIgnoreCase(name, "te")) {
+            if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t"), "trailers")) return error.Protocol;
+        }
+    }
     if (is_pseudo) {
         switch (mode) {
             .request => {
@@ -1255,7 +1349,14 @@ fn appendHeader(
                     authority.?.* = value;
                     return;
                 }
-                if (std.mem.eql(u8, name, ":scheme")) return;
+                if (std.mem.eql(u8, name, ":scheme")) {
+                    // RFC 9113 §8.3.1: :scheme MUST be present, track it
+                    if (scheme) |s| {
+                        if (s.*.len != 0) return error.Protocol; // duplicate
+                        s.* = value;
+                    }
+                    return;
+                }
                 return error.Protocol;
             },
             .response => {
@@ -1486,17 +1587,74 @@ pub fn encodeResponseHeaders(
     } else {
         idx += try encodeLiteralHeader(buf[idx..], ":status", statusString(status));
     }
-    var length_buf: [20]u8 = undefined;
-    const length_slice = try std.fmt.bufPrint(length_buf[0..], "{d}", .{content_length});
-    idx += try encodeLiteralHeaderIndexed(buf[idx..], "content-length", length_slice);
+    // RFC 9110 §15.2: 1xx responses have no content-length, no date
+    if (status >= 100 and status < 200) {
+        return idx;
+    }
+    // RFC 9110 §8.6: MUST NOT send content-length in 204 or 304 responses
+    if (status != 204 and status != 304) {
+        var length_buf: [20]u8 = undefined;
+        const length_slice = try std.fmt.bufPrint(length_buf[0..], "{d}", .{content_length});
+        idx += try encodeLiteralHeaderIndexed(buf[idx..], "content-length", length_slice);
+    }
+    // RFC 9110 §6.6.1: Origin servers MUST send Date header
+    idx += try encodeLiteralHeaderIndexed(buf[idx..], "date", formatImfDateHttp2(&date_scratch_buf));
     for (headers) |header| {
         // Skip pseudo-headers (already handled)
         if (header.name.len > 0 and header.name[0] == ':') continue;
         // Skip content-length (already added above to avoid duplicates)
         if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
+        // Skip date (already added above)
+        if (std.ascii.eqlIgnoreCase(header.name, "date")) continue;
         idx += try encodeLiteralHeader(buf[idx..], header.name, header.value);
     }
     return idx;
+}
+
+/// Thread-local scratch buffer for IMF-fixdate in HTTP/2 responses
+threadlocal var date_scratch_buf: [29]u8 = undefined;
+
+/// Format current time as IMF-fixdate (RFC 9110 §5.6.7) for HTTP/2
+/// e.g., "Sun, 06 Nov 1994 08:49:37 GMT"
+fn formatImfDateHttp2(buf: *[29]u8) []const u8 {
+    const day_names = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
+    const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+
+    const ts = std.posix.clock_gettime(.REALTIME) catch return "Thu, 01 Jan 1970 00:00:00 GMT";
+    const epoch_secs: u64 = @intCast(ts.sec);
+    const secs_per_day: u64 = 86400;
+    var days = epoch_secs / secs_per_day;
+    const day_secs = epoch_secs % secs_per_day;
+    const hour = day_secs / 3600;
+    const minute = (day_secs % 3600) / 60;
+    const second = day_secs % 60;
+    const wday = days % 7;
+    var year: u64 = 1970;
+    while (true) {
+        const days_in_year: u64 = if (isLeapYear(year)) 366 else 365;
+        if (days < days_in_year) break;
+        days -= days_in_year;
+        year += 1;
+    }
+    const leap = isLeapYear(year);
+    const month_days_arr = if (leap)
+        [_]u64{ 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 }
+    else
+        [_]u64{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    var month: usize = 0;
+    while (month < 11) : (month += 1) {
+        if (days < month_days_arr[month]) break;
+        days -= month_days_arr[month];
+    }
+    const day = days + 1;
+    _ = std.fmt.bufPrint(buf, "{s}, {d:0>2} {s} {d:0>4} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
+        day_names[wday], day, month_names[month], year, hour, minute, second,
+    }) catch return "Thu, 01 Jan 1970 00:00:00 GMT";
+    return buf[0..29];
+}
+
+fn isLeapYear(year: u64) bool {
+    return (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0);
 }
 
 fn statusStaticIndex(status: u16) usize {
@@ -1512,16 +1670,37 @@ fn statusStaticIndex(status: u16) usize {
     };
 }
 
+/// Thread-local buffer for formatting arbitrary status codes as strings.
+/// The static index covers 200, 204, 206, 304, 400, 404, 500 — this handles everything else.
+threadlocal var status_fmt_buf: [3]u8 = undefined;
+
 fn statusString(status: u16) []const u8 {
     return switch (status) {
         200 => "200",
+        201 => "201",
         204 => "204",
         206 => "206",
+        301 => "301",
+        302 => "302",
         304 => "304",
         400 => "400",
+        401 => "401",
+        403 => "403",
         404 => "404",
+        405 => "405",
+        429 => "429",
         500 => "500",
-        else => "500",
+        502 => "502",
+        503 => "503",
+        504 => "504",
+        else => {
+            // Dynamically format any 3-digit status code
+            if (status >= 100 and status <= 999) {
+                _ = std.fmt.bufPrint(&status_fmt_buf, "{d}", .{status}) catch return "500";
+                return &status_fmt_buf;
+            }
+            return "500";
+        },
     };
 }
 
@@ -1583,4 +1762,84 @@ fn staticNameIndex(name: []const u8) usize {
         }
     }
     return 0;
+}
+
+// ============================================================
+// Server-side frame generation helpers
+// ============================================================
+
+/// Write the server SETTINGS frame (RFC 9113 §3.4: MUST be first frame sent)
+pub fn writeServerSettings(buf: []u8, cfg: StackConfig) !usize {
+    // Each setting is 6 bytes: 2-byte ID + 4-byte value
+    var payload: [42]u8 = undefined; // Up to 7 settings
+    var plen: usize = 0;
+
+    // SETTINGS_HEADER_TABLE_SIZE (0x1)
+    writeSetting(&payload, &plen, 0x1, @intCast(cfg.max_dynamic_table_size));
+    // SETTINGS_ENABLE_PUSH (0x2) - server MUST NOT send push, advertise 0
+    writeSetting(&payload, &plen, 0x2, 0);
+    // SETTINGS_MAX_CONCURRENT_STREAMS (0x3)
+    writeSetting(&payload, &plen, 0x3, @intCast(cfg.max_streams));
+    // SETTINGS_INITIAL_WINDOW_SIZE (0x4)
+    writeSetting(&payload, &plen, 0x4, cfg.initial_window_size);
+    // SETTINGS_MAX_FRAME_SIZE (0x5)
+    writeSetting(&payload, &plen, 0x5, cfg.max_frame_size);
+    // SETTINGS_MAX_HEADER_LIST_SIZE (0x6)
+    writeSetting(&payload, &plen, 0x6, @intCast(cfg.max_header_list_size));
+
+    return writeFrame(buf, .settings, 0, 0, payload[0..plen]);
+}
+
+/// Write a SETTINGS ACK frame (RFC 9113 §6.5.3)
+pub fn writeSettingsAck(buf: []u8) !usize {
+    return writeFrame(buf, .settings, 0x1, 0, &.{});
+}
+
+/// Write a PING ACK frame (RFC 9113 §6.7)
+pub fn writePingAck(buf: []u8, opaque_data: [8]u8) !usize {
+    return writeFrame(buf, .ping, 0x1, 0, &opaque_data);
+}
+
+/// Write a WINDOW_UPDATE frame (RFC 9113 §6.9)
+pub fn writeWindowUpdate(buf: []u8, stream_id: u32, increment: u32) !usize {
+    var payload: [4]u8 = undefined;
+    payload[0] = @intCast((increment >> 24) & 0x7f);
+    payload[1] = @intCast((increment >> 16) & 0xff);
+    payload[2] = @intCast((increment >> 8) & 0xff);
+    payload[3] = @intCast(increment & 0xff);
+    return writeFrame(buf, .window_update, 0, stream_id, &payload);
+}
+
+/// Write a RST_STREAM frame (RFC 9113 §6.4)
+pub fn writeRstStream(buf: []u8, stream_id: u32, error_code: u32) !usize {
+    var payload: [4]u8 = undefined;
+    payload[0] = @intCast((error_code >> 24) & 0xff);
+    payload[1] = @intCast((error_code >> 16) & 0xff);
+    payload[2] = @intCast((error_code >> 8) & 0xff);
+    payload[3] = @intCast(error_code & 0xff);
+    return writeFrame(buf, .rst_stream, 0, stream_id, &payload);
+}
+
+/// Write a GOAWAY frame (RFC 9113 §5.4.1)
+pub fn writeGoaway(buf: []u8, last_stream_id: u32, error_code: u32) !usize {
+    var payload: [8]u8 = undefined;
+    payload[0] = @intCast((last_stream_id >> 24) & 0x7f);
+    payload[1] = @intCast((last_stream_id >> 16) & 0xff);
+    payload[2] = @intCast((last_stream_id >> 8) & 0xff);
+    payload[3] = @intCast(last_stream_id & 0xff);
+    payload[4] = @intCast((error_code >> 24) & 0xff);
+    payload[5] = @intCast((error_code >> 16) & 0xff);
+    payload[6] = @intCast((error_code >> 8) & 0xff);
+    payload[7] = @intCast(error_code & 0xff);
+    return writeFrame(buf, .goaway, 0, 0, &payload);
+}
+
+fn writeSetting(payload: []u8, pos: *usize, id: u16, value: u32) void {
+    payload[pos.*] = @intCast((id >> 8) & 0xff);
+    payload[pos.* + 1] = @intCast(id & 0xff);
+    payload[pos.* + 2] = @intCast((value >> 24) & 0xff);
+    payload[pos.* + 3] = @intCast((value >> 16) & 0xff);
+    payload[pos.* + 4] = @intCast((value >> 8) & 0xff);
+    payload[pos.* + 5] = @intCast(value & 0xff);
+    pos.* += 6;
 }

@@ -237,6 +237,7 @@ pub const FormatBuffer = struct {
 // Re-export sub-middleware modules
 pub const health = @import("health.zig");
 pub const metrics = @import("metrics_mw.zig");
+pub const access_log = @import("access_log.zig");
 pub const ratelimit = @import("ratelimit.zig");
 pub const security = @import("security.zig");
 pub const observability = @import("observability.zig");

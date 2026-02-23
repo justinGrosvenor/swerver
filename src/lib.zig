@@ -1,8 +1,10 @@
 pub const config = @import("config.zig");
+pub const config_file = @import("config_file.zig");
 const server_mod = @import("server.zig");
 pub const Server = server_mod.Server;
 pub const registerDefaultRoutes = server_mod.registerDefaultRoutes;
 pub const ServerBuilder = @import("server_builder.zig").ServerBuilder;
+pub const Master = @import("master.zig").Master;
 pub const router = @import("router/router.zig");
 pub const request = @import("protocol/request.zig");
 pub const response = @import("response/response.zig");

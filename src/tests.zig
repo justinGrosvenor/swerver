@@ -20,7 +20,15 @@ const quic_metrics = @import("quic/metrics.zig");
 const http3_frame = @import("protocol/http3/frame.zig");
 const http3_qpack = @import("protocol/http3/qpack.zig");
 const metrics_mw = @import("middleware/metrics_mw.zig");
+const access_log = @import("middleware/access_log.zig");
 const server = @import("server.zig");
+const master = @import("master.zig");
+
+// Config file parser
+const config_file = @import("config_file.zig");
+
+// I/O backend modules
+const io_uring = @import("runtime/backend/io_uring.zig");
 
 // Proxy modules
 const proxy_upstream = @import("proxy/upstream.zig");
@@ -46,7 +54,13 @@ comptime {
     _ = http3_frame;
     _ = http3_qpack;
     _ = metrics_mw;
+    _ = access_log;
     _ = server;
+    _ = master;
+    // Config file parser
+    _ = config_file;
+    // I/O backend modules
+    _ = io_uring;
     // Proxy modules
     _ = proxy_upstream;
     _ = proxy_pool;
@@ -74,9 +88,11 @@ fn parseRequest(input: []const u8, limits: http1.Limits) !Parsed {
 
 fn buildHeaderBlockAuthority(buffer: []u8, authority: []const u8) []u8 {
     var idx: usize = 0;
-    buffer[idx] = 0x82; // :method GET
+    buffer[idx] = 0x82; // :method GET (static index 2)
     idx += 1;
-    buffer[idx] = 0x84; // :path /
+    buffer[idx] = 0x84; // :path / (static index 4)
+    idx += 1;
+    buffer[idx] = 0x86; // :scheme http (static index 6)
     idx += 1;
     buffer[idx] = 0x01; // literal without indexing, indexed name :authority (index 1)
     idx += 1;
@@ -262,7 +278,7 @@ test "http1 expect 100-continue invalid value rejects" {
     defer parsed.deinit();
 
     try std.testing.expectEqual(http1.ParseState.err, parsed.result.state);
-    try std.testing.expectEqual(http1.ErrorCode.invalid_header_value, parsed.result.error_code);
+    try std.testing.expectEqual(http1.ErrorCode.expectation_failed, parsed.result.error_code);
 }
 
 test "http1 parses chunked with trailers" {
@@ -596,13 +612,15 @@ test "http2 hpack decodes huffman example" {
 test "http2 response encoder roundtrip" {
     var decoder = http2.HpackDecoder.init();
     var headers: [8]request.Header = undefined;
-    var buf: [128]u8 = undefined;
+    var buf: [256]u8 = undefined;
     const encoded_len = try http2.encodeResponseHeaders(buf[0..], 200, &[_]response.Header{}, 12);
     const decoded = try decoder.decodeResponseBlock(buf[0..encoded_len], headers[0..], 4096);
     try std.testing.expectEqualStrings("200", decoded.status);
-    try std.testing.expectEqual(@as(usize, 1), decoded.headers.len);
+    try std.testing.expectEqual(@as(usize, 2), decoded.headers.len);
     try std.testing.expectEqualStrings("content-length", decoded.headers[0].name);
     try std.testing.expectEqualStrings("12", decoded.headers[0].value);
+    try std.testing.expectEqualStrings("date", decoded.headers[1].name);
+    try std.testing.expect(decoded.headers[1].value.len == 29); // IMF-fixdate is exactly 29 chars
 }
 
 test "http2 response encoder includes custom headers" {
@@ -616,13 +634,14 @@ test "http2 response encoder includes custom headers" {
     const encoded_len = try http2.encodeResponseHeaders(buf[0..], 200, custom[0..], 0);
     const decoded = try decoder.decodeResponseBlock(buf[0..encoded_len], headers[0..], 4096);
     try std.testing.expectEqualStrings("200", decoded.status);
-    try std.testing.expectEqual(@as(usize, 3), decoded.headers.len);
+    try std.testing.expectEqual(@as(usize, 4), decoded.headers.len);
     try std.testing.expectEqualStrings("content-length", decoded.headers[0].name);
     try std.testing.expectEqualStrings("0", decoded.headers[0].value);
-    try std.testing.expectEqualStrings("x-test", decoded.headers[1].name);
-    try std.testing.expectEqualStrings("one", decoded.headers[1].value);
-    try std.testing.expectEqualStrings("cache-control", decoded.headers[2].name);
-    try std.testing.expectEqualStrings("no-cache", decoded.headers[2].value);
+    try std.testing.expectEqualStrings("date", decoded.headers[1].name);
+    try std.testing.expectEqualStrings("x-test", decoded.headers[2].name);
+    try std.testing.expectEqualStrings("one", decoded.headers[2].value);
+    try std.testing.expectEqualStrings("cache-control", decoded.headers[3].name);
+    try std.testing.expectEqualStrings("no-cache", decoded.headers[3].value);
 }
 
 test "http2 dynamic table resolves indexed header" {
@@ -666,15 +685,16 @@ test "http2 response encoder preserves header order and duplicates" {
     const encoded_len = try http2.encodeResponseHeaders(buf[0..], 200, custom[0..], 0);
     const decoded = try decoder.decodeResponseBlock(buf[0..encoded_len], headers[0..], 4096);
     try std.testing.expectEqualStrings("200", decoded.status);
-    try std.testing.expectEqual(@as(usize, 4), decoded.headers.len);
+    try std.testing.expectEqual(@as(usize, 5), decoded.headers.len);
     try std.testing.expectEqualStrings("content-length", decoded.headers[0].name);
     try std.testing.expectEqualStrings("0", decoded.headers[0].value);
-    try std.testing.expectEqualStrings("set-cookie", decoded.headers[1].name);
-    try std.testing.expectEqualStrings("a=1", decoded.headers[1].value);
-    try std.testing.expectEqualStrings("x-order", decoded.headers[2].name);
-    try std.testing.expectEqualStrings("first", decoded.headers[2].value);
-    try std.testing.expectEqualStrings("set-cookie", decoded.headers[3].name);
-    try std.testing.expectEqualStrings("b=2", decoded.headers[3].value);
+    try std.testing.expectEqualStrings("date", decoded.headers[1].name);
+    try std.testing.expectEqualStrings("set-cookie", decoded.headers[2].name);
+    try std.testing.expectEqualStrings("a=1", decoded.headers[2].value);
+    try std.testing.expectEqualStrings("x-order", decoded.headers[3].name);
+    try std.testing.expectEqualStrings("first", decoded.headers[3].value);
+    try std.testing.expectEqualStrings("set-cookie", decoded.headers[4].name);
+    try std.testing.expectEqualStrings("b=2", decoded.headers[4].value);
 }
 
 test "http2 response encoder ignores pseudo headers in custom list" {
@@ -688,9 +708,10 @@ test "http2 response encoder ignores pseudo headers in custom list" {
     const encoded_len = try http2.encodeResponseHeaders(buf[0..], 200, custom[0..], 0);
     const decoded = try decoder.decodeResponseBlock(buf[0..encoded_len], headers[0..], 4096);
     try std.testing.expectEqualStrings("200", decoded.status);
-    try std.testing.expectEqual(@as(usize, 2), decoded.headers.len);
+    try std.testing.expectEqual(@as(usize, 3), decoded.headers.len);
     try std.testing.expectEqualStrings("content-length", decoded.headers[0].name);
     try std.testing.expectEqualStrings("0", decoded.headers[0].value);
-    try std.testing.expectEqualStrings("x-ok", decoded.headers[1].name);
-    try std.testing.expectEqualStrings("yes", decoded.headers[1].value);
+    try std.testing.expectEqualStrings("date", decoded.headers[1].name);
+    try std.testing.expectEqualStrings("x-ok", decoded.headers[2].name);
+    try std.testing.expectEqualStrings("yes", decoded.headers[2].value);
 }

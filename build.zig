@@ -9,6 +9,7 @@ pub fn build(b: *std.Build) void {
     options.addOption(bool, "enable_http2", b.option(bool, "enable-http2", "Enable HTTP/2 support") orelse false);
     options.addOption(bool, "enable_http3", b.option(bool, "enable-http3", "Enable HTTP/3 support") orelse false);
     options.addOption(bool, "enable_proxy", b.option(bool, "enable-proxy", "Enable reverse proxy support") orelse false);
+    options.addOption(bool, "enable_io_uring", b.option(bool, "enable-io-uring", "Enable io_uring backend (Linux only)") orelse false);
 
     const swerver_module = b.createModule(.{
         .root_source_file = b.path("src/lib.zig"),
@@ -60,6 +61,7 @@ pub fn build(b: *std.Build) void {
     options_tls.addOption(bool, "enable_http2", false);
     options_tls.addOption(bool, "enable_http3", false);
     options_tls.addOption(bool, "enable_proxy", false);
+    options_tls.addOption(bool, "enable_io_uring", false);
     test_tls.root_module.addOptions("build_options", options_tls);
     const test_tls_run = b.addRunArtifact(test_tls);
 
@@ -72,6 +74,7 @@ pub fn build(b: *std.Build) void {
     options_http2.addOption(bool, "enable_http2", true);
     options_http2.addOption(bool, "enable_http3", false);
     options_http2.addOption(bool, "enable_proxy", false);
+    options_http2.addOption(bool, "enable_io_uring", false);
     test_http2.root_module.addOptions("build_options", options_http2);
     const test_http2_run = b.addRunArtifact(test_http2);
 
@@ -84,6 +87,7 @@ pub fn build(b: *std.Build) void {
     options_http3.addOption(bool, "enable_http2", false);
     options_http3.addOption(bool, "enable_http3", true);
     options_http3.addOption(bool, "enable_proxy", false);
+    options_http3.addOption(bool, "enable_io_uring", false);
     test_http3.root_module.addOptions("build_options", options_http3);
     const test_http3_run = b.addRunArtifact(test_http3);
 
@@ -96,8 +100,22 @@ pub fn build(b: *std.Build) void {
     options_proxy.addOption(bool, "enable_http2", false);
     options_proxy.addOption(bool, "enable_http3", false);
     options_proxy.addOption(bool, "enable_proxy", true);
+    options_proxy.addOption(bool, "enable_io_uring", false);
     test_proxy.root_module.addOptions("build_options", options_proxy);
     const test_proxy_run = b.addRunArtifact(test_proxy);
+
+    const test_io_uring = b.addTest(.{
+        .root_module = test_module,
+    });
+    test_io_uring.root_module.addImport("swerver", swerver_module);
+    const options_io_uring = b.addOptions();
+    options_io_uring.addOption(bool, "enable_tls", false);
+    options_io_uring.addOption(bool, "enable_http2", false);
+    options_io_uring.addOption(bool, "enable_http3", false);
+    options_io_uring.addOption(bool, "enable_proxy", false);
+    options_io_uring.addOption(bool, "enable_io_uring", true);
+    test_io_uring.root_module.addOptions("build_options", options_io_uring);
+    const test_io_uring_run = b.addRunArtifact(test_io_uring);
 
     const test_all = b.addTest(.{
         .root_module = test_module,
@@ -108,6 +126,7 @@ pub fn build(b: *std.Build) void {
     options_all.addOption(bool, "enable_http2", true);
     options_all.addOption(bool, "enable_http3", true);
     options_all.addOption(bool, "enable_proxy", true);
+    options_all.addOption(bool, "enable_io_uring", true);
     test_all.root_module.addOptions("build_options", options_all);
     const test_all_run = b.addRunArtifact(test_all);
 
@@ -117,6 +136,7 @@ pub fn build(b: *std.Build) void {
     test_matrix.dependOn(&test_http2_run.step);
     test_matrix.dependOn(&test_http3_run.step);
     test_matrix.dependOn(&test_proxy_run.step);
+    test_matrix.dependOn(&test_io_uring_run.step);
     test_matrix.dependOn(&test_all_run.step);
 
     const test_flags = b.step("test-flags", "Compile unit tests across build flag combinations");
@@ -125,6 +145,7 @@ pub fn build(b: *std.Build) void {
     test_flags.dependOn(&test_http2.step);
     test_flags.dependOn(&test_http3.step);
     test_flags.dependOn(&test_proxy.step);
+    test_flags.dependOn(&test_io_uring.step);
     test_flags.dependOn(&test_all.step);
 
     const fuzz_module = b.createModule(.{

@@ -133,6 +133,43 @@ const StreamState = struct {
 /// Maximum size of body data per DATA frame (16KB)
 pub const MAX_DATA_FRAME_SIZE: usize = 16 * 1024;
 
+/// Format current time as IMF-fixdate (RFC 9110 §5.6.7) for HTTP/3
+fn formatImfDateHttp3(buf: *[29]u8) []const u8 {
+    const day_names = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
+    const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    const ts = std.posix.clock_gettime(.REALTIME) catch return "Thu, 01 Jan 1970 00:00:00 GMT";
+    const epoch_secs: u64 = @intCast(ts.sec);
+    const secs_per_day: u64 = 86400;
+    var days = epoch_secs / secs_per_day;
+    const day_secs = epoch_secs % secs_per_day;
+    const hour = day_secs / 3600;
+    const minute = (day_secs % 3600) / 60;
+    const second = day_secs % 60;
+    const wday = days % 7;
+    var year: u64 = 1970;
+    while (true) {
+        const days_in_year: u64 = if (year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)) 366 else 365;
+        if (days < days_in_year) break;
+        days -= days_in_year;
+        year += 1;
+    }
+    const leap = (year % 4 == 0 and (year % 100 != 0 or year % 400 == 0));
+    const month_days_arr = if (leap)
+        [_]u64{ 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 }
+    else
+        [_]u64{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    var month: usize = 0;
+    while (month < 11) : (month += 1) {
+        if (days < month_days_arr[month]) break;
+        days -= month_days_arr[month];
+    }
+    const day = days + 1;
+    _ = std.fmt.bufPrint(buf, "{s}, {d:0>2} {s} {d:0>4} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
+        day_names[wday], day, month_names[month], year, hour, minute, second,
+    }) catch return "Thu, 01 Jan 1970 00:00:00 GMT";
+    return buf[0..29];
+}
+
 /// HTTP/3 Stack
 pub const Stack = struct {
     allocator: std.mem.Allocator,
@@ -515,17 +552,28 @@ pub const Stack = struct {
         var offset: usize = 0;
 
         // Build header array with :status pseudo-header first
-        var all_headers: [65]Header = undefined;
+        var all_headers: [66]Header = undefined;
         var status_buf: [3]u8 = undefined;
         _ = std.fmt.bufPrint(&status_buf, "{d}", .{status}) catch {
             return error.BufferTooSmall;
         };
 
         all_headers[0] = .{ .name = ":status", .value = &status_buf };
-        for (headers, 1..) |h, i| {
-            all_headers[i] = h;
+        // RFC 9110 §6.3: Suppress content-length for 1xx/204/304 (no message body)
+        const suppress_body = (status >= 100 and status < 200) or status == 204 or status == 304;
+        var header_count: usize = 1;
+        for (headers) |h| {
+            if (suppress_body and std.ascii.eqlIgnoreCase(h.name, "content-length")) continue;
+            all_headers[header_count] = h;
+            header_count += 1;
         }
-        const header_count = headers.len + 1;
+        // RFC 9110 §6.6.1: Origin servers MUST send Date header (except 1xx)
+        var date_buf: [29]u8 = undefined;
+        if (status >= 200) {
+            const date_str = formatImfDateHttp3(&date_buf);
+            all_headers[header_count] = .{ .name = "date", .value = date_str };
+            header_count += 1;
+        }
 
         // Encode headers with QPACK
         var qpack_buf: [4096]u8 = undefined;
@@ -537,6 +585,9 @@ pub const Stack = struct {
         offset += frame.writeHeadersFrame(buf[offset..], qpack_buf[0..qpack_len]) catch {
             return error.BufferTooSmall;
         };
+
+        // RFC 9110 §6.3: 1xx/204/304 MUST NOT contain a message body
+        if (suppress_body) return offset;
 
         // Write DATA frame(s) if body present - chunk large bodies
         if (body) |b| {
@@ -584,17 +635,27 @@ pub const Stack = struct {
 
             // Send headers first
             if (!self.headers_sent) {
-                var all_headers: [65]Header = undefined;
+                var all_headers: [66]Header = undefined;
                 var status_buf: [3]u8 = undefined;
                 _ = std.fmt.bufPrint(&status_buf, "{d}", .{self.status}) catch {
                     return error.BufferTooSmall;
                 };
 
+                const suppress_body = (self.status >= 100 and self.status < 200) or self.status == 204 or self.status == 304;
                 all_headers[0] = .{ .name = ":status", .value = &status_buf };
-                for (self.headers, 1..) |h, i| {
-                    all_headers[i] = h;
+                var header_count: usize = 1;
+                for (self.headers) |h| {
+                    if (suppress_body and std.ascii.eqlIgnoreCase(h.name, "content-length")) continue;
+                    all_headers[header_count] = h;
+                    header_count += 1;
                 }
-                const header_count = self.headers.len + 1;
+                // RFC 9110 §6.6.1: Date header (except 1xx)
+                var date_buf: [29]u8 = undefined;
+                if (self.status >= 200) {
+                    const date_str = formatImfDateHttp3(&date_buf);
+                    all_headers[header_count] = .{ .name = "date", .value = date_str };
+                    header_count += 1;
+                }
 
                 var qpack_buf: [4096]u8 = undefined;
                 const qpack_len = self.stack.qpack_encoder.encode(&qpack_buf, all_headers[0..header_count]) catch {
@@ -606,6 +667,7 @@ pub const Stack = struct {
                 };
 
                 self.headers_sent = true;
+                if (suppress_body) return offset;
             }
 
             // Send body chunk if there's more body

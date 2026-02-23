@@ -102,6 +102,7 @@ pub fn statusPhrase(code: u16) []const u8 {
         413 => "Content Too Large",
         414 => "URI Too Long",
         415 => "Unsupported Media Type",
+        417 => "Expectation Failed",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
         501 => "Not Implemented",

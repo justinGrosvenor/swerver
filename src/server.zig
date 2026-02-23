@@ -17,12 +17,19 @@ const quic_connection = @import("quic/connection.zig");
 const middleware = @import("middleware/middleware.zig");
 const request = @import("protocol/request.zig");
 const metrics_mw = @import("middleware/metrics_mw.zig");
+const proxy_mod = @import("proxy/proxy.zig");
 
 /// Global shutdown flag set by signal handler (atomic for signal safety)
 var shutdown_requested = std.atomic.Value(bool).init(false);
+/// Global reload flag set by SIGHUP handler (atomic for signal safety)
+var reload_requested = std.atomic.Value(bool).init(false);
 
 fn handleShutdownSignal(_: std.posix.SIG) callconv(.c) void {
     shutdown_requested.store(true, .release);
+}
+
+fn handleReloadSignal(_: std.posix.SIG) callconv(.c) void {
+    reload_requested.store(true, .release);
 }
 
 pub const Server = struct {
@@ -36,6 +43,10 @@ pub const Server = struct {
     http2_stack: ?http2.Stack,
     http3_stack: ?http3.Stack,
     quic: ?quic_handler.Handler,
+    /// Reverse proxy handler (null if proxy not configured)
+    proxy: ?*proxy_mod.Proxy = null,
+    /// Config file path for hot reload (null if not using config file)
+    config_path: ?[]const u8 = null,
     /// Buffer for receiving UDP datagrams
     udp_recv_buf: [2048]u8 = undefined,
     /// Pre-computed Alt-Svc header value for HTTP/3 advertisement
@@ -43,56 +54,23 @@ pub const Server = struct {
     alt_svc_len: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, cfg: config.ServerConfig) !Server {
-        if (cfg.limits.max_header_count > connection.HeaderCapacity) return error.InvalidHeaderTable;
-        const io_runtime = try runtime.IoRuntime.init(allocator, cfg);
         var app_router = router.Router.init(.{
             .require_payment = cfg.x402.enabled,
             .payment_required_b64 = cfg.x402.payment_required_b64,
         });
-
         try registerDefaultRoutes(&app_router);
-        const tls_provider: ?tls.Provider = if (build_options.enable_tls and cfg.quic.enabled)
-            try tls.Provider.init(allocator, cfg.quic.cert_path, cfg.quic.key_path)
-        else
-            null;
-        const http2_stack: ?http2.Stack = if (build_options.enable_http2) http2.Stack.initWithConfig(.{
-            .max_streams = cfg.http2.max_streams,
-            .max_header_list_size = cfg.http2.max_header_list_size,
-            .initial_window_size = cfg.http2.initial_window_size,
-            .max_frame_size = cfg.http2.max_frame_size,
-            .max_dynamic_table_size = cfg.http2.max_dynamic_table_size,
-        }) else null;
-        const http3_stack: ?http3.Stack = if (build_options.enable_http3) http3.Stack.init(allocator, true) else null;
-        const quic: ?quic_handler.Handler = if (build_options.enable_http3 and cfg.quic.enabled)
-            quic_handler.Handler.init(allocator, true, cfg.max_connections)
-        else
-            null;
-
-        // Pre-compute Alt-Svc header if QUIC is enabled
-        var alt_svc_value: [64]u8 = undefined;
-        var alt_svc_len: usize = 0;
-        if (cfg.quic.enabled) {
-            const alt_svc = cfg.quic.buildAltSvcHeader(&alt_svc_value) catch "";
-            alt_svc_len = alt_svc.len;
-        }
-
-        return .{
-            .allocator = allocator,
-            .cfg = cfg,
-            .io = io_runtime,
-            .app_router = app_router,
-            .listener_fd = null,
-            .udp_fd = null,
-            .tls_provider = tls_provider,
-            .http2_stack = http2_stack,
-            .http3_stack = http3_stack,
-            .quic = quic,
-            .alt_svc_value = alt_svc_value,
-            .alt_svc_len = alt_svc_len,
-        };
+        return initWithRouter(allocator, cfg, app_router);
     }
 
     pub fn initWithRouter(allocator: std.mem.Allocator, cfg: config.ServerConfig, app_router: router.Router) !Server {
+        var srv: Server = undefined;
+        try srv.initInPlace(allocator, cfg, app_router);
+        return srv;
+    }
+
+    /// Initialize a Server in-place at the given pointer. Use this to avoid
+    /// constructing the large Server struct on the stack.
+    pub fn initInPlace(self: *Server, allocator: std.mem.Allocator, cfg: config.ServerConfig, app_router: router.Router) !void {
         if (cfg.limits.max_header_count > connection.HeaderCapacity) return error.InvalidHeaderTable;
         const io_runtime = try runtime.IoRuntime.init(allocator, cfg);
         const tls_provider: ?tls.Provider = if (build_options.enable_tls and cfg.quic.enabled)
@@ -107,20 +85,12 @@ pub const Server = struct {
             .max_dynamic_table_size = cfg.http2.max_dynamic_table_size,
         }) else null;
         const http3_stack: ?http3.Stack = if (build_options.enable_http3) http3.Stack.init(allocator, true) else null;
-        const quic: ?quic_handler.Handler = if (build_options.enable_http3 and cfg.quic.enabled)
+        const quic_inst: ?quic_handler.Handler = if (build_options.enable_http3 and cfg.quic.enabled)
             quic_handler.Handler.init(allocator, true, cfg.max_connections)
         else
             null;
 
-        // Pre-compute Alt-Svc header if QUIC is enabled
-        var alt_svc_value: [64]u8 = undefined;
-        var alt_svc_len: usize = 0;
-        if (cfg.quic.enabled) {
-            const alt_svc = cfg.quic.buildAltSvcHeader(&alt_svc_value) catch "";
-            alt_svc_len = alt_svc.len;
-        }
-
-        return .{
+        self.* = .{
             .allocator = allocator,
             .cfg = cfg,
             .io = io_runtime,
@@ -130,10 +100,16 @@ pub const Server = struct {
             .tls_provider = tls_provider,
             .http2_stack = http2_stack,
             .http3_stack = http3_stack,
-            .quic = quic,
-            .alt_svc_value = alt_svc_value,
-            .alt_svc_len = alt_svc_len,
+            .quic = quic_inst,
+            .alt_svc_value = undefined,
+            .alt_svc_len = 0,
         };
+
+        // Pre-compute Alt-Svc header if QUIC is enabled
+        if (cfg.quic.enabled) {
+            const alt_svc = cfg.quic.buildAltSvcHeader(&self.alt_svc_value) catch "";
+            self.alt_svc_len = alt_svc.len;
+        }
     }
 
     pub fn deinit(self: *Server) void {
@@ -149,6 +125,34 @@ pub const Server = struct {
         shutdown_requested.store(true, .release);
     }
 
+    /// Apply hot reload from config file.
+    /// Safe-to-change fields (value types only): timeouts, limits.
+    /// Requires restart: address, port, max_connections, buffer pool, allowed_hosts.
+    fn applyReload(self: *Server) void {
+        const path = self.config_path orelse {
+            std.log.info("SIGHUP received but no config file path set, ignoring", .{});
+            return;
+        };
+        const config_file = @import("config_file.zig");
+        var loaded = config_file.loadConfigFile(self.allocator, path) catch |err| {
+            std.log.err("Config reload failed: {}", .{err});
+            return;
+        };
+        defer loaded.deinit();
+
+        // Validate the new config before applying
+        loaded.server_config.validate() catch |err| {
+            std.log.err("Config reload validation failed: {}", .{err});
+            return;
+        };
+
+        const new = loaded.server_config;
+        // Hot-reload value-type fields (no pointer/slice ownership issues)
+        self.cfg.timeouts = new.timeouts;
+        self.cfg.limits = new.limits;
+        std.log.info("Config reloaded from {s}", .{path});
+    }
+
     pub fn run(self: *Server, run_for_ms: ?u64) !void {
         // Install signal handlers for graceful shutdown
         const sa = std.posix.Sigaction{
@@ -158,6 +162,13 @@ pub const Server = struct {
         };
         std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
         std.posix.sigaction(std.posix.SIG.INT, &sa, null);
+        // Install SIGHUP handler for config hot reload
+        const reload_sa = std.posix.Sigaction{
+            .handler = .{ .handler = handleReloadSignal },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.HUP, &reload_sa, null);
 
         try self.io.start();
         if (self.listener_fd == null) {
@@ -187,6 +198,9 @@ pub const Server = struct {
                 std.log.info("Shutdown requested, stopping server", .{});
                 return;
             }
+            if (reload_requested.swap(false, .acq_rel)) {
+                self.applyReload();
+            }
             if (deadline) |limit| {
                 if (self.io.nowMs() >= limit) return;
             }
@@ -203,6 +217,10 @@ pub const Server = struct {
             // Periodic QUIC cleanup
             if (self.quic) |*q| {
                 q.cleanup();
+            }
+            // Periodic proxy maintenance (pool eviction + health checks)
+            if (self.proxy) |proxy| {
+                proxy.runMaintenance(self.io.nowMs());
             }
             if (events.len == 0) continue;
             for (events) |event| {
@@ -566,7 +584,7 @@ pub const Server = struct {
         }
         if (bytes_read < 0) {
             switch (std.posix.errno(bytes_read)) {
-                .AGAIN => return,
+                .AGAIN, .INTR => return, // Not ready or interrupted, retry on next event
                 else => {
                     self.closeConnection(conn);
                     return;
@@ -595,6 +613,11 @@ pub const Server = struct {
                         conn.http2_stack = stack_ptr;
                     }
                     conn.protocol = .http2;
+                    // RFC 9113 §3.4: Server MUST send SETTINGS as first frame
+                    self.sendHttp2ServerPreface(conn) catch {
+                        self.closeConnection(conn);
+                        return;
+                    };
                 }
             }
         }
@@ -628,6 +651,9 @@ pub const Server = struct {
                 return;
             }
             conn.header_count = parse.view.headers.len;
+            conn.is_head_request = (parse.view.method == .HEAD);
+            // Reset sent_continue for each new request in pipelined connections
+            conn.sent_continue = false;
             if (!parse.keep_alive) conn.close_after_write = true;
             self.io.onReadConsumed(conn, parse.consumed_bytes);
 
@@ -660,6 +686,41 @@ pub const Server = struct {
                 try self.queueFileResponse(conn, self.cfg.static_root, file_path, content_type);
                 if (conn.read_buffered_bytes == 0) break;
                 continue;
+            }
+
+            // Check proxy routes before router dispatch
+            if (self.proxy) |proxy| {
+                if (proxy.matchRoute(&parse.view) != null) {
+                    var mw_ctx = middleware.Context{
+                        .protocol = .http1,
+                        .buffer_ops = .{
+                            .ctx = &self.io,
+                            .acquire = acquireBufferOpaque,
+                            .release = releaseBufferOpaque,
+                        },
+                    };
+                    // Extract client IP string for proxy headers
+                    var ip_buf: [64]u8 = undefined;
+                    var client_ip_str: ?[]const u8 = null;
+                    if (net.getPeerAddress(fd)) |peer| {
+                        if (peer.getIp4Bytes()) |ip4| {
+                            const ip_len = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ ip4[0], ip4[1], ip4[2], ip4[3] }) catch "";
+                            if (ip_len.len > 0) client_ip_str = ip_buf[0..ip_len.len];
+                        }
+                    }
+                    var proxy_result = proxy.handle(
+                        parse.view,
+                        &mw_ctx,
+                        client_ip_str,
+                        false, // TODO: detect TLS
+                        self.io.nowMs(),
+                    );
+                    defer proxy_result.release();
+
+                    try self.queueResponse(conn, proxy_result.resp);
+                    if (conn.read_buffered_bytes == 0) break;
+                    continue;
+                }
             }
 
             var mw_ctx = middleware.Context{
@@ -701,6 +762,41 @@ pub const Server = struct {
         }
     }
 
+    /// Send the HTTP/2 server connection preface (SETTINGS frame)
+    fn sendHttp2ServerPreface(self: *Server, conn: *connection.Connection) !void {
+        const buf = self.io.acquireBuffer() orelse return error.OutOfMemory;
+        const len = http2.writeServerSettings(buf.bytes, .{
+            .max_streams = self.cfg.http2.max_streams,
+            .max_header_list_size = self.cfg.http2.max_header_list_size,
+            .initial_window_size = self.cfg.http2.initial_window_size,
+            .max_frame_size = self.cfg.http2.max_frame_size,
+            .max_dynamic_table_size = self.cfg.http2.max_dynamic_table_size,
+        }) catch {
+            self.io.releaseBuffer(buf);
+            return error.OutOfMemory;
+        };
+        if (!conn.enqueueWrite(buf, len)) {
+            self.io.releaseBuffer(buf);
+            return error.OutOfMemory;
+        }
+        self.io.onWriteBuffered(conn, len);
+    }
+
+    /// Send an HTTP/2 control frame (SETTINGS ACK, PING ACK, WINDOW_UPDATE, GOAWAY)
+    fn sendHttp2ControlFrame(self: *Server, conn: *connection.Connection, frame_data: []const u8) void {
+        const buf = self.io.acquireBuffer() orelse return;
+        if (frame_data.len > buf.bytes.len) {
+            self.io.releaseBuffer(buf);
+            return;
+        }
+        @memcpy(buf.bytes[0..frame_data.len], frame_data);
+        if (!conn.enqueueWrite(buf, frame_data.len)) {
+            self.io.releaseBuffer(buf);
+            return;
+        }
+        self.io.onWriteBuffered(conn, frame_data.len);
+    }
+
     fn handleHttp2Read(self: *Server, conn: *connection.Connection) !void {
         const buffer_handle = conn.read_buffer orelse return;
         const stack = conn.http2_stack orelse return;
@@ -714,6 +810,12 @@ pub const Server = struct {
             const ingest = stack.ingest(slice, frames[0..], events[0..]);
             if (ingest.state == .partial) return;
             if (ingest.state == .err) {
+                // RFC 9113 §5.4.1: Send GOAWAY before closing on connection error
+                var goaway_buf: [17]u8 = undefined;
+                const goaway_len = http2.writeGoaway(&goaway_buf, stack.last_stream_id, 0x01) catch 0;
+                if (goaway_len > 0) {
+                    self.sendHttp2ControlFrame(conn, goaway_buf[0..goaway_len]);
+                }
                 self.closeConnection(conn);
                 return;
             }
@@ -770,7 +872,32 @@ pub const Server = struct {
                     .data => |data| {
                         _ = data;
                     },
-                    .settings => |_| {},
+                    .settings => |settings_event| {
+                        if (!settings_event.ack) {
+                            // RFC 9113 §6.5.3: MUST send SETTINGS ACK
+                            var ack_buf: [9]u8 = undefined;
+                            const ack_len = http2.writeSettingsAck(&ack_buf) catch 0;
+                            if (ack_len > 0) {
+                                self.sendHttp2ControlFrame(conn, ack_buf[0..ack_len]);
+                            }
+                        }
+                    },
+                    .ping => |ping_event| {
+                        // RFC 9113 §6.7: MUST respond with PING ACK
+                        var ping_buf: [17]u8 = undefined;
+                        const ping_len = http2.writePingAck(&ping_buf, ping_event.opaque_data) catch 0;
+                        if (ping_len > 0) {
+                            self.sendHttp2ControlFrame(conn, ping_buf[0..ping_len]);
+                        }
+                    },
+                    .window_update_needed => |wu| {
+                        // RFC 9113 §6.9: Send WINDOW_UPDATE
+                        var wu_buf: [13]u8 = undefined;
+                        const wu_len = http2.writeWindowUpdate(&wu_buf, wu.stream_id, wu.increment) catch 0;
+                        if (wu_len > 0) {
+                            self.sendHttp2ControlFrame(conn, wu_buf[0..wu_len]);
+                        }
+                    },
                     .err => |_| {},
                 }
             }
@@ -789,6 +916,7 @@ pub const Server = struct {
             if (bytes_written < 0) {
                 switch (std.posix.errno(bytes_written)) {
                     .AGAIN => return, // Socket not ready, wait for next event
+                    .INTR => continue, // Interrupted by signal, retry
                     else => {
                         self.closeConnection(conn);
                         return;
@@ -853,6 +981,8 @@ pub const Server = struct {
             .managed => |managed| managed,
             else => null,
         };
+        // RFC 9110 §9.3.2: HEAD response MUST NOT contain a message body
+        const suppress_body = conn.is_head_request;
         const buf = self.io.acquireBuffer() orelse {
             // Cannot acquire buffer to send response - close connection
             if (managed_body) |managed| self.io.releaseBuffer(managed.handle);
@@ -872,7 +1002,7 @@ pub const Server = struct {
                 self.closeConnection(conn);
                 return;
             }
-            const header_len = encodeResponseHeaders(buf.bytes, resp, alt_svc) catch {
+            const header_len = encodeResponseHeaders(buf.bytes, resp, alt_svc, conn.close_after_write) catch {
                 self.io.releaseBuffer(managed.handle);
                 self.io.releaseBuffer(buf);
                 self.closeConnection(conn);
@@ -886,7 +1016,7 @@ pub const Server = struct {
             }
             self.io.onWriteBuffered(conn, header_len);
 
-            if (body_len == 0) {
+            if (body_len == 0 or suppress_body) {
                 self.io.releaseBuffer(managed.handle);
                 self.io.setTimeoutPhase(conn, .write);
                 return;
@@ -901,11 +1031,28 @@ pub const Server = struct {
             return;
         }
 
+        if (suppress_body) {
+            // HEAD: send headers with Content-Length but no body
+            const header_len = encodeResponseHeaders(buf.bytes, resp, alt_svc, conn.close_after_write) catch {
+                self.io.releaseBuffer(buf);
+                self.closeConnection(conn);
+                return;
+            };
+            if (!conn.enqueueWrite(buf, header_len)) {
+                self.io.releaseBuffer(buf);
+                self.closeConnection(conn);
+                return;
+            }
+            self.io.onWriteBuffered(conn, header_len);
+            self.io.setTimeoutPhase(conn, .write);
+            return;
+        }
+
         // For large bodies that don't fit in a single buffer, write headers first then chunk body
         const header_space = 512; // Reserve space for headers
         if (body_len > buf.bytes.len - header_space) {
             // Write headers only first
-            const header_len = encodeResponseHeaders(buf.bytes, resp, alt_svc) catch {
+            const header_len = encodeResponseHeaders(buf.bytes, resp, alt_svc, conn.close_after_write) catch {
                 self.io.releaseBuffer(buf);
                 self.closeConnection(conn);
                 return;
@@ -924,7 +1071,7 @@ pub const Server = struct {
         }
 
         // Small response - write everything in one buffer
-        const written = encodeResponse(buf.bytes, resp, alt_svc) catch {
+        const written = encodeResponse(buf.bytes, resp, alt_svc, conn.close_after_write) catch {
             // Cannot encode response - close connection
             self.io.releaseBuffer(buf);
             self.closeConnection(conn);
@@ -1072,7 +1219,6 @@ pub const Server = struct {
     }
 
     fn queueHttp2Response(self: *Server, conn: *connection.Connection, stream_id: u32, resp: response_mod.Response) !void {
-        _ = stream_id;
         const body_len = resp.bodyLen();
         const body_bytes = resp.bodyBytes();
         const managed_body = switch (resp.body) {
@@ -1110,7 +1256,8 @@ pub const Server = struct {
             return;
         }
         const headers_flags: u8 = if (body_len == 0) 0x5 else 0x4;
-        const resp_stream_id: u32 = if (conn.http2_stack) |stack| stack.last_stream_id else 1;
+        // RFC 9113 §8.1: Response MUST be on the stream that carried the request
+        const resp_stream_id: u32 = stream_id;
         http2.writeFrameHeader(header_buf.bytes, .headers, headers_flags, resp_stream_id, header_block_len) catch {
             self.io.releaseBuffer(header_buf);
             self.closeConnection(conn);
@@ -1125,7 +1272,11 @@ pub const Server = struct {
         self.io.onWriteBuffered(conn, header_frame_len);
         self.io.setTimeoutPhase(conn, .write);
 
-        if (body_len == 0) return;
+        if (body_len == 0) {
+            // END_STREAM was set on HEADERS frame — stream is fully closed
+            if (conn.http2_stack) |stack| stack.closeStream(resp_stream_id);
+            return;
+        }
         var remaining = body_bytes;
         while (remaining.len > 0) {
             const data_buf = self.io.acquireBuffer() orelse {
@@ -1151,18 +1302,36 @@ pub const Server = struct {
             self.io.onWriteBuffered(conn, frame_len);
             remaining = remaining[chunk_len..];
         }
+        // END_STREAM was set on last DATA frame — stream is fully closed
+        if (conn.http2_stack) |stack| stack.closeStream(resp_stream_id);
     }
 
-    fn encodeResponse(buf: []u8, resp: response_mod.Response, alt_svc: ?[]const u8) !usize {
+    fn encodeResponse(buf: []u8, resp: response_mod.Response, alt_svc: ?[]const u8, connection_close: bool) !usize {
         var index: usize = 0;
         const reason = reasonPhrase(resp.status);
         const status_line = try std.fmt.bufPrint(buf[index..], "HTTP/1.1 {d} {s}\r\n", .{ resp.status, reason });
         index += status_line.len;
         const body_bytes = resp.bodyBytes();
+
+        // RFC 9110 §15.2: 1xx responses have no body, no Date, no Content-Length
+        if (resp.status >= 100 and resp.status < 200) {
+            if (index + 2 > buf.len) return error.NoSpaceLeft;
+            buf[index] = '\r';
+            buf[index + 1] = '\n';
+            index += 2;
+            return index;
+        }
+
         for (resp.headers) |header| {
             const header_line = try std.fmt.bufPrint(buf[index..], "{s}: {s}\r\n", .{ header.name, header.value });
             index += header_line.len;
         }
+        // RFC 9110 §6.6.1: Origin servers MUST send Date header in responses
+        // RFC 9110 §5.6.7: Date must be in IMF-fixdate format
+        var date_buf: [29]u8 = undefined;
+        const date_str = formatImfDate(&date_buf);
+        const date_line = try std.fmt.bufPrint(buf[index..], "Date: {s}\r\n", .{date_str});
+        index += date_line.len;
         // Add Alt-Svc header to advertise HTTP/3 availability
         if (alt_svc) |svc| {
             if (svc.len > 0) {
@@ -1170,7 +1339,13 @@ pub const Server = struct {
                 index += alt_svc_line.len;
             }
         }
-        if (resp.status == 100) {
+        // RFC 9112 §9.6: Signal connection close to the client
+        if (connection_close) {
+            const close_line = try std.fmt.bufPrint(buf[index..], "Connection: close\r\n", .{});
+            index += close_line.len;
+        }
+        // RFC 9110 §8.6: MUST NOT send Content-Length in 204 or 304 responses
+        if (resp.status == 204 or resp.status == 304) {
             if (index + 2 > buf.len) return error.NoSpaceLeft;
             buf[index] = '\r';
             buf[index + 1] = '\n';
@@ -1186,7 +1361,7 @@ pub const Server = struct {
     }
 
     /// Encode response headers only (for large body responses that need chunking)
-    fn encodeResponseHeaders(buf: []u8, resp: response_mod.Response, alt_svc: ?[]const u8) !usize {
+    fn encodeResponseHeaders(buf: []u8, resp: response_mod.Response, alt_svc: ?[]const u8, connection_close: bool) !usize {
         var index: usize = 0;
         const reason = reasonPhrase(resp.status);
         const status_line = try std.fmt.bufPrint(buf[index..], "HTTP/1.1 {d} {s}\r\n", .{ resp.status, reason });
@@ -1196,11 +1371,37 @@ pub const Server = struct {
             const header_line = try std.fmt.bufPrint(buf[index..], "{s}: {s}\r\n", .{ header.name, header.value });
             index += header_line.len;
         }
+        // RFC 9110 §15.2: 1xx responses have no body, no Date, no Content-Length
+        if (resp.status >= 100 and resp.status < 200) {
+            if (index + 2 > buf.len) return error.NoSpaceLeft;
+            buf[index] = '\r';
+            buf[index + 1] = '\n';
+            index += 2;
+            return index;
+        }
+        // RFC 9110 §6.6.1: Origin servers MUST send Date header
+        var date_buf: [29]u8 = undefined;
+        const date_str = formatImfDate(&date_buf);
+        const date_line = try std.fmt.bufPrint(buf[index..], "Date: {s}\r\n", .{date_str});
+        index += date_line.len;
         if (alt_svc) |svc| {
             if (svc.len > 0) {
                 const alt_svc_line = try std.fmt.bufPrint(buf[index..], "Alt-Svc: {s}\r\n", .{svc});
                 index += alt_svc_line.len;
             }
+        }
+        // RFC 9112 §9.6: Signal connection close to the client
+        if (connection_close) {
+            const close_line = try std.fmt.bufPrint(buf[index..], "Connection: close\r\n", .{});
+            index += close_line.len;
+        }
+        // RFC 9110 §8.6: MUST NOT send Content-Length in 204 or 304 responses
+        if (resp.status == 204 or resp.status == 304) {
+            if (index + 2 > buf.len) return error.NoSpaceLeft;
+            buf[index] = '\r';
+            buf[index + 1] = '\n';
+            index += 2;
+            return index;
         }
         const length_line = try std.fmt.bufPrint(buf[index..], "Content-Length: {d}\r\n\r\n", .{body_len});
         index += length_line.len;
@@ -1217,6 +1418,11 @@ pub const Server = struct {
             const header_line = try std.fmt.bufPrint(buf[index..], "{s}: {s}\r\n", .{ header.name, header.value });
             index += header_line.len;
         }
+        // RFC 9110 §6.6.1: Origin servers MUST send Date header
+        var date_buf: [29]u8 = undefined;
+        const date_str = formatImfDate(&date_buf);
+        const file_date_line = try std.fmt.bufPrint(buf[index..], "Date: {s}\r\n", .{date_str});
+        index += file_date_line.len;
         // End headers
         if (index + 2 > buf.len) return error.NoSpaceLeft;
         buf[index] = '\r';
@@ -1226,18 +1432,64 @@ pub const Server = struct {
     }
 
     fn reasonPhrase(status: u16) []const u8 {
-        return switch (status) {
-            100 => "Continue",
-            200 => "OK",
-            400 => "Bad Request",
-            404 => "Not Found",
-            413 => "Payload Too Large",
-            431 => "Request Header Fields Too Large",
-            408 => "Request Timeout",
-            501 => "Not Implemented",
-            500 => "Internal Server Error",
-            else => "OK",
-        };
+        return response_mod.statusPhrase(status);
+    }
+
+    /// Format current time as IMF-fixdate (RFC 9110 §5.6.7)
+    /// e.g., "Sun, 06 Nov 1994 08:49:37 GMT"
+    fn formatImfDate(buf: *[29]u8) []const u8 {
+        const day_names = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
+        const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+
+        const ts = std.posix.clock_gettime(.REALTIME) catch return "Thu, 01 Jan 1970 00:00:00 GMT";
+        const epoch_secs: u64 = @intCast(ts.sec);
+
+        // Calculate date components from Unix timestamp
+        const secs_per_day: u64 = 86400;
+        var days = epoch_secs / secs_per_day;
+        const day_secs = epoch_secs % secs_per_day;
+        const hour = day_secs / 3600;
+        const minute = (day_secs % 3600) / 60;
+        const second = day_secs % 60;
+
+        // Day of week (Jan 1 1970 = Thursday = index 0)
+        const wday = days % 7;
+
+        // Year/month/day from days since epoch
+        var year: u64 = 1970;
+        while (true) {
+            const days_in_year: u64 = if (isLeapYear(year)) 366 else 365;
+            if (days < days_in_year) break;
+            days -= days_in_year;
+            year += 1;
+        }
+        const leap = isLeapYear(year);
+        const month_days = if (leap)
+            [_]u64{ 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 }
+        else
+            [_]u64{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+        var month: usize = 0;
+        while (month < 11) : (month += 1) {
+            if (days < month_days[month]) break;
+            days -= month_days[month];
+        }
+        const day = days + 1;
+
+        // Format: "Sun, 06 Nov 1994 08:49:37 GMT"
+        _ = std.fmt.bufPrint(buf, "{s}, {d:0>2} {s} {d:0>4} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
+            day_names[wday],
+            day,
+            month_names[month],
+            year,
+            hour,
+            minute,
+            second,
+        }) catch return "Thu, 01 Jan 1970 00:00:00 GMT";
+        return buf[0..29];
+    }
+
+    fn isLeapYear(year: u64) bool {
+        return (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0);
     }
 
     fn continueResponse() response_mod.Response {
@@ -1304,6 +1556,11 @@ pub const Server = struct {
                 .status = 431,
                 .headers = &[_]response_mod.Header{},
                 .body = .{ .bytes = "Request Header Fields Too Large\n" },
+            },
+            .expectation_failed => .{
+                .status = 417,
+                .headers = &[_]response_mod.Header{},
+                .body = .{ .bytes = "Expectation Failed\n" },
             },
             else => .{
                 .status = 400,
@@ -1719,9 +1976,11 @@ test "metrics middleware end-to-end http2" {
 
 fn buildHeaderBlockAuthority(buffer: []u8, authority: []const u8) []u8 {
     var idx: usize = 0;
-    buffer[idx] = 0x82; // :method GET
+    buffer[idx] = 0x82; // :method GET (static index 2)
     idx += 1;
-    buffer[idx] = 0x84; // :path /
+    buffer[idx] = 0x84; // :path / (static index 4)
+    idx += 1;
+    buffer[idx] = 0x86; // :scheme http (static index 6)
     idx += 1;
     buffer[idx] = 0x01; // literal without indexing, indexed name :authority (index 1)
     idx += 1;
@@ -1767,10 +2026,12 @@ test "http1 response bytes from write queue" {
     const bytes = try drainWriteQueue(&server.io, conn, allocator);
     defer allocator.free(bytes);
 
-    try std.testing.expectEqualStrings(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nhi",
-        bytes,
-    );
+    // Verify structural correctness (Date header is dynamic so check components)
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "Content-Type: text/plain\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "Date: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "Content-Length: 2\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, bytes, "\r\n\r\nhi"));
 }
 
 test "http1 managed response bytes from write queue" {
@@ -1812,10 +2073,12 @@ test "http1 managed response bytes from write queue" {
     const bytes = try drainWriteQueue(&server.io, conn, allocator);
     defer allocator.free(bytes);
 
-    try std.testing.expectEqualStrings(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello",
-        bytes,
-    );
+    // Verify structural correctness (Date header is dynamic so check components)
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "Content-Type: text/plain\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "Date: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "Content-Length: 5\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, bytes, "\r\n\r\nhello"));
 }
 
 fn drainWriteQueue(io: *runtime.IoRuntime, conn: *connection.Connection, allocator: std.mem.Allocator) ![]u8 {
