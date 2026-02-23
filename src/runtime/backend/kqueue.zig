@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const clock = @import("../clock.zig");
 
 // BSD/Darwin kqueue constants for a minimal backend implementation.
 pub const EV_ADD: u16 = 0x0001;
@@ -41,7 +42,7 @@ pub const KqueueBackend = struct {
 
     pub fn deinit(self: *KqueueBackend, allocator: std.mem.Allocator) void {
         allocator.free(self.events);
-        std.posix.close(self.kq);
+        clock.closeFd(self.kq);
     }
 
     pub fn poll(self: *KqueueBackend, timeout_ms: u32) ![]Kevent {

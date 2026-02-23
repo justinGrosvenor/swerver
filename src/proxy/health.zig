@@ -3,6 +3,7 @@ const upstream = @import("upstream.zig");
 const pool_mod = @import("pool.zig");
 const forward = @import("forward.zig");
 const net = @import("../runtime/net.zig");
+const clock = @import("../runtime/clock.zig");
 
 /// Health Check System
 ///
@@ -168,7 +169,7 @@ pub const HealthChecker = struct {
             health_state.recordFailure(now_ms, &self.config);
             return false;
         };
-        defer std.posix.close(fd);
+        defer clock.closeFd(fd);
 
         // Set socket timeouts
         net.setSocketTimeouts(fd, self.config.timeout_ms, self.config.timeout_ms);
@@ -214,10 +215,8 @@ pub const HealthChecker = struct {
     }
 
     fn getMonotonicMs() u64 {
-        const ts = std.posix.clock_gettime(.MONOTONIC) catch return 0;
-        const sec_ms: u64 = @intCast(ts.sec * std.time.ms_per_s);
-        const nsec_ms: u64 = @intCast(@divTrunc(ts.nsec, std.time.ns_per_ms));
-        return sec_ms + nsec_ms;
+        const instant = clock.Instant.now() orelse return 0;
+        return instant.ns / @as(u64, std.time.ns_per_ms);
     }
 
     /// Build HTTP health check request

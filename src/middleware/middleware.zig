@@ -2,6 +2,7 @@ const std = @import("std");
 const request = @import("../protocol/request.zig");
 const response = @import("../response/response.zig");
 const buffer_pool = @import("../runtime/buffer_pool.zig");
+const clock = @import("../runtime/clock.zig");
 
 /// Middleware Framework
 ///
@@ -52,9 +53,9 @@ pub const Context = struct {
     /// HTTP/2 or HTTP/3 stream ID (0 for HTTP/1.1)
     stream_id: u64 = 0,
     /// Connection start time
-    conn_start: ?std.time.Instant = null,
+    conn_start: ?clock.Instant = null,
     /// Request start time
-    request_start: ?std.time.Instant = null,
+    request_start: ?clock.Instant = null,
     /// Whether connection is TLS
     is_tls: bool = false,
     /// Request ID (from header or generated) - slice into request_id_buf

@@ -2,6 +2,7 @@ const std = @import("std");
 const config = @import("../config.zig");
 const buffer_pool = @import("buffer_pool.zig");
 const connection = @import("connection.zig");
+const clock = @import("clock.zig");
 const kqueue_backend = @import("backend/kqueue.zig");
 const epoll_backend = @import("backend/epoll.zig");
 const io_uring_backend = @import("backend/io_uring.zig");
@@ -14,7 +15,7 @@ pub const IoRuntime = struct {
     connections: connection.ConnectionPool,
     buffers: buffer_pool.BufferPool,
     events: []Event,
-    timer: std.time.Timer,
+    timer: clock.Timer,
 
     pub fn init(allocator: std.mem.Allocator, cfg: config.ServerConfig) !IoRuntime {
         const backend = pickBackend();
@@ -22,7 +23,7 @@ pub const IoRuntime = struct {
         const buffers = try buffer_pool.BufferPool.init(allocator, cfg.buffer_pool);
         const events = try allocator.alloc(Event, cfg.max_connections);
         const backend_state = try initBackend(allocator, backend, cfg.max_connections);
-        const timer = try std.time.Timer.start();
+        const timer = try clock.Timer.start();
         return .{
             .allocator = allocator,
             .cfg = cfg,
@@ -107,7 +108,7 @@ pub const IoRuntime = struct {
     }
 
     pub fn nowMs(self: *IoRuntime) u64 {
-        return self.timer.read() / std.time.ns_per_ms;
+        return self.timer.read() / @as(u64, std.time.ns_per_ms);
     }
 
     pub fn acquireConnection(self: *IoRuntime, now_ms: u64) ?*connection.Connection {

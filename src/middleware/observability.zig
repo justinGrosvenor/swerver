@@ -2,6 +2,7 @@ const std = @import("std");
 const request = @import("../protocol/request.zig");
 const response = @import("../response/response.zig");
 const middleware = @import("middleware.zig");
+const clock = @import("../runtime/clock.zig");
 
 /// Observability Middleware
 ///
@@ -449,7 +450,7 @@ pub fn getOrGenerateRequestId(req: request.RequestView, storage: *RequestIdStora
 /// Observability middleware - extracts request ID
 pub fn evaluate(ctx: *middleware.Context, req: request.RequestView) middleware.Decision {
     // Record request start time
-    ctx.request_start = std.time.Instant.now() catch null;
+    ctx.request_start = clock.Instant.now();
 
     // Look for existing request ID header
     var found_id: ?[]const u8 = null;

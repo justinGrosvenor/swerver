@@ -3,6 +3,7 @@ const swerver = @import("swerver");
 const config = swerver.config;
 const buffer_pool = swerver.runtime.buffer_pool;
 const connection = swerver.runtime.connection;
+const clock = swerver.runtime.clock;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -21,7 +22,7 @@ fn benchBufferPool(allocator: std.mem.Allocator) !void {
     var pool = try buffer_pool.BufferPool.init(allocator, cfg);
     defer pool.deinit();
 
-    var timer = try std.time.Timer.start();
+    var timer = try clock.Timer.start();
     var i: usize = 0;
     while (i < iterations) : (i += 1) {
         const handle = pool.acquire() orelse continue;
@@ -37,7 +38,7 @@ fn benchConnectionPool(allocator: std.mem.Allocator) !void {
     var pool = try connection.ConnectionPool.init(allocator, 1024);
     defer pool.deinit();
 
-    var timer = try std.time.Timer.start();
+    var timer = try clock.Timer.start();
     var i: usize = 0;
     while (i < iterations) : (i += 1) {
         const conn = pool.acquire(0) orelse continue;

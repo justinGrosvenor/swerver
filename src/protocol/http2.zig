@@ -1,6 +1,7 @@
 const std = @import("std");
 const request = @import("request.zig");
 const response = @import("../response/response.zig");
+const clock = @import("../runtime/clock.zig");
 
 pub const Preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
@@ -1620,7 +1621,7 @@ fn formatImfDateHttp2(buf: *[29]u8) []const u8 {
     const day_names = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
     const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
 
-    const ts = std.posix.clock_gettime(.REALTIME) catch return "Thu, 01 Jan 1970 00:00:00 GMT";
+    const ts = clock.realtimeTimespec() orelse return "Thu, 01 Jan 1970 00:00:00 GMT";
     const epoch_secs: u64 = @intCast(ts.sec);
     const secs_per_day: u64 = 86400;
     var days = epoch_secs / secs_per_day;

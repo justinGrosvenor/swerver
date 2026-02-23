@@ -1,6 +1,7 @@
 const std = @import("std");
 pub const frame = @import("http3/frame.zig");
 pub const qpack = @import("http3/qpack.zig");
+const clock = @import("../runtime/clock.zig");
 
 /// HTTP/3 Protocol Stack
 ///
@@ -137,7 +138,7 @@ pub const MAX_DATA_FRAME_SIZE: usize = 16 * 1024;
 fn formatImfDateHttp3(buf: *[29]u8) []const u8 {
     const day_names = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
     const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
-    const ts = std.posix.clock_gettime(.REALTIME) catch return "Thu, 01 Jan 1970 00:00:00 GMT";
+    const ts = clock.realtimeTimespec() orelse return "Thu, 01 Jan 1970 00:00:00 GMT";
     const epoch_secs: u64 = @intCast(ts.sec);
     const secs_per_day: u64 = 86400;
     var days = epoch_secs / secs_per_day;

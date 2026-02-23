@@ -2,6 +2,7 @@ const std = @import("std");
 const config = @import("config.zig");
 const ServerBuilder = @import("server_builder.zig").ServerBuilder;
 const router = @import("router/router.zig");
+const clock = @import("runtime/clock.zig");
 
 const MAX_WORKERS = 256;
 
@@ -314,10 +315,8 @@ fn sleepMs(ms: u32) void {
 }
 
 fn nowMs() u64 {
-    const ts = std.posix.clock_gettime(.MONOTONIC) catch return 0;
-    const sec_ms: u64 = @intCast(ts.sec * std.time.ms_per_s);
-    const nsec_ms: u64 = @intCast(@divTrunc(ts.nsec, std.time.ns_per_ms));
-    return sec_ms + nsec_ms;
+    const instant = clock.Instant.now() orelse return 0;
+    return instant.ns / @as(u64, std.time.ns_per_ms);
 }
 
 test "detectCpuCount returns at least 1" {

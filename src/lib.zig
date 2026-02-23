@@ -12,6 +12,7 @@ pub const middleware = @import("middleware/middleware.zig");
 pub const runtime = struct {
     pub const buffer_pool = @import("runtime/buffer_pool.zig");
     pub const connection = @import("runtime/connection.zig");
+    pub const clock = @import("runtime/clock.zig");
 };
 
 /// Reverse proxy support

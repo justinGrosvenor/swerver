@@ -1,4 +1,5 @@
 const std = @import("std");
+const clock = @import("../runtime/clock.zig");
 
 /// QUIC Metrics Collection
 ///
@@ -8,9 +9,9 @@ const std = @import("std");
 /// Per-connection metrics
 pub const ConnectionMetrics = struct {
     /// Instant when connection was created
-    created_at: ?std.time.Instant,
+    created_at: ?clock.Instant,
     /// Instant when handshake completed (null if not complete)
-    handshake_completed_at: ?std.time.Instant = null,
+    handshake_completed_at: ?clock.Instant = null,
     /// Current RTT estimate (microseconds)
     rtt_us: u64 = 0,
     /// Minimum RTT observed (microseconds)
@@ -40,13 +41,13 @@ pub const ConnectionMetrics = struct {
 
     pub fn init() ConnectionMetrics {
         return .{
-            .created_at = std.time.Instant.now() catch null,
+            .created_at = clock.Instant.now(),
         };
     }
 
     /// Mark handshake as complete
     pub fn handshakeComplete(self: *ConnectionMetrics) void {
-        self.handshake_completed_at = std.time.Instant.now() catch null;
+        self.handshake_completed_at = clock.Instant.now();
     }
 
     /// Get handshake duration in milliseconds (0 if not complete)
@@ -54,7 +55,7 @@ pub const ConnectionMetrics = struct {
         const completed = self.handshake_completed_at orelse return 0;
         const created = self.created_at orelse return 0;
         const elapsed_ns = completed.since(created);
-        return elapsed_ns / std.time.ns_per_ms;
+        return elapsed_ns / @as(u64, std.time.ns_per_ms);
     }
 
     /// Get packet loss rate (0.0 - 1.0)

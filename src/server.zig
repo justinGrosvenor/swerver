@@ -4,6 +4,7 @@ const config = @import("config.zig");
 const runtime = @import("runtime/io.zig");
 const connection = @import("runtime/connection.zig");
 const buffer_pool = @import("runtime/buffer_pool.zig");
+const clock = @import("runtime/clock.zig");
 const router = @import("router/router.zig");
 const net = @import("runtime/net.zig");
 const http1 = @import("protocol/http1.zig");
@@ -113,8 +114,8 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Server) void {
-        if (self.listener_fd) |fd| std.posix.close(fd);
-        if (self.udp_fd) |fd| std.posix.close(fd);
+        if (self.listener_fd) |fd| clock.closeFd(fd);
+        if (self.udp_fd) |fd| clock.closeFd(fd);
         if (self.quic) |*q| q.deinit();
         self.io.deinit();
     }
@@ -187,7 +188,7 @@ pub const Server = struct {
                 self.udp_fd = udp_fd;
                 self.io.registerUdpSocket(udp_fd) catch |err| {
                     std.log.warn("Failed to register UDP socket: {}", .{err});
-                    std.posix.close(udp_fd);
+                    clock.closeFd(udp_fd);
                     self.udp_fd = null;
                 };
             }
@@ -273,17 +274,17 @@ pub const Server = struct {
             error.WouldBlock => return,
             else => return err,
         };
-        errdefer std.posix.close(client_fd);
+        errdefer clock.closeFd(client_fd);
         const now_ms = self.io.nowMs();
         const conn = self.io.acquireConnection(now_ms) orelse {
-            std.posix.close(client_fd);
+            clock.closeFd(client_fd);
             return;
         };
         if (self.io.acquireBuffer()) |buf| {
             conn.read_buffer = buf;
         } else {
             self.io.releaseConnection(conn);
-            std.posix.close(client_fd);
+            clock.closeFd(client_fd);
             return;
         }
         conn.fd = client_fd;
@@ -291,14 +292,14 @@ pub const Server = struct {
             // Invalid state transition - close connection
             if (conn.read_buffer) |buf| self.io.releaseBuffer(buf);
             self.io.releaseConnection(conn);
-            std.posix.close(client_fd);
+            clock.closeFd(client_fd);
             return;
         };
         self.io.setTimeoutPhase(conn, .header);
         self.io.registerConnection(conn.index, client_fd) catch |err| {
             if (conn.read_buffer) |buf| self.io.releaseBuffer(buf);
             self.io.releaseConnection(conn);
-            std.posix.close(client_fd);
+            clock.closeFd(client_fd);
             return err;
         };
         // With edge-triggered epoll, we must try to read immediately after accept
@@ -898,7 +899,7 @@ pub const Server = struct {
                             self.sendHttp2ControlFrame(conn, wu_buf[0..wu_len]);
                         }
                     },
-                    .err => |_| {},
+                    .err => {},
                 }
             }
             if (conn.read_buffered_bytes == 0) break;
@@ -1153,31 +1154,28 @@ pub const Server = struct {
         path_buf[full_path_len] = 0;
         const path_z: [*:0]const u8 = @ptrCast(&path_buf);
 
-        // Open file using C library for portability — use O_NOFOLLOW to prevent symlink traversal
-        const c = @cImport({
-            @cInclude("fcntl.h");
-            @cInclude("sys/stat.h");
-        });
-        const file_fd_c = c.open(path_z, c.O_RDONLY | c.O_NOFOLLOW);
-        if (file_fd_c < 0) {
+        // Open file using posix APIs — use NOFOLLOW to prevent symlink traversal
+        var o_flags: std.posix.O = .{};
+        if (@hasField(std.posix.O, "NOFOLLOW")) o_flags.NOFOLLOW = true;
+        const file_fd = std.posix.openatZ(std.posix.AT.FDCWD, path_z, o_flags, 0) catch {
+            try self.queueResponse(conn, notFoundResponse());
+            return;
+        };
+
+        // Get file size using lseek. Also rejects directories (can't seek on them).
+        const end_pos = std.c.lseek(file_fd, 0, std.posix.SEEK.END);
+        if (end_pos < 0) {
+            clock.closeFd(file_fd);
             try self.queueResponse(conn, notFoundResponse());
             return;
         }
-        const file_fd: std.posix.fd_t = @intCast(file_fd_c);
-
-        // Verify the resolved file is still under static_root using fstat to check it's a regular file
-        var stat_buf_check: c.struct_stat = undefined;
-        if (c.fstat(file_fd_c, &stat_buf_check) != 0 or (stat_buf_check.st_mode & c.S_IFMT) != c.S_IFREG) {
-            std.posix.close(file_fd);
-            try self.queueResponse(conn, notFoundResponse());
-            return;
-        }
-
-        const file_size: u64 = @intCast(stat_buf_check.st_size);
+        // Seek back to start for reading
+        _ = std.c.lseek(file_fd, 0, std.posix.SEEK.SET);
+        const file_size: u64 = @intCast(end_pos);
 
         // Build and send headers
         const buf = self.io.acquireBuffer() orelse {
-            std.posix.close(file_fd);
+            clock.closeFd(file_fd);
             self.closeConnection(conn);
             return;
         };
@@ -1185,7 +1183,7 @@ pub const Server = struct {
         var size_buf: [20]u8 = undefined;
         const size_str = std.fmt.bufPrint(&size_buf, "{d}", .{file_size}) catch {
             self.io.releaseBuffer(buf);
-            std.posix.close(file_fd);
+            clock.closeFd(file_fd);
             self.closeConnection(conn);
             return;
         };
@@ -1197,14 +1195,14 @@ pub const Server = struct {
 
         const header_len = encodeFileHeaders(buf.bytes, 200, &headers) catch {
             self.io.releaseBuffer(buf);
-            std.posix.close(file_fd);
+            clock.closeFd(file_fd);
             self.closeConnection(conn);
             return;
         };
 
         if (!conn.enqueueWrite(buf, header_len)) {
             self.io.releaseBuffer(buf);
-            std.posix.close(file_fd);
+            clock.closeFd(file_fd);
             self.closeConnection(conn);
             return;
         }
@@ -1441,7 +1439,7 @@ pub const Server = struct {
         const day_names = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
         const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
 
-        const ts = std.posix.clock_gettime(.REALTIME) catch return "Thu, 01 Jan 1970 00:00:00 GMT";
+        const ts = clock.realtimeTimespec() orelse return "Thu, 01 Jan 1970 00:00:00 GMT";
         const epoch_secs: u64 = @intCast(ts.sec);
 
         // Calculate date components from Unix timestamp
@@ -1573,7 +1571,7 @@ pub const Server = struct {
     fn closeConnection(self: *Server, conn: *connection.Connection) void {
         if (conn.fd) |fd| {
             _ = self.io.unregister(fd) catch {};
-            std.posix.close(fd);
+            clock.closeFd(fd);
             conn.fd = null;
         }
         if (conn.http2_stack) |stack| {

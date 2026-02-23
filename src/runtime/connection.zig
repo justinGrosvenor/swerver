@@ -1,6 +1,7 @@
 const std = @import("std");
 const config = @import("../config.zig");
 const buffer_pool = @import("buffer_pool.zig");
+const clock = @import("clock.zig");
 const request = @import("../protocol/request.zig");
 const http2 = @import("../protocol/http2.zig");
 const tls = @import("../tls/provider.zig");
@@ -142,7 +143,7 @@ pub const Connection = struct {
     /// Clean up pending file if present
     pub fn cleanupPendingFile(self: *Connection) void {
         if (self.pending_file_fd) |fd| {
-            std.posix.close(fd);
+            clock.closeFd(fd);
             self.pending_file_fd = null;
         }
         self.pending_file_offset = 0;

@@ -8,6 +8,7 @@ pub const metrics = @import("metrics.zig");
 const tls = @import("../tls/provider.zig");
 const stream = @import("stream.zig");
 const http3 = @import("../protocol/http3.zig");
+const clock = @import("../runtime/clock.zig");
 
 /// QUIC Connection State Machine per RFC 9000.
 ///
@@ -111,19 +112,19 @@ pub const PacketNumberSpace = struct {
 };
 
 // Starting instant for relative time calculation
-var start_instant: ?std.time.Instant = null;
+var start_instant: ?clock.Instant = null;
 
 /// Get current time in microseconds (relative to first call)
 fn getCurrentTimeMicros() u64 {
-    const now = std.time.Instant.now() catch return 0;
+    const now_inst = clock.Instant.now() orelse return 0;
 
     if (start_instant == null) {
-        start_instant = now;
+        start_instant = now_inst;
         return 0;
     }
 
     // Return nanoseconds since start, converted to microseconds
-    const ns = now.since(start_instant.?);
+    const ns = now_inst.since(start_instant.?);
     return ns / 1000;
 }
 
@@ -240,7 +241,7 @@ pub const Connection = struct {
     /// Timer for idle timeout (in nanoseconds)
     idle_timeout_ns: u64 = 30 * std.time.ns_per_s,
     /// Last activity instant
-    last_activity: ?std.time.Instant = null,
+    last_activity: ?clock.Instant = null,
     /// Connection metrics
     conn_metrics: metrics.ConnectionMetrics = .{ .created_at = null },
     /// TLS session for handshake and key derivation
@@ -278,7 +279,7 @@ pub const Connection = struct {
             .our_cid = types.ConnectionId{},
             .peer_cid = dcid,
             .crypto_ctx = crypto.CryptoContext.init(),
-            .last_activity = std.time.Instant.now() catch null,
+            .last_activity = clock.Instant.now(),
             .conn_metrics = metrics.ConnectionMetrics.init(),
         };
 
@@ -536,7 +537,7 @@ pub const Connection = struct {
 
     /// Process an incoming packet
     pub fn processPacket(self: *Connection, data: []const u8) Error!void {
-        self.last_activity = std.time.Instant.now() catch self.last_activity;
+        self.last_activity = clock.Instant.now() orelse self.last_activity;
 
         // Parse header
         const result = packet.parseHeader(data, self.our_cid.len);
@@ -750,8 +751,8 @@ pub const Connection = struct {
     /// Check if idle timeout has expired
     pub fn isIdleTimedOut(self: *const Connection) bool {
         const last = self.last_activity orelse return false;
-        const now = std.time.Instant.now() catch return false;
-        const elapsed = now.since(last);
+        const now_inst = clock.Instant.now() orelse return false;
+        const elapsed = now_inst.since(last);
         return elapsed > self.idle_timeout_ns;
     }
 

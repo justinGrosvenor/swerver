@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const clock = @import("clock.zig");
 
 const has_len_field = switch (builtin.os.tag) {
     .macos, .freebsd, .netbsd, .openbsd, .dragonfly => true,
@@ -48,13 +49,13 @@ pub const ListenError = error{
     ListenFailed,
     SetSockOptFailed,
     NonBlockingFailed,
-} || std.posix.FcntlError;
+};
 
 pub const AcceptError = error{
     AcceptFailed,
     WouldBlock,
     NonBlockingFailed,
-} || std.posix.FcntlError;
+};
 
 pub const UdpError = error{
     UnsupportedPlatform,
@@ -66,7 +67,7 @@ pub const UdpError = error{
     RecvFailed,
     SendFailed,
     WouldBlock,
-} || std.posix.FcntlError;
+};
 
 pub const RecvFromResult = struct {
     bytes_read: usize,
@@ -98,7 +99,7 @@ pub const PeerAddress = struct {
     }
 };
 
-const NonBlockingError = error{NonBlockingFailed} || std.posix.FcntlError;
+const NonBlockingError = error{NonBlockingFailed};
 
 pub fn listen(address: []const u8, port: u16, backlog: u32) ListenError!std.posix.fd_t {
     if (!isSupportedPlatform()) return error.UnsupportedPlatform;
@@ -110,7 +111,7 @@ pub fn listen(address: []const u8, port: u16, backlog: u32) ListenError!std.posi
     };
     const fd = std.posix.system.socket(domain, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
     if (fd < 0) return error.SocketFailed;
-    errdefer std.posix.close(fd);
+    errdefer clock.closeFd(fd);
 
     try setReuseAddr(fd);
     try setReusePort(fd);
@@ -145,7 +146,7 @@ pub fn accept(listener_fd: std.posix.fd_t) AcceptError!std.posix.fd_t {
             },
         }
     }
-    errdefer std.posix.close(fd);
+    errdefer clock.closeFd(fd);
     setNonBlocking(fd) catch return error.NonBlockingFailed;
     return fd;
 }
@@ -162,7 +163,7 @@ pub fn bindUdp(address: []const u8, port: u16) UdpError!std.posix.fd_t {
     };
     const fd = std.posix.system.socket(domain, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP);
     if (fd < 0) return error.SocketFailed;
-    errdefer std.posix.close(fd);
+    errdefer clock.closeFd(fd);
 
     setReuseAddr(fd) catch return error.SetSockOptFailed;
     setReusePort(fd) catch return error.SetSockOptFailed;
@@ -312,9 +313,11 @@ fn setReusePort(fd: std.posix.fd_t) ListenError!void {
 }
 
 fn setNonBlocking(fd: std.posix.fd_t) NonBlockingError!void {
-    var flags = std.posix.fcntl(fd, std.posix.F.GETFL, 0) catch return error.NonBlockingFailed;
-    flags |= 1 << @bitOffsetOf(std.posix.O, "NONBLOCK");
-    _ = std.posix.fcntl(fd, std.posix.F.SETFL, flags) catch return error.NonBlockingFailed;
+    const flags = std.c.fcntl(fd, std.posix.F.GETFL);
+    if (flags < 0) return error.NonBlockingFailed;
+    const nonblock: c_int = @bitCast(@as(c_uint, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK"));
+    if (std.c.fcntl(fd, std.posix.F.SETFL, flags | nonblock) < 0)
+        return error.NonBlockingFailed;
 }
 
 /// Extract the peer IP address from a connected socket via getpeername.
@@ -478,7 +481,7 @@ pub fn connectBlocking(address: []const u8, port: u16, timeout_ms: u32) ConnectE
     };
     const fd = std.posix.system.socket(domain, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
     if (fd < 0) return error.SocketFailed;
-    errdefer std.posix.close(fd);
+    errdefer clock.closeFd(fd);
 
     // Set non-blocking for connect with timeout
     setNonBlocking(fd) catch return error.SocketFailed;
@@ -538,9 +541,11 @@ fn msToTimeval(ms: u32) std.posix.timeval {
 }
 
 fn clearNonBlocking(fd: std.posix.fd_t) NonBlockingError!void {
-    var flags = std.posix.fcntl(fd, std.posix.F.GETFL, 0) catch return error.NonBlockingFailed;
-    flags &= ~(@as(@TypeOf(flags), 1) << @bitOffsetOf(std.posix.O, "NONBLOCK"));
-    _ = std.posix.fcntl(fd, std.posix.F.SETFL, flags) catch return error.NonBlockingFailed;
+    const flags = std.c.fcntl(fd, std.posix.F.GETFL);
+    if (flags < 0) return error.NonBlockingFailed;
+    const nonblock: c_int = @bitCast(@as(c_uint, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK"));
+    if (std.c.fcntl(fd, std.posix.F.SETFL, flags & ~nonblock) < 0)
+        return error.NonBlockingFailed;
 }
 
 fn pollWriteReady(fd: std.posix.fd_t, timeout_ms: u32) bool {

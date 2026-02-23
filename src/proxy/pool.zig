@@ -1,5 +1,6 @@
 const std = @import("std");
 const upstream = @import("upstream.zig");
+const clock = @import("../runtime/clock.zig");
 
 /// Upstream Connection Pool
 ///
@@ -168,7 +169,7 @@ pub const Pool = struct {
             if (maybe_conn) |conn| {
                 // Only close valid file descriptors
                 if (conn.fd >= 0) {
-                    std.posix.close(conn.fd);
+                    clock.closeFd(conn.fd);
                 }
             }
         }
@@ -252,7 +253,7 @@ pub const Pool = struct {
         }
         // Only close valid file descriptors
         if (conn.fd >= 0) {
-            std.posix.close(conn.fd);
+            clock.closeFd(conn.fd);
         }
         self.connections[index] = null;
         self.connection_count -= 1;
