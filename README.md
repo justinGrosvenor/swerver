@@ -186,15 +186,33 @@ export ZIG_LOCAL_CACHE_DIR="$(pwd)/.zig-cache"
 
 ## Performance
 
-Measured on a local Darwin/arm64 workstation with `zig 0.16.0-dev` using the built-in microbenchmarks.
+### Native (wrk, single process, macOS Apple Silicon)
+
+| Endpoint | Connections | Requests/sec | Avg Latency | Transfer/sec |
+|----------|------------|-------------|-------------|--------------|
+| GET /health | 100 | **274,617** | 328us | 19.6 MB/s |
+| GET /echo | 50 | **264,698** | 163us | 31.1 MB/s |
+| GET /plaintext | 100 | **285,606** | 321us | 31.3 MB/s |
+| GET /json | 100 | **267,543** | 335us | 34.5 MB/s |
+| GET /blob (1MB) | 50 | **6,811** | 7.35ms | 6.65 GB/s |
+
+### Docker k6 (100 VUs, 30s, 2 CPU / 512MB per container)
+
+| Scenario | swerver | actix (Rust) | nginx |
+|----------|---------|-------------|-------|
+| **Throughput** (req/s) | **174,733** | 134,691 | 118,265 |
+| **Concurrent** ramp to 1000 VUs (req/s) | **176,281** | 151,055 | 140,250 |
+| **Connections** new conn/req (conn/s) | **89,702** | 77,411 | 24,154 |
+| **Latency** p99 (ms) | 4.97 | 5.50 | **4.75** |
+| **Mixed** GET+POST+blob (req/s) | 29,834 | 33,714 | **33,886** |
+
+### Microbenchmarks
+
 ```
 zig build bench
-swerver microbench
 buffer_pool acquire/release: 21 ns/op
 connection_pool acquire/release: 30 ns/op
 ```
-
-Micros are dominated by fixed-size pool helpers that power the zero-copy runtime; results may vary per platform and optimization level.
 
 ## License
 
