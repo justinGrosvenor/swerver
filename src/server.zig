@@ -53,6 +53,9 @@ pub const Server = struct {
     /// Pre-computed Alt-Svc header value for HTTP/3 advertisement
     alt_svc_value: [64]u8 = undefined,
     alt_svc_len: usize = 0,
+    /// Cached Date header value (updated once per second)
+    cached_date: [29]u8 = undefined,
+    cached_date_epoch: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, cfg: config.ServerConfig) !Server {
         var app_router = router.Router.init(.{
@@ -982,6 +985,7 @@ pub const Server = struct {
             .managed => |managed| managed,
             else => null,
         };
+        const date_str = self.getCachedDate();
         // RFC 9110 §9.3.2: HEAD response MUST NOT contain a message body
         const suppress_body = conn.is_head_request;
         const buf = self.io.acquireBuffer() orelse {
@@ -1003,7 +1007,34 @@ pub const Server = struct {
                 self.closeConnection(conn);
                 return;
             }
-            const header_len = encodeResponseHeaders(buf.bytes, resp, alt_svc, conn.close_after_write) catch {
+            const managed_bytes = managed.handle.bytes[0..body_len];
+
+            // Try to fit headers + body in a single buffer for one write() syscall
+            const header_space = 512;
+            if (!suppress_body and body_len > 0 and body_len <= buf.bytes.len - header_space) {
+                const header_len = encodeResponseHeaders(buf.bytes, resp, alt_svc, conn.close_after_write, date_str) catch {
+                    self.io.releaseBuffer(managed.handle);
+                    self.io.releaseBuffer(buf);
+                    self.closeConnection(conn);
+                    return;
+                };
+                if (header_len + body_len <= buf.bytes.len) {
+                    // Copy body into header buffer — single write
+                    @memcpy(buf.bytes[header_len .. header_len + body_len], managed_bytes);
+                    self.io.releaseBuffer(managed.handle);
+                    if (!conn.enqueueWrite(buf, header_len + body_len)) {
+                        self.io.releaseBuffer(buf);
+                        self.closeConnection(conn);
+                        return;
+                    }
+                    self.io.onWriteBuffered(conn, header_len + body_len);
+                    self.io.setTimeoutPhase(conn, .write);
+                    return;
+                }
+            }
+
+            // Fallback: headers and body as separate writes
+            const header_len = encodeResponseHeaders(buf.bytes, resp, alt_svc, conn.close_after_write, date_str) catch {
                 self.io.releaseBuffer(managed.handle);
                 self.io.releaseBuffer(buf);
                 self.closeConnection(conn);
@@ -1034,7 +1065,7 @@ pub const Server = struct {
 
         if (suppress_body) {
             // HEAD: send headers with Content-Length but no body
-            const header_len = encodeResponseHeaders(buf.bytes, resp, alt_svc, conn.close_after_write) catch {
+            const header_len = encodeResponseHeaders(buf.bytes, resp, alt_svc, conn.close_after_write, date_str) catch {
                 self.io.releaseBuffer(buf);
                 self.closeConnection(conn);
                 return;
@@ -1053,7 +1084,7 @@ pub const Server = struct {
         const header_space = 512; // Reserve space for headers
         if (body_len > buf.bytes.len - header_space) {
             // Write headers only first
-            const header_len = encodeResponseHeaders(buf.bytes, resp, alt_svc, conn.close_after_write) catch {
+            const header_len = encodeResponseHeaders(buf.bytes, resp, alt_svc, conn.close_after_write, date_str) catch {
                 self.io.releaseBuffer(buf);
                 self.closeConnection(conn);
                 return;
@@ -1072,7 +1103,7 @@ pub const Server = struct {
         }
 
         // Small response - write everything in one buffer
-        const written = encodeResponse(buf.bytes, resp, alt_svc, conn.close_after_write) catch {
+        const written = encodeResponse(buf.bytes, resp, alt_svc, conn.close_after_write, date_str) catch {
             // Cannot encode response - close connection
             self.io.releaseBuffer(buf);
             self.closeConnection(conn);
@@ -1193,7 +1224,7 @@ pub const Server = struct {
             .{ .name = "Content-Length", .value = size_str },
         };
 
-        const header_len = encodeFileHeaders(buf.bytes, 200, &headers) catch {
+        const header_len = encodeFileHeaders(buf.bytes, 200, &headers, self.getCachedDate()) catch {
             self.io.releaseBuffer(buf);
             clock.closeFd(file_fd);
             self.closeConnection(conn);
@@ -1304,7 +1335,7 @@ pub const Server = struct {
         if (conn.http2_stack) |stack| stack.closeStream(resp_stream_id);
     }
 
-    fn encodeResponse(buf: []u8, resp: response_mod.Response, alt_svc: ?[]const u8, connection_close: bool) !usize {
+    fn encodeResponse(buf: []u8, resp: response_mod.Response, alt_svc: ?[]const u8, connection_close: bool, date_str: []const u8) !usize {
         var index: usize = 0;
         const reason = reasonPhrase(resp.status);
         const status_line = try std.fmt.bufPrint(buf[index..], "HTTP/1.1 {d} {s}\r\n", .{ resp.status, reason });
@@ -1324,10 +1355,6 @@ pub const Server = struct {
             const header_line = try std.fmt.bufPrint(buf[index..], "{s}: {s}\r\n", .{ header.name, header.value });
             index += header_line.len;
         }
-        // RFC 9110 §6.6.1: Origin servers MUST send Date header in responses
-        // RFC 9110 §5.6.7: Date must be in IMF-fixdate format
-        var date_buf: [29]u8 = undefined;
-        const date_str = formatImfDate(&date_buf);
         const date_line = try std.fmt.bufPrint(buf[index..], "Date: {s}\r\n", .{date_str});
         index += date_line.len;
         // Add Alt-Svc header to advertise HTTP/3 availability
@@ -1359,7 +1386,7 @@ pub const Server = struct {
     }
 
     /// Encode response headers only (for large body responses that need chunking)
-    fn encodeResponseHeaders(buf: []u8, resp: response_mod.Response, alt_svc: ?[]const u8, connection_close: bool) !usize {
+    fn encodeResponseHeaders(buf: []u8, resp: response_mod.Response, alt_svc: ?[]const u8, connection_close: bool, date_str: []const u8) !usize {
         var index: usize = 0;
         const reason = reasonPhrase(resp.status);
         const status_line = try std.fmt.bufPrint(buf[index..], "HTTP/1.1 {d} {s}\r\n", .{ resp.status, reason });
@@ -1377,9 +1404,6 @@ pub const Server = struct {
             index += 2;
             return index;
         }
-        // RFC 9110 §6.6.1: Origin servers MUST send Date header
-        var date_buf: [29]u8 = undefined;
-        const date_str = formatImfDate(&date_buf);
         const date_line = try std.fmt.bufPrint(buf[index..], "Date: {s}\r\n", .{date_str});
         index += date_line.len;
         if (alt_svc) |svc| {
@@ -1407,7 +1431,7 @@ pub const Server = struct {
     }
 
     /// Encode HTTP/1.1 response headers for file responses (doesn't add Content-Length)
-    fn encodeFileHeaders(buf: []u8, status: u16, headers: []const response_mod.Header) !usize {
+    fn encodeFileHeaders(buf: []u8, status: u16, headers: []const response_mod.Header, date_str: []const u8) !usize {
         var index: usize = 0;
         const reason = reasonPhrase(status);
         const status_line = try std.fmt.bufPrint(buf[index..], "HTTP/1.1 {d} {s}\r\n", .{ status, reason });
@@ -1416,9 +1440,6 @@ pub const Server = struct {
             const header_line = try std.fmt.bufPrint(buf[index..], "{s}: {s}\r\n", .{ header.name, header.value });
             index += header_line.len;
         }
-        // RFC 9110 §6.6.1: Origin servers MUST send Date header
-        var date_buf: [29]u8 = undefined;
-        const date_str = formatImfDate(&date_buf);
         const file_date_line = try std.fmt.bufPrint(buf[index..], "Date: {s}\r\n", .{date_str});
         index += file_date_line.len;
         // End headers
@@ -1488,6 +1509,17 @@ pub const Server = struct {
 
     fn isLeapYear(year: u64) bool {
         return (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0);
+    }
+
+    /// Return cached IMF-fixdate string, updating once per second.
+    fn getCachedDate(self: *Server) []const u8 {
+        const ts = clock.realtimeTimespec() orelse return "Thu, 01 Jan 1970 00:00:00 GMT";
+        const epoch_secs: u64 = @intCast(ts.sec);
+        if (epoch_secs != self.cached_date_epoch) {
+            _ = formatImfDate(&self.cached_date);
+            self.cached_date_epoch = epoch_secs;
+        }
+        return self.cached_date[0..29];
     }
 
     fn continueResponse() response_mod.Response {
@@ -1657,27 +1689,23 @@ test "metrics middleware response queued for http1" {
     if (scratch.arena_handle) |handle| server.io.releaseBuffer(handle);
     try std.testing.expect(result.resp.bodyLen() > 0);
 
-    const managed = switch (result.resp.body) {
-        .managed => |m| m,
-        else => return error.UnexpectedBody,
-    };
+    const body_bytes_1 = result.resp.bodyBytes();
+    try std.testing.expect(body_bytes_1.len > 0);
 
     const conn = server.io.acquireConnection(server.io.nowMs()) orelse return error.OutOfMemory;
     defer if (conn.state != .closed) server.io.releaseConnection(conn);
 
     try server.queueResponse(conn, result.resp);
-    try std.testing.expectEqual(@as(u8, 2), conn.write_count);
+    // Managed body fits alongside headers — combined into single write
+    try std.testing.expectEqual(@as(u8, 1), conn.write_count);
 
-    const header_entry = conn.peekWrite().?.*;
+    const entry = conn.peekWrite().?.*;
     conn.popWrite();
-    const body_entry = conn.peekWrite().?.*;
-    conn.popWrite();
+    // Verify the combined buffer contains the body
+    const entry_bytes = entry.handle.bytes[0..entry.len];
+    try std.testing.expect(std.mem.endsWith(u8, entry_bytes, body_bytes_1));
 
-    try std.testing.expectEqual(managed.handle.index, body_entry.handle.index);
-    try std.testing.expectEqualStrings(result.resp.bodyBytes(), body_entry.handle.bytes[0..body_entry.len]);
-
-    server.io.releaseBuffer(header_entry.handle);
-    server.io.releaseBuffer(body_entry.handle);
+    server.io.releaseBuffer(entry.handle);
 }
 
 test "metrics middleware response queued for http2" {
@@ -1838,27 +1866,22 @@ test "metrics middleware end-to-end http1" {
     if (scratch.arena_handle) |handle| server.io.releaseBuffer(handle);
     try std.testing.expect(result.resp.bodyLen() > 0);
 
-    const managed = switch (result.resp.body) {
-        .managed => |m| m,
-        else => return error.UnexpectedBody,
-    };
+    const body_bytes_2 = result.resp.bodyBytes();
+    try std.testing.expect(body_bytes_2.len > 0);
 
     const conn = server.io.acquireConnection(server.io.nowMs()) orelse return error.OutOfMemory;
     defer if (conn.state != .closed) server.io.releaseConnection(conn);
 
     try server.queueResponse(conn, result.resp);
-    try std.testing.expectEqual(@as(u8, 2), conn.write_count);
+    // Managed body fits alongside headers — combined into single write
+    try std.testing.expectEqual(@as(u8, 1), conn.write_count);
 
-    const header_entry = conn.peekWrite().?.*;
+    const entry = conn.peekWrite().?.*;
     conn.popWrite();
-    const body_entry = conn.peekWrite().?.*;
-    conn.popWrite();
+    const entry_bytes = entry.handle.bytes[0..entry.len];
+    try std.testing.expect(std.mem.endsWith(u8, entry_bytes, body_bytes_2));
 
-    try std.testing.expectEqual(managed.handle.index, body_entry.handle.index);
-    try std.testing.expectEqualStrings(result.resp.bodyBytes(), body_entry.handle.bytes[0..body_entry.len]);
-
-    server.io.releaseBuffer(header_entry.handle);
-    server.io.releaseBuffer(body_entry.handle);
+    server.io.releaseBuffer(entry.handle);
 }
 
 test "metrics middleware end-to-end http2" {
@@ -2144,21 +2167,19 @@ const benchmark_blob: [1024 * 1024]u8 = [_]u8{0} ** (1024 * 1024);
     }
 
 /// POST /echo - echo back request body
+    /// Returns .bytes pointing into the read buffer — safe because queueResponse
+    /// copies body into the write buffer synchronously before the next read().
 fn handleBenchEchoPost(ctx: *router.HandlerContext) response_mod.Response {
     const body = ctx.request.body;
     if (body.len == 0) {
         return handleBenchEchoGet(ctx);
     }
-    var builder = ctx.respond() catch return .{
-        .status = 503,
-        .headers = &[_]response_mod.Header{},
-        .body = .{ .bytes = "No buffers available\n" },
-    };
-    defer ctx.releaseBuilder(&builder);
-    return builder.json(200, body) catch .{
-        .status = 413,
-        .headers = &[_]response_mod.Header{},
-        .body = .{ .bytes = "Payload Too Large\n" },
+    return .{
+        .status = 200,
+        .headers = &[_]response_mod.Header{
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .body = .{ .bytes = body },
     };
 }
 
