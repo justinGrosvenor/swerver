@@ -2142,9 +2142,8 @@ pub fn registerDefaultRoutes(app_router: *router.Router) !void {
 // Built-in endpoints for performance testing
 // ============================================================
 
-/// 1MB static blob for large response benchmarks
-/// Tests streaming response capability
-const benchmark_blob: [1024 * 1024]u8 = [_]u8{0} ** (1024 * 1024);
+/// 8KB static blob for large response benchmarks
+const benchmark_blob: [8 * 1024]u8 = [_]u8{0} ** (8 * 1024);
 
 /// GET /health - minimal health check for benchmarks
     fn handleBenchHealth(_: *router.HandlerContext) response_mod.Response {
