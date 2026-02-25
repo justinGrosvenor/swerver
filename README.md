@@ -200,11 +200,11 @@ export ZIG_LOCAL_CACHE_DIR="$(pwd)/.zig-cache"
 
 | Scenario | swerver | actix (Rust) | nginx |
 |----------|---------|-------------|-------|
-| **Throughput** (req/s) | **174,733** | 134,691 | 118,265 |
-| **Concurrent** ramp to 1000 VUs (req/s) | **176,281** | 151,055 | 140,250 |
-| **Connections** new conn/req (conn/s) | **89,702** | 77,411 | 24,154 |
-| **Latency** p99 (ms) | 4.97 | 5.50 | **4.75** |
-| **Mixed** GET+POST+blob (req/s) | 29,834 | 33,714 | **33,886** |
+| **Throughput** (req/s) | **168,588** | 129,903 | 121,745 |
+| **Concurrent** ramp to 1000 VUs (req/s) | **196,990** | 159,399 | 132,025 |
+| **Connections** new conn/req (conn/s) | **86,971** | 64,733 | 23,928 |
+| **Latency** p99 (ms) | **5.02** | 5.52 | 5.18 |
+| **Mixed** GET+POST+blob (req/s) | **36,405** | 35,970 | 34,781 |
 
 ### Microbenchmarks
 
