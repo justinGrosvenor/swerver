@@ -15,43 +15,56 @@ zig build -Doptimize=ReleaseSmall \
     -Denable-http3
 ```
 
-- `-Denable-tls` turns on the TLS provider (BoringSSL shim). Supply keys via `config.yaml`.
+- `-Denable-tls` turns on the TLS provider (BoringSSL shim). Supply keys via `config.json`.
 - HTTP/2/3 flags automatically wire ALPN/QUIC stacks.
 - Release builds default to `ReleaseFast` if `optimize` omitted; specify `ReleaseSmall` or `Debug` as needed.
 
 ## Configuration
 
-Create `config.yaml` (or JSON/TOML) describing:
+Create `config.json`:
 
-```yaml
-address: "0.0.0.0"
-port: 8080
-tls:
-  cert_path: "/etc/ssl/certs/server.crt"
-  key_path: "/etc/ssl/private/server.key"
-limits:
-  max_header_bytes: 8192
-  max_body_bytes: 65536
-  max_header_count: 128
-  buffer_size: 16384
-  buffer_count: 4096
-x402:
-  enabled: true
-  payment_required_b64: ABCE...
-timeouts:
-  idle_ms: 60000
-  header_ms: 5000
-  body_ms: 30000
-  write_ms: 5000
+```json
+{
+  "server": {
+    "address": "0.0.0.0",
+    "port": 8080,
+    "workers": 4,
+    "max_connections": 4096
+  },
+  "timeouts": {
+    "idle_ms": 60000,
+    "header_ms": 5000,
+    "body_ms": 30000,
+    "write_ms": 5000
+  },
+  "limits": {
+    "max_header_bytes": 8192,
+    "max_body_bytes": 8388608,
+    "max_header_count": 128
+  },
+  "upstreams": [{
+    "name": "api",
+    "servers": [
+      { "address": "10.0.0.1", "port": 8080 },
+      { "address": "10.0.0.2", "port": 8080, "weight": 2 }
+    ],
+    "load_balancer": "round_robin",
+    "health_check": { "path": "/healthz", "interval_ms": 10000 }
+  }],
+  "routes": [{
+    "path_prefix": "/api/",
+    "upstream": "api"
+  }]
+}
 ```
 
-- `x402.payment_required_b64` holds the base64-encoded JSON challenge payload documented in `docs/design/4.0-x402-payments.md`.
-- Use the `config` module to load the file at startup (currently part of `src/main.zig`).
+- See `src/config_file.zig` for the full schema (all fields are optional with sensible defaults).
+- Use `--config config.json` to load the file at startup.
 
 ## Running
 
 ```sh
-./zig-out/bin/swerver --config config.yaml
+./zig-out/bin/swerver --config config.json
 ```
 
 - On Linux, wrap this in systemd, runit, or containers. Ensure `/metrics`, `/.healthz`, and `/.ready` are reachable from monitoring systems.

@@ -104,7 +104,7 @@ The buffer pool pre-allocates all memory at startup:
 
 ```zig
 const cfg = BufferPoolConfig{
-    .buffer_size = 16 * 1024,   // 16KB per buffer
+    .buffer_size = 64 * 1024,   // 64KB per buffer
     .buffer_count = 4096,        // 64MB total
 };
 ```
@@ -180,7 +180,7 @@ export ZIG_LOCAL_CACHE_DIR="$(pwd)/.zig-cache"
 
 ## Requirements
 
-- Zig 0.14.0 or later
+- Zig 0.16.0-dev or later
 - OpenSSL/BoringSSL (for TLS)
 - macOS, Linux, or BSD
 
