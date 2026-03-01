@@ -3,6 +3,7 @@ const upstream = @import("upstream.zig");
 const pool_mod = @import("pool.zig");
 const request = @import("../protocol/request.zig");
 const response = @import("../response/response.zig");
+const buffer_pool = @import("../runtime/buffer_pool.zig");
 
 /// Request/Response Forwarding
 ///
@@ -157,6 +158,148 @@ pub fn buildUpstreamRequest(
         @memcpy(buf[pos .. pos + ctx.client_request.body.len], ctx.client_request.body);
         pos += ctx.client_request.body.len;
     }
+
+    return pos;
+}
+
+/// Abstraction over a request body that may be a contiguous slice or a chain of pool buffers.
+pub const BodyView = union(enum) {
+    slice: []const u8,
+    buffers: struct {
+        handles: []const buffer_pool.BufferHandle,
+        last_buf_len: usize,
+        total_len: usize,
+        buffer_size: usize,
+    },
+
+    pub fn totalLen(self: BodyView) usize {
+        return switch (self) {
+            .slice => |s| s.len,
+            .buffers => |b| b.total_len,
+        };
+    }
+
+    pub const Iterator = struct {
+        view: *const BodyView,
+        index: usize,
+
+        pub fn next(self: *Iterator) ?[]const u8 {
+            switch (self.view.*) {
+                .slice => |s| {
+                    if (self.index > 0) return null;
+                    self.index = 1;
+                    return s;
+                },
+                .buffers => |b| {
+                    if (self.index >= b.handles.len) return null;
+                    const handle = b.handles[self.index];
+                    const len = if (self.index == b.handles.len - 1)
+                        b.last_buf_len
+                    else
+                        b.buffer_size;
+                    self.index += 1;
+                    return handle.bytes[0..len];
+                },
+            }
+        }
+    };
+
+    pub fn iterator(self: *const BodyView) Iterator {
+        return .{ .view = self, .index = 0 };
+    }
+};
+
+/// Build upstream request headers only (no body). Uses body_len for Content-Length.
+pub fn buildUpstreamRequestHeaders(
+    buf: []u8,
+    ctx: *const ForwardContext,
+    body_len: usize,
+) !usize {
+    var pos: usize = 0;
+
+    // Request line
+    const method_name = ctx.client_request.getMethodName();
+    const path = rewritePath(ctx.client_request.path, ctx.route.rewrite);
+
+    pos += (std.fmt.bufPrint(buf[pos..], "{s} {s} HTTP/1.1\r\n", .{ method_name, path }) catch return error.BufferFull).len;
+
+    // Host header
+    if (ctx.route.headers.preserve_host) {
+        if (ctx.client_request.getHeader("Host")) |host| {
+            pos += (std.fmt.bufPrint(buf[pos..], "Host: {s}\r\n", .{host}) catch return error.BufferFull).len;
+        } else {
+            pos += (std.fmt.bufPrint(buf[pos..], "Host: {s}:{d}\r\n", .{ ctx.server.address, ctx.server.port }) catch return error.BufferFull).len;
+        }
+    } else {
+        pos += (std.fmt.bufPrint(buf[pos..], "Host: {s}:{d}\r\n", .{ ctx.server.address, ctx.server.port }) catch return error.BufferFull).len;
+    }
+
+    // RFC 9110 §7.6.1: Parse Connection header to find dynamic hop-by-hop headers
+    var dynamic_hop_by_hop: [16][]const u8 = undefined;
+    var dynamic_hop_count: usize = 0;
+    if (ctx.client_request.getHeader("Connection")) |conn_value| {
+        var it = std.mem.splitScalar(u8, conn_value, ',');
+        while (it.next()) |token| {
+            const trimmed = std.mem.trim(u8, token, " \t");
+            if (trimmed.len > 0 and dynamic_hop_count < dynamic_hop_by_hop.len) {
+                dynamic_hop_by_hop[dynamic_hop_count] = trimmed;
+                dynamic_hop_count += 1;
+            }
+        }
+    }
+
+    // Forward non-hop-by-hop headers
+    for (ctx.client_request.headers) |hdr| {
+        if (upstream.isHopByHop(hdr.name)) continue;
+
+        var is_dynamic_hop = false;
+        for (dynamic_hop_by_hop[0..dynamic_hop_count]) |dh| {
+            if (std.ascii.eqlIgnoreCase(hdr.name, dh)) {
+                is_dynamic_hop = true;
+                break;
+            }
+        }
+        if (is_dynamic_hop) continue;
+        if (std.ascii.eqlIgnoreCase(hdr.name, "host")) continue;
+        if (std.ascii.eqlIgnoreCase(hdr.name, "via")) continue;
+        // Skip Content-Length — we'll write our own based on body_len
+        if (std.ascii.eqlIgnoreCase(hdr.name, "content-length")) continue;
+
+        var should_remove = false;
+        for (ctx.route.headers.remove_request) |remove_name| {
+            if (std.ascii.eqlIgnoreCase(hdr.name, remove_name)) {
+                should_remove = true;
+                break;
+            }
+        }
+        if (should_remove) continue;
+
+        pos += (std.fmt.bufPrint(buf[pos..], "{s}: {s}\r\n", .{ hdr.name, hdr.value }) catch return error.BufferFull).len;
+    }
+
+    // Add configured request headers
+    for (ctx.route.headers.set_request) |hdr| {
+        pos += (std.fmt.bufPrint(buf[pos..], "{s}: {s}\r\n", .{ hdr.name, hdr.value }) catch return error.BufferFull).len;
+    }
+
+    // Add proxy headers if enabled
+    if (ctx.route.headers.add_proxy_headers) {
+        pos = try addProxyHeaders(buf, pos, ctx);
+    }
+
+    // Content-Length for the body
+    if (body_len > 0) {
+        pos += (std.fmt.bufPrint(buf[pos..], "Content-Length: {d}\r\n", .{body_len}) catch return error.BufferFull).len;
+    }
+
+    // Connection header for keep-alive
+    pos += (std.fmt.bufPrint(buf[pos..], "Connection: keep-alive\r\n", .{}) catch return error.BufferFull).len;
+
+    // End of headers
+    if (pos + 2 > buf.len) return error.BufferFull;
+    buf[pos] = '\r';
+    buf[pos + 1] = '\n';
+    pos += 2;
 
     return pos;
 }

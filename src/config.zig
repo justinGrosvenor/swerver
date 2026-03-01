@@ -103,7 +103,7 @@ pub const Backpressure = struct {
 };
 
 pub const BufferPoolConfig = struct {
-    buffer_size: usize = 16 * 1024,
+    buffer_size: usize = 64 * 1024,
     buffer_count: usize = 4096,
 };
 

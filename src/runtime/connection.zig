@@ -4,7 +4,26 @@ const buffer_pool = @import("buffer_pool.zig");
 const clock = @import("clock.zig");
 const request = @import("../protocol/request.zig");
 const http2 = @import("../protocol/http2.zig");
+const http1 = @import("../protocol/http1.zig");
 const tls = @import("../tls/provider.zig");
+
+/// State for accumulating large request bodies across multiple reads.
+/// Heap-allocated on demand (only for bodies that exceed the read buffer).
+pub const BodyAccumState = struct {
+    pub const MAX_BODY_BUFFERS = 128; // 128 × 64KB = 8MB
+
+    content_length: usize,
+    is_chunked: bool,
+    bytes_received: usize,
+    bytes_decoded: usize,
+    body_buffers: [MAX_BODY_BUFFERS]buffer_pool.BufferHandle,
+    buffer_count: u8,
+    current_buf_offset: usize,
+    chunk_decoder: http1.ChunkDecoder,
+    header_result: http1.HeaderParseResult,
+    /// Retains the original read buffer so header slices (path, headers) remain valid.
+    original_read_buffer: ?buffer_pool.BufferHandle,
+};
 
 pub const State = enum {
     accept,
@@ -63,6 +82,8 @@ pub const Connection = struct {
     is_tls: bool,
     /// Whether current request is HEAD (body suppressed in response per RFC 9110 §9.3.2)
     is_head_request: bool,
+    /// Body accumulation state for large request bodies (inline, no heap alloc)
+    body_accum: ?BodyAccumState = null,
     /// Pending response body for streaming large responses
     pending_body: []const u8,
     /// File descriptor for sendfile-based response (null = no file pending)
@@ -102,6 +123,7 @@ pub const Connection = struct {
             .tls_session = null,
             .is_tls = false,
             .is_head_request = false,
+            .body_accum = null,
             .pending_body = &[_]u8{},
             .pending_file_fd = null,
             .pending_file_offset = 0,
@@ -135,6 +157,8 @@ pub const Connection = struct {
         self.tls_session = null;
         self.is_tls = false;
         self.is_head_request = false;
+        // body_accum is cleaned up by the server before reset
+        self.body_accum = null;
         self.pending_body = &[_]u8{};
         self.cleanupPendingFile();
         // active_list_pos is set by ConnectionPool.acquire
@@ -161,6 +185,11 @@ pub const Connection = struct {
             session.deinit();
             self.tls_session = null;
         }
+    }
+
+    /// Returns true if this connection is accumulating a large request body
+    pub fn isAccumulatingBody(self: *const Connection) bool {
+        return self.body_accum != null;
     }
 
     pub fn transition(self: *Connection, next: State, now_ms: u64) TransitionError!void {
@@ -383,6 +412,7 @@ pub const ConnectionPool = struct {
         conn.sent_continue = false;
         conn.protocol = .http1;
         conn.http2_stack = null;
+        conn.body_accum = null;
         conn.read_buffer = null;
         conn.write_head = 0;
         conn.write_tail = 0;

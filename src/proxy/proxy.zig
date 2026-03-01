@@ -432,6 +432,224 @@ pub const Proxy = struct {
         return .{ .resp = forward.createErrorResponse(502), .proxy = self };
     }
 
+    /// Handle a proxy request with a body provided as a BodyView (multi-buffer).
+    /// Sends request headers first, then streams body chunks to upstream.
+    /// The caller MUST call `result.release()` after the response has been consumed.
+    pub fn handleWithBody(
+        self: *Proxy,
+        req: request.RequestView,
+        body_view: forward.BodyView,
+        mw_ctx: *middleware.Context,
+        client_ip: ?[]const u8,
+        client_tls: bool,
+        now_ms: u64,
+    ) ProxyResult {
+        _ = mw_ctx;
+
+        // Find matching route
+        const route = self.matchRoute(&req) orelse {
+            return .{ .resp = forward.createErrorResponse(502), .proxy = self };
+        };
+
+        // Get upstream configuration
+        const upstream_def = self.upstreams_by_name.get(route.upstream) orelse {
+            return .{ .resp = forward.createErrorResponse(502), .proxy = self };
+        };
+        _ = upstream_def;
+
+        // Get balancer and pool
+        const bal = self.balancers.get(route.upstream) orelse {
+            return .{ .resp = forward.createErrorResponse(502), .proxy = self };
+        };
+
+        const pool = self.pool_manager.getPool(route.upstream) orelse {
+            return .{ .resp = forward.createErrorResponse(502), .proxy = self };
+        };
+
+        // Acquire buffers
+        const req_buf_idx = self.acquireRequestBuffer() orelse {
+            return .{ .resp = forward.createErrorResponse(503), .proxy = self };
+        };
+        defer self.releaseRequestBuffer(req_buf_idx);
+
+        const resp_buf_idx = self.acquireResponseBuffer() orelse {
+            return .{ .resp = forward.createErrorResponse(503), .proxy = self };
+        };
+
+        const client_ip_u32: ?u32 = if (client_ip) |ip| parseIpToU32(ip) else null;
+
+        const retry_config = route.retry;
+        var attempts: u8 = 0;
+        const max_attempts = retry_config.max_retries + 1;
+        const body_len = body_view.totalLen();
+
+        while (attempts < max_attempts) {
+            attempts += 1;
+
+            const selection = bal.select(client_ip_u32, now_ms) orelse {
+                self.releaseResponseBuffer(resp_buf_idx);
+                return .{ .resp = forward.createErrorResponse(502), .proxy = self };
+            };
+
+            var conn = pool.acquireForServer(selection.server_index, now_ms);
+            var created_new = false;
+
+            if (conn == null) {
+                const slot = pool.reserveSlot() orelse {
+                    if (attempts < max_attempts) continue;
+                    self.releaseResponseBuffer(resp_buf_idx);
+                    return .{ .resp = forward.createErrorResponse(503), .proxy = self };
+                };
+
+                const fd = net.connectBlocking(
+                    selection.server.address,
+                    selection.server.port,
+                    route.timeouts.connect_ms,
+                ) catch {
+                    if (selection.server_index < pool.server_failures.len) {
+                        pool.server_failures[selection.server_index].consecutive_failures += 1;
+                        pool.server_failures[selection.server_index].last_failure_ms = now_ms;
+                        if (pool.server_failures[selection.server_index].consecutive_failures >= selection.server.max_fails) {
+                            pool.server_failures[selection.server_index].available = false;
+                        }
+                    }
+                    continue;
+                };
+
+                net.setSocketTimeouts(fd, route.timeouts.send_ms, route.timeouts.read_ms);
+
+                var new_conn = pool_mod.UpstreamConnection.init(fd, selection.server_index, now_ms, slot);
+                new_conn.state = .idle;
+                pool.addConnection(slot, new_conn);
+                conn = pool.acquireForServer(selection.server_index, now_ms);
+                created_new = true;
+            }
+
+            if (conn) |c| {
+                // Verify existing connection is still alive
+                if (!created_new and c.fd >= 0) {
+                    var pfd = [1]std.posix.pollfd{.{
+                        .fd = c.fd,
+                        .events = std.posix.POLL.IN,
+                        .revents = 0,
+                    }};
+                    const poll_rc = std.posix.system.poll(&pfd, 1, 0);
+                    if (poll_rc > 0 and (pfd[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0) {
+                        pool.removeConnection(c);
+                        continue;
+                    }
+                }
+
+                // Build upstream request headers only (no body in buffer)
+                const ctx = forward.ForwardContext{
+                    .client_request = req,
+                    .client_ip = client_ip,
+                    .client_tls = client_tls,
+                    .route = route,
+                    .server = selection.server,
+                    .upstream_conn = c,
+                    .request_buf = &self.request_bufs[req_buf_idx],
+                    .response_buf = &self.response_bufs[resp_buf_idx],
+                };
+
+                const header_len = forward.buildUpstreamRequestHeaders(&self.request_bufs[req_buf_idx], &ctx, body_len) catch {
+                    pool.markConnectionFailed(c, now_ms, selection.server.max_fails);
+                    continue;
+                };
+
+                // Send headers to upstream
+                net.sendAll(c.fd, self.request_bufs[req_buf_idx][0..header_len]) catch {
+                    pool.markConnectionFailed(c, now_ms, selection.server.max_fails);
+                    if (!forward.isIdempotent(req.method)) {
+                        self.releaseResponseBuffer(resp_buf_idx);
+                        return .{ .resp = forward.createErrorResponse(502), .proxy = self };
+                    }
+                    continue;
+                };
+
+                // Stream body chunks to upstream
+                var body_send_failed = false;
+                var body_iter = body_view.iterator();
+                while (body_iter.next()) |chunk| {
+                    net.sendAll(c.fd, chunk) catch {
+                        pool.markConnectionFailed(c, now_ms, selection.server.max_fails);
+                        body_send_failed = true;
+                        break;
+                    };
+                }
+
+                if (body_send_failed) {
+                    if (!forward.isIdempotent(req.method)) {
+                        self.releaseResponseBuffer(resp_buf_idx);
+                        return .{ .resp = forward.createErrorResponse(502), .proxy = self };
+                    }
+                    continue;
+                }
+
+                // Read response from upstream
+                var total_read: usize = 0;
+                var read_failed = false;
+                while (total_read < RESPONSE_BUF_SIZE) {
+                    const n = net.recvBlocking(c.fd, self.response_bufs[resp_buf_idx][total_read..]) catch {
+                        pool.markConnectionFailed(c, now_ms, selection.server.max_fails);
+                        read_failed = true;
+                        break;
+                    };
+                    if (n == 0) break;
+                    total_read += n;
+
+                    if (forward.parseUpstreamResponse(self.response_bufs[resp_buf_idx][0..total_read])) |_| {
+                        break;
+                    } else |_| {}
+                }
+
+                if (read_failed) {
+                    if (!forward.isIdempotent(req.method)) {
+                        self.releaseResponseBuffer(resp_buf_idx);
+                        return .{ .resp = forward.createErrorResponse(502), .proxy = self };
+                    }
+                    continue;
+                }
+
+                if (total_read == 0) {
+                    pool.markConnectionFailed(c, now_ms, selection.server.max_fails);
+                    continue;
+                }
+
+                const parsed = forward.parseUpstreamResponse(self.response_bufs[resp_buf_idx][0..total_read]) catch {
+                    pool.markConnectionFailed(c, now_ms, selection.server.max_fails);
+                    continue;
+                };
+
+                if (forward.shouldRetry(parsed.status, &retry_config) and
+                    forward.isMethodRetryable(req.method, &retry_config) and
+                    attempts < max_attempts)
+                {
+                    pool.release(c, now_ms, parsed.keep_alive);
+                    continue;
+                }
+
+                pool.markServerSuccess(selection.server_index);
+                pool.release(c, now_ms, parsed.keep_alive);
+
+                const body = self.response_bufs[resp_buf_idx][parsed.body_start..parsed.body_end];
+
+                return .{
+                    .resp = .{
+                        .status = parsed.status,
+                        .headers = parsed.headers(),
+                        .body = .{ .bytes = body },
+                    },
+                    .proxy = self,
+                    .resp_buf_idx = resp_buf_idx,
+                };
+            }
+        }
+
+        self.releaseResponseBuffer(resp_buf_idx);
+        return .{ .resp = forward.createErrorResponse(502), .proxy = self };
+    }
+
     /// Run periodic maintenance tasks
     pub fn runMaintenance(self: *Proxy, now_ms: u64) void {
         // Evict expired connections
