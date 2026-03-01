@@ -53,3 +53,5 @@ coverage/
 *.iml
 *.sublime-project
 *.sublime-workspace
+test_getaddrinfo
+.claude
