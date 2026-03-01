@@ -7,6 +7,8 @@ const varint = @import("varint.zig");
 pub const metrics = @import("metrics.zig");
 const tls = @import("../tls/provider.zig");
 const stream = @import("stream.zig");
+const recovery_mod = @import("recovery.zig");
+const congestion_mod = @import("congestion.zig");
 const http3 = @import("../protocol/http3.zig");
 const clock = @import("../runtime/clock.zig");
 
@@ -244,6 +246,10 @@ pub const Connection = struct {
     last_activity: ?clock.Instant = null,
     /// Connection metrics
     conn_metrics: metrics.ConnectionMetrics = .{ .created_at = null },
+    /// Loss recovery manager (RFC 9002)
+    recovery: recovery_mod.Recovery,
+    /// Congestion controller (NewReno)
+    congestion: congestion_mod.CongestionController = congestion_mod.CongestionController.init(),
     /// TLS session for handshake and key derivation
     tls_session: ?tls.Session = null,
     /// Buffer for outgoing CRYPTO data
@@ -281,6 +287,7 @@ pub const Connection = struct {
             .crypto_ctx = crypto.CryptoContext.init(),
             .last_activity = clock.Instant.now(),
             .conn_metrics = metrics.ConnectionMetrics.init(),
+            .recovery = recovery_mod.Recovery.init(allocator),
         };
 
         // Generate our connection ID (8 bytes) from hash of DCID
@@ -297,6 +304,7 @@ pub const Connection = struct {
     }
 
     pub fn deinit(self: *Connection) void {
+        self.recovery.deinit();
         self.crypto_buffer.deinit(self.allocator);
         if (self.tls_session) |*session| {
             session.deinit();
@@ -587,15 +595,78 @@ pub const Connection = struct {
     }
 
     fn processShortHeaderPacket(self: *Connection, header: packet.ShortHeader, data: []const u8) Error!void {
-        _ = data;
-        _ = header;
-
         if (self.state != .connected) {
             return Error.InvalidState;
         }
 
-        // Process 1-RTT packet
-        // TODO: Decrypt and process frames
+        // Get application keys for decryption
+        const keys_opt: ?crypto.Keys = if (self.is_server)
+            self.crypto_ctx.application.client
+        else
+            self.crypto_ctx.application.server;
+        const keys = keys_opt orelse return Error.CryptoError;
+
+        // Calculate packet number offset: flags (1) + DCID
+        const pn_offset = 1 + header.dcid.len;
+
+        // Copy to mutable buffer for in-place decryption
+        var decrypt_buf: [65536]u8 = undefined;
+        if (data.len > decrypt_buf.len) return Error.InvalidPacket;
+        @memcpy(decrypt_buf[0..data.len], data);
+
+        const largest_pn = self.application_space.largest_received orelse 0;
+        const result = crypto.unprotectPacket(
+            &keys, largest_pn, pn_offset, &decrypt_buf, data.len,
+        ) catch return Error.InvalidPacket;
+
+        // Record receipt
+        self.application_space.onPacketReceived(result.pn);
+        self.last_activity = clock.Instant.now();
+
+        // Process frames in decrypted payload
+        const payload = decrypt_buf[result.header_len .. result.header_len + result.payload_len];
+        var offset: usize = 0;
+        while (offset < payload.len) {
+            const fr = frame.parseFrame(payload[offset..]) catch return Error.InvalidPacket;
+            offset += fr.consumed;
+            switch (fr.frame) {
+                .padding, .ping => {},
+                .ack => |ack| self.processAckFrame(ack, types.PacketNumberSpace.application),
+                .stream => |sf| {
+                    const s = self.getOrCreateStream(sf.stream_id) catch return Error.ProtocolViolation;
+                    s.receive(sf.offset, sf.data, sf.fin) catch return Error.ProtocolViolation;
+                    self.flow_control.onDataReceived(sf.data.len) catch return Error.FlowControlError;
+                    _ = self.processHttp3Stream(sf.stream_id, sf.data, sf.fin) catch {};
+                },
+                .max_data => |md| self.processMaxDataFrame(md.maximum_data),
+                .max_stream_data => |msd| {
+                    if (self.getStream(msd.stream_id)) |s| s.updateSendLimit(msd.maximum_stream_data);
+                },
+                .max_streams => |ms| {
+                    if (self.stream_manager) |*mgr| {
+                        if (ms.bidirectional) mgr.max_streams_bidi_local = ms.maximum_streams
+                        else mgr.max_streams_uni_local = ms.maximum_streams;
+                    }
+                },
+                .connection_close => |cf| self.processConnectionClose(cf.error_code, cf.reason_phrase),
+                .handshake_done => {
+                    if (!self.is_server) self.onHandshakeComplete();
+                },
+                .reset_stream => |rs| {
+                    if (self.getStream(rs.stream_id)) |s| {
+                        s.onReset(rs.final_size) catch {};
+                    }
+                },
+                .stop_sending => |ss| {
+                    if (self.getStream(ss.stream_id)) |s| s.reset(ss.application_error_code);
+                },
+                .path_challenge => |pc| self.queuePathResponse(pc.data),
+                .path_response => |pr| self.validatePathResponse(pr.data),
+                .new_connection_id => |nc| self.addPeerConnectionId(nc),
+                .retire_connection_id => |rc| self.retireConnectionId(rc.sequence_number),
+                else => {},
+            }
+        }
     }
 
     fn handleInitialPacket(self: *Connection, header: packet.LongHeader) Error!void {
@@ -783,20 +854,32 @@ pub const Connection = struct {
         }
     }
 
-    /// Mark a range of packets as acknowledged
+    /// Mark a range of packets as acknowledged, feeding into recovery and congestion control
     fn markPacketsAcked(self: *Connection, space: types.PacketNumberSpace, smallest: u64, largest: u64) void {
-        // In a full implementation, we would:
-        // 1. Look up sent packets in this range
-        // 2. Mark them as acknowledged
-        // 3. Stop retransmission timers
-        // 4. Update RTT estimates based on ack timing
-        // 5. Trigger congestion control on_ack events
+        const now_us = getCurrentTimeMicros();
+        const now_ns = now_us * 1000;
+        const ack_delay_ns = self.application_space.calculateAckDelay() * 1000;
 
-        // For now, update metrics
+        // Feed ACK to recovery — updates RTT estimates and detects losses
+        self.recovery.onAckReceived(space, largest, ack_delay_ns, now_ns);
+
+        // Process lost packets through congestion controller
+        for (self.recovery.lost_packets.items) |lost_pkt| {
+            self.congestion.onPacketLost(lost_pkt.size, lost_pkt.packet_number);
+        }
+        self.recovery.lost_packets.clearRetainingCapacity();
+
+        // Update congestion window for acked bytes
+        var acked_bytes: usize = 0;
+        var pn = smallest;
+        while (pn <= largest) : (pn += 1) {
+            acked_bytes += 1;
+        }
+        self.congestion.onPacketAcked(acked_bytes, largest);
+
+        // Update metrics
         self.conn_metrics.packets_acked += (largest - smallest + 1);
-
-        // Space-specific tracking could be added here
-        _ = space;
+        self.conn_metrics.rtt_us = self.recovery.rtt.smoothed_rtt / 1000;
     }
 
     /// Process a received MAX_DATA frame

@@ -716,7 +716,7 @@ pub const Server = struct {
                         parse.view,
                         &mw_ctx,
                         client_ip_str,
-                        false, // TODO: detect TLS
+                        false, // HTTP/1.1 listener is non-TLS; QUIC/HTTP3 connections don't use this proxy path
                         self.io.nowMs(),
                     );
                     defer proxy_result.release();

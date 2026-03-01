@@ -1,8 +1,12 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const request = @import("../protocol/request.zig");
 const response = @import("../response/response.zig");
 const middleware = @import("middleware.zig");
 const clock = @import("../runtime/clock.zig");
+
+const is_linux = builtin.os.tag == .linux;
+const linux = if (is_linux) std.os.linux else undefined;
 
 /// Observability Middleware
 ///
@@ -255,72 +259,135 @@ pub fn exitReasonFromStatus(status: u16) ExitReason {
 }
 
 // =============================================================================
-// eBPF Counter Interface - Stub for kernel-side instrumentation
+// eBPF Counter Interface - BPF maps on Linux, in-memory fallback elsewhere
 // =============================================================================
 
 /// eBPF counter types
-pub const EbpfCounter = enum {
-    requests_total,
-    responses_total,
-    bytes_sent,
-    bytes_received,
-    errors,
-    congestion_events,
-    rate_limit_hits,
-    connection_timeouts,
+pub const EbpfCounter = enum(u32) {
+    requests_total = 0,
+    responses_total = 1,
+    bytes_sent = 2,
+    bytes_received = 3,
+    errors = 4,
+    congestion_events = 5,
+    rate_limit_hits = 6,
+    connection_timeouts = 7,
 };
 
-/// eBPF counter interface (stub - would use bpf syscalls in real impl)
-pub const EbpfCounters = struct {
-    enabled: bool = false,
+const ebpf_counter_count = 8;
 
-    // Counter values (in-memory fallback when eBPF not available)
-    requests: u64 = 0,
-    responses: u64 = 0,
-    bytes_sent: u64 = 0,
-    bytes_received: u64 = 0,
-    errors: u64 = 0,
-    congestion_events: u64 = 0,
-    rate_limit_hits: u64 = 0,
-    connection_timeouts: u64 = 0,
+/// BPF map wrapper — creates a BPF_MAP_TYPE_ARRAY on Linux via bpf() syscall.
+/// Falls back gracefully if not on Linux or if bpf() fails (no CAP_BPF).
+const BpfMap = struct {
+    fd: i32 = -1,
 
-    /// Initialize eBPF counters (would load BPF program in real impl)
-    pub fn init(enable: bool) EbpfCounters {
-        return .{ .enabled = enable };
+    const BPF_MAP_CREATE: usize = 0;
+    const BPF_MAP_LOOKUP_ELEM: usize = 1;
+    const BPF_MAP_UPDATE_ELEM: usize = 2;
+    const BPF_MAP_TYPE_ARRAY: u32 = 2;
+    const BPF_ANY: u64 = 0;
+
+    const BpfMapCreateAttr = extern struct {
+        map_type: u32,
+        key_size: u32,
+        value_size: u32,
+        max_entries: u32,
+        map_flags: u32 = 0,
+        _pad: [48]u8 = [_]u8{0} ** 48,
+    };
+
+    const BpfMapElemAttr = extern struct {
+        map_fd: u32,
+        _pad0: u32 = 0,
+        key: u64,
+        value: u64,
+        flags: u64 = BPF_ANY,
+        _pad: [32]u8 = [_]u8{0} ** 32,
+    };
+
+    fn create(max_entries: u32) BpfMap {
+        if (!is_linux) return .{};
+        var attr = BpfMapCreateAttr{
+            .map_type = BPF_MAP_TYPE_ARRAY,
+            .key_size = @sizeOf(u32),
+            .value_size = @sizeOf(u64),
+            .max_entries = max_entries,
+        };
+        const rc = linux.syscall3(.bpf, BPF_MAP_CREATE, @intFromPtr(&attr), @sizeOf(BpfMapCreateAttr));
+        const fd: i64 = @bitCast(rc);
+        if (fd < 0) return .{}; // No CAP_BPF or not supported — fall back
+        return .{ .fd = @intCast(fd) };
     }
 
-    /// Increment a counter
+    fn update(self: BpfMap, key: u32, value: u64) void {
+        if (!is_linux or self.fd < 0) return;
+        var k = key;
+        var v = value;
+        var attr = BpfMapElemAttr{
+            .map_fd = @intCast(self.fd),
+            .key = @intFromPtr(&k),
+            .value = @intFromPtr(&v),
+        };
+        _ = linux.syscall3(.bpf, BPF_MAP_UPDATE_ELEM, @intFromPtr(&attr), @sizeOf(BpfMapElemAttr));
+    }
+
+    fn lookup(self: BpfMap, key: u32) u64 {
+        if (!is_linux or self.fd < 0) return 0;
+        var k = key;
+        var v: u64 = 0;
+        var attr = BpfMapElemAttr{
+            .map_fd = @intCast(self.fd),
+            .key = @intFromPtr(&k),
+            .value = @intFromPtr(&v),
+        };
+        const rc = linux.syscall3(.bpf, BPF_MAP_LOOKUP_ELEM, @intFromPtr(&attr), @sizeOf(BpfMapElemAttr));
+        const result: i64 = @bitCast(rc);
+        if (result < 0) return 0;
+        return v;
+    }
+};
+
+/// eBPF counter interface — uses BPF maps on Linux (when available),
+/// falls back to in-memory counters on other platforms or when bpf() fails.
+pub const EbpfCounters = struct {
+    enabled: bool = false,
+    bpf_map: BpfMap = .{},
+
+    // In-memory fallback counters (always maintained for atomicity)
+    counters: [ebpf_counter_count]u64 = [_]u64{0} ** ebpf_counter_count,
+
+    /// Initialize eBPF counters. On Linux, attempts to create a BPF array map.
+    pub fn init(enable: bool) EbpfCounters {
+        var self = EbpfCounters{ .enabled = enable };
+        if (enable) {
+            self.bpf_map = BpfMap.create(ebpf_counter_count);
+        }
+        return self;
+    }
+
+    /// Increment a counter (updates both in-memory and BPF map if available)
     pub fn increment(self: *EbpfCounters, counter: EbpfCounter, value: u64) void {
         if (!self.enabled) return;
 
-        // In a real implementation, this would use bpf_map_update_elem
-        // For now, use in-memory counters as fallback
-        switch (counter) {
-            .requests_total => self.requests +|= value,
-            .responses_total => self.responses +|= value,
-            .bytes_sent => self.bytes_sent +|= value,
-            .bytes_received => self.bytes_received +|= value,
-            .errors => self.errors +|= value,
-            .congestion_events => self.congestion_events +|= value,
-            .rate_limit_hits => self.rate_limit_hits +|= value,
-            .connection_timeouts => self.connection_timeouts +|= value,
+        const idx = @intFromEnum(counter);
+        self.counters[idx] +|= value;
+
+        // Also update BPF map if available
+        if (self.bpf_map.fd >= 0) {
+            self.bpf_map.update(idx, self.counters[idx]);
         }
     }
 
-    /// Read a counter value
+    /// Read a counter value (prefers BPF map if available, else in-memory)
     pub fn read(self: *const EbpfCounters, counter: EbpfCounter) u64 {
         if (!self.enabled) return 0;
 
-        return switch (counter) {
-            .requests_total => self.requests,
-            .responses_total => self.responses,
-            .bytes_sent => self.bytes_sent,
-            .bytes_received => self.bytes_received,
-            .errors => self.errors,
-            .congestion_events => self.congestion_events,
-            .rate_limit_hits => self.rate_limit_hits,
-            .connection_timeouts => self.connection_timeouts,
-        };
+        const idx = @intFromEnum(counter);
+        if (self.bpf_map.fd >= 0) {
+            const bpf_val = self.bpf_map.lookup(idx);
+            if (bpf_val > 0) return bpf_val;
+        }
+        return self.counters[idx];
     }
 };
 

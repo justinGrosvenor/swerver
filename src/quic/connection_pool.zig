@@ -241,12 +241,9 @@ pub const ConnectionPool = struct {
             return .{ .conn = conn, .is_new = false };
         }
 
-        // Try IP-only match for coalescing
-        if (self.findByPeerIp(peer_addr)) |conn| {
-            // Found a connection from same IP that could be coalesced
-            // Note: In a full implementation, we'd verify the TLS certificate covers the origin
-            return .{ .conn = conn, .is_new = false };
-        }
+        // IP-only coalescing removed: RFC 9000 §9.1 requires TLS certificate
+        // verification before coalescing connections from the same IP.
+        // Without cert checking infrastructure, we only reuse exact peer matches.
 
         // No existing connection - create new one
         const conn = try self.createConnection(dcid, peer_addr);

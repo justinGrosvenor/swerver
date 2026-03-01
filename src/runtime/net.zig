@@ -352,6 +352,94 @@ pub const SockAddrStorage = union(enum) {
 };
 
 // ============================================================
+// DNS resolution via getaddrinfo
+// ============================================================
+
+const has_bsd_addrinfo = switch (builtin.os.tag) {
+    .macos, .freebsd, .netbsd, .openbsd, .dragonfly => true,
+    else => false,
+};
+
+// BSD and Linux have different field ordering for struct addrinfo
+const addrinfo = if (has_bsd_addrinfo)
+    extern struct {
+        flags: c_int,
+        family: c_int,
+        socktype: c_int,
+        protocol: c_int,
+        addrlen: std.posix.socklen_t,
+        canonname: ?[*:0]u8,
+        addr: ?*std.posix.sockaddr,
+        next: ?*@This(),
+    }
+else
+    extern struct {
+        flags: c_int,
+        family: c_int,
+        socktype: c_int,
+        protocol: c_int,
+        addrlen: std.posix.socklen_t,
+        addr: ?*std.posix.sockaddr,
+        canonname: ?[*:0]u8,
+        next: ?*@This(),
+    };
+
+extern "c" fn getaddrinfo(
+    node: [*:0]const u8,
+    service: ?[*:0]const u8,
+    hints: ?*const addrinfo,
+    res: *?*addrinfo,
+) c_int;
+
+extern "c" fn freeaddrinfo(res: *addrinfo) void;
+
+const ResolvedAddr = struct {
+    storage: SockAddrStorage,
+    len: std.posix.socklen_t,
+};
+
+fn resolveAddress(address: []const u8, port: u16) ConnectError!ResolvedAddr {
+    // Fast path: try IP literal parse
+    if (std.Io.net.IpAddress.parse(address, port)) |ip_addr| {
+        const storage = buildSockaddr(ip_addr);
+        const len: std.posix.socklen_t = switch (storage) {
+            .ip4 => @intCast(@sizeOf(SockAddrIn)),
+            .ip6 => @intCast(@sizeOf(SockAddrIn6)),
+        };
+        return .{ .storage = storage, .len = len };
+    } else |_| {}
+
+    // Slow path: DNS resolution via getaddrinfo
+    var buf: [256]u8 = undefined;
+    if (address.len >= buf.len) return error.UnsupportedAddress;
+    @memcpy(buf[0..address.len], address);
+    buf[address.len] = 0;
+
+    var hints: addrinfo = std.mem.zeroes(addrinfo);
+    hints.family = @intCast(std.posix.AF.INET);
+    hints.socktype = @intCast(std.posix.SOCK.STREAM);
+
+    var result: ?*addrinfo = null;
+    const rc = getaddrinfo(@ptrCast(buf[0..address.len :0]), null, &hints, &result);
+    if (rc != 0 or result == null) return error.UnsupportedAddress;
+    defer freeaddrinfo(result.?);
+
+    const info = result.?;
+    const sa = info.addr orelse return error.UnsupportedAddress;
+
+    // Copy sockaddr into our SockAddrIn and set the requested port
+    const sa_bytes: [*]const u8 = @ptrCast(sa);
+    var sa4: SockAddrIn = undefined;
+    @memcpy(std.mem.asBytes(&sa4), sa_bytes[0..@sizeOf(SockAddrIn)]);
+    sa4.port = std.mem.nativeToBig(u16, port);
+
+    return .{
+        .storage = .{ .ip4 = sa4 },
+        .len = @intCast(@sizeOf(SockAddrIn)),
+    };
+}
+
+// ============================================================
 // sendfile() - Zero-copy file transfer to socket
 // ============================================================
 
@@ -474,8 +562,8 @@ pub const ConnectError = error{
 pub fn connectBlocking(address: []const u8, port: u16, timeout_ms: u32) ConnectError!std.posix.fd_t {
     if (!isSupportedPlatform()) return error.UnsupportedPlatform;
 
-    const addr = parseAddress(address, port) catch return error.UnsupportedAddress;
-    const domain: c_uint = switch (addr) {
+    const resolved = resolveAddress(address, port) catch return error.UnsupportedAddress;
+    const domain: c_uint = switch (resolved.storage) {
         .ip4 => @intCast(std.posix.AF.INET),
         .ip6 => @intCast(std.posix.AF.INET6),
     };
@@ -486,15 +574,12 @@ pub fn connectBlocking(address: []const u8, port: u16, timeout_ms: u32) ConnectE
     // Set non-blocking for connect with timeout
     setNonBlocking(fd) catch return error.SocketFailed;
 
-    var storage = buildSockaddr(addr);
+    var storage = resolved.storage;
     const sockaddr_ptr: *const std.posix.sockaddr = switch (storage) {
         .ip4 => |*sa| @ptrCast(sa),
         .ip6 => |*sa| @ptrCast(sa),
     };
-    const addr_len: std.posix.socklen_t = switch (storage) {
-        .ip4 => @intCast(@sizeOf(SockAddrIn)),
-        .ip6 => @intCast(@sizeOf(SockAddrIn6)),
-    };
+    const addr_len = resolved.len;
 
     const rc = std.posix.system.connect(fd, sockaddr_ptr, addr_len);
     if (rc == 0) {

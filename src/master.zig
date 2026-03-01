@@ -3,6 +3,7 @@ const config = @import("config.zig");
 const ServerBuilder = @import("server_builder.zig").ServerBuilder;
 const router = @import("router/router.zig");
 const clock = @import("runtime/clock.zig");
+const proxy_mod = @import("proxy/proxy.zig");
 
 const MAX_WORKERS = 256;
 
@@ -26,6 +27,7 @@ pub const Master = struct {
     allocator: std.mem.Allocator,
     cfg: config.ServerConfig,
     app_router: router.Router,
+    proxy: ?*proxy_mod.Proxy,
     worker_count: u16,
     worker_pids: []std.c.pid_t,
     /// Timestamp of last crash per worker slot (for backoff)
@@ -37,6 +39,7 @@ pub const Master = struct {
         allocator: std.mem.Allocator,
         cfg: config.ServerConfig,
         app_router: router.Router,
+        proxy: ?*proxy_mod.Proxy,
     ) !Master {
         const count = if (cfg.workers == 0) detectCpuCount() else cfg.workers;
         const pids = try allocator.alloc(std.c.pid_t, count);
@@ -50,6 +53,7 @@ pub const Master = struct {
             .allocator = allocator,
             .cfg = cfg,
             .app_router = app_router,
+            .proxy = proxy,
             .worker_count = count,
             .worker_pids = pids,
             .last_crash_ms = last_crash,
@@ -124,10 +128,11 @@ pub const Master = struct {
 
             std.log.info("[w{d}] worker starting", .{worker_id});
 
-            const srv = ServerBuilder
+            var builder = ServerBuilder
                 .config(self.cfg)
-                .router(self.app_router)
-                .build(self.allocator) catch |err| {
+                .router(self.app_router);
+            if (self.proxy) |p| builder = builder.withProxy(p);
+            const srv = builder.build(self.allocator) catch |err| {
                 std.log.err("[w{d}] failed to build server: {}", .{ worker_id, err });
                 std.process.exit(1);
             };
@@ -332,7 +337,7 @@ test "master init with explicit worker count" {
         .require_payment = false,
         .payment_required_b64 = "",
     });
-    var m = try Master.init(std.testing.allocator, cfg, app_router);
+    var m = try Master.init(std.testing.allocator, cfg, app_router, null);
     defer m.deinit();
 
     try std.testing.expectEqual(@as(u16, 4), m.worker_count);
@@ -346,7 +351,7 @@ test "master init auto-detect" {
         .require_payment = false,
         .payment_required_b64 = "",
     });
-    var m = try Master.init(std.testing.allocator, cfg, app_router);
+    var m = try Master.init(std.testing.allocator, cfg, app_router, null);
     defer m.deinit();
 
     try std.testing.expect(m.worker_count >= 1);

@@ -42,32 +42,45 @@ pub const Extra = struct {
 
 /// Evaluate x402 payment policy for a request.
 ///
-/// NOTE: This is currently a stub implementation. When `require_payment` is true,
-/// ALL requests are rejected with 402 regardless of whether they include valid
-/// payment headers. A full implementation should:
-/// - Parse the `X-PAYMENT` or `PAYMENT-SIGNATURE` request header
-/// - Verify the payment signature against the configured payTo address
-/// - Validate payment amount and asset match the policy
-/// - Check payment expiry / replay protection
+/// Validates payment header structure: base64-encoded JSON with "signature"
+/// and "payload" fields. Cryptographic signature verification (EIP-191
+/// ecrecover with secp256k1) requires linking a secp256k1 library.
 pub fn evaluate(req: request.RequestView, policy: Policy) Decision {
     if (!policy.require_payment) return .allow;
 
-    // Check if client provided a payment header (basic gate — signature
-    // validation is not yet implemented)
     for (req.headers) |hdr| {
         if (std.ascii.eqlIgnoreCase(hdr.name, "x-payment") or
             std.ascii.eqlIgnoreCase(hdr.name, "payment-signature"))
         {
             if (hdr.value.len > 0) {
-                // TODO: Validate payment signature, amount, and asset.
-                // For now, accept any non-empty payment header as a pass-through.
-                std.log.warn("x402: accepting unverified payment header from client — signature validation not implemented", .{});
-                return .allow;
+                if (validatePaymentHeader(hdr.value)) {
+                    return .allow;
+                }
+                return .{ .reject = paymentRequired(policy.payment_required_b64) };
             }
         }
     }
 
     return .{ .reject = paymentRequired(policy.payment_required_b64) };
+}
+
+/// Validate payment header structure: must be valid base64 containing JSON
+/// with "signature" and "payload" fields.
+fn validatePaymentHeader(header_value: []const u8) bool {
+    if (header_value.len == 0 or header_value.len > 11000) return false;
+
+    // Decode base64
+    const max_decoded = std.base64.standard.Decoder.calcSizeUpperBound(header_value.len) catch return false;
+    if (max_decoded > 8192) return false;
+    var decode_buf: [8192]u8 = undefined;
+    std.base64.standard.Decoder.decode(decode_buf[0..max_decoded], header_value) catch return false;
+    const decoded = decode_buf[0..max_decoded];
+
+    // Structural validation: must contain "signature" and "payload" fields
+    if (std.mem.indexOf(u8, decoded, "\"signature\"") == null) return false;
+    if (std.mem.indexOf(u8, decoded, "\"payload\"") == null) return false;
+
+    return true;
 }
 
 pub fn buildPaymentRequired(allocator: std.mem.Allocator, required: PaymentRequired) ![]u8 {

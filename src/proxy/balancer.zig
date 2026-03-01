@@ -28,10 +28,9 @@ pub const Balancer = struct {
     /// Random number generator
     rng: std.Random.DefaultPrng,
 
-    /// State for weighted round-robin
+    /// State for smooth weighted round-robin (nginx-style SWRR)
     pub const WeightedState = struct {
-        current_index: u16 = 0,
-        current_weight: i32 = 0,
+        current_weights: [256]i32 = [_]i32{0} ** 256,
         max_weight: u16 = 0,
         gcd_weight: u16 = 1,
     };
@@ -134,39 +133,36 @@ pub const Balancer = struct {
         return null;
     }
 
-    /// Weighted round-robin using smooth weighted round-robin algorithm
+    /// Smooth weighted round-robin (nginx-style SWRR algorithm).
+    /// Each round: add effective weight to current_weight for each server,
+    /// pick the server with highest current_weight, subtract total_weight from winner.
+    /// With weights 3:2:1 this produces the smooth sequence: 0,1,0,2,0,1 (period 6).
     fn selectWeightedRoundRobin(self: *Balancer, now_ms: u64) ?SelectionResult {
         const servers = self.upstream_def.servers;
         if (servers.len == 0) return null;
 
         var best_index: ?u16 = null;
-        var best_weight: i32 = std.math.minInt(i32);
+        var best_current_weight: i32 = std.math.minInt(i32);
         var total_weight: i32 = 0;
 
-        // Calculate effective weights and find best candidate
         for (servers, 0..) |server, i| {
             const index: u16 = @intCast(i);
 
-            // Skip unavailable servers
-            if (!self.pool.isServerAvailable(index, now_ms, server.fail_timeout_ms)) {
-                continue;
-            }
-
-            // Skip backup servers for now
             if (server.backup) continue;
+            if (!self.pool.isServerAvailable(index, now_ms, server.fail_timeout_ms)) continue;
 
             const weight: i32 = @intCast(server.weight);
+            self.weighted_state.current_weights[index] += weight;
             total_weight += weight;
 
-            // Current weight increases by effective weight
-            // (In a full implementation, we'd track per-server current weights)
-            if (best_index == null or weight > best_weight) {
-                best_weight = weight;
+            if (self.weighted_state.current_weights[index] > best_current_weight) {
+                best_current_weight = self.weighted_state.current_weights[index];
                 best_index = index;
             }
         }
 
         if (best_index) |index| {
+            self.weighted_state.current_weights[index] -= total_weight;
             return .{ .server_index = index, .server = &servers[index] };
         }
 
@@ -505,4 +501,40 @@ test "gcd calculation" {
     try std.testing.expectEqual(@as(u16, 6), gcd(12, 18));
     try std.testing.expectEqual(@as(u16, 4), gcd(0, 4));
     try std.testing.expectEqual(@as(u16, 4), gcd(4, 0));
+}
+
+test "smooth weighted round-robin distribution" {
+    const allocator = std.testing.allocator;
+
+    const servers = [_]upstream.Server{
+        .{ .address = "10.0.0.1", .port = 8080, .weight = 3 },
+        .{ .address = "10.0.0.2", .port = 8080, .weight = 2 },
+        .{ .address = "10.0.0.3", .port = 8080, .weight = 1 },
+    };
+
+    const upstream_def = upstream.Upstream{
+        .name = "test",
+        .servers = &servers,
+        .load_balancer = .weighted_round_robin,
+    };
+
+    var conn_pool = try pool_mod.Pool.init(allocator, upstream_def.connection_pool, servers.len);
+    defer conn_pool.deinit();
+
+    var balancer = Balancer.init(&upstream_def, &conn_pool);
+
+    // Run 6 selections (one full cycle for weights 3:2:1)
+    var counts = [_]u32{ 0, 0, 0 };
+    for (0..6) |_| {
+        const result = balancer.select(null, 0);
+        try std.testing.expect(result != null);
+        counts[result.?.server_index] += 1;
+    }
+
+    // Server 0 (weight 3) should be selected 3 times
+    try std.testing.expectEqual(@as(u32, 3), counts[0]);
+    // Server 1 (weight 2) should be selected 2 times
+    try std.testing.expectEqual(@as(u32, 2), counts[1]);
+    // Server 2 (weight 1) should be selected 1 time
+    try std.testing.expectEqual(@as(u32, 1), counts[2]);
 }

@@ -53,7 +53,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (cfg.workers != 1) {
         // Multi-process mode
-        var master = try swerver.Master.init(allocator, cfg, app_router);
+        var master = try swerver.Master.init(allocator, cfg, app_router, if (proxy_instance) |*p| p else null);
         defer master.deinit();
         try master.run(args.run_for_ms);
     } else {

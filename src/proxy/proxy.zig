@@ -7,7 +7,6 @@ const health = @import("health.zig");
 const request = @import("../protocol/request.zig");
 const response = @import("../response/response.zig");
 const middleware = @import("../middleware/middleware.zig");
-const router = @import("../router/router.zig");
 const net = @import("../runtime/net.zig");
 
 /// Reverse Proxy Handler
@@ -526,26 +525,6 @@ fn parseIpToU32(ip: []const u8) ?u32 {
         (@as(u32, parts[1]) << 16) |
         (@as(u32, parts[2]) << 8) |
         @as(u32, parts[3]);
-}
-
-/// Create a proxy handler function for use with router
-pub fn createProxyHandler(proxy: *Proxy) router.HandlerFn {
-    // Note: In practice, we'd need a way to pass the proxy instance
-    // to the handler. This would typically use a closure or context.
-    // For now, return a placeholder handler.
-    _ = proxy;
-    return struct {
-        fn handler(ctx: *router.HandlerContext) response.Response {
-            // In production, this would access the proxy instance
-            // and call proxy.handle()
-            _ = ctx;
-            return .{
-                .status = 502,
-                .headers = &[_]response.Header{},
-                .body = .{ .bytes = "Proxy not configured" },
-            };
-        }
-    }.handler;
 }
 
 // Tests
