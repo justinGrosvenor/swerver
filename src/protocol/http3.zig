@@ -709,7 +709,7 @@ pub const Stack = struct {
     }
 
     /// Accumulate request body data for a stream
-    fn accumulateBody(self: *Stack, stream_id: u64, data: []const u8) Error!void {
+    pub fn accumulateBody(self: *Stack, stream_id: u64, data: []const u8) Error!void {
         if (data.len == 0) return;
 
         const entry = self.request_bodies.getPtr(stream_id);

@@ -127,7 +127,7 @@ pub const Proxy = struct {
             const bal = try allocator.create(balancer.Balancer);
             errdefer allocator.destroy(bal);
 
-            bal.* = balancer.Balancer.init(up, pool);
+            bal.* = try balancer.Balancer.init(up, pool);
             try proxy.balancers.put(up.name, bal);
 
             // Register for health checking

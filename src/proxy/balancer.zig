@@ -28,14 +28,19 @@ pub const Balancer = struct {
     /// Random number generator
     rng: std.Random.DefaultPrng,
 
+    /// Maximum number of servers per upstream (bounds the fixed-size current_weights array).
+    pub const MAX_SERVERS = 256;
+
     /// State for smooth weighted round-robin (nginx-style SWRR)
     pub const WeightedState = struct {
-        current_weights: [256]i32 = [_]i32{0} ** 256,
+        current_weights: [MAX_SERVERS]i32 = [_]i32{0} ** MAX_SERVERS,
         max_weight: u16 = 0,
         gcd_weight: u16 = 1,
     };
 
-    pub fn init(upstream_def: *const upstream.Upstream, conn_pool: *pool_mod.Pool) Balancer {
+    pub fn init(upstream_def: *const upstream.Upstream, conn_pool: *pool_mod.Pool) error{TooManyServers}!Balancer {
+        if (upstream_def.servers.len > MAX_SERVERS) return error.TooManyServers;
+
         var balancer = Balancer{
             .upstream_def = upstream_def,
             .pool = conn_pool,
@@ -393,7 +398,7 @@ test "round robin selection" {
     var conn_pool = try pool_mod.Pool.init(allocator, upstream_def.connection_pool, servers.len);
     defer conn_pool.deinit();
 
-    var balancer = Balancer.init(&upstream_def, &conn_pool);
+    var balancer = try Balancer.init(&upstream_def, &conn_pool);
 
     // Should cycle through servers
     const s1 = balancer.select(null, 0);
@@ -432,7 +437,7 @@ test "ip hash consistent selection" {
     var conn_pool = try pool_mod.Pool.init(allocator, upstream_def.connection_pool, servers.len);
     defer conn_pool.deinit();
 
-    var balancer = Balancer.init(&upstream_def, &conn_pool);
+    var balancer = try Balancer.init(&upstream_def, &conn_pool);
 
     const client_ip: u32 = 0xC0A80001; // 192.168.0.1
 
@@ -465,7 +470,7 @@ test "backup server fallback" {
     var conn_pool = try pool_mod.Pool.init(allocator, upstream_def.connection_pool, servers.len);
     defer conn_pool.deinit();
 
-    var balancer = Balancer.init(&upstream_def, &conn_pool);
+    var balancer = try Balancer.init(&upstream_def, &conn_pool);
 
     // Primary available - should select primary
     const s1 = balancer.select(null, 0);
@@ -521,7 +526,7 @@ test "smooth weighted round-robin distribution" {
     var conn_pool = try pool_mod.Pool.init(allocator, upstream_def.connection_pool, servers.len);
     defer conn_pool.deinit();
 
-    var balancer = Balancer.init(&upstream_def, &conn_pool);
+    var balancer = try Balancer.init(&upstream_def, &conn_pool);
 
     // Run 6 selections (one full cycle for weights 3:2:1)
     var counts = [_]u32{ 0, 0, 0 };

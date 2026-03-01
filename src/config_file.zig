@@ -1,6 +1,7 @@
 const std = @import("std");
 const config_mod = @import("config.zig");
 const upstream_mod = @import("proxy/upstream.zig");
+const balancer_mod = @import("proxy/balancer.zig");
 const clock = @import("runtime/clock.zig");
 
 /// Loaded configuration from a JSON file.
@@ -97,6 +98,7 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
     const upstream_defs = file_cfg.upstreams orelse &[_]UpstreamJson{};
     const upstreams_out = try alloc.alloc(upstream_mod.Upstream, upstream_defs.len);
     for (upstream_defs, 0..) |u, ui| {
+        if (u.servers.len > balancer_mod.Balancer.MAX_SERVERS) return error.ConfigParseError;
         const servers_out = try alloc.alloc(upstream_mod.Server, u.servers.len);
         for (u.servers, 0..) |s, si| {
             // Validate server address doesn't contain control characters

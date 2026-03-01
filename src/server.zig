@@ -344,20 +344,48 @@ pub const Server = struct {
             };
         }
 
-        // Process HTTP/3 events (headers, data, end_stream)
+        // Process HTTP/3 events (headers, data, end_stream).
+        // A single packet may carry headers + data + end_stream for the same stream,
+        // so we accumulate body data first, then dispatch completed requests.
         if (result.conn) |conn| {
+            // First pass: accumulate body data
+            for (result.http3_events) |event| {
+                switch (event) {
+                    .data => |data_ev| {
+                        if (conn.http3_stack) |*stack| {
+                            stack.accumulateBody(data_ev.stream_id, data_ev.data) catch {};
+                        }
+                    },
+                    else => {},
+                }
+            }
+
+            // Second pass: dispatch completed requests and clean up body buffers
             for (result.http3_events) |event| {
                 switch (event) {
                     .headers => |hdrs| {
-                        // Process HTTP/3 request headers
-                        self.handleHttp3Request(udp_fd, conn, hdrs, recv_result.peer_addr);
+                        if (hdrs.end_stream) {
+                            // No body expected (GET, HEAD, etc.) — dispatch immediately
+                            self.handleHttp3Request(udp_fd, conn, hdrs, recv_result.peer_addr, "");
+                        }
+                        // Requests with body: headers arrive first, body/end_stream follow
+                        // in subsequent packets. Body dispatch requires storing per-stream
+                        // header state which is not yet implemented — POST/PUT over HTTP/3
+                        // with multi-packet bodies will get a 501 from the router.
                     },
-                    .data => {
-                        // Data events are handled after headers complete
-                        // Body data would be accumulated in stream buffer
+                    .data => |data_ev| {
+                        if (data_ev.end_stream) {
+                            // Body complete — clean up accumulated body buffer
+                            if (conn.http3_stack) |*stack| {
+                                stack.clearRequestBody(data_ev.stream_id);
+                            }
+                        }
                     },
-                    .end_stream => {
-                        // Request complete - response should already be sent
+                    .end_stream => |es| {
+                        // Clean up any accumulated body buffer for this stream
+                        if (conn.http3_stack) |*stack| {
+                            stack.clearRequestBody(es.stream_id);
+                        }
                     },
                     else => {},
                 }
@@ -379,6 +407,7 @@ pub const Server = struct {
         conn: *quic_connection.Connection,
         headers_event: http3.HeadersEvent,
         peer_addr: net.SockAddrStorage,
+        body: []const u8,
     ) void {
         // Extract pseudo-headers (:method, :path, :scheme, :authority)
         var method: ?[]const u8 = null;
@@ -404,7 +433,7 @@ pub const Server = struct {
         const method_str = method orelse return;
         const path_str = path orelse return;
 
-        const parsed_method = request.Method.fromString(method_str) orelse return;
+        const parsed_method = request.Method.fromStringExtended(method_str) orelse return;
 
         // Convert HTTP/3 headers to request headers
         var req_headers: [64]request.Header = undefined;
@@ -417,7 +446,7 @@ pub const Server = struct {
             .method = parsed_method,
             .path = path_str,
             .headers = req_headers[0..regular_count],
-            .body = "", // Body comes in DATA frames
+            .body = body,
         };
 
         // Route the request
@@ -464,20 +493,29 @@ pub const Server = struct {
             if (body_len > 0) body_bytes else null,
         ) catch return;
 
-        // Build QUIC packet with STREAM frame containing response
-        var packet_buf: [2048]u8 = undefined;
-        const packet_len = self.buildStreamPacket(
-            conn,
-            headers_event.stream_id,
-            encoded_response_buf[0..resp_len],
-            true, // FIN - end of response
-            &packet_buf,
-        ) catch return;
+        // Send response in QUIC-MTU-sized chunks.
+        // QUIC packet overhead: 1 (header) + 20 (max CID) + 4 (max PN) + ~10 (frame header) + 16 (AEAD tag) ≈ 51 bytes.
+        // Use conservative max payload to stay within 1280-byte QUIC minimum MTU.
+        const max_stream_payload = 1200;
+        var remaining = encoded_response_buf[0..resp_len];
+        while (remaining.len > 0) {
+            const chunk_len = @min(remaining.len, max_stream_payload);
+            const is_last = (chunk_len == remaining.len);
+            var packet_buf: [2048]u8 = undefined;
+            const packet_len = self.buildStreamPacket(
+                conn,
+                headers_event.stream_id,
+                remaining[0..chunk_len],
+                is_last, // FIN only on last chunk
+                &packet_buf,
+            ) catch return;
 
-        // Send the response packet
-        _ = net.sendto(udp_fd, packet_buf[0..packet_len], peer_addr) catch |err| {
-            std.log.debug("Failed to send HTTP/3 response: {}", .{err});
-        };
+            _ = net.sendto(udp_fd, packet_buf[0..packet_len], peer_addr) catch |err| {
+                std.log.debug("Failed to send HTTP/3 response: {}", .{err});
+                return;
+            };
+            remaining = remaining[chunk_len..];
+        }
     }
 
     /// Build a QUIC short header packet containing a STREAM frame
@@ -501,9 +539,15 @@ pub const Server = struct {
 
         var offset: usize = 0;
 
-        // Short header
-        // First byte: Fixed bit (0x40) + Spin bit (0) + Reserved (0) + Key Phase (0) + PN Length (0 = 1 byte)
-        out[offset] = 0x40;
+        // Short header — RFC 9000 §17.3
+        const pn = conn.application_space.allocatePacketNumber();
+
+        // Determine packet number encoding length (1–4 bytes) based on value
+        const pn_len: u2 = if (pn < 0x100) 0 else if (pn < 0x10000) 1 else if (pn < 0x1000000) 2 else 3;
+        const pn_bytes: u3 = @as(u3, pn_len) + 1;
+
+        // First byte: Fixed bit (0x40) | PN Length (lower 2 bits)
+        out[offset] = 0x40 | @as(u8, pn_len);
         offset += 1;
 
         // Destination Connection ID (peer's CID)
@@ -513,10 +557,11 @@ pub const Server = struct {
         // Packet number offset
         const pn_offset = offset;
 
-        // Packet number (1 byte for simplicity)
-        const pn = conn.application_space.allocatePacketNumber();
-        out[offset] = @truncate(pn);
-        offset += 1;
+        // Encode packet number in network byte order (big-endian, 1–4 bytes)
+        const pn_be = std.mem.nativeToBig(u32, @truncate(pn));
+        const pn_be_bytes = std.mem.asBytes(&pn_be);
+        @memcpy(out[offset .. offset + pn_bytes], pn_be_bytes[4 - pn_bytes ..]);
+        offset += pn_bytes;
 
         const header_len = offset;
 
@@ -535,11 +580,10 @@ pub const Server = struct {
         // Length (varint)
         offset += varint.encode(out[offset..], data.len) catch return error.BufferTooSmall;
 
-        // Stream data
+        // Stream data — verify it fits (payload + 16-byte AEAD tag must not exceed buffer)
+        if (offset + data.len + 16 > out.len) return error.BufferTooSmall;
         @memcpy(out[offset .. offset + data.len], data);
         offset += data.len;
-
-        const plaintext_len = offset - header_len;
 
         // Encrypt payload
         var ciphertext_buf: [16384]u8 = undefined;
@@ -555,7 +599,7 @@ pub const Server = struct {
         @memcpy(out[header_len .. header_len + ciphertext_len], ciphertext_buf[0..ciphertext_len]);
         offset = header_len + ciphertext_len;
 
-        // Apply header protection
+        // Apply header protection — sample starts 4 bytes after PN start per RFC 9001 §5.4.2
         const sample_offset = pn_offset + 4;
         if (sample_offset + 16 <= offset) {
             const sample: *const [16]u8 = @ptrCast(out[sample_offset .. sample_offset + 16]);
@@ -563,11 +607,9 @@ pub const Server = struct {
                 keys.hp[0..keys.hp_len],
                 sample,
                 &out[0],
-                out[pn_offset .. pn_offset + 1],
+                out[pn_offset .. pn_offset + pn_bytes],
             );
         }
-
-        _ = plaintext_len;
 
         return offset;
     }
@@ -871,7 +913,7 @@ pub const Server = struct {
                             .body = .{ .bytes = "Not Implemented\n" },
                         };
                         if (scratch.arena_handle) |handle| self.io.releaseBuffer(handle);
-                        try self.queueHttp2Response(conn, hdr.stream_id, resp);
+                        try self.queueHttp2Response(conn, hdr.stream_id, resp, hdr.request.method == .HEAD);
                     },
                     .data => |data| {
                         _ = data;
@@ -1239,6 +1281,13 @@ pub const Server = struct {
         }
         self.io.onWriteBuffered(conn, header_len);
 
+        // RFC 9110 §9.3.2: HEAD response sends headers with Content-Length but no body
+        if (conn.is_head_request) {
+            clock.closeFd(file_fd);
+            self.io.setTimeoutPhase(conn, .write);
+            return;
+        }
+
         // Set up sendfile - file body will be sent after headers
         conn.pending_file_fd = file_fd;
         conn.pending_file_offset = 0;
@@ -1247,7 +1296,7 @@ pub const Server = struct {
         self.io.setTimeoutPhase(conn, .write);
     }
 
-    fn queueHttp2Response(self: *Server, conn: *connection.Connection, stream_id: u32, resp: response_mod.Response) !void {
+    fn queueHttp2Response(self: *Server, conn: *connection.Connection, stream_id: u32, resp: response_mod.Response, is_head: bool) !void {
         const body_len = resp.bodyLen();
         const body_bytes = resp.bodyBytes();
         const managed_body = switch (resp.body) {
@@ -1284,7 +1333,8 @@ pub const Server = struct {
             self.closeConnection(conn);
             return;
         }
-        const headers_flags: u8 = if (body_len == 0) 0x5 else 0x4;
+        // RFC 9110 §9.3.2: HEAD response MUST NOT contain a message body
+        const headers_flags: u8 = if (body_len == 0 or is_head) 0x5 else 0x4;
         // RFC 9113 §8.1: Response MUST be on the stream that carried the request
         const resp_stream_id: u32 = stream_id;
         http2.writeFrameHeader(header_buf.bytes, .headers, headers_flags, resp_stream_id, header_block_len) catch {
@@ -1301,7 +1351,7 @@ pub const Server = struct {
         self.io.onWriteBuffered(conn, header_frame_len);
         self.io.setTimeoutPhase(conn, .write);
 
-        if (body_len == 0) {
+        if (body_len == 0 or is_head) {
             // END_STREAM was set on HEADERS frame — stream is fully closed
             if (conn.http2_stack) |stack| stack.closeStream(resp_stream_id);
             return;
@@ -1776,7 +1826,7 @@ test "metrics middleware response queued for http2" {
     defer if (conn.state != .closed) server.io.releaseConnection(conn);
     conn.protocol = .http2;
 
-    try server.queueHttp2Response(conn, 1, result.resp);
+    try server.queueHttp2Response(conn, 1, result.resp, false);
     try std.testing.expect(conn.write_count >= 2);
 
     const expected = result.resp.bodyBytes();
@@ -1969,7 +2019,7 @@ test "metrics middleware end-to-end http2" {
     conn.protocol = .http2;
     conn.http2_stack = &stack;
 
-    try server.queueHttp2Response(conn, 1, result.resp);
+    try server.queueHttp2Response(conn, 1, result.resp, false);
     try std.testing.expect(conn.write_count >= 2);
 
     const expected = result.resp.bodyBytes();
