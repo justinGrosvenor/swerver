@@ -1,5 +1,6 @@
 const std = @import("std");
 const ffi = @import("ffi.zig");
+const build_options = @import("build_options");
 
 /// TLS 1.3 provider for QUIC handshake and key derivation.
 /// Uses OpenSSL/BoringSSL via C FFI.
@@ -124,17 +125,21 @@ pub const Session = struct {
 
     /// Feed incoming TLS handshake data (from CRYPTO frames).
     pub fn feedCryptoData(self: *Session, data: []const u8) Error!usize {
+        if (!build_options.enable_tls) return error.TlsError;
         return ffi.feedCryptoData(self.ssl, data) catch |err| switch (err) {
             error.NoBio => error.NoBio,
             error.BioWriteFailed => error.BioWriteFailed,
+            else => error.TlsError,
         };
     }
 
     /// Read outgoing TLS handshake data (for CRYPTO frames).
     pub fn readCryptoData(self: *Session, buf: []u8) Error!usize {
+        if (!build_options.enable_tls) return error.TlsError;
         return ffi.readCryptoData(self.ssl, buf) catch |err| switch (err) {
             error.NoBio => error.NoBio,
             error.BioReadFailed => error.BioReadFailed,
+            else => error.TlsError,
         };
     }
 

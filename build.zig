@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -10,10 +11,14 @@ pub fn build(b: *std.Build) void {
     const enable_proxy = b.option(bool, "enable-proxy", "Enable reverse proxy support") orelse false;
     const enable_io_uring = b.option(bool, "enable-io-uring", "Enable io_uring backend (Linux only)") orelse false;
 
+    const is_native = target.result.os.tag == builtin.os.tag and target.result.cpu.arch == builtin.cpu.arch;
+    const effective_enable_tls = enable_tls and is_native;
+    const effective_enable_http3 = enable_http3 and effective_enable_tls;
+
     const options = b.addOptions();
-    options.addOption(bool, "enable_tls", enable_tls);
+    options.addOption(bool, "enable_tls", effective_enable_tls);
     options.addOption(bool, "enable_http2", enable_http2);
-    options.addOption(bool, "enable_http3", enable_http3);
+    options.addOption(bool, "enable_http3", effective_enable_http3);
     options.addOption(bool, "enable_proxy", enable_proxy);
     options.addOption(bool, "enable_io_uring", enable_io_uring);
 
@@ -24,11 +29,12 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     swerver_module.addOptions("build_options", options);
-    // SSL/crypto linked unconditionally: TLS FFI symbols are always compiled
-    // (gated at runtime via build_options, not compile-time exclusion).
-    // Test variants that enable TLS/HTTP3 require these symbols.
-    swerver_module.linkSystemLibrary("ssl", .{});
-    swerver_module.linkSystemLibrary("crypto", .{});
+    // Only link OpenSSL when TLS/HTTP3 is enabled and the target matches the host.
+    const need_tls = effective_enable_tls or effective_enable_http3;
+    if (need_tls and is_native) {
+        swerver_module.linkSystemLibrary("ssl", .{});
+        swerver_module.linkSystemLibrary("crypto", .{});
+    }
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,

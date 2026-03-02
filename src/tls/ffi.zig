@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const tls_enabled = build_options.enable_tls;
 
 /// C FFI bindings for OpenSSL/BoringSSL TLS 1.3 operations.
 /// Used by QUIC for handshake and key derivation.
@@ -132,6 +133,7 @@ extern fn ERR_error_string_n(e: c_ulong, buf: [*]u8, len: usize) void;
 // Zig wrapper functions for safer usage
 
 pub fn createContext(is_server: bool) !*SSL_CTX {
+    if (!tls_enabled) return error.TlsNotAvailable;
     const method = if (is_server) TLS_server_method() else TLS_client_method();
     const ctx = SSL_CTX_new(method) orelse return error.ContextCreationFailed;
 
@@ -143,16 +145,19 @@ pub fn createContext(is_server: bool) !*SSL_CTX {
 }
 
 pub fn freeContext(ctx: *SSL_CTX) void {
+    if (!tls_enabled) return;
     SSL_CTX_free(ctx);
 }
 
 pub fn loadCertificateChain(ctx: *SSL_CTX, path: [:0]const u8) !void {
+    if (!tls_enabled) return error.TlsNotAvailable;
     if (SSL_CTX_use_certificate_chain_file(ctx, path.ptr) != 1) {
         return error.CertificateLoadFailed;
     }
 }
 
 pub fn loadPrivateKey(ctx: *SSL_CTX, path: [:0]const u8) !void {
+    if (!tls_enabled) return error.TlsNotAvailable;
     if (SSL_CTX_use_PrivateKey_file(ctx, path.ptr, SSL_FILETYPE_PEM) != 1) {
         return error.PrivateKeyLoadFailed;
     }
@@ -162,6 +167,7 @@ pub fn loadPrivateKey(ctx: *SSL_CTX, path: [:0]const u8) !void {
 }
 
 pub fn createSession(ctx: *SSL_CTX, is_server: bool) !*SSL {
+    if (!tls_enabled) return error.TlsNotAvailable;
     const ssl = SSL_new(ctx) orelse return error.SessionCreationFailed;
     if (is_server) {
         SSL_set_accept_state(ssl);
@@ -185,11 +191,13 @@ pub fn createSession(ctx: *SSL_CTX, is_server: bool) !*SSL {
 }
 
 pub fn freeSession(ssl: *SSL) void {
+    if (!tls_enabled) return;
     SSL_free(ssl);
 }
 
 /// Create a session for socket-based TLS (not memory BIO)
 pub fn createSocketSession(ctx: *SSL_CTX, fd: c_int, is_server: bool) !*SSL {
+    if (!tls_enabled) return error.TlsNotAvailable;
     const ssl = SSL_new(ctx) orelse return error.SessionCreationFailed;
     errdefer SSL_free(ssl);
 
@@ -208,6 +216,7 @@ pub fn createSocketSession(ctx: *SSL_CTX, fd: c_int, is_server: bool) !*SSL {
 
 /// Perform TLS accept handshake (for server)
 pub fn sslAccept(ssl: *SSL) HandshakeResult {
+    if (!tls_enabled) return .err;
     const ret = SSL_accept(ssl);
     if (ret == 1) return .complete;
 
@@ -221,6 +230,7 @@ pub fn sslAccept(ssl: *SSL) HandshakeResult {
 
 /// Read decrypted data from TLS connection
 pub fn sslRead(ssl: *SSL, buf: []u8) !usize {
+    if (!tls_enabled) return error.TlsNotAvailable;
     const ret = SSL_read(ssl, buf.ptr, @intCast(buf.len));
     if (ret > 0) return @intCast(ret);
     if (ret == 0) return 0; // Connection closed
@@ -236,6 +246,7 @@ pub fn sslRead(ssl: *SSL, buf: []u8) !usize {
 
 /// Write data to TLS connection (encrypts automatically)
 pub fn sslWrite(ssl: *SSL, data: []const u8) !usize {
+    if (!tls_enabled) return error.TlsNotAvailable;
     const ret = SSL_write(ssl, data.ptr, @intCast(data.len));
     if (ret > 0) return @intCast(ret);
 
@@ -249,10 +260,12 @@ pub fn sslWrite(ssl: *SSL, data: []const u8) !usize {
 
 /// Shutdown TLS connection
 pub fn sslShutdown(ssl: *SSL) void {
+    if (!tls_enabled) return;
     _ = SSL_shutdown(ssl);
 }
 
 pub fn doHandshake(ssl: *SSL) HandshakeResult {
+    if (!tls_enabled) return .err;
     const ret = SSL_do_handshake(ssl);
     if (ret == 1) return .complete;
 
@@ -265,10 +278,12 @@ pub fn doHandshake(ssl: *SSL) HandshakeResult {
 }
 
 pub fn isHandshakeComplete(ssl: *const SSL) bool {
+    if (!tls_enabled) return false;
     return SSL_is_init_finished(ssl) != 0;
 }
 
 pub fn feedCryptoData(ssl: *SSL, data: []const u8) !usize {
+    if (!tls_enabled) return error.TlsNotAvailable;
     const rbio = SSL_get_rbio(ssl) orelse return error.NoBio;
     const written = BIO_write(rbio, data.ptr, @intCast(data.len));
     if (written < 0) return error.BioWriteFailed;
@@ -276,6 +291,7 @@ pub fn feedCryptoData(ssl: *SSL, data: []const u8) !usize {
 }
 
 pub fn readCryptoData(ssl: *SSL, buf: []u8) !usize {
+    if (!tls_enabled) return error.TlsNotAvailable;
     const wbio = SSL_get_wbio(ssl) orelse return error.NoBio;
     const pending = BIO_ctrl_pending(wbio);
     if (pending == 0) return 0;
@@ -292,6 +308,7 @@ pub fn exportKeyingMaterial(
     label: []const u8,
     context: ?[]const u8,
 ) !void {
+    if (!tls_enabled) return error.TlsNotAvailable;
     const ctx_ptr = if (context) |ctx| ctx.ptr else null;
     const ctx_len = if (context) |ctx| ctx.len else 0;
     const use_ctx: c_int = if (context != null) 1 else 0;
@@ -310,6 +327,7 @@ pub fn exportKeyingMaterial(
 }
 
 pub fn getSelectedAlpn(ssl: *const SSL) ?[]const u8 {
+    if (!tls_enabled) return null;
     var data: [*]const u8 = undefined;
     var len: c_uint = 0;
     SSL_get0_alpn_selected(ssl, &data, &len);
@@ -318,6 +336,7 @@ pub fn getSelectedAlpn(ssl: *const SSL) ?[]const u8 {
 }
 
 pub fn getLastError() [256]u8 {
+    if (!tls_enabled) return [_]u8{0} ** 256;
     var buf: [256]u8 = undefined;
     const err = ERR_get_error();
     if (err != 0) {
