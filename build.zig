@@ -18,8 +18,6 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     swerver_module.addOptions("build_options", options);
-
-    // Link the TLS runtime with OpenSSL/BoringSSL.
     swerver_module.linkSystemLibrary("ssl", .{});
     swerver_module.linkSystemLibrary("crypto", .{});
     const root_module = b.createModule(.{
@@ -37,97 +35,36 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
-    const test_module = b.createModule(.{
-        .root_source_file = b.path("src/tests.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    const tests = b.addTest(.{
-        .root_module = test_module,
-    });
-    tests.root_module.addOptions("build_options", options);
-    tests.root_module.addImport("swerver", swerver_module);
+    // --- Test targets ---
+    // Each test variant needs its own module because build_options differ.
+
+    const tests = addTestVariant(b, target, optimize, swerver_module, options);
     const test_run = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&test_run.step);
 
-    const test_tls = b.addTest(.{
-        .root_module = test_module,
-    });
-    test_tls.root_module.addImport("swerver", swerver_module);
-    const options_tls = b.addOptions();
-    options_tls.addOption(bool, "enable_tls", true);
-    options_tls.addOption(bool, "enable_http2", false);
-    options_tls.addOption(bool, "enable_http3", false);
-    options_tls.addOption(bool, "enable_proxy", false);
-    options_tls.addOption(bool, "enable_io_uring", false);
-    test_tls.root_module.addOptions("build_options", options_tls);
+    const options_tls = makeOptions(b, .{ .enable_tls = true });
+    const test_tls = addTestVariant(b, target, optimize, swerver_module, options_tls);
     const test_tls_run = b.addRunArtifact(test_tls);
 
-    const test_http2 = b.addTest(.{
-        .root_module = test_module,
-    });
-    test_http2.root_module.addImport("swerver", swerver_module);
-    const options_http2 = b.addOptions();
-    options_http2.addOption(bool, "enable_tls", false);
-    options_http2.addOption(bool, "enable_http2", true);
-    options_http2.addOption(bool, "enable_http3", false);
-    options_http2.addOption(bool, "enable_proxy", false);
-    options_http2.addOption(bool, "enable_io_uring", false);
-    test_http2.root_module.addOptions("build_options", options_http2);
+    const options_http2 = makeOptions(b, .{ .enable_http2 = true });
+    const test_http2 = addTestVariant(b, target, optimize, swerver_module, options_http2);
     const test_http2_run = b.addRunArtifact(test_http2);
 
-    const test_http3 = b.addTest(.{
-        .root_module = test_module,
-    });
-    test_http3.root_module.addImport("swerver", swerver_module);
-    const options_http3 = b.addOptions();
-    options_http3.addOption(bool, "enable_tls", true);
-    options_http3.addOption(bool, "enable_http2", false);
-    options_http3.addOption(bool, "enable_http3", true);
-    options_http3.addOption(bool, "enable_proxy", false);
-    options_http3.addOption(bool, "enable_io_uring", false);
-    test_http3.root_module.addOptions("build_options", options_http3);
+    const options_http3 = makeOptions(b, .{ .enable_tls = true, .enable_http3 = true });
+    const test_http3 = addTestVariant(b, target, optimize, swerver_module, options_http3);
     const test_http3_run = b.addRunArtifact(test_http3);
 
-    const test_proxy = b.addTest(.{
-        .root_module = test_module,
-    });
-    test_proxy.root_module.addImport("swerver", swerver_module);
-    const options_proxy = b.addOptions();
-    options_proxy.addOption(bool, "enable_tls", false);
-    options_proxy.addOption(bool, "enable_http2", false);
-    options_proxy.addOption(bool, "enable_http3", false);
-    options_proxy.addOption(bool, "enable_proxy", true);
-    options_proxy.addOption(bool, "enable_io_uring", false);
-    test_proxy.root_module.addOptions("build_options", options_proxy);
+    const options_proxy = makeOptions(b, .{ .enable_proxy = true });
+    const test_proxy = addTestVariant(b, target, optimize, swerver_module, options_proxy);
     const test_proxy_run = b.addRunArtifact(test_proxy);
 
-    const test_io_uring = b.addTest(.{
-        .root_module = test_module,
-    });
-    test_io_uring.root_module.addImport("swerver", swerver_module);
-    const options_io_uring = b.addOptions();
-    options_io_uring.addOption(bool, "enable_tls", false);
-    options_io_uring.addOption(bool, "enable_http2", false);
-    options_io_uring.addOption(bool, "enable_http3", false);
-    options_io_uring.addOption(bool, "enable_proxy", false);
-    options_io_uring.addOption(bool, "enable_io_uring", true);
-    test_io_uring.root_module.addOptions("build_options", options_io_uring);
+    const options_io_uring = makeOptions(b, .{ .enable_io_uring = true });
+    const test_io_uring = addTestVariant(b, target, optimize, swerver_module, options_io_uring);
     const test_io_uring_run = b.addRunArtifact(test_io_uring);
 
-    const test_all = b.addTest(.{
-        .root_module = test_module,
-    });
-    test_all.root_module.addImport("swerver", swerver_module);
-    const options_all = b.addOptions();
-    options_all.addOption(bool, "enable_tls", true);
-    options_all.addOption(bool, "enable_http2", true);
-    options_all.addOption(bool, "enable_http3", true);
-    options_all.addOption(bool, "enable_proxy", true);
-    options_all.addOption(bool, "enable_io_uring", true);
-    test_all.root_module.addOptions("build_options", options_all);
+    const options_all = makeOptions(b, .{ .enable_tls = true, .enable_http2 = true, .enable_http3 = true, .enable_proxy = true, .enable_io_uring = true });
+    const test_all = addTestVariant(b, target, optimize, swerver_module, options_all);
     const test_all_run = b.addRunArtifact(test_all);
 
     const test_matrix = b.step("test-matrix", "Run unit tests across build flag combinations");
@@ -200,4 +137,40 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| example_run.addArgs(args);
     const example_step = b.step("example", "Run embedded API example");
     example_step.dependOn(&example_run.step);
+}
+
+const FeatureFlags = struct {
+    enable_tls: bool = false,
+    enable_http2: bool = false,
+    enable_http3: bool = false,
+    enable_proxy: bool = false,
+    enable_io_uring: bool = false,
+};
+
+fn makeOptions(b: *std.Build, flags: FeatureFlags) *std.Build.Step.Options {
+    const opts = b.addOptions();
+    opts.addOption(bool, "enable_tls", flags.enable_tls);
+    opts.addOption(bool, "enable_http2", flags.enable_http2);
+    opts.addOption(bool, "enable_http3", flags.enable_http3);
+    opts.addOption(bool, "enable_proxy", flags.enable_proxy);
+    opts.addOption(bool, "enable_io_uring", flags.enable_io_uring);
+    return opts;
+}
+
+fn addTestVariant(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    swerver_module: *std.Build.Module,
+    opts: *std.Build.Step.Options,
+) *std.Build.Step.Compile {
+    const test_module = b.createModule(.{
+        .root_source_file = b.path("src/tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    test_module.addOptions("build_options", opts);
+    test_module.addImport("swerver", swerver_module);
+    return b.addTest(.{ .root_module = test_module });
 }

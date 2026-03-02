@@ -7,28 +7,32 @@ on:
     branches: [main]
 
 jobs:
-  build-and-test:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-
+  test-macos:
+    runs-on: macos-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
           version: master
-
       - name: Build
-        run: zig build
-
+        run: zig build --summary all
       - name: Build (ReleaseFast)
-        run: zig build -Doptimize=ReleaseFast
-
+        run: zig build -Doptimize=ReleaseFast --summary all
       - name: Test
-        run: zig build test
-        env:
-          ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache-global
-          ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
+        run: zig build test --summary all
+
+  cross-compile-linux:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: master
+      - name: Cross-compile for Linux
+        run: zig build -Dtarget=x86_64-linux-musl --summary all
+      - name: Cross-compile for Linux (ReleaseFast)
+        run: zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast --summary all

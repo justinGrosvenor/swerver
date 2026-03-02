@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 
 /// C FFI bindings for OpenSSL/BoringSSL TLS 1.3 operations.
 /// Used by QUIC for handshake and key derivation.
@@ -58,13 +59,24 @@ pub const QuicEncryptionLevel = enum(c_int) {
 
 // Function pointer types for callbacks
 pub const AlpnSelectCallback = *const fn (
-    ssl: *SSL,
+    ssl_p: *SSL,
     out: *[*]const u8,
     outlen: *u8,
     in: [*]const u8,
     inlen: c_uint,
     arg: ?*anyopaque,
 ) callconv(.c) c_int;
+
+// File type constants for SSL_CTX_use_PrivateKey_file
+pub const SSL_FILETYPE_PEM: c_int = 1;
+pub const SSL_FILETYPE_ASN1: c_int = 2;
+
+pub const HandshakeResult = enum {
+    complete,
+    want_read,
+    want_write,
+    err,
+};
 
 // External C functions - these are resolved at link time
 extern fn SSL_CTX_new(method: *const SSL_METHOD) ?*SSL_CTX;
@@ -116,10 +128,6 @@ extern fn SSL_shutdown(ssl: *SSL) c_int;
 
 extern fn ERR_get_error() c_ulong;
 extern fn ERR_error_string_n(e: c_ulong, buf: [*]u8, len: usize) void;
-
-// File type constants for SSL_CTX_use_PrivateKey_file
-pub const SSL_FILETYPE_PEM: c_int = 1;
-pub const SSL_FILETYPE_ASN1: c_int = 2;
 
 // Zig wrapper functions for safer usage
 
@@ -244,13 +252,6 @@ pub fn sslShutdown(ssl: *SSL) void {
     _ = SSL_shutdown(ssl);
 }
 
-pub const HandshakeResult = enum {
-    complete,
-    want_read,
-    want_write,
-    err,
-};
-
 pub fn doHandshake(ssl: *SSL) HandshakeResult {
     const ret = SSL_do_handshake(ssl);
     if (ret == 1) return .complete;
@@ -291,8 +292,8 @@ pub fn exportKeyingMaterial(
     label: []const u8,
     context: ?[]const u8,
 ) !void {
-    const ctx_ptr = if (context) |c| c.ptr else null;
-    const ctx_len = if (context) |c| c.len else 0;
+    const ctx_ptr = if (context) |ctx| ctx.ptr else null;
+    const ctx_len = if (context) |ctx| ctx.len else 0;
     const use_ctx: c_int = if (context != null) 1 else 0;
 
     const ret = SSL_export_keying_material(
