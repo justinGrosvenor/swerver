@@ -423,7 +423,9 @@ fn io_uring_enter(fd: i32, to_submit: u32, min_complete: u32, flags: u32, sig: ?
 
 fn mapRing(ring_fd: i32, offset: u64, size: u32) ?[]u8 {
     if (!is_linux) return null;
-    const rc = linux.mmap(null, size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED, .POPULATE = true }, ring_fd, @intCast(offset));
+    const prot = linux.PROT.READ | linux.PROT.WRITE;
+    const flags: linux.MAP = .{ .TYPE = .SHARED, .POPULATE = true };
+    const rc = linux.mmap(null, @as(usize, size), prot, flags, ring_fd, @intCast(offset));
     const err = std.posix.errno(rc);
     if (err != .SUCCESS) return null;
     return @as([*]u8, @ptrCast(@as(?[*]u8, @ptrFromInt(rc))))[0..size];

@@ -5,7 +5,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const enable_tls = b.option(bool, "enable-tls", "Enable TLS support") orelse false;
+    const enable_tls = b.option(bool, "enable-tls", "Enable TLS support") orelse true;
     const enable_http2 = b.option(bool, "enable-http2", "Enable HTTP/2 support") orelse false;
     const enable_http3 = b.option(bool, "enable-http3", "Enable HTTP/3 support") orelse false;
     const enable_proxy = b.option(bool, "enable-proxy", "Enable reverse proxy support") orelse false;

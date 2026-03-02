@@ -129,7 +129,6 @@ pub const Session = struct {
         return ffi.feedCryptoData(self.ssl, data) catch |err| switch (err) {
             error.NoBio => error.NoBio,
             error.BioWriteFailed => error.BioWriteFailed,
-            else => error.TlsError,
         };
     }
 
@@ -139,7 +138,6 @@ pub const Session = struct {
         return ffi.readCryptoData(self.ssl, buf) catch |err| switch (err) {
             error.NoBio => error.NoBio,
             error.BioReadFailed => error.BioReadFailed,
-            else => error.TlsError,
         };
     }
 
