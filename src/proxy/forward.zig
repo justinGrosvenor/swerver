@@ -456,6 +456,7 @@ const ResponseParser = struct {
 
         // Determine body bounds
         var body_end = self.buf.len;
+        var close_delimited = false;
         if (content_length) |len| {
             if (self.pos + len > self.buf.len) return error.IncompleteResponse;
             body_end = self.pos + len;
@@ -465,6 +466,10 @@ const ResponseParser = struct {
             if (std.mem.indexOf(u8, self.buf[self.pos..], "0\r\n\r\n")) |end| {
                 body_end = self.pos + end + 5;
             }
+        } else {
+            // No Content-Length and not chunked — close-delimited body.
+            // Body ends at EOF; caller must read until connection close.
+            close_delimited = true;
         }
 
         var result = ParsedResponse{
@@ -476,6 +481,7 @@ const ResponseParser = struct {
             .body_end = body_end,
             .keep_alive = keep_alive,
             .is_chunked = is_chunked,
+            .close_delimited = close_delimited,
         };
         // Copy headers to struct-owned storage
         @memcpy(result.headers_storage[0..header_count], headers[0..header_count]);
@@ -494,6 +500,8 @@ pub const ParsedResponse = struct {
     body_end: usize,
     keep_alive: bool,
     is_chunked: bool,
+    /// True when body length is determined by connection close (no Content-Length, not chunked)
+    close_delimited: bool = false,
 
     /// Get headers slice (safe - points to struct-owned storage)
     pub fn headers(self: *const ParsedResponse) []const response.Header {
@@ -684,7 +692,7 @@ fn decodeChunkedInto(data: []const u8, out: []u8) ?usize {
 /// Check if a request method is idempotent (safe to retry)
 pub fn isIdempotent(method: request.Method) bool {
     return switch (method) {
-        .GET, .HEAD, .OPTIONS, .TRACE => true,
+        .GET, .HEAD, .OPTIONS, .TRACE, .PUT, .DELETE => true,
         else => false,
     };
 }
@@ -824,9 +832,9 @@ test "isIdempotent" {
     try std.testing.expect(isIdempotent(.GET));
     try std.testing.expect(isIdempotent(.HEAD));
     try std.testing.expect(isIdempotent(.OPTIONS));
+    try std.testing.expect(isIdempotent(.PUT));
+    try std.testing.expect(isIdempotent(.DELETE));
     try std.testing.expect(!isIdempotent(.POST));
-    try std.testing.expect(!isIdempotent(.PUT));
-    try std.testing.expect(!isIdempotent(.DELETE));
 }
 
 test "shouldRetry" {

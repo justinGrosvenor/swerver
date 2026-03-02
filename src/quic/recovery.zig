@@ -233,10 +233,15 @@ pub const Recovery = struct {
     }
 
     fn markAcked(self: *Recovery, space: types.PacketNumberSpace, largest_acked: u64) void {
+        self.markAckedRange(space, 0, largest_acked);
+    }
+
+    /// Mark only packets within [smallest, largest] range as acknowledged
+    pub fn markAckedRange(self: *Recovery, space: types.PacketNumberSpace, smallest: u64, largest: u64) void {
         var i: usize = 0;
         while (i < self.sent_packets.items.len) {
             const pkt = &self.sent_packets.items[i];
-            if (pkt.space == space and pkt.packet_number <= largest_acked and !pkt.lost) {
+            if (pkt.space == space and pkt.packet_number >= smallest and pkt.packet_number <= largest and !pkt.lost) {
                 if (pkt.in_flight) {
                     self.bytes_in_flight -|= pkt.size;
                 }

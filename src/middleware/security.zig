@@ -104,17 +104,7 @@ pub fn buildCache() void {
 
 /// Security headers middleware - adds headers to response
 pub fn evaluate(ctx: *middleware.Context, req: request.RequestView) middleware.Decision {
-    // Handle CORS preflight — only respond to actual preflight requests
-    // (must have Access-Control-Request-Method header per CORS spec)
-    if (config.cors_enabled and req.method == .OPTIONS) {
-        for (req.headers) |hdr| {
-            if (std.ascii.eqlIgnoreCase(hdr.name, "access-control-request-method")) {
-                return .{ .reject = corsPreflightResponse() };
-            }
-        }
-    }
-
-    // Check for missing Host header (security requirement)
+    // Check for missing Host header first (security requirement)
     var has_host = false;
     for (req.headers) |hdr| {
         if (std.ascii.eqlIgnoreCase(hdr.name, "host") or
@@ -129,6 +119,16 @@ pub fn evaluate(ctx: *middleware.Context, req: request.RequestView) middleware.D
         // RFC 7230 Section 5.4: Host header required for HTTP/1.1
         // HTTP/2 and HTTP/3 require :authority pseudo-header
         return .{ .reject = badRequestResponse() };
+    }
+
+    // Handle CORS preflight — only respond to actual preflight requests
+    // (must have Access-Control-Request-Method header per CORS spec)
+    if (config.cors_enabled and req.method == .OPTIONS) {
+        for (req.headers) |hdr| {
+            if (std.ascii.eqlIgnoreCase(hdr.name, "access-control-request-method")) {
+                return .{ .reject = corsPreflightResponse() };
+            }
+        }
     }
 
     // Build response headers to add (use threadlocal buffer)
@@ -211,6 +211,20 @@ pub fn evaluate(ctx: *middleware.Context, req: request.RequestView) middleware.D
 }
 
 fn corsPreflightResponse() response.Response {
+    if (config.cors_allow_credentials and !std.mem.eql(u8, config.cors_allow_origin, "*")) {
+        return .{
+            .status = 204,
+            .headers = &[_]response.Header{
+                .{ .name = "Access-Control-Allow-Origin", .value = config.cors_allow_origin },
+                .{ .name = "Access-Control-Allow-Methods", .value = config.cors_allow_methods },
+                .{ .name = "Access-Control-Allow-Headers", .value = config.cors_allow_headers },
+                .{ .name = "Access-Control-Allow-Credentials", .value = "true" },
+                .{ .name = "Access-Control-Max-Age", .value = "86400" },
+                .{ .name = "Content-Length", .value = "0" },
+            },
+            .body = .none,
+        };
+    }
     return .{
         .status = 204,
         .headers = &[_]response.Header{

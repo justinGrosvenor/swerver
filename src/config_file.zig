@@ -175,6 +175,21 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
         };
     }
 
+    // Validate that every route references a valid upstream name
+    for (routes_out) |route| {
+        var found = false;
+        for (upstreams_out) |u| {
+            if (std.mem.eql(u8, route.upstream, u.name)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            std.log.err("config: route references unknown upstream '{s}'", .{route.upstream});
+            return error.ConfigParseError;
+        }
+    }
+
     return .{
         .server_config = cfg,
         .upstreams = upstreams_out,

@@ -19,10 +19,14 @@ pub const IoRuntime = struct {
 
     pub fn init(allocator: std.mem.Allocator, cfg: config.ServerConfig) !IoRuntime {
         const backend = pickBackend();
-        const connections = try connection.ConnectionPool.init(allocator, cfg.max_connections);
-        const buffers = try buffer_pool.BufferPool.init(allocator, cfg.buffer_pool);
+        var connections = try connection.ConnectionPool.init(allocator, cfg.max_connections);
+        errdefer connections.deinit();
+        var buffers = try buffer_pool.BufferPool.init(allocator, cfg.buffer_pool);
+        errdefer buffers.deinit();
         const events = try allocator.alloc(Event, cfg.max_connections);
-        const backend_state = try initBackend(allocator, backend, cfg.max_connections);
+        errdefer allocator.free(events);
+        var backend_state = try initBackend(allocator, backend, cfg.max_connections);
+        errdefer deinitBackend(&backend_state, allocator);
         const timer = try clock.Timer.start();
         return .{
             .allocator = allocator,
@@ -178,7 +182,7 @@ pub const IoRuntime = struct {
             }
             if (!conn.isTimedOut(now_ms, conn.timeout_phase, self.cfg.timeouts)) continue;
             const next_state: connection.State = switch (conn.timeout_phase) {
-                .idle => .draining,
+                .idle => .err, // idle timeout means client is inactive — close directly
                 .header, .body, .write => .err,
             };
             _ = conn.transition(next_state, now_ms) catch |err| {

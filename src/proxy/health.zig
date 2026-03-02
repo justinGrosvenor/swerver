@@ -156,7 +156,7 @@ pub const HealthChecker = struct {
     /// Check a single server's health via a real TCP connection.
     fn checkServer(self: *HealthChecker, server: *const upstream.Server, index: usize, now_ms: u64) bool {
         const health_state = &self.server_health[index];
-        const start_ms = now_ms;
+        const start_ms = getMonotonicMs();
 
         // Build health check request
         const request_len = self.buildHealthRequest(server) catch {

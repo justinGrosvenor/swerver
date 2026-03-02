@@ -9,6 +9,7 @@ pub const Error = error{
     BufferTooSmall,
     InvalidEncoding,
     InvalidIndex,
+    IntegerOverflow,
     StringTooLong,
     TableFull,
     UnexpectedEnd,
@@ -458,13 +459,7 @@ pub const Decoder = struct {
         while (offset < data.len) {
             const first_byte = data[offset];
 
-            if ((first_byte & 0x20) != 0) {
-                // 001xxxxx - Set Dynamic Table Capacity
-                const result = try decodeInteger(data[offset..], 5);
-                offset += result.len;
-                self.dynamic_table.max_size = @intCast(result.value);
-                instructions += 1;
-            } else if ((first_byte & 0x80) != 0) {
+            if ((first_byte & 0x80) != 0) {
                 // 1xxxxxxx - Insert With Name Reference
                 const consumed = try self.processInsertNameRef(data[offset..]);
                 offset += consumed;
@@ -473,6 +468,12 @@ pub const Decoder = struct {
                 // 01xxxxxx - Insert Without Name Reference (literal name)
                 const consumed = try self.processInsertLiteral(data[offset..]);
                 offset += consumed;
+                instructions += 1;
+            } else if ((first_byte & 0x20) != 0) {
+                // 001xxxxx - Set Dynamic Table Capacity
+                const result = try decodeInteger(data[offset..], 5);
+                offset += result.len;
+                self.dynamic_table.max_size = @intCast(result.value);
                 instructions += 1;
             } else {
                 // 000xxxxx - Duplicate
@@ -656,6 +657,7 @@ pub const Decoder = struct {
         offset += value_result.len;
 
         if (self.header_count >= 64) return error.BufferTooSmall;
+        if (value_result.str.len > MAX_HEADER_VALUE_LEN) return error.StringTooLong;
 
         @memcpy(self.name_storage[self.header_count][0..name.len], name);
         @memcpy(self.value_storage[self.header_count][0..value_result.str.len], value_result.str);
@@ -672,20 +674,28 @@ pub const Decoder = struct {
     fn decodeLiteral(self: *Decoder, buf: []const u8) Error!usize {
         var offset: usize = 0;
 
-        // Skip first byte pattern bits
-        const name_result = try decodeString(buf[1..]);
-        offset += 1 + name_result.len;
+        // Decode name: first byte has 0010Hnnn pattern, name length is 3-bit prefix
+        const name_int = try decodeInteger(buf, 3);
+        offset += name_int.len;
+        const name_len: usize = @intCast(name_int.value);
+
+        if (buf.len < offset + name_len) return error.UnexpectedEnd;
+        if (name_len > MAX_HEADER_NAME_LEN) return error.StringTooLong;
+        const name_data = buf[offset .. offset + name_len];
+        offset += name_len;
 
         const value_result = try decodeString(buf[offset..]);
         offset += value_result.len;
 
         if (self.header_count >= 64) return error.BufferTooSmall;
+        if (name_len > MAX_HEADER_NAME_LEN) return error.StringTooLong;
+        if (value_result.str.len > MAX_HEADER_VALUE_LEN) return error.StringTooLong;
 
-        @memcpy(self.name_storage[self.header_count][0..name_result.str.len], name_result.str);
+        @memcpy(self.name_storage[self.header_count][0..name_data.len], name_data);
         @memcpy(self.value_storage[self.header_count][0..value_result.str.len], value_result.str);
 
         self.headers[self.header_count] = .{
-            .name = self.name_storage[self.header_count][0..name_result.str.len],
+            .name = self.name_storage[self.header_count][0..name_data.len],
             .value = self.value_storage[self.header_count][0..value_result.str.len],
         };
         self.header_count += 1;
@@ -762,13 +772,14 @@ fn decodeInteger(buf: []const u8, prefix_bits: u4) Error!struct { value: u64, le
     }
 
     var offset: usize = 1;
-    var m: u6 = 0;
+    var m: u7 = 0;
 
     while (offset < buf.len) {
         const b = buf[offset];
-        value += @as(u64, b & 0x7f) << m;
+        value += @as(u64, b & 0x7f) << @as(u6, @intCast(m));
         offset += 1;
         m += 7;
+        if (m > 62) return error.IntegerOverflow; // max 9 continuation bytes for u64
 
         if ((b & 0x80) == 0) {
             return .{ .value = value, .len = offset };

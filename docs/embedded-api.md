@@ -23,7 +23,7 @@ pub fn main() !void {
 
     var state = AppState{ .greeting = "hello, galaxy" };
 
-    var router = swerver.router.Router.init(.{ .require_payment = false });
+    var router = swerver.router.Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
     try router.get("/hello", hello);
 
     var server = try swerver.ServerBuilder
@@ -33,7 +33,7 @@ pub fn main() !void {
         .build(gpa.allocator());
     defer server.deinit();
 
-    try server.run();
+    try server.run(null);
 }
 ```
 
@@ -45,7 +45,7 @@ pub fn main() !void {
 - `ServerBuilder.withState(*AppState)`
 - `ServerBuilder.withServices(*Services)`
 - `ServerBuilder.build(allocator)` -> `Server`
-- `Server.run()` or `Server.runFor(ms)`
+- `Server.run(run_for_ms: ?u64)`
 
 ## Router + routes
 

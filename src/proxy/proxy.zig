@@ -374,8 +374,9 @@ pub const Proxy = struct {
                     total_read += n;
 
                     // Try to parse — if we have a complete response, stop reading
-                    if (forward.parseUpstreamResponse(self.response_bufs[resp_buf_idx][0..total_read])) |_| {
-                        break;
+                    // For close-delimited responses, keep reading until EOF
+                    if (forward.parseUpstreamResponse(self.response_bufs[resp_buf_idx][0..total_read])) |parsed_check| {
+                        if (!parsed_check.close_delimited) break;
                     } else |_| {}
                 }
 
@@ -598,8 +599,8 @@ pub const Proxy = struct {
                     if (n == 0) break;
                     total_read += n;
 
-                    if (forward.parseUpstreamResponse(self.response_bufs[resp_buf_idx][0..total_read])) |_| {
-                        break;
+                    if (forward.parseUpstreamResponse(self.response_bufs[resp_buf_idx][0..total_read])) |parsed_check| {
+                        if (!parsed_check.close_delimited) break;
                     } else |_| {}
                 }
 

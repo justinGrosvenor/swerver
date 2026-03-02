@@ -290,11 +290,11 @@ pub const Connection = struct {
             .recovery = recovery_mod.Recovery.init(allocator),
         };
 
-        // Generate our connection ID (8 bytes) from hash of DCID
-        // Note: In production, use cryptographically secure random bytes
-        const hash = std.hash.Wyhash.hash(0, dcid.slice());
-        const hash_bytes = std.mem.toBytes(hash);
-        @memcpy(conn.our_cid.bytes[0..8], &hash_bytes);
+        // Generate our connection ID (8 bytes) using random seeded from clock + DCID
+        const now = clock.Instant.now();
+        const seed_ns: u64 = if (now) |i| i.ns else 0;
+        var rng = std.Random.DefaultPrng.init(seed_ns ^ std.hash.Wyhash.hash(0, dcid.slice()));
+        rng.random().bytes(conn.our_cid.bytes[0..8]);
         conn.our_cid.len = 8;
 
         // Derive initial keys from DCID
@@ -862,6 +862,8 @@ pub const Connection = struct {
 
         // Feed ACK to recovery — updates RTT estimates and detects losses
         self.recovery.onAckReceived(space, largest, ack_delay_ns, now_ns);
+        // Mark only this specific range (not cumulative) in recovery
+        self.recovery.markAckedRange(space, smallest, largest);
 
         // Process lost packets through congestion controller
         for (self.recovery.lost_packets.items) |lost_pkt| {
@@ -869,12 +871,14 @@ pub const Connection = struct {
         }
         self.recovery.lost_packets.clearRetainingCapacity();
 
-        // Update congestion window for acked bytes
+        // Update congestion window for acked bytes (use actual packet sizes)
         var acked_bytes: usize = 0;
-        var pn = smallest;
-        while (pn <= largest) : (pn += 1) {
-            acked_bytes += 1;
+        for (self.recovery.sent_packets.items) |pkt| {
+            if (pkt.space == space and pkt.packet_number >= smallest and pkt.packet_number <= largest) {
+                acked_bytes += pkt.size;
+            }
         }
+        if (acked_bytes == 0) acked_bytes = largest - smallest + 1; // fallback
         self.congestion.onPacketAcked(acked_bytes, largest);
 
         // Update metrics
@@ -994,7 +998,10 @@ pub const Connection = struct {
     pub fn startPathValidation(self: *Connection) [8]u8 {
         // Generate 8 random bytes for challenge
         var data: [8]u8 = undefined;
-        std.crypto.random.bytes(&data);
+        const now = clock.Instant.now();
+        const seed: u64 = if (now) |i| i.ns else 42;
+        var prng = std.Random.DefaultPrng.init(seed);
+        prng.random().bytes(&data);
         self.pending_path_challenge = data;
         return data;
     }
@@ -1077,10 +1084,10 @@ pub const Connection = struct {
         const encoded_delay = delay_us >> @intCast(exponent);
 
         return frame.AckFrame{
-            .largest_ack = largest,
+            .largest_acked = largest,
             .ack_delay = encoded_delay,
-            .first_ack_range = largest, // Simple: ACK only largest
-            .ack_ranges = &[_]frame.AckRange{},
+            .first_ack_range = 0, // ACK only the single largest packet
+            .ranges = &[_]frame.AckRange{},
             .ecn = null,
         };
     }

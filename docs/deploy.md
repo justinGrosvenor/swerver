@@ -10,14 +10,14 @@
 
 ```sh
 zig build -Doptimize=ReleaseSmall \
-    -Denable-tls \
-    -Denable-http2 \
-    -Denable-http3
+    -Denable-tls=true \
+    -Denable-http2=true \
+    -Denable-http3=true
 ```
 
-- `-Denable-tls` turns on the TLS provider (BoringSSL shim). Supply keys via `config.json`.
+- `-Denable-tls=true` turns on the TLS provider (BoringSSL shim). Supply keys via `config.json`.
 - HTTP/2/3 flags automatically wire ALPN/QUIC stacks.
-- Release builds default to `ReleaseFast` if `optimize` omitted; specify `ReleaseSmall` or `Debug` as needed.
+- Release builds default to `Debug` if `optimize` omitted; specify `ReleaseFast`, `ReleaseSmall`, or `ReleaseSafe` for production.
 
 ## Configuration
 

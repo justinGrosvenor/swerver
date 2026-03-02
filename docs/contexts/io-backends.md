@@ -20,7 +20,6 @@ This pack covers event loops, socket lifecycle, and cross-platform I/O abstracti
 flowchart TD
     IO[Platform I/O] --> L[Linux: io_uring + epoll fallback]
     IO --> M[macOS/BSD: kqueue]
-    IO --> W[Windows: IOCP]
 ```
 
 ## Responsibilities

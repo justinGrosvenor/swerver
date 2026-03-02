@@ -111,13 +111,13 @@ fn unwrapSyscallI32(rc: usize) error{SyscallFailed}!i32 {
 }
 
 // Helper to convert Linux syscall return to usize result
-fn unwrapSyscall(rc: usize) error{INTR}!usize {
+fn unwrapSyscall(rc: usize) error{ INTR, SyscallFailed }!usize {
     if (is_linux) {
         const signed: isize = @bitCast(rc);
         if (signed < 0) {
             const errno: u16 = @intCast(-signed);
             if (errno == 4) return error.INTR; // EINTR = 4
-            return error.INTR; // Use same error for simplicity
+            return error.SyscallFailed;
         }
         return rc;
     }

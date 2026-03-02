@@ -8,7 +8,9 @@ We ship a simple fuzz harness that exercises the HTTP/1.1 parser to uncover fram
 zig build fuzz
 ```
 
-This builds and runs `fuzz/http1_parser.zig`, which feeds random byte buffers into `src/protocol/http1.zig::parse` with conservative limits (`8K` headers, `32K` body, 128 header slots). Zig's fuzz driver will keep iterating until it either finds a crash or is interrupted.
+This builds and runs `src/fuzz/http1_parser.zig`, which feeds random byte buffers into `src/protocol/http1.zig::parse` with conservative limits (`8K` headers, `32K` body, 128 header slots). Zig's fuzz driver will keep iterating until it either finds a crash or is interrupted.
+
+> **Note:** The fuzz build step is currently a placeholder — the fuzz harness source exists but may not yet be wired into the default build.
 
 The harness is wired via `build.zig` so it respects `-Doptimize`, `-Denable-tls`, and other options; just pass them through the CLI the same way you do for `zig build test`.
 

@@ -13,8 +13,8 @@ Swerver is designed to embed as a library with a public server/router API. The p
 - `ServerBuilder.middleware(MiddlewareChain)`
 - `ServerBuilder.withState(*AppState)` for app-wide state
 - `ServerBuilder.withServices(*Services)` for typed dependencies
-- `ServerBuilder.build()` -> `Server`
-- `Server.run()` and `Server.runFor(ms)`
+- `ServerBuilder.build(allocator)` -> `Server`
+- `Server.run(run_for_ms: ?u64)`
 
 ### Router + handlers
 

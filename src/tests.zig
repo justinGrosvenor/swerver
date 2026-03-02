@@ -426,7 +426,7 @@ test "http2 parser handles partial preface" {
     const part1 = http2.Preface[0..10];
     const res1 = parser.parse(part1, frames[0..], .{ .max_frame_size = 16384 });
     try std.testing.expectEqual(http2.ParseState.partial, res1.state);
-    try std.testing.expectEqual(@as(usize, 0), res1.consumed_bytes);
+    try std.testing.expectEqual(@as(usize, 10), res1.consumed_bytes);
 
     const part2 = http2.Preface[10..];
     const res2 = parser.parse(part2, frames[0..], .{ .max_frame_size = 16384 });

@@ -88,7 +88,7 @@ pub const Parser = struct {
                 return .{
                     .state = .partial,
                     .error_code = .none,
-                    .consumed_bytes = 0,
+                    .consumed_bytes = take,
                     .frame_count = 0,
                 };
             }
@@ -482,6 +482,9 @@ pub const HpackDecoder = struct {
         if (self.entry_count < self.entries.len) {
             self.entry_count += 1;
         } else {
+            const displaced = self.entries[self.entry_head];
+            self.dynamic_size -= displaced.size;
+            self.storage_used -= (displaced.name_len + displaced.value_len);
             self.entry_head = (self.entry_head + 1) % self.entries.len;
         }
         self.dynamic_size += size;
@@ -566,8 +569,10 @@ pub const HpackDecoder = struct {
         if (dynamic_index == 0 or dynamic_index > self.entry_count) return null;
         const pos = (self.entry_head + self.entry_count - dynamic_index) % self.entries.len;
         const entry = self.entries[pos];
+        const total_len = entry.name_len + entry.value_len;
+        if (entry.base + total_len > self.storage.len) return null;
         const name = self.storage[entry.base .. entry.base + entry.name_len];
-        const value = self.storage[entry.base + entry.name_len .. entry.base + entry.name_len + entry.value_len];
+        const value = self.storage[entry.base + entry.name_len .. entry.base + total_len];
         return .{ .name = name, .value = value };
     }
 

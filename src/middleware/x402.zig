@@ -73,8 +73,10 @@ fn validatePaymentHeader(header_value: []const u8) bool {
     const max_decoded = std.base64.standard.Decoder.calcSizeUpperBound(header_value.len) catch return false;
     if (max_decoded > 8192) return false;
     var decode_buf: [8192]u8 = undefined;
+    // calcSizeForSlice gives exact decoded length (vs upper bound)
+    const actual_len = std.base64.standard.Decoder.calcSizeForSlice(header_value) catch return false;
     std.base64.standard.Decoder.decode(decode_buf[0..max_decoded], header_value) catch return false;
-    const decoded = decode_buf[0..max_decoded];
+    const decoded = decode_buf[0..actual_len];
 
     // Structural validation: must contain "signature" and "payload" fields
     if (std.mem.indexOf(u8, decoded, "\"signature\"") == null) return false;

@@ -54,5 +54,4 @@ coverage/
 *.sublime-project
 *.sublime-workspace
 test_getaddrinfo
-test
 .claude

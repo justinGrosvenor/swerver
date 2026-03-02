@@ -280,11 +280,11 @@ pub const Handler = struct {
 
         // Parse and process frames from decrypted payload
         const payload = decrypt_buf[unprotect_result.header_len .. unprotect_result.header_len + unprotect_result.payload_len];
-        try processCryptoFrames(conn, payload);
+        try processCryptoFrames(conn, payload, pn_space);
     }
 
     /// Process CRYPTO frames from Initial/Handshake packets
-    fn processCryptoFrames(conn: *connection.Connection, payload: []const u8) Error!void {
+    fn processCryptoFrames(conn: *connection.Connection, payload: []const u8, space: types.PacketNumberSpace) Error!void {
         var offset: usize = 0;
 
         while (offset < payload.len) {
@@ -295,9 +295,7 @@ pub const Handler = struct {
                 .padding => {}, // Ignore padding
                 .ping => {}, // PING just triggers ACK
                 .ack => |ack| {
-                    // ACK in Initial uses initial space, in Handshake uses handshake space
-                    // For now just process as application (works for basic case)
-                    conn.processAckFrame(ack, types.PacketNumberSpace.initial);
+                    conn.processAckFrame(ack, space);
                 },
                 .crypto => |crypto_frame| {
                     // Feed CRYPTO data to TLS session

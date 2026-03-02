@@ -97,14 +97,12 @@ pub const Master = struct {
                 }
             }
 
-            if (master_reload_requested.load(.acquire)) {
-                master_reload_requested.store(false, .release);
+            if (master_reload_requested.swap(false, .acq_rel)) {
                 std.log.info("[master] reload requested, rolling restart", .{});
                 self.rollingRestart();
             }
 
-            if (master_child_exited.load(.acquire)) {
-                master_child_exited.store(false, .release);
+            if (master_child_exited.swap(false, .acq_rel)) {
                 self.reapChildren();
             }
 

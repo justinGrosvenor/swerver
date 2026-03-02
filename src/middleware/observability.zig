@@ -77,9 +77,11 @@ pub const LogEntry = struct {
             try writer.print(",\"method\":\"{s}\"", .{@tagName(m)});
         }
 
-        // Path
+        // Path (escaped for JSON safety)
         if (self.path) |p| {
-            try writer.print(",\"path\":\"{s}\"", .{p});
+            try writer.writeAll(",\"path\":\"");
+            try writeJsonEscaped(writer, p);
+            try writer.writeAll("\"");
         }
 
         // Status
@@ -97,19 +99,25 @@ pub const LogEntry = struct {
             try writer.print(",\"client_ip\":\"{d}.{d}.{d}.{d}\"", .{ ip[0], ip[1], ip[2], ip[3] });
         }
 
-        // Route
+        // Route (escaped for JSON safety)
         if (self.route) |r| {
-            try writer.print(",\"route\":\"{s}\"", .{r});
+            try writer.writeAll(",\"route\":\"");
+            try writeJsonEscaped(writer, r);
+            try writer.writeAll("\"");
         }
 
-        // Message
+        // Message (escaped for JSON safety)
         if (self.message) |msg| {
-            try writer.print(",\"msg\":\"{s}\"", .{msg});
+            try writer.writeAll(",\"msg\":\"");
+            try writeJsonEscaped(writer, msg);
+            try writer.writeAll("\"");
         }
 
-        // Error
-        if (self.error_msg) |err| {
-            try writer.print(",\"error\":\"{s}\"", .{err});
+        // Error (escaped for JSON safety)
+        if (self.error_msg) |err_msg| {
+            try writer.writeAll(",\"error\":\"");
+            try writeJsonEscaped(writer, err_msg);
+            try writer.writeAll("\"");
         }
 
         try writer.writeAll("}\n");
@@ -494,6 +502,26 @@ pub const RequestIdStorage = struct {
         return self.buf[0..self.len];
     }
 };
+
+/// Escape a string for safe JSON embedding (handles \, ", and control chars)
+fn writeJsonEscaped(writer: anytype, input: []const u8) !void {
+    for (input) |ch| {
+        switch (ch) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => {
+                if (ch < 0x20) {
+                    try writer.print("\\u{x:0>4}", .{ch});
+                } else {
+                    try writer.writeByte(ch);
+                }
+            },
+        }
+    }
+}
 
 /// Extract or generate request ID
 pub fn getOrGenerateRequestId(req: request.RequestView, storage: *RequestIdStorage) []const u8 {

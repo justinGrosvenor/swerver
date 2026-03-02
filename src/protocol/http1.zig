@@ -541,6 +541,7 @@ pub const ChunkDecoder = struct {
     max_body_bytes: usize,
     size_buf: [20]u8, // partial size-line buffer
     size_buf_len: u8,
+    trailer_term_pos: u3, // tracks 0-4 bytes of \r\n\r\n matched across boundaries
 
     pub const State = enum {
         size_line,
@@ -568,6 +569,7 @@ pub const ChunkDecoder = struct {
             .max_body_bytes = max_body_bytes,
             .size_buf = undefined,
             .size_buf_len = 0,
+            .trailer_term_pos = 0,
         };
     }
 
@@ -642,37 +644,25 @@ pub const ChunkDecoder = struct {
                     }
                 },
                 .trailer => {
-                    // Consume trailer section until \r\n (empty line after 0-size chunk)
-                    // Simplified: consume until we see \r\n as first chars (empty trailer)
-                    // or find \r\n\r\n for non-empty trailers
+                    // Consume trailer section terminated by \r\n\r\n.
+                    // Uses trailer_term_pos to track partial match across buffer boundaries.
+                    const terminator = "\r\n\r\n";
                     while (consumed < src.len) {
                         const ch = src[consumed];
                         consumed += 1;
-                        if (self.size_buf_len == 0 and ch == '\r') {
-                            self.size_buf_len = 1;
-                        } else if (self.size_buf_len == 1 and ch == '\n') {
-                            // \r\n found — could be end of empty trailer or end of a trailer line
-                            self.state = .done;
-                            break;
+                        if (ch == terminator[self.trailer_term_pos]) {
+                            self.trailer_term_pos += 1;
+                            if (self.trailer_term_pos == 4) {
+                                self.state = .done;
+                                break;
+                            }
                         } else {
-                            // Non-empty trailer line — scan until \r\n\r\n
-                            self.size_buf_len = 0;
-                            // Continue scanning for end of trailers
-                            while (consumed + 3 < src.len) {
-                                if (src[consumed] == '\r' and src[consumed + 1] == '\n' and
-                                    src[consumed + 2] == '\r' and src[consumed + 3] == '\n')
-                                {
-                                    consumed += 4;
-                                    self.state = .done;
-                                    break;
-                                }
-                                consumed += 1;
+                            // Reset match — but check if current byte restarts the pattern
+                            if (ch == '\r') {
+                                self.trailer_term_pos = 1;
+                            } else {
+                                self.trailer_term_pos = 0;
                             }
-                            if (self.state != .done) {
-                                // Not enough data for trailer termination
-                                return .{ .decoded = decoded, .consumed = consumed };
-                            }
-                            break;
                         }
                     }
                 },
@@ -1295,6 +1285,16 @@ fn scanChunked(buf: []const u8, body_start: usize, max_body_bytes: usize) !?Chun
         const size = parseChunkSize(line) catch return error.InvalidChunk;
         src = line_end + 2;
         if (size == 0) {
+            // No-trailer fast path: just \r\n terminates the chunked body
+            if (src + 2 <= buf.len and buf[src] == '\r' and buf[src + 1] == '\n') {
+                return .{
+                    .complete = true,
+                    .body_start = body_start,
+                    .body_len = total,
+                    .consumed_bytes = src + 2,
+                };
+            }
+            // Trailers present or incomplete — search for terminal \r\n\r\n
             const trailer_end = std.mem.indexOfPos(u8, buf, src, "\r\n\r\n") orelse return null;
             try validateTrailerHeaders(buf, src, trailer_end);
             return .{
@@ -1348,4 +1348,36 @@ fn containsToken(header_value: []const u8, token: []const u8) bool {
         }
     }
     return false;
+}
+
+test "scanChunked: no trailers" {
+    // "5\r\nhello\r\n0\r\n\r\n"
+    const buf = "5\r\nhello\r\n0\r\n\r\n";
+    const result = try scanChunked(buf, 0, 1024) orelse return error.UnexpectedNull;
+    try std.testing.expect(result.complete);
+    try std.testing.expectEqual(@as(usize, 5), result.body_len);
+    try std.testing.expectEqual(@as(usize, buf.len), result.consumed_bytes);
+}
+
+test "scanChunked: with trailers" {
+    const buf = "5\r\nhello\r\n0\r\nX-Checksum: abc\r\n\r\n";
+    const result = try scanChunked(buf, 0, 1024) orelse return error.UnexpectedNull;
+    try std.testing.expect(result.complete);
+    try std.testing.expectEqual(@as(usize, 5), result.body_len);
+    try std.testing.expectEqual(@as(usize, buf.len), result.consumed_bytes);
+}
+
+test "scanChunked: incomplete terminal returns null" {
+    // Missing final \r\n — only "0\r\n" with one byte of the terminator
+    const buf = "5\r\nhello\r\n0\r\n\r";
+    const result = try scanChunked(buf, 0, 1024);
+    try std.testing.expect(result == null);
+}
+
+test "scanChunked: zero-length body no trailers" {
+    const buf = "0\r\n\r\n";
+    const result = try scanChunked(buf, 0, 1024) orelse return error.UnexpectedNull;
+    try std.testing.expect(result.complete);
+    try std.testing.expectEqual(@as(usize, 0), result.body_len);
+    try std.testing.expectEqual(@as(usize, buf.len), result.consumed_bytes);
 }

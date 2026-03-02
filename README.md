@@ -30,6 +30,12 @@ Swerver processes HTTP requests using fixed-size buffer pools and stack-allocate
 | TLS 1.3 (via OpenSSL/BoringSSL) | ✓ |
 | Prometheus metrics (`/metrics`) | ✓ |
 | Health probes (`/.healthz`, `/.ready`) | ✓ |
+| Reverse proxy (load balancing, health checks) | ✓ |
+| Multi-worker (fork + SO_REUSEPORT) | ✓ |
+| JSON config file (`--config`) | ✓ |
+| io_uring backend (Linux) | ✓ |
+| Access logging (combined/JSON) | ✓ |
+| Static file serving (sendfile) | ✓ |
 | Rate limiting (token bucket) | ✓ |
 | Security headers (HSTS, CSP, CORS) | ✓ |
 | x402 payment protocol | ✓ |
@@ -42,6 +48,9 @@ zig build
 
 # Run
 zig build run
+
+# Run with a config file
+zig build run -- --config config.json
 
 # Run with HTTP/3 enabled
 zig build -Denable-http3=true -Denable-tls=true run
@@ -65,14 +74,18 @@ src/
 ├── runtime/
 │   ├── buffer_pool.zig    # Fixed-size buffer management
 │   ├── connection.zig     # Connection state machine
+│   ├── clock.zig          # Monotonic clock, timers
 │   ├── io.zig             # Event loop abstraction
 │   └── backend/
 │       ├── kqueue.zig     # macOS/BSD
-│       └── epoll.zig      # Linux
+│       ├── epoll.zig      # Linux
+│       └── io_uring.zig   # Linux (io_uring)
 ├── protocol/
 │   ├── http1.zig          # HTTP/1.1 parser
 │   ├── http2.zig          # HTTP/2 + HPACK
 │   └── http3.zig          # HTTP/3 + QPACK
+├── proxy/
+│   └── proxy.zig          # Reverse proxy + load balancing
 ├── quic/
 │   ├── connection.zig     # QUIC state machine
 │   ├── stream.zig         # QUIC streams
@@ -84,7 +97,10 @@ src/
 │   ├── security.zig       # Security headers
 │   ├── metrics_mw.zig     # Prometheus exporter
 │   ├── health.zig         # Liveness/readiness probes
+│   ├── access_log.zig     # Access logging (combined/JSON)
 │   └── observability.zig  # Structured logging
+├── config_file.zig        # JSON config parser
+├── master.zig             # Multi-process fork manager
 └── server.zig             # Main server loop
 ```
 
@@ -110,6 +126,50 @@ const cfg = BufferPoolConfig{
 ```
 
 ## Configuration
+
+### JSON config file
+
+```bash
+zig build run -- --config config.json
+```
+
+```json
+{
+  "server": {
+    "port": 8080,
+    "workers": 4,
+    "max_connections": 4096,
+    "static_root": "./public"
+  },
+  "timeouts": {
+    "idle_ms": 60000,
+    "header_ms": 10000,
+    "body_ms": 30000,
+    "write_ms": 30000
+  },
+  "limits": {
+    "max_header_bytes": 32768,
+    "max_body_bytes": 8388608
+  },
+  "upstreams": [
+    {
+      "name": "api_backend",
+      "servers": ["127.0.0.1:3000", "127.0.0.1:3001"],
+      "load_balancer": "round_robin"
+    }
+  ],
+  "routes": [
+    {
+      "path_prefix": "/api",
+      "upstream": "api_backend"
+    }
+  ]
+}
+```
+
+Config is hot-reloaded on `SIGHUP` (timeouts, limits, and other value types).
+
+### Embedded (Zig API)
 
 ```zig
 const cfg = ServerConfig{
@@ -149,16 +209,27 @@ Full RFC 9000-9002 implementation:
 Middleware runs in a chain with zero allocations:
 
 ```zig
-// Middleware returns a decision
+// Middleware returns a decision (simplified — actual type has 5 variants)
 pub const Decision = union(enum) {
     allow,                           // Continue to next middleware
+    skip,                            // Skip remaining middleware
     reject: Response,                // Stop and return response
     modify: struct {                 // Add headers, continue
         response_headers: []Header,
         continue_chain: bool,
     },
+    rate_limit_backpressure: u64,    // Apply backpressure (ms)
 };
 ```
+
+## CLI Flags
+
+| Flag | Description |
+|------|-------------|
+| `--config <path>` | Load JSON configuration file |
+| `--workers <n>` | Number of worker processes (default: CPU count) |
+| `--static-root <path>` | Serve static files from directory |
+| `--run-for-ms <ms>` | Run for specified duration then exit (testing) |
 
 ## Build Options
 
@@ -167,6 +238,8 @@ pub const Decision = union(enum) {
 | `-Denable-tls=true` | Enable TLS 1.3 support |
 | `-Denable-http2=true` | Enable HTTP/2 support |
 | `-Denable-http3=true` | Enable HTTP/3 over QUIC |
+| `-Denable-proxy=true` | Enable reverse proxy |
+| `-Denable-io-uring=true` | Enable io_uring backend (Linux) |
 | `-Doptimize=ReleaseFast` | Maximum performance |
 
 ### CI note

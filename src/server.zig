@@ -278,7 +278,6 @@ pub const Server = struct {
             error.WouldBlock => return,
             else => return err,
         };
-        errdefer clock.closeFd(client_fd);
         const now_ms = self.io.nowMs();
         const conn = self.io.acquireConnection(now_ms) orelse {
             clock.closeFd(client_fd);
@@ -309,7 +308,10 @@ pub const Server = struct {
         // With edge-triggered epoll, we must try to read immediately after accept
         // because data may have arrived before we registered the socket.
         // If we don't do this, we'll miss the EPOLLIN notification.
-        try self.handleRead(conn.index);
+        self.handleRead(conn.index) catch {
+            self.closeConnection(conn);
+            return;
+        };
     }
 
     fn handleDatagram(self: *Server) !void {
@@ -874,6 +876,10 @@ pub const Server = struct {
                     defer proxy_result.release();
 
                     try self.queueResponse(conn, proxy_result.resp);
+                    // Materialize pending_body before proxy_result.release() frees the upstream buffer
+                    if (conn.pending_body.len > 0) {
+                        self.materializePendingBody(conn);
+                    }
                     if (conn.read_buffered_bytes == 0) break;
                     continue;
                 }
@@ -1095,9 +1101,10 @@ pub const Server = struct {
             }
         }
 
-        // All buffer writes done, try sendfile if file is pending
-        if (conn.hasPendingFile()) {
-            // Use sendfile for file transfer
+        // All buffer writes done, try sendfile if file is pending.
+        // Loop until WouldBlock or completion — edge-triggered epoll won't re-fire
+        // EPOLLOUT if socket stays writable.
+        while (conn.hasPendingFile()) {
             const file_fd = conn.pending_file_fd.?;
             const result = net.sendfile(socket_fd, file_fd, &conn.pending_file_offset, conn.pending_file_remaining) catch |err| {
                 switch (err) {
@@ -1109,12 +1116,13 @@ pub const Server = struct {
                     },
                 }
             };
+            if (result.bytes_sent == 0) return;
             conn.pending_file_remaining -= result.bytes_sent;
             conn.markActive(self.io.nowMs());
 
-            // Check if file transfer is complete
             if (conn.pending_file_remaining == 0) {
                 conn.cleanupPendingFile();
+                break;
             }
         }
 
@@ -1495,6 +1503,13 @@ pub const Server = struct {
         if (conn.http2_stack) |stack| stack.closeStream(resp_stream_id);
     }
 
+    fn isValidHeaderBytes(s: []const u8) bool {
+        for (s) |ch| {
+            if (ch == '\r' or ch == '\n' or ch == 0) return false;
+        }
+        return true;
+    }
+
     fn encodeResponse(buf: []u8, resp: response_mod.Response, alt_svc: ?[]const u8, connection_close: bool, date_str: []const u8) !usize {
         var index: usize = 0;
         const reason = reasonPhrase(resp.status);
@@ -1512,6 +1527,7 @@ pub const Server = struct {
         }
 
         for (resp.headers) |header| {
+            if (!isValidHeaderBytes(header.name) or !isValidHeaderBytes(header.value)) continue;
             const header_line = try std.fmt.bufPrint(buf[index..], "{s}: {s}\r\n", .{ header.name, header.value });
             index += header_line.len;
         }
@@ -1553,6 +1569,7 @@ pub const Server = struct {
         index += status_line.len;
         const body_len = resp.bodyLen();
         for (resp.headers) |header| {
+            if (!isValidHeaderBytes(header.name) or !isValidHeaderBytes(header.value)) continue;
             const header_line = try std.fmt.bufPrint(buf[index..], "{s}: {s}\r\n", .{ header.name, header.value });
             index += header_line.len;
         }
@@ -1597,6 +1614,7 @@ pub const Server = struct {
         const status_line = try std.fmt.bufPrint(buf[index..], "HTTP/1.1 {d} {s}\r\n", .{ status, reason });
         index += status_line.len;
         for (headers) |header| {
+            if (!isValidHeaderBytes(header.name) or !isValidHeaderBytes(header.value)) continue;
             const header_line = try std.fmt.bufPrint(buf[index..], "{s}: {s}\r\n", .{ header.name, header.value });
             index += header_line.len;
         }
@@ -1953,6 +1971,10 @@ pub const Server = struct {
 
                 self.cleanupBodyAccumulation(conn);
                 try self.queueResponse(conn, proxy_result.resp);
+                // Materialize pending_body before proxy_result.release() frees the upstream buffer
+                if (conn.pending_body.len > 0) {
+                    self.materializePendingBody(conn);
+                }
                 return;
             }
         }

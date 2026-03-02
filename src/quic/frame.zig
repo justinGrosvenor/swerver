@@ -290,8 +290,8 @@ fn parseStreamFrame(buf: []const u8, initial_offset: usize, frame_type: u64) Par
     };
 }
 
-/// Static buffer for ACK ranges (reused per parse)
-var ack_ranges_buf: [64]AckRange = undefined;
+/// Static buffer for ACK ranges (reused per parse, threadlocal for re-entrancy safety)
+threadlocal var ack_ranges_buf: [64]AckRange = undefined;
 
 fn parseAckFrame(buf: []const u8, initial_offset: usize, has_ecn: bool) ParseError!ParseResult {
     var offset = initial_offset;

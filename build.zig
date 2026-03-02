@@ -4,12 +4,18 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const enable_tls = b.option(bool, "enable-tls", "Enable TLS support") orelse false;
+    const enable_http2 = b.option(bool, "enable-http2", "Enable HTTP/2 support") orelse false;
+    const enable_http3 = b.option(bool, "enable-http3", "Enable HTTP/3 support") orelse false;
+    const enable_proxy = b.option(bool, "enable-proxy", "Enable reverse proxy support") orelse false;
+    const enable_io_uring = b.option(bool, "enable-io-uring", "Enable io_uring backend (Linux only)") orelse false;
+
     const options = b.addOptions();
-    options.addOption(bool, "enable_tls", b.option(bool, "enable-tls", "Enable TLS support") orelse false);
-    options.addOption(bool, "enable_http2", b.option(bool, "enable-http2", "Enable HTTP/2 support") orelse false);
-    options.addOption(bool, "enable_http3", b.option(bool, "enable-http3", "Enable HTTP/3 support") orelse false);
-    options.addOption(bool, "enable_proxy", b.option(bool, "enable-proxy", "Enable reverse proxy support") orelse false);
-    options.addOption(bool, "enable_io_uring", b.option(bool, "enable-io-uring", "Enable io_uring backend (Linux only)") orelse false);
+    options.addOption(bool, "enable_tls", enable_tls);
+    options.addOption(bool, "enable_http2", enable_http2);
+    options.addOption(bool, "enable_http3", enable_http3);
+    options.addOption(bool, "enable_proxy", enable_proxy);
+    options.addOption(bool, "enable_io_uring", enable_io_uring);
 
     const swerver_module = b.createModule(.{
         .root_source_file = b.path("src/lib.zig"),
@@ -18,6 +24,9 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     swerver_module.addOptions("build_options", options);
+    // SSL/crypto linked unconditionally: TLS FFI symbols are always compiled
+    // (gated at runtime via build_options, not compile-time exclusion).
+    // Test variants that enable TLS/HTTP3 require these symbols.
     swerver_module.linkSystemLibrary("ssl", .{});
     swerver_module.linkSystemLibrary("crypto", .{});
     const root_module = b.createModule(.{
