@@ -92,6 +92,10 @@ pub const Connection = struct {
     pending_file_offset: u64,
     /// Bytes remaining to send from file
     pending_file_remaining: u64,
+    /// Cached peer IPv4 address (populated once at accept time)
+    cached_peer_ip: ?[4]u8,
+    /// Cached peer IPv6 address (populated once at accept time)
+    cached_peer_ip6: ?[16]u8,
 
     pub fn init(index: u32) Connection {
         return .{
@@ -128,6 +132,8 @@ pub const Connection = struct {
             .pending_file_fd = null,
             .pending_file_offset = 0,
             .pending_file_remaining = 0,
+            .cached_peer_ip = null,
+            .cached_peer_ip6 = null,
         };
     }
 
@@ -161,6 +167,8 @@ pub const Connection = struct {
         self.body_accum = null;
         self.pending_body = &[_]u8{};
         self.cleanupPendingFile();
+        self.cached_peer_ip = null;
+        self.cached_peer_ip6 = null;
         // active_list_pos is set by ConnectionPool.acquire
     }
 

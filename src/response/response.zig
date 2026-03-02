@@ -9,10 +9,21 @@ pub const ManagedBody = struct {
     len: usize,
 };
 
+/// Pre-scattered body: multiple pool buffers that can be enqueued directly
+/// to the write queue without linearizing. Used for echo POST optimization.
+pub const ScatteredBody = struct {
+    handles: []buffer_pool.BufferHandle,
+    count: u8,
+    last_buf_len: usize,
+    total_len: usize,
+    buffer_size: usize,
+};
+
 pub const Body = union(enum) {
     none,
     bytes: []const u8,
     managed: ManagedBody,
+    scattered: ScatteredBody,
 };
 
 /// Response body type
@@ -63,6 +74,7 @@ pub const Response = struct {
             .none => 0,
             .bytes => |bytes| bytes.len,
             .managed => |managed| managed.len,
+            .scattered => |sc| sc.total_len,
         };
     }
 
@@ -71,6 +83,7 @@ pub const Response = struct {
             .none => "",
             .bytes => |bytes| bytes,
             .managed => |managed| managed.handle.bytes[0..managed.len],
+            .scattered => "", // scattered bodies can't be accessed as contiguous bytes
         };
     }
 };

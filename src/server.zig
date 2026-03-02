@@ -291,6 +291,14 @@ pub const Server = struct {
             return;
         }
         conn.fd = client_fd;
+        // Cache peer address once at accept time (avoids getpeername syscall per request)
+        if (net.getPeerAddress(client_fd)) |peer| {
+            if (peer.getIp4Bytes()) |ip4| {
+                conn.cached_peer_ip = ip4;
+            } else if (peer.getIp6Bytes()) |ip6| {
+                conn.cached_peer_ip6 = ip6;
+            }
+        }
         conn.transition(.active, now_ms) catch {
             // Invalid state transition - close connection
             if (conn.read_buffer) |buf| self.io.releaseBuffer(buf);
@@ -857,14 +865,12 @@ pub const Server = struct {
                             .release = releaseBufferOpaque,
                         },
                     };
-                    // Extract client IP string for proxy headers
+                    // Use cached client IP for proxy headers
                     var ip_buf: [64]u8 = undefined;
                     var client_ip_str: ?[]const u8 = null;
-                    if (net.getPeerAddress(fd)) |peer| {
-                        if (peer.getIp4Bytes()) |ip4| {
-                            const ip_len = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ ip4[0], ip4[1], ip4[2], ip4[3] }) catch "";
-                            if (ip_len.len > 0) client_ip_str = ip_buf[0..ip_len.len];
-                        }
+                    if (conn.cached_peer_ip) |ip4| {
+                        const ip_len = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ ip4[0], ip4[1], ip4[2], ip4[3] }) catch "";
+                        if (ip_len.len > 0) client_ip_str = ip_buf[0..ip_len.len];
                     }
                     var proxy_result = proxy.handle(
                         parse.view,
@@ -893,13 +899,11 @@ pub const Server = struct {
                     .release = releaseBufferOpaque,
                 },
             };
-            // Extract client IP from socket for rate limiting and logging
-            if (net.getPeerAddress(fd)) |peer| {
-                if (peer.getIp4Bytes()) |ip4| {
-                    mw_ctx.client_ip = ip4;
-                } else if (peer.getIp6Bytes()) |ip6| {
-                    mw_ctx.client_ip6 = ip6;
-                }
+            // Use cached client IP for rate limiting and logging
+            if (conn.cached_peer_ip) |ip4| {
+                mw_ctx.client_ip = ip4;
+            } else if (conn.cached_peer_ip6) |ip6| {
+                mw_ctx.client_ip6 = ip6;
             }
             var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
             var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
@@ -921,6 +925,23 @@ pub const Server = struct {
             }
             try self.queueResponse(conn, result.resp);
             if (conn.read_buffered_bytes == 0) break;
+        }
+
+        // Read-loop draining: if buffer is fully consumed and we can still process,
+        // try one more non-blocking read to avoid an extra event loop round-trip.
+        // This helps with fast persistent-connection clients (e.g., k6 benchmarks).
+        if (conn.read_buffered_bytes == 0 and conn.canEnqueueWrite() and !conn.close_after_write) {
+            conn.read_offset = 0;
+            const drain_buf = conn.read_buffer orelse return;
+            const more = std.posix.system.read(fd, drain_buf.bytes.ptr, drain_buf.bytes.len);
+            if (more > 0) {
+                const drain_count: usize = @intCast(more);
+                self.io.onReadBuffered(conn, drain_count);
+                conn.markActive(self.io.nowMs());
+                // Re-enter handleRead to process the newly read data
+                return self.handleRead(index);
+            }
+            // EAGAIN or error — no more data available, continue normally
         }
     }
 
@@ -994,15 +1015,11 @@ pub const Server = struct {
                                 .release = releaseBufferOpaque,
                             },
                         };
-                        // Extract client IP from socket for rate limiting and logging
-                        if (conn.fd) |conn_fd| {
-                            if (net.getPeerAddress(conn_fd)) |peer| {
-                                if (peer.getIp4Bytes()) |ip4| {
-                                    mw_ctx.client_ip = ip4;
-                                } else if (peer.getIp6Bytes()) |ip6| {
-                                    mw_ctx.client_ip6 = ip6;
-                                }
-                            }
+                        // Use cached client IP for rate limiting and logging
+                        if (conn.cached_peer_ip) |ip4| {
+                            mw_ctx.client_ip = ip4;
+                        } else if (conn.cached_peer_ip6) |ip6| {
+                            mw_ctx.client_ip6 = ip6;
                         }
                         var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
                         var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
@@ -1071,14 +1088,33 @@ pub const Server = struct {
         const conn = self.io.getConnection(index) orelse return;
         const socket_fd = conn.fd orelse return;
 
-        // Process buffer writes in a loop (edge-triggered epoll requires draining until EAGAIN)
-        while (conn.peekWrite()) |entry| {
-            const slice = entry.handle.bytes[entry.offset..entry.len];
-            const bytes_written = std.posix.system.write(socket_fd, slice.ptr, slice.len);
+        // Process buffer writes using writev to gather multiple entries per syscall.
+        // Edge-triggered epoll requires draining until EAGAIN.
+        while (conn.write_count > 0) {
+            // Gather consecutive write queue entries into an iovec array
+            var iov: [16]std.posix.iovec_const = undefined;
+            var iov_count: u32 = 0;
+
+            {
+                var scan_head = conn.write_head;
+                var scan_remaining = conn.write_count;
+                while (scan_remaining > 0 and iov_count < 16) {
+                    const e = &conn.write_queue[scan_head];
+                    const s = e.handle.bytes[e.offset..e.len];
+                    iov[iov_count] = .{ .base = s.ptr, .len = s.len };
+                    iov_count += 1;
+                    scan_head = if (scan_head + 1 >= conn.write_queue.len) 0 else scan_head + 1;
+                    scan_remaining -= 1;
+                }
+            }
+
+            if (iov_count == 0) break;
+
+            const bytes_written = std.c.writev(socket_fd, &iov, @intCast(iov_count));
             if (bytes_written < 0) {
                 switch (std.posix.errno(bytes_written)) {
-                    .AGAIN => return, // Socket not ready, wait for next event
-                    .INTR => continue, // Interrupted by signal, retry
+                    .AGAIN => return,
+                    .INTR => continue,
                     else => {
                         self.closeConnection(conn);
                         return;
@@ -1086,17 +1122,29 @@ pub const Server = struct {
                 }
             }
             if (bytes_written == 0) return;
-            const count: usize = @intCast(bytes_written);
-            entry.offset += count;
-            self.io.onWriteCompleted(conn, count);
+            var written: usize = @intCast(bytes_written);
             conn.markActive(self.io.nowMs());
-            if (entry.offset >= entry.len) {
-                self.io.releaseBuffer(entry.handle);
-                conn.popWrite();
 
-                // Continue streaming pending body if there's more data
-                if (conn.hasPendingBody()) {
-                    self.streamBodyChunks(conn, conn.pending_body);
+            // Walk through entries consumed by this write
+            while (written > 0) {
+                const entry = conn.peekWrite() orelse break;
+                const remaining_in_entry = entry.len - entry.offset;
+                if (written >= remaining_in_entry) {
+                    // Fully consumed this entry
+                    written -= remaining_in_entry;
+                    self.io.onWriteCompleted(conn, remaining_in_entry);
+                    self.io.releaseBuffer(entry.handle);
+                    conn.popWrite();
+
+                    // Continue streaming pending body if there's more data
+                    if (conn.hasPendingBody()) {
+                        self.streamBodyChunks(conn, conn.pending_body);
+                    }
+                } else {
+                    // Partial write within this entry
+                    entry.offset += written;
+                    self.io.onWriteCompleted(conn, written);
+                    written = 0;
                 }
             }
         }
@@ -1145,12 +1193,19 @@ pub const Server = struct {
             .managed => |managed| managed,
             else => null,
         };
+        const scattered_body = switch (resp.body) {
+            .scattered => |sc| sc,
+            else => null,
+        };
         const date_str = self.getCachedDate();
         // RFC 9110 §9.3.2: HEAD response MUST NOT contain a message body
         const suppress_body = conn.is_head_request;
         const buf = self.io.acquireBuffer() orelse {
             // Cannot acquire buffer to send response - close connection
             if (managed_body) |managed| self.io.releaseBuffer(managed.handle);
+            if (scattered_body) |sc| {
+                for (sc.handles[0..sc.count]) |h| self.io.releaseBuffer(h);
+            }
             self.closeConnection(conn);
             return;
         };
@@ -1219,6 +1274,43 @@ pub const Server = struct {
                 return;
             }
             self.io.onWriteBuffered(conn, body_len);
+            self.io.setTimeoutPhase(conn, .write);
+            return;
+        }
+
+        // Scattered body: enqueue pre-allocated pool buffers directly (zero-copy echo)
+        if (scattered_body) |sc| {
+            const header_len = encodeResponseHeaders(buf.bytes, resp, alt_svc, conn.close_after_write, date_str) catch {
+                for (sc.handles[0..sc.count]) |h| self.io.releaseBuffer(h);
+                self.io.releaseBuffer(buf);
+                self.closeConnection(conn);
+                return;
+            };
+            if (!conn.enqueueWrite(buf, header_len)) {
+                for (sc.handles[0..sc.count]) |h| self.io.releaseBuffer(h);
+                self.io.releaseBuffer(buf);
+                self.closeConnection(conn);
+                return;
+            }
+            self.io.onWriteBuffered(conn, header_len);
+
+            if (suppress_body or sc.count == 0) {
+                for (sc.handles[0..sc.count]) |h| self.io.releaseBuffer(h);
+                self.io.setTimeoutPhase(conn, .write);
+                return;
+            }
+
+            // Enqueue each body buffer directly — no copy needed
+            for (0..sc.count) |i| {
+                const buf_len = if (i == sc.count - 1) sc.last_buf_len else sc.buffer_size;
+                if (!conn.enqueueWrite(sc.handles[i], buf_len)) {
+                    // Can't enqueue — release remaining buffers and close
+                    for (i..sc.count) |j| self.io.releaseBuffer(sc.handles[j]);
+                    self.closeConnection(conn);
+                    return;
+                }
+                self.io.onWriteBuffered(conn, buf_len);
+            }
             self.io.setTimeoutPhase(conn, .write);
             return;
         }
@@ -1510,122 +1602,240 @@ pub const Server = struct {
         return true;
     }
 
-    fn encodeResponse(buf: []u8, resp: response_mod.Response, alt_svc: ?[]const u8, connection_close: bool, date_str: []const u8) !usize {
-        var index: usize = 0;
-        const reason = reasonPhrase(resp.status);
-        const status_line = try std.fmt.bufPrint(buf[index..], "HTTP/1.1 {d} {s}\r\n", .{ resp.status, reason });
-        index += status_line.len;
-        const body_bytes = resp.bodyBytes();
+    /// Comptime-generated status line lookup table for common HTTP status codes.
+    /// Maps status codes to pre-formatted "HTTP/1.1 NNN Reason\r\n" byte strings.
+    const StatusLine = struct {
+        bytes: []const u8,
 
-        // RFC 9110 §15.2: 1xx responses have no body, no Date, no Content-Length
-        if (resp.status >= 100 and resp.status < 200) {
-            if (index + 2 > buf.len) return error.NoSpaceLeft;
-            buf[index] = '\r';
-            buf[index + 1] = '\n';
-            index += 2;
-            return index;
+        fn comptimeFor(code: u16, reason: []const u8) StatusLine {
+            return .{ .bytes = std.fmt.comptimePrint("HTTP/1.1 {d} {s}\r\n", .{ code, reason }) };
         }
+    };
 
-        for (resp.headers) |header| {
-            if (!isValidHeaderBytes(header.name) or !isValidHeaderBytes(header.value)) continue;
-            const header_line = try std.fmt.bufPrint(buf[index..], "{s}: {s}\r\n", .{ header.name, header.value });
-            index += header_line.len;
+    const status_line_table: [512]?StatusLine = blk: {
+        var table: [512]?StatusLine = .{null} ** 512;
+        const entries = .{
+            .{ 100, "Continue" },
+            .{ 101, "Switching Protocols" },
+            .{ 200, "OK" },
+            .{ 201, "Created" },
+            .{ 202, "Accepted" },
+            .{ 204, "No Content" },
+            .{ 206, "Partial Content" },
+            .{ 301, "Moved Permanently" },
+            .{ 302, "Found" },
+            .{ 303, "See Other" },
+            .{ 304, "Not Modified" },
+            .{ 307, "Temporary Redirect" },
+            .{ 308, "Permanent Redirect" },
+            .{ 400, "Bad Request" },
+            .{ 401, "Unauthorized" },
+            .{ 402, "Payment Required" },
+            .{ 403, "Forbidden" },
+            .{ 404, "Not Found" },
+            .{ 405, "Method Not Allowed" },
+            .{ 408, "Request Timeout" },
+            .{ 411, "Length Required" },
+            .{ 413, "Content Too Large" },
+            .{ 414, "URI Too Long" },
+            .{ 415, "Unsupported Media Type" },
+            .{ 417, "Expectation Failed" },
+            .{ 429, "Too Many Requests" },
+            .{ 500, "Internal Server Error" },
+            .{ 501, "Not Implemented" },
+            .{ 502, "Bad Gateway" },
+            .{ 503, "Service Unavailable" },
+            .{ 504, "Gateway Timeout" },
+        };
+        for (entries) |entry| {
+            table[entry[0]] = StatusLine.comptimeFor(entry[0], entry[1]);
         }
-        const date_line = try std.fmt.bufPrint(buf[index..], "Date: {s}\r\n", .{date_str});
-        index += date_line.len;
-        // Add Alt-Svc header to advertise HTTP/3 availability
-        if (alt_svc) |svc| {
-            if (svc.len > 0) {
-                const alt_svc_line = try std.fmt.bufPrint(buf[index..], "Alt-Svc: {s}\r\n", .{svc});
-                index += alt_svc_line.len;
+        break :blk table;
+    };
+
+    /// Write pre-formatted status line via lookup table, falling back to bufPrint.
+    inline fn writeStatusLine(buf: []u8, status: u16) !usize {
+        if (status < status_line_table.len) {
+            if (status_line_table[status]) |sl| {
+                if (sl.bytes.len > buf.len) return error.NoSpaceLeft;
+                @memcpy(buf[0..sl.bytes.len], sl.bytes);
+                return sl.bytes.len;
             }
         }
-        // RFC 9112 §9.6: Signal connection close to the client
-        if (connection_close) {
-            const close_line = try std.fmt.bufPrint(buf[index..], "Connection: close\r\n", .{});
-            index += close_line.len;
+        // Fallback for unknown status codes
+        const reason = reasonPhrase(status);
+        const line = try std.fmt.bufPrint(buf, "HTTP/1.1 {d} {s}\r\n", .{ status, reason });
+        return line.len;
+    }
+
+    /// Fast header write: "Name: Value\r\n" via @memcpy (no format string parsing).
+    inline fn writeHeader(buf: []u8, name: []const u8, value: []const u8) !usize {
+        const needed = name.len + 2 + value.len + 2; // ": " + "\r\n"
+        if (needed > buf.len) return error.NoSpaceLeft;
+        @memcpy(buf[0..name.len], name);
+        var pos = name.len;
+        buf[pos] = ':';
+        buf[pos + 1] = ' ';
+        pos += 2;
+        @memcpy(buf[pos..][0..value.len], value);
+        pos += value.len;
+        buf[pos] = '\r';
+        buf[pos + 1] = '\n';
+        return pos + 2;
+    }
+
+    /// Fast usize-to-ASCII into buf, returns slice written.
+    inline fn writeUsize(buf: []u8, value: usize) !usize {
+        if (value == 0) {
+            if (buf.len < 1) return error.NoSpaceLeft;
+            buf[0] = '0';
+            return 1;
         }
-        // RFC 9110 §8.6: MUST NOT send Content-Length in 204 or 304 responses
-        if (resp.status == 204 or resp.status == 304) {
+        // Write digits in reverse, then flip
+        var tmp: [20]u8 = undefined; // max u64 is 20 digits
+        var len: usize = 0;
+        var v = value;
+        while (v > 0) {
+            tmp[len] = @intCast((v % 10) + '0');
+            len += 1;
+            v /= 10;
+        }
+        if (len > buf.len) return error.NoSpaceLeft;
+        // Reverse into output
+        for (0..len) |i| {
+            buf[i] = tmp[len - 1 - i];
+        }
+        return len;
+    }
+
+    const connection_close_hdr = "Connection: close\r\n";
+    const date_prefix = "Date: ";
+    const alt_svc_prefix = "Alt-Svc: ";
+    const content_length_prefix = "Content-Length: ";
+    const crlf = "\r\n";
+
+    /// Unified response encoder. When include_body is true, appends body bytes after headers.
+    fn encodeResponseInner(buf: []u8, status: u16, headers: []const response_mod.Header, body_len: usize, body_bytes: []const u8, alt_svc: ?[]const u8, connection_close: bool, date_str: []const u8, include_body: bool) !usize {
+        var index: usize = 0;
+
+        // Status line
+        index += try writeStatusLine(buf[index..], status);
+
+        // RFC 9110 §15.2: 1xx responses have no body, no Date, no Content-Length
+        if (status >= 100 and status < 200) {
             if (index + 2 > buf.len) return error.NoSpaceLeft;
             buf[index] = '\r';
             buf[index + 1] = '\n';
-            index += 2;
-            return index;
+            return index + 2;
         }
-        const length_line = try std.fmt.bufPrint(buf[index..], "Content-Length: {d}\r\n\r\n", .{body_bytes.len});
-        index += length_line.len;
-        if (index + body_bytes.len > buf.len) return error.NoSpaceLeft;
-        @memcpy(buf[index .. index + body_bytes.len], body_bytes);
-        index += body_bytes.len;
+
+        // Response headers
+        for (headers) |header| {
+            if (!isValidHeaderBytes(header.name) or !isValidHeaderBytes(header.value)) continue;
+            index += try writeHeader(buf[index..], header.name, header.value);
+        }
+
+        // Date header
+        const date_total = date_prefix.len + date_str.len + crlf.len;
+        if (index + date_total > buf.len) return error.NoSpaceLeft;
+        @memcpy(buf[index..][0..date_prefix.len], date_prefix);
+        index += date_prefix.len;
+        @memcpy(buf[index..][0..date_str.len], date_str);
+        index += date_str.len;
+        buf[index] = '\r';
+        buf[index + 1] = '\n';
+        index += 2;
+
+        // Alt-Svc header
+        if (alt_svc) |svc| {
+            if (svc.len > 0) {
+                const svc_total = alt_svc_prefix.len + svc.len + crlf.len;
+                if (index + svc_total > buf.len) return error.NoSpaceLeft;
+                @memcpy(buf[index..][0..alt_svc_prefix.len], alt_svc_prefix);
+                index += alt_svc_prefix.len;
+                @memcpy(buf[index..][0..svc.len], svc);
+                index += svc.len;
+                buf[index] = '\r';
+                buf[index + 1] = '\n';
+                index += 2;
+            }
+        }
+
+        // Connection: close
+        if (connection_close) {
+            if (index + connection_close_hdr.len > buf.len) return error.NoSpaceLeft;
+            @memcpy(buf[index..][0..connection_close_hdr.len], connection_close_hdr);
+            index += connection_close_hdr.len;
+        }
+
+        // RFC 9110 §8.6: MUST NOT send Content-Length in 204 or 304 responses
+        if (status == 204 or status == 304) {
+            if (index + 2 > buf.len) return error.NoSpaceLeft;
+            buf[index] = '\r';
+            buf[index + 1] = '\n';
+            return index + 2;
+        }
+
+        // Content-Length + header terminator
+        if (index + content_length_prefix.len > buf.len) return error.NoSpaceLeft;
+        @memcpy(buf[index..][0..content_length_prefix.len], content_length_prefix);
+        index += content_length_prefix.len;
+        index += try writeUsize(buf[index..], body_len);
+        // "\r\n\r\n" terminates headers
+        if (index + 4 > buf.len) return error.NoSpaceLeft;
+        buf[index] = '\r';
+        buf[index + 1] = '\n';
+        buf[index + 2] = '\r';
+        buf[index + 3] = '\n';
+        index += 4;
+
+        // Body (for small, inline responses)
+        if (include_body) {
+            if (index + body_bytes.len > buf.len) return error.NoSpaceLeft;
+            @memcpy(buf[index..][0..body_bytes.len], body_bytes);
+            index += body_bytes.len;
+        }
+
         return index;
     }
 
-    /// Encode response headers only (for large body responses that need chunking)
+    fn encodeResponse(buf: []u8, resp: response_mod.Response, alt_svc: ?[]const u8, connection_close: bool, date_str: []const u8) !usize {
+        const body_bytes = resp.bodyBytes();
+        return encodeResponseInner(buf, resp.status, resp.headers, body_bytes.len, body_bytes, alt_svc, connection_close, date_str, true);
+    }
+
     fn encodeResponseHeaders(buf: []u8, resp: response_mod.Response, alt_svc: ?[]const u8, connection_close: bool, date_str: []const u8) !usize {
-        var index: usize = 0;
-        const reason = reasonPhrase(resp.status);
-        const status_line = try std.fmt.bufPrint(buf[index..], "HTTP/1.1 {d} {s}\r\n", .{ resp.status, reason });
-        index += status_line.len;
         const body_len = resp.bodyLen();
-        for (resp.headers) |header| {
-            if (!isValidHeaderBytes(header.name) or !isValidHeaderBytes(header.value)) continue;
-            const header_line = try std.fmt.bufPrint(buf[index..], "{s}: {s}\r\n", .{ header.name, header.value });
-            index += header_line.len;
-        }
-        // RFC 9110 §15.2: 1xx responses have no body, no Date, no Content-Length
-        if (resp.status >= 100 and resp.status < 200) {
-            if (index + 2 > buf.len) return error.NoSpaceLeft;
-            buf[index] = '\r';
-            buf[index + 1] = '\n';
-            index += 2;
-            return index;
-        }
-        const date_line = try std.fmt.bufPrint(buf[index..], "Date: {s}\r\n", .{date_str});
-        index += date_line.len;
-        if (alt_svc) |svc| {
-            if (svc.len > 0) {
-                const alt_svc_line = try std.fmt.bufPrint(buf[index..], "Alt-Svc: {s}\r\n", .{svc});
-                index += alt_svc_line.len;
-            }
-        }
-        // RFC 9112 §9.6: Signal connection close to the client
-        if (connection_close) {
-            const close_line = try std.fmt.bufPrint(buf[index..], "Connection: close\r\n", .{});
-            index += close_line.len;
-        }
-        // RFC 9110 §8.6: MUST NOT send Content-Length in 204 or 304 responses
-        if (resp.status == 204 or resp.status == 304) {
-            if (index + 2 > buf.len) return error.NoSpaceLeft;
-            buf[index] = '\r';
-            buf[index + 1] = '\n';
-            index += 2;
-            return index;
-        }
-        const length_line = try std.fmt.bufPrint(buf[index..], "Content-Length: {d}\r\n\r\n", .{body_len});
-        index += length_line.len;
-        return index;
+        return encodeResponseInner(buf, resp.status, resp.headers, body_len, "", alt_svc, connection_close, date_str, false);
     }
 
     /// Encode HTTP/1.1 response headers for file responses (doesn't add Content-Length)
     fn encodeFileHeaders(buf: []u8, status: u16, headers: []const response_mod.Header, date_str: []const u8) !usize {
         var index: usize = 0;
-        const reason = reasonPhrase(status);
-        const status_line = try std.fmt.bufPrint(buf[index..], "HTTP/1.1 {d} {s}\r\n", .{ status, reason });
-        index += status_line.len;
+
+        index += try writeStatusLine(buf[index..], status);
+
         for (headers) |header| {
             if (!isValidHeaderBytes(header.name) or !isValidHeaderBytes(header.value)) continue;
-            const header_line = try std.fmt.bufPrint(buf[index..], "{s}: {s}\r\n", .{ header.name, header.value });
-            index += header_line.len;
+            index += try writeHeader(buf[index..], header.name, header.value);
         }
-        const file_date_line = try std.fmt.bufPrint(buf[index..], "Date: {s}\r\n", .{date_str});
-        index += file_date_line.len;
+
+        // Date header
+        const date_total = date_prefix.len + date_str.len + crlf.len;
+        if (index + date_total > buf.len) return error.NoSpaceLeft;
+        @memcpy(buf[index..][0..date_prefix.len], date_prefix);
+        index += date_prefix.len;
+        @memcpy(buf[index..][0..date_str.len], date_str);
+        index += date_str.len;
+        buf[index] = '\r';
+        buf[index + 1] = '\n';
+        index += 2;
+
         // End headers
         if (index + 2 > buf.len) return error.NoSpaceLeft;
         buf[index] = '\r';
         buf[index + 1] = '\n';
-        index += 2;
-        return index;
+        return index + 2;
     }
 
     fn reasonPhrase(status: u16) []const u8 {
@@ -1953,11 +2163,9 @@ pub const Server = struct {
                 };
                 var ip_buf: [64]u8 = undefined;
                 var client_ip_str: ?[]const u8 = null;
-                if (net.getPeerAddress(fd)) |peer| {
-                    if (peer.getIp4Bytes()) |ip4| {
-                        const ip_len = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ ip4[0], ip4[1], ip4[2], ip4[3] }) catch "";
-                        if (ip_len.len > 0) client_ip_str = ip_buf[0..ip_len.len];
-                    }
+                if (conn.cached_peer_ip) |ip4| {
+                    const ip_len = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ ip4[0], ip4[1], ip4[2], ip4[3] }) catch "";
+                    if (ip_len.len > 0) client_ip_str = ip_buf[0..ip_len.len];
                 }
                 var proxy_result = proxy.handleWithBody(
                     hparse.view,
@@ -1982,6 +2190,10 @@ pub const Server = struct {
         // Handler path: linearize body into contiguous allocation
         const total_len = accum.bytes_decoded;
         if (total_len > 0) {
+            const buffer_count = accum.buffer_count;
+            const last_buf_len = accum.current_buf_offset;
+            const buffer_size = self.cfg.buffer_pool.buffer_size;
+
             const body_mem = self.allocator.alloc(u8, total_len) catch {
                 self.abortBodyAccumulation(conn, 503);
                 return;
@@ -1989,12 +2201,12 @@ pub const Server = struct {
 
             // Copy from body buffers into contiguous memory
             var copied: usize = 0;
-            for (0..accum.buffer_count) |i| {
+            for (0..buffer_count) |i| {
                 const handle = accum.body_buffers[i];
-                const buf_len = if (i == accum.buffer_count - 1)
-                    accum.current_buf_offset
+                const buf_len = if (i == buffer_count - 1)
+                    last_buf_len
                 else
-                    self.cfg.buffer_pool.buffer_size;
+                    buffer_size;
                 @memcpy(body_mem[copied .. copied + buf_len], handle.bytes[0..buf_len]);
                 copied += buf_len;
             }
@@ -2008,15 +2220,98 @@ pub const Server = struct {
                 .body = body_mem[0..total_len],
             };
 
-            self.cleanupBodyAccumulation(conn);
-            self.dispatchToRouter(conn, req_view, fd);
-
-            // If the response stored a pending_body (for streaming large responses),
-            // it may reference body_mem. Materialize it into pool buffers before freeing.
-            if (conn.pending_body.len > 0) {
-                self.materializePendingBody(conn);
+            // Validate Host header against allowed_hosts if configured
+            if (self.cfg.allowed_hosts.len > 0) {
+                const host_value = req_view.getHeader("Host") orelse "";
+                const host_name = if (std.mem.indexOfScalar(u8, host_value, ':')) |colon|
+                    host_value[0..colon]
+                else
+                    host_value;
+                var host_allowed = false;
+                for (self.cfg.allowed_hosts) |allowed| {
+                    if (std.ascii.eqlIgnoreCase(host_name, allowed)) {
+                        host_allowed = true;
+                        break;
+                    }
+                }
+                if (!host_allowed) {
+                    conn.close_after_write = true;
+                    self.cleanupBodyAccumulation(conn);
+                    self.queueResponse(conn, badRequestResponse()) catch {};
+                    self.allocator.free(body_mem);
+                    return;
+                }
             }
-            self.allocator.free(body_mem);
+
+            // Dispatch to router, but check result before queueing to detect echo responses
+            // that can use scattered body buffers instead of re-copying.
+            var mw_ctx = middleware.Context{
+                .protocol = .http1,
+                .buffer_ops = .{
+                    .ctx = &self.io,
+                    .acquire = acquireBufferOpaque,
+                    .release = releaseBufferOpaque,
+                },
+            };
+            if (conn.cached_peer_ip) |ip4| {
+                mw_ctx.client_ip = ip4;
+            } else if (conn.cached_peer_ip6) |ip6| {
+                mw_ctx.client_ip6 = ip6;
+            }
+            var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
+            var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
+            const arena_handle = self.io.acquireBuffer();
+            var empty_arena: [0]u8 = undefined;
+            const arena_buf = if (arena_handle) |handle| handle.bytes else empty_arena[0..];
+            var scratch = router.HandlerScratch{
+                .response_buf = response_buf[0..],
+                .response_headers = response_headers[0..],
+                .arena_buf = arena_buf,
+                .arena_handle = arena_handle,
+                .buffer_ops = mw_ctx.buffer_ops,
+            };
+            const result = self.app_router.handle(req_view, &mw_ctx, &scratch);
+            if (scratch.arena_handle) |handle| self.io.releaseBuffer(handle);
+            if (result.pause_reads_ms) |pause_ms| {
+                conn.setRateLimitPause(self.io.nowMs(), pause_ms);
+            }
+
+            // Check if the handler echoed back the body (response .bytes ptr == body_mem ptr).
+            // If so, use scattered body to enqueue accum buffers directly (skip re-copy).
+            const is_echo = switch (result.resp.body) {
+                .bytes => |b| b.ptr == body_mem.ptr and b.len == total_len,
+                else => false,
+            };
+
+            if (is_echo and buffer_count > 0) {
+                // Echo detected: build a scattered response and transfer body buffers directly
+                var scattered_resp = result.resp;
+                scattered_resp.body = .{ .scattered = .{
+                    .handles = accum.body_buffers[0..buffer_count],
+                    .count = buffer_count,
+                    .last_buf_len = last_buf_len,
+                    .total_len = total_len,
+                    .buffer_size = buffer_size,
+                } };
+                // Release original read buffer (header data no longer needed)
+                if (accum.original_read_buffer) |orig_buf| {
+                    self.io.releaseBuffer(orig_buf);
+                    accum.original_read_buffer = null;
+                }
+                self.queueResponse(conn, scattered_resp) catch {};
+                // queueResponse transferred the buffer handles — zero out to prevent double-free
+                accum.buffer_count = 0;
+                conn.body_accum = null;
+                self.allocator.free(body_mem);
+            } else {
+                // Non-echo response: cleanup body buffers and queue normally
+                self.cleanupBodyAccumulation(conn);
+                self.queueResponse(conn, result.resp) catch {};
+                if (conn.pending_body.len > 0) {
+                    self.materializePendingBody(conn);
+                }
+                self.allocator.free(body_mem);
+            }
         } else {
             self.cleanupBodyAccumulation(conn);
             self.dispatchToRouter(conn, hparse.view, fd);
@@ -2024,7 +2319,7 @@ pub const Server = struct {
     }
 
     /// Dispatch a fully-formed request to the router (extracted for reuse).
-    fn dispatchToRouter(self: *Server, conn: *connection.Connection, req_view: request.RequestView, fd: std.posix.fd_t) void {
+    fn dispatchToRouter(self: *Server, conn: *connection.Connection, req_view: request.RequestView, _: std.posix.fd_t) void {
         // Validate Host header against allowed_hosts if configured
         if (self.cfg.allowed_hosts.len > 0) {
             const host_value = req_view.getHeader("Host") orelse "";
@@ -2054,12 +2349,11 @@ pub const Server = struct {
                 .release = releaseBufferOpaque,
             },
         };
-        if (net.getPeerAddress(fd)) |peer| {
-            if (peer.getIp4Bytes()) |ip4| {
-                mw_ctx.client_ip = ip4;
-            } else if (peer.getIp6Bytes()) |ip6| {
-                mw_ctx.client_ip6 = ip6;
-            }
+        // Use cached client IP for rate limiting and logging
+        if (conn.cached_peer_ip) |ip4| {
+            mw_ctx.client_ip = ip4;
+        } else if (conn.cached_peer_ip6) |ip6| {
+            mw_ctx.client_ip6 = ip6;
         }
         var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
         var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
