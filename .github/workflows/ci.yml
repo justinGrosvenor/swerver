@@ -12,6 +12,16 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Verify checkout
+        run: |
+          git rev-parse HEAD
+          if command -v rg >/dev/null 2>&1; then
+            rg -n "const prot" src/runtime/backend/io_uring.zig
+          else
+            grep -n "const prot" src/runtime/backend/io_uring.zig
+          fi
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
@@ -28,6 +38,16 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Verify checkout
+        run: |
+          git rev-parse HEAD
+          if command -v rg >/dev/null 2>&1; then
+            rg -n "const prot" src/runtime/backend/io_uring.zig
+          else
+            grep -n "const prot" src/runtime/backend/io_uring.zig
+          fi
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:

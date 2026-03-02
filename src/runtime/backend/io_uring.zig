@@ -423,18 +423,62 @@ fn io_uring_enter(fd: i32, to_submit: u32, min_complete: u32, flags: u32, sig: ?
 
 fn mapRing(ring_fd: i32, offset: u64, size: u32) ?[]u8 {
     if (!is_linux) return null;
-    const prot = linux.PROT.READ | linux.PROT.WRITE;
-    const flags: linux.MAP = .{ .TYPE = .SHARED, .POPULATE = true };
-    const rc = linux.mmap(null, @as(usize, size), prot, flags, ring_fd, @intCast(offset));
-    const err = std.posix.errno(rc);
-    if (err != .SUCCESS) return null;
-    return @as([*]u8, @ptrCast(@as(?[*]u8, @ptrFromInt(rc))))[0..size];
+    const prot = mmapProtReadWrite();
+    const flags: std.posix.MAP = .{ .TYPE = .SHARED, .POPULATE = true };
+    const mapping = std.posix.mmap(null, @as(usize, size), prot, flags, ring_fd, offset) catch return null;
+    return mapping;
 }
 
 fn unmapRing(ring: []u8) void {
     if (!is_linux) return;
-    _ = linux.munmap(@ptrCast(ring.ptr), ring.len);
+    const aligned: []align(std.heap.page_size_min) const u8 = @alignCast(ring);
+    std.posix.munmap(aligned);
 }
+
+fn mmapProtReadWrite() MmapProt {
+    const prot_type_info = @typeInfo(MmapProt);
+    switch (prot_type_info) {
+        .int => return @as(MmapProt, 0x1 | 0x2),
+        .@"struct" => |info| {
+            if (info.backing_integer) |Backing| {
+                return @bitCast(@as(Backing, 0x1 | 0x2));
+            }
+
+            var prot: MmapProt = .{};
+            var set_any = false;
+            if (@hasField(MmapProt, "READ")) {
+                @field(prot, "READ") = true;
+                set_any = true;
+            }
+            if (@hasField(MmapProt, "read")) {
+                @field(prot, "read") = true;
+                set_any = true;
+            }
+            if (@hasField(MmapProt, "WRITE")) {
+                @field(prot, "WRITE") = true;
+                set_any = true;
+            }
+            if (@hasField(MmapProt, "write")) {
+                @field(prot, "write") = true;
+                set_any = true;
+            }
+            if (!set_any) {
+                @compileError("Unsupported mmap PROT layout");
+            }
+            return prot;
+        },
+        else => @compileError("Unsupported mmap PROT type"),
+    }
+}
+
+const MmapProt = blk: {
+    const mmap_type_info = @typeInfo(@TypeOf(std.posix.mmap));
+    const fn_info = if (@hasField(std.builtin.Type, "Fn"))
+        mmap_type_info.Fn
+    else
+        mmap_type_info.@"fn";
+    break :blk fn_info.params[2].type.?;
+};
 
 // Probe whether the kernel supports io_uring
 pub fn probeIoUring() bool {
