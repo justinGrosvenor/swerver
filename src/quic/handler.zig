@@ -138,7 +138,6 @@ pub const Handler = struct {
                 switch (long.packet_type) {
                     .initial => {
                         try self.handleInitialPacket(conn, long, data);
-                        result.response = try self.buildInitialResponse(conn);
                     },
                     .handshake => {
                         try self.handleHandshakePacket(conn, long, data);
@@ -155,6 +154,10 @@ pub const Handler = struct {
                         // Retry handling (client-side)
                     },
                 }
+                // Build whatever needs to go on the wire after handling
+                // this long-header packet (could be Initial+Handshake
+                // flight, Handshake-only, or 1-RTT once handshake is done).
+                result.response = try self.buildResponseFlight(conn);
             },
             .short => |short| {
                 // Find connection by DCID
@@ -166,6 +169,10 @@ pub const Handler = struct {
 
                 // Collect HTTP/3 events after processing
                 result.http3_events = getHttp3Events(conn);
+
+                // Build outgoing 1-RTT response (ACK + HANDSHAKE_DONE +
+                // any HTTP/3 stream data the application produced).
+                result.response = try self.buildResponseFlight(conn);
             },
         }
 
@@ -511,68 +518,101 @@ pub const Handler = struct {
         return &.{};
     }
 
-    /// Build a coalesced response datagram for a server-side connection in
-    /// the handshake phase. Drains any pending CRYPTO bytes from the TLS
-    /// adapter at the Initial and Handshake encryption levels and emits
-    /// the corresponding QUIC packets back-to-back in a single datagram
-    /// (RFC 9000 §12.2 packet coalescing).
+    /// Build whatever needs to go on the wire right now for `conn`. Called
+    /// after every processPacket invocation. Coalesces an Initial, a
+    /// Handshake, and a 1-RTT packet into a single UDP datagram (RFC 9000
+    /// §12.2) — emitting only the levels that have something to say:
     ///
-    /// Layout:
-    ///   [Initial packet] [Handshake packet?]
+    ///   - Initial: pending CRYPTO bytes (server's ServerHello), or an ACK
+    ///     for a received Initial. Skipped once the connection enters the
+    ///     handshake phase and Initial keys are dropped.
+    ///   - Handshake: pending CRYPTO bytes (server's EE+Cert+CertVerify+
+    ///     Finished), or an ACK for a received Handshake.
+    ///   - 1-RTT: HANDSHAKE_DONE (once on the first 1-RTT we send), an
+    ///     ACK for a received 1-RTT, plus any pending HTTP/3 stream data.
     ///
-    /// The Initial packet is always padded to make the *datagram* at least
-    /// 1200 bytes (RFC 9000 §14.1). When a Handshake packet is also being
-    /// sent, the padding requirement applies to the combined size.
-    fn buildInitialResponse(self: *Handler, conn: *connection.Connection) Error![]const u8 {
+    /// Returns an empty slice if there's nothing to send.
+    fn buildResponseFlight(self: *Handler, conn: *connection.Connection) Error![]const u8 {
         var offset: usize = 0;
 
-        // ---- Initial packet (always emitted in the response to a client Initial) ----
-        const initial_keys = conn.crypto_ctx.initial.server orelse return Error.HandshakeFailed;
-        const initial_crypto = conn.getPendingCryptoData(types.PacketNumberSpace.initial);
+        // What will we end up emitting? We need to know in advance to
+        // decide whether the Initial datagram-padding requirement still
+        // applies (it only does until the handshake completes).
+        const initial_keys_opt: ?crypto.Keys = conn.crypto_ctx.initial.server;
+        const handshake_keys_opt: ?crypto.Keys = conn.crypto_ctx.handshake.server;
+        const application_keys_opt: ?crypto.Keys = conn.crypto_ctx.application.server;
 
-        // We need to know whether a Handshake packet will follow so we can
-        // decide how much PADDING to put inside the Initial. To make that
-        // decision we have to peek at the Handshake outbound queue.
-        const handshake_crypto = conn.getPendingCryptoData(types.PacketNumberSpace.handshake);
-        const will_emit_handshake = handshake_crypto.len > 0 and conn.crypto_ctx.handshake.server != null;
+        const initial_crypto = if (initial_keys_opt != null) conn.getPendingCryptoData(types.PacketNumberSpace.initial) else &.{};
+        const handshake_crypto = if (handshake_keys_opt != null) conn.getPendingCryptoData(types.PacketNumberSpace.handshake) else &.{};
 
-        // Build the Initial packet header into response_buffer[offset..]
-        const initial_built = try buildHandshakePacket(
-            self.response_buffer[offset..],
-            .{
-                .packet_type = .initial,
-                .conn = conn,
-                .crypto_data = initial_crypto,
-                .keys = &initial_keys,
-                .pad_datagram_to = if (will_emit_handshake) 0 else 1200,
-                .datagram_bytes_so_far = offset,
-                .ack_largest = if (conn.initial_space.ack_needed) conn.initial_space.largest_received else null,
-            },
-        );
-        offset += initial_built.bytes_written;
-        if (initial_crypto.len > 0) {
-            conn.consumePendingCryptoData(types.PacketNumberSpace.initial, initial_crypto.len);
+        const want_initial = initial_keys_opt != null and (initial_crypto.len > 0 or conn.initial_space.ack_needed);
+        const want_handshake = handshake_keys_opt != null and (handshake_crypto.len > 0 or conn.handshake_space.ack_needed);
+        const want_one_rtt = application_keys_opt != null and conn.state == .connected and
+            (conn.application_space.ack_needed or !conn.handshake_done_sent or conn.has1RttPayloadPending());
+
+        // Pre-handshake datagrams must be padded to 1200 bytes (RFC 9000
+        // §14.1). After handshake-complete this no longer applies.
+        const need_pad_to_1200 = !conn.handshake_done_sent;
+
+        // ---- Initial packet ----
+        if (want_initial) {
+            const built = try buildHandshakePacket(
+                self.response_buffer[offset..],
+                .{
+                    .packet_type = .initial,
+                    .conn = conn,
+                    .crypto_data = initial_crypto,
+                    .keys = &initial_keys_opt.?,
+                    // Only request 1200-byte padding from the *last* long-
+                    // header packet in the coalesced flight; otherwise inner
+                    // packets blow past their length field.
+                    .pad_datagram_to = if (need_pad_to_1200 and !want_handshake and !want_one_rtt) 1200 else 0,
+                    .datagram_bytes_so_far = offset,
+                    .ack_largest = if (conn.initial_space.ack_needed) conn.initial_space.largest_received else null,
+                },
+            );
+            offset += built.bytes_written;
+            if (initial_crypto.len > 0) {
+                conn.consumePendingCryptoData(types.PacketNumberSpace.initial, initial_crypto.len);
+            }
+            conn.initial_space.ack_needed = false;
         }
-        if (conn.initial_space.ack_needed) conn.initial_space.ack_needed = false;
 
-        // ---- Handshake packet (only if there's pending Handshake CRYPTO data) ----
-        if (will_emit_handshake) {
-            const handshake_keys = conn.crypto_ctx.handshake.server.?;
-            const handshake_built = try buildHandshakePacket(
+        // ---- Handshake packet ----
+        if (want_handshake) {
+            const built = try buildHandshakePacket(
                 self.response_buffer[offset..],
                 .{
                     .packet_type = .handshake,
                     .conn = conn,
                     .crypto_data = handshake_crypto,
-                    .keys = &handshake_keys,
-                    .pad_datagram_to = 1200,
+                    .keys = &handshake_keys_opt.?,
+                    .pad_datagram_to = if (need_pad_to_1200 and !want_one_rtt) 1200 else 0,
                     .datagram_bytes_so_far = offset,
                     .ack_largest = if (conn.handshake_space.ack_needed) conn.handshake_space.largest_received else null,
                 },
             );
-            offset += handshake_built.bytes_written;
-            conn.consumePendingCryptoData(types.PacketNumberSpace.handshake, handshake_crypto.len);
-            if (conn.handshake_space.ack_needed) conn.handshake_space.ack_needed = false;
+            offset += built.bytes_written;
+            if (handshake_crypto.len > 0) {
+                conn.consumePendingCryptoData(types.PacketNumberSpace.handshake, handshake_crypto.len);
+            }
+            conn.handshake_space.ack_needed = false;
+        }
+
+        // ---- 1-RTT packet ----
+        if (want_one_rtt) {
+            const built = try buildShortPacket(
+                self.response_buffer[offset..],
+                .{
+                    .conn = conn,
+                    .keys = &application_keys_opt.?,
+                    .ack_largest = if (conn.application_space.ack_needed) conn.application_space.largest_received else null,
+                    .send_handshake_done = !conn.handshake_done_sent,
+                },
+            );
+            offset += built.bytes_written;
+            conn.application_space.ack_needed = false;
+            if (!conn.handshake_done_sent) conn.handshake_done_sent = true;
         }
 
         return self.response_buffer[0..offset];
@@ -752,6 +792,91 @@ fn buildHandshakePacket(out: []u8, opts: BuildPacketOptions) Error!BuildPacketRe
     out[length_offset + 1] = @intCast(length_value & 0xff);
 
     // ---- AEAD packet protection + header protection ----
+    const protected_len = crypto.protectPacket(
+        opts.keys,
+        pn,
+        header_len,
+        pn_offset,
+        pn_len,
+        out,
+        off,
+    ) catch return Error.HandshakeFailed;
+
+    return .{ .bytes_written = protected_len };
+}
+
+/// Options for building a short-header (1-RTT) packet.
+const BuildShortPacketOptions = struct {
+    conn: *connection.Connection,
+    keys: *const crypto.Keys,
+    /// If non-null, emit an ACK frame for this largest_received packet
+    /// number in the application packet number space.
+    ack_largest: ?u64,
+    /// Should this packet include a HANDSHAKE_DONE frame?
+    send_handshake_done: bool,
+};
+
+/// Build a single 1-RTT (short header) QUIC packet into `out`. Layout is
+/// much simpler than long-header: just flags byte + DCID + packet number,
+/// then frames, then AEAD + header protection.
+fn buildShortPacket(out: []u8, opts: BuildShortPacketOptions) Error!BuildPacketResult {
+    const conn_ref = opts.conn;
+    var off: usize = 0;
+
+    // Short header first byte (RFC 9000 §17.3.1):
+    //   0|1|S|R|R|K|P|P
+    //   ^   ^   ^   ^----- packet number length (00 = 1 byte)
+    //   |   |   key phase (0)
+    //   |   spin bit (0)
+    //   fixed bit (1)
+    // High bit (form) = 0 = short header.
+    if (off >= out.len) return Error.HandshakeFailed;
+    out[off] = 0x40; // 0b01000000 — fixed bit set, all other flags 0
+    off += 1;
+
+    // DCID: peer's connection ID (no length byte in short header form;
+    // both endpoints know each other's CID lengths from the handshake).
+    if (off + conn_ref.peer_cid.len > out.len) return Error.HandshakeFailed;
+    if (conn_ref.peer_cid.len > 0) {
+        @memcpy(out[off .. off + conn_ref.peer_cid.len], conn_ref.peer_cid.slice());
+        off += conn_ref.peer_cid.len;
+    }
+
+    // Packet number — 1 byte for now, like the long-header builder.
+    const pn_offset = off;
+    const pn_len: u8 = 1;
+    const pn = conn_ref.application_space.allocatePacketNumber();
+    if (off >= out.len) return Error.HandshakeFailed;
+    out[off] = @truncate(pn);
+    off += 1;
+
+    const header_len = off;
+
+    // ---- Plaintext payload ----
+
+    // ACK frame (per-application-space)
+    if (opts.ack_largest) |largest| {
+        const acked = frame.writeAck(out[off..], largest, 0) catch return Error.HandshakeFailed;
+        off += acked;
+    }
+
+    // HANDSHAKE_DONE frame (sent exactly once after handshake completes)
+    if (opts.send_handshake_done) {
+        const written = frame.writeHandshakeDone(out[off..]) catch return Error.HandshakeFailed;
+        off += written;
+    }
+
+    // Need at least one byte of plaintext (a PING frame, type 0x01) so
+    // header protection has a sample to work on. RFC 9001 §5.4.2: the
+    // packet must have at least 4 bytes of payload after the packet
+    // number for the HP sample.
+    while (off - header_len < 4) {
+        if (off >= out.len) return Error.HandshakeFailed;
+        out[off] = 0x00; // PADDING
+        off += 1;
+    }
+
+    // ---- AEAD + header protection ----
     const protected_len = crypto.protectPacket(
         opts.keys,
         pn,

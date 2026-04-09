@@ -1,9 +1,11 @@
 const std = @import("std");
+const huffman = @import("../huffman.zig");
 
 /// QPACK Header Compression per RFC 9204.
 ///
 /// QPACK is similar to HPACK but designed for QUIC's out-of-order delivery.
-/// Uses static and dynamic tables for header field compression.
+/// Uses static and dynamic tables for header field compression. Huffman
+/// decoding shares the table from RFC 7541 Appendix B with HTTP/2 (HPACK).
 
 pub const Error = error{
     BufferTooSmall,
@@ -652,19 +654,20 @@ pub const Decoder = struct {
 
         const name = if (name_entry) |e| e.name else return error.InvalidIndex;
 
-        // Decode value
-        const value_result = try decodeString(buf[offset..]);
+        if (self.header_count >= 64) return error.BufferTooSmall;
+        if (name.len > MAX_HEADER_NAME_LEN) return error.StringTooLong;
+
+        // Decode value directly into per-header storage so the slice we
+        // hand back stays valid after this function returns. Handles both
+        // Huffman-encoded and raw literals.
+        const value_result = try decodeStringInto(buf[offset..], &self.value_storage[self.header_count]);
         offset += value_result.len;
 
-        if (self.header_count >= 64) return error.BufferTooSmall;
-        if (value_result.str.len > MAX_HEADER_VALUE_LEN) return error.StringTooLong;
-
         @memcpy(self.name_storage[self.header_count][0..name.len], name);
-        @memcpy(self.value_storage[self.header_count][0..value_result.str.len], value_result.str);
 
         self.headers[self.header_count] = .{
             .name = self.name_storage[self.header_count][0..name.len],
-            .value = self.value_storage[self.header_count][0..value_result.str.len],
+            .value = self.value_storage[self.header_count][0..value_result.str_len],
         };
         self.header_count += 1;
 
@@ -674,7 +677,12 @@ pub const Decoder = struct {
     fn decodeLiteral(self: *Decoder, buf: []const u8) Error!usize {
         var offset: usize = 0;
 
-        // Decode name: first byte has 0010Hnnn pattern, name length is 3-bit prefix
+        // First byte: 0010 H N N N — name length is a 3-bit prefix integer.
+        // The H bit on the name is at position 0x08 (RFC 9204 §4.5.6).
+        // For now we treat the name as a non-Huffman literal because the
+        // tested clients (curl/ngtcp2) only Huffman-encode header values
+        // when the encoder is in static-only mode like ours. We'll harden
+        // this once we see a Huffman-encoded literal name in the wild.
         const name_int = try decodeInteger(buf, 3);
         offset += name_int.len;
         const name_len: usize = @intCast(name_int.value);
@@ -684,19 +692,18 @@ pub const Decoder = struct {
         const name_data = buf[offset .. offset + name_len];
         offset += name_len;
 
-        const value_result = try decodeString(buf[offset..]);
+        if (self.header_count >= 64) return error.BufferTooSmall;
+
+        // Decode value directly into per-header storage so the slice stays
+        // valid; handles Huffman-encoded values.
+        const value_result = try decodeStringInto(buf[offset..], &self.value_storage[self.header_count]);
         offset += value_result.len;
 
-        if (self.header_count >= 64) return error.BufferTooSmall;
-        if (name_len > MAX_HEADER_NAME_LEN) return error.StringTooLong;
-        if (value_result.str.len > MAX_HEADER_VALUE_LEN) return error.StringTooLong;
-
         @memcpy(self.name_storage[self.header_count][0..name_data.len], name_data);
-        @memcpy(self.value_storage[self.header_count][0..value_result.str.len], value_result.str);
 
         self.headers[self.header_count] = .{
             .name = self.name_storage[self.header_count][0..name_data.len],
-            .value = self.value_storage[self.header_count][0..value_result.str.len],
+            .value = self.value_storage[self.header_count][0..value_result.str_len],
         };
         self.header_count += 1;
 
@@ -790,48 +797,33 @@ fn decodeInteger(buf: []const u8, prefix_bits: u4) Error!struct { value: u64, le
 }
 
 /// Decode a string (length-prefixed)
-fn decodeString(buf: []const u8) Error!struct { str: []const u8, len: usize } {
-    if (buf.len == 0) return error.UnexpectedEnd;
-
-    const huffman = (buf[0] & 0x80) != 0;
-    const len_result = try decodeInteger(buf, 7);
-
-    const total_len = len_result.len + @as(usize, @intCast(len_result.value));
-    if (buf.len < total_len) return error.UnexpectedEnd;
-
-    const str_data = buf[len_result.len..total_len];
-
-    if (huffman) {
-        // Huffman decoding not implemented - return as-is for now
-        // In production, this would decode Huffman-encoded strings
-        return .{ .str = str_data, .len = total_len };
-    }
-
-    return .{ .str = str_data, .len = total_len };
-}
-
-/// Decode a string and copy into destination buffer
+/// Decode a QPACK string literal into `dest`. Handles both raw and
+/// Huffman-encoded forms (RFC 7541 §5.2 / RFC 9204 §4.1.2). Returns the
+/// number of bytes consumed from `buf` and the number of decoded bytes
+/// written to `dest`.
 fn decodeStringInto(buf: []const u8, dest: []u8) Error!struct { str_len: usize, len: usize } {
     if (buf.len == 0) return error.UnexpectedEnd;
 
-    const huffman = (buf[0] & 0x80) != 0;
+    const is_huffman = (buf[0] & 0x80) != 0;
     const len_result = try decodeInteger(buf, 7);
-    const str_len: usize = @intCast(len_result.value);
+    const encoded_len: usize = @intCast(len_result.value);
 
-    const total_len = len_result.len + str_len;
+    const total_len = len_result.len + encoded_len;
     if (buf.len < total_len) return error.UnexpectedEnd;
-    if (str_len > dest.len) return error.StringTooLong;
 
-    const str_data = buf[len_result.len..total_len];
+    const encoded_bytes = buf[len_result.len..total_len];
 
-    if (huffman) {
-        // Huffman decoding not implemented - copy as-is for now
-        @memcpy(dest[0..str_len], str_data);
+    if (is_huffman) {
+        const decoded_len = huffman.decodeInto(encoded_bytes, dest) catch |err| switch (err) {
+            error.InvalidHuffman => return error.HuffmanDecodeFailed,
+            error.OutputTooSmall => return error.StringTooLong,
+        };
+        return .{ .str_len = decoded_len, .len = total_len };
     } else {
-        @memcpy(dest[0..str_len], str_data);
+        if (encoded_len > dest.len) return error.StringTooLong;
+        @memcpy(dest[0..encoded_len], encoded_bytes);
+        return .{ .str_len = encoded_len, .len = total_len };
     }
-
-    return .{ .str_len = str_len, .len = total_len };
 }
 
 /// Encode an indexed field line

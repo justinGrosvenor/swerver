@@ -466,6 +466,11 @@ pub const Connection = struct {
     crypto_reasm_initial: CryptoReassembly = .{},
     crypto_reasm_handshake: CryptoReassembly = .{},
     crypto_reasm_application: CryptoReassembly = .{},
+    /// Server: have we already sent HANDSHAKE_DONE to the client?
+    /// HANDSHAKE_DONE is sent exactly once after the server's handshake
+    /// completes (RFC 9000 §19.20) and signals to the client that it
+    /// can discard its Handshake-level keys.
+    handshake_done_sent: bool = false,
     /// Stream manager for this connection
     stream_manager: ?stream.StreamManager = null,
     /// HTTP/3 protocol stack
@@ -722,6 +727,15 @@ pub const Connection = struct {
         if (self.tls_session) |*session| {
             session.feedQuicCryptoData(levelFromSpace(space), data) catch return Error.TlsError;
         }
+    }
+
+    /// Stub: do we have any HTTP/3 stream data waiting to be flushed in a
+    /// 1-RTT packet? (false until the h3 response path is wired up). For
+    /// now we send 1-RTT packets only when we have an ACK or HANDSHAKE_DONE
+    /// to send, not for stream data.
+    pub fn has1RttPayloadPending(self: *const Connection) bool {
+        _ = self;
+        return false;
     }
 
     /// Get the per-level reassembly buffer.
