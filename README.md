@@ -11,7 +11,7 @@ HTTP/3   ──┘      │
 
 ## Why
 
-Because allocators are for the weak. Because `malloc` is a syscall in disguise. Because the fastest memory operation is the one you don't do.
+Because the fastest memory operation is the one you don't do.
 
 Swerver processes HTTP requests using fixed-size buffer pools and stack-allocated parsing. No garbage collection. No hidden allocations. No surprises.
 
