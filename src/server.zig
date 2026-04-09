@@ -304,10 +304,26 @@ pub const Server = struct {
     }
 
     fn handleAccept(self: *Server, listener_fd: std.posix.fd_t) !void {
+        // Edge-triggered epoll: must drain the accept queue in a loop or
+        // pending connections will be stranded until the next "transition".
+        while (true) {
+            self.acceptOne(listener_fd) catch |err| switch (err) {
+                error.WouldBlock => return,
+                else => return err,
+            };
+        }
+    }
+
+    fn acceptOne(self: *Server, listener_fd: std.posix.fd_t) !void {
         const client_fd = net.accept(listener_fd) catch |err| switch (err) {
-            error.WouldBlock => return,
+            error.WouldBlock => return error.WouldBlock,
             else => return err,
         };
+        // Disable Nagle's algorithm — without this, h2 HEADERS+DATA writes
+        // can stall for 40ms (TCP delayed ACK) since they're separate sends.
+        // For h1 we use writev (one syscall), so this also helps multi-frame writes.
+        const one: c_int = 1;
+        _ = std.posix.system.setsockopt(client_fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one), @sizeOf(c_int));
         const now_ms = self.io.nowMs();
         const conn = self.io.acquireConnection(now_ms) orelse {
             clock.closeFd(client_fd);
@@ -1087,7 +1103,10 @@ pub const Server = struct {
     fn handleHttp2Read(self: *Server, conn: *connection.Connection) !void {
         const buffer_handle = conn.read_buffer orelse return;
         const stack = conn.http2_stack orelse return;
-        while (conn.read_buffered_bytes > 0 and conn.canEnqueueWrite()) {
+        // Reserve enough write queue space for a full ingest batch:
+        // 16 events × 2 frames (HEADERS+DATA) per event + control frames headroom.
+        const min_write_slots: u8 = 36;
+        while (conn.read_buffered_bytes > 0 and conn.writeQueueAvailable() >= min_write_slots) {
             const start = conn.read_offset;
             const end = start + conn.read_buffered_bytes;
             if (end > buffer_handle.bytes.len) break;
@@ -1095,7 +1114,11 @@ pub const Server = struct {
             var frames: [16]http2.Frame = undefined;
             var events: [16]http2.Event = undefined;
             const ingest = stack.ingest(slice, frames[0..], events[0..]);
-            if (ingest.state == .partial) return;
+            // .partial means either we need more bytes from the socket OR the
+            // frames buffer was full (16 slots) and more frames remain in the
+            // read buffer. If we made progress, continue the loop to drain.
+            // If we made no progress, we genuinely need more socket data.
+            if (ingest.state == .partial and ingest.consumed_bytes == 0) return;
             if (ingest.state == .err) {
                 // RFC 9113 §5.4.1: Send GOAWAY before closing on connection error
                 var goaway_buf: [17]u8 = undefined;

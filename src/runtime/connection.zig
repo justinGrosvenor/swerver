@@ -449,7 +449,10 @@ fn isValidTransition(from: State, to: State) bool {
     };
 }
 
-const write_queue_capacity: u8 = 32;
+/// Per-connection write queue capacity. Sized for HTTP/2 multiplexing where
+/// each response can take 2 slots (HEADERS + DATA) plus control frames.
+/// 128 entries supports ~60 concurrent in-flight h2 responses.
+const write_queue_capacity: u8 = 128;
 pub const HeaderCapacity: usize = 128;
 
 const WriteEntry = struct {

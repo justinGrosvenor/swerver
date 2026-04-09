@@ -9,6 +9,10 @@
   - SIGPIPE ignored for clean TLS connection teardown
 - Fix HTTP/2 response headers sent with mixed case (RFC 9113 §8.2 requires lowercase)
 - Fix edge-triggered epoll not flushing h2 responses queued during read dispatch
+- Fix edge-triggered epoll dropping pending TCP connections (drain accept queue in loop)
+- Fix h2 ingest stranding frames when 16-slot frames buffer fills mid-batch
+- Set TCP_NODELAY on accepted sockets (eliminates 40ms Nagle delay for h2 multi-frame writes)
+- Increase per-connection write queue from 32 to 128 entries for h2 multiplexing
 - Streaming request body support (bodies up to 8MB via buffer accumulation)
 - Buffer size increased from 16KB to 64KB
 - Fix edge-triggered epoll stall on large body uploads
