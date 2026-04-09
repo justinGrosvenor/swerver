@@ -90,6 +90,8 @@ extern fn SSL_CTX_use_PrivateKey_file(ctx: *SSL_CTX, file: [*:0]const u8, typ: c
 extern fn SSL_CTX_check_private_key(ctx: *SSL_CTX) c_int;
 extern fn SSL_CTX_set_alpn_select_cb(ctx: *SSL_CTX, cb: AlpnSelectCallback, arg: ?*anyopaque) void;
 extern fn SSL_CTX_ctrl(ctx: *SSL_CTX, cmd: c_int, larg: c_long, parg: ?*anyopaque) c_long;
+extern fn SSL_CTX_set_ciphersuites(ctx: *SSL_CTX, str: [*:0]const u8) c_int;
+extern fn SSL_CTX_set_alpn_protos(ctx: *SSL_CTX, protos: [*]const u8, protos_len: c_uint) c_int;
 
 extern fn SSL_new(ctx: *SSL_CTX) ?*SSL;
 extern fn SSL_free(ssl: *SSL) void;
@@ -350,6 +352,61 @@ pub fn createContext(is_server: bool) !*SSL_CTX {
     return ctx;
 }
 
+/// Create a TLS context for QUIC: TLS 1.3 only, AES-128-GCM ciphersuite,
+/// h3 ALPN preference. The QUIC packet protection layer currently only
+/// supports AES-128-GCM, so we restrict negotiation to TLS_AES_128_GCM_SHA256.
+pub fn createQuicContext(is_server: bool) !*SSL_CTX {
+    if (!tls_enabled) return error.TlsNotAvailable;
+    const method = if (is_server) TLS_server_method() else TLS_client_method();
+    const ctx = SSL_CTX_new(method) orelse return error.ContextCreationFailed;
+    errdefer SSL_CTX_free(ctx);
+
+    // Force TLS 1.3 (QUIC requires it).
+    _ = SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, TLS1_3_VERSION, null);
+    _ = SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MAX_PROTO_VERSION, TLS1_3_VERSION, null);
+
+    // Restrict to AES-128-GCM until we wire up SHA-384 / AES-256-GCM secret sizes.
+    try setCiphersuites(ctx, "TLS_AES_128_GCM_SHA256");
+
+    // ALPN: server prefers h3, client advertises h3.
+    if (is_server) {
+        SSL_CTX_set_alpn_select_cb(ctx, quicAlpnSelectCallback, null);
+    } else {
+        // Client side: advertise h3 as the only protocol.
+        // Wire format: <1-byte len><proto bytes>.
+        const h3_protos = [_]u8{ 2, 'h', '3' };
+        try setAlpnProtocols(ctx, &h3_protos);
+    }
+
+    return ctx;
+}
+
+/// ALPN selection callback for QUIC TLS: only accept h3.
+fn quicAlpnSelectCallback(
+    _: *SSL,
+    out: *[*]const u8,
+    outlen: *u8,
+    in_data: [*]const u8,
+    inlen: c_uint,
+    _: ?*anyopaque,
+) callconv(.c) c_int {
+    const client_list = in_data[0..inlen];
+    var i: usize = 0;
+    while (i < client_list.len) {
+        const proto_len = client_list[i];
+        i += 1;
+        if (i + proto_len > client_list.len) break;
+        const proto = client_list[i .. i + proto_len];
+        if (std.mem.eql(u8, proto, "h3")) {
+            out.* = @ptrCast(client_list[i..].ptr);
+            outlen.* = proto_len;
+            return SSL_TLSEXT_ERR_OK;
+        }
+        i += proto_len;
+    }
+    return SSL_TLSEXT_ERR_ALERT_FATAL;
+}
+
 /// Create a TLS context for TCP connections (TLS 1.2+, sets ALPN for h2/http1.1).
 /// Unlike createContext() which forces TLS 1.3 for QUIC, this uses library defaults
 /// which support TLS 1.2+ on both OpenSSL and LibreSSL.
@@ -472,6 +529,28 @@ pub fn createBareSession(ctx: *SSL_CTX, is_server: bool) !*SSL {
     return ssl;
 }
 
+/// Restrict the TLS 1.3 ciphersuites this context will negotiate. Pass a
+/// colon-separated list (e.g. "TLS_AES_128_GCM_SHA256"). Used by the QUIC
+/// path so we only see SHA-256 32-byte traffic secrets matching our
+/// AES-128-GCM packet protection — until we wire up SHA-384 support.
+pub fn setCiphersuites(ctx: *SSL_CTX, ciphers: [:0]const u8) !void {
+    if (!tls_enabled) return error.TlsNotAvailable;
+    if (SSL_CTX_set_ciphersuites(ctx, ciphers.ptr) != 1) {
+        return error.CipherSuiteSetFailed;
+    }
+}
+
+/// Set the ALPN protocol list this context will advertise (server-side
+/// override of the default ALPN selection callback). `protos` is the
+/// length-prefixed wire format: each protocol is 1-byte-len + bytes.
+pub fn setAlpnProtocols(ctx: *SSL_CTX, protos: []const u8) !void {
+    if (!tls_enabled) return error.TlsNotAvailable;
+    if (SSL_CTX_set_alpn_protos(ctx, protos.ptr, @intCast(protos.len)) != 0) {
+        // OpenSSL convention: SSL_CTX_set_alpn_protos returns 0 on success.
+        return error.AlpnSetFailed;
+    }
+}
+
 pub fn freeSession(ssl: *SSL) void {
     if (!tls_enabled) return;
     SSL_free(ssl);
@@ -553,6 +632,21 @@ pub fn doHandshake(ssl: *SSL) HandshakeResult {
     if (ret == 1) return .complete;
 
     const err = SSL_get_error(ssl, ret);
+    if (err != SSL_ERROR_WANT_READ and err != SSL_ERROR_WANT_WRITE) {
+        // Drain the OpenSSL error queue for diagnostics — these errors are
+        // fatal for the connection (handshake failed for a non-recoverable
+        // reason like a malformed message or protocol violation).
+        var buf: [256]u8 = undefined;
+        @memset(&buf, 0);
+        const e = ERR_get_error();
+        if (e != 0) {
+            ERR_error_string_n(e, &buf, buf.len);
+            const msg_len = std.mem.indexOfScalar(u8, &buf, 0) orelse buf.len;
+            std.log.debug("TLS handshake failed: ret={d} ssl_err={d} {s}", .{
+                ret, err, buf[0..msg_len],
+            });
+        }
+    }
     return switch (err) {
         SSL_ERROR_WANT_READ => .want_read,
         SSL_ERROR_WANT_WRITE => .want_write,

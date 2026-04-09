@@ -130,6 +130,27 @@ fn getCurrentTimeMicros() u64 {
     return ns / 1000;
 }
 
+/// Transport parameter identifiers (RFC 9000 §18.2)
+pub const TpId = struct {
+    pub const original_destination_connection_id: u64 = 0x00;
+    pub const max_idle_timeout: u64 = 0x01;
+    pub const stateless_reset_token: u64 = 0x02;
+    pub const max_udp_payload_size: u64 = 0x03;
+    pub const initial_max_data: u64 = 0x04;
+    pub const initial_max_stream_data_bidi_local: u64 = 0x05;
+    pub const initial_max_stream_data_bidi_remote: u64 = 0x06;
+    pub const initial_max_stream_data_uni: u64 = 0x07;
+    pub const initial_max_streams_bidi: u64 = 0x08;
+    pub const initial_max_streams_uni: u64 = 0x09;
+    pub const ack_delay_exponent: u64 = 0x0a;
+    pub const max_ack_delay: u64 = 0x0b;
+    pub const disable_active_migration: u64 = 0x0c;
+    pub const preferred_address: u64 = 0x0d;
+    pub const active_connection_id_limit: u64 = 0x0e;
+    pub const initial_source_connection_id: u64 = 0x0f;
+    pub const retry_source_connection_id: u64 = 0x10;
+};
+
 /// Transport parameters negotiated with peer
 pub const TransportParams = struct {
     max_idle_timeout: u64 = 0,
@@ -144,6 +165,135 @@ pub const TransportParams = struct {
     max_ack_delay: u64 = types.TransportParamDefaults.max_ack_delay,
     active_connection_id_limit: u64 = types.TransportParamDefaults.active_connection_id_limit,
     disable_active_migration: bool = false,
+    /// Server-only: DCID from client's first Initial packet (RFC 9000 §7.3)
+    original_destination_connection_id: ?types.ConnectionId = null,
+    /// SCID we put in our long-header packets (both peers send this)
+    initial_source_connection_id: ?types.ConnectionId = null,
+
+    /// Encode this set into the QUIC transport parameters TLV format
+    /// (RFC 9000 §18). Returns the number of bytes written.
+    /// Each parameter is: varint(id) varint(len) value-bytes.
+    /// For varint-typed parameters, value-bytes is itself varint-encoded.
+    pub fn encode(self: *const TransportParams, out: []u8) !usize {
+        var off: usize = 0;
+
+        // Helper: emit a varint-valued parameter (id, value).
+        const emitVarint = struct {
+            fn call(buf: []u8, cur: *usize, id: u64, value: u64) !void {
+                const var_len = varint.encodedLength(value);
+                cur.* += try varint.encode(buf[cur.*..], id);
+                cur.* += try varint.encode(buf[cur.*..], var_len);
+                cur.* += try varint.encode(buf[cur.*..], value);
+            }
+        }.call;
+
+        // Helper: emit an opaque-valued parameter (id, bytes).
+        const emitBytes = struct {
+            fn call(buf: []u8, cur: *usize, id: u64, value: []const u8) !void {
+                cur.* += try varint.encode(buf[cur.*..], id);
+                cur.* += try varint.encode(buf[cur.*..], value.len);
+                if (buf.len < cur.* + value.len) return error.BufferTooSmall;
+                @memcpy(buf[cur.* .. cur.* + value.len], value);
+                cur.* += value.len;
+            }
+        }.call;
+
+        // Helper: emit a zero-length flag parameter.
+        const emitFlag = struct {
+            fn call(buf: []u8, cur: *usize, id: u64) !void {
+                cur.* += try varint.encode(buf[cur.*..], id);
+                cur.* += try varint.encode(buf[cur.*..], 0);
+            }
+        }.call;
+
+        if (self.original_destination_connection_id) |cid| {
+            try emitBytes(out, &off, TpId.original_destination_connection_id, cid.slice());
+        }
+        if (self.max_idle_timeout != 0) {
+            try emitVarint(out, &off, TpId.max_idle_timeout, self.max_idle_timeout);
+        }
+        try emitVarint(out, &off, TpId.max_udp_payload_size, self.max_udp_payload_size);
+        try emitVarint(out, &off, TpId.initial_max_data, self.initial_max_data);
+        try emitVarint(out, &off, TpId.initial_max_stream_data_bidi_local, self.initial_max_stream_data_bidi_local);
+        try emitVarint(out, &off, TpId.initial_max_stream_data_bidi_remote, self.initial_max_stream_data_bidi_remote);
+        try emitVarint(out, &off, TpId.initial_max_stream_data_uni, self.initial_max_stream_data_uni);
+        try emitVarint(out, &off, TpId.initial_max_streams_bidi, self.initial_max_streams_bidi);
+        try emitVarint(out, &off, TpId.initial_max_streams_uni, self.initial_max_streams_uni);
+        try emitVarint(out, &off, TpId.ack_delay_exponent, self.ack_delay_exponent);
+        try emitVarint(out, &off, TpId.max_ack_delay, self.max_ack_delay);
+        if (self.disable_active_migration) {
+            try emitFlag(out, &off, TpId.disable_active_migration);
+        }
+        try emitVarint(out, &off, TpId.active_connection_id_limit, self.active_connection_id_limit);
+        if (self.initial_source_connection_id) |cid| {
+            try emitBytes(out, &off, TpId.initial_source_connection_id, cid.slice());
+        }
+
+        return off;
+    }
+
+    /// Parse a peer's transport parameters TLV blob into this struct.
+    /// Unknown parameters are silently ignored (forward compatibility).
+    pub fn decode(self: *TransportParams, blob: []const u8) !void {
+        var off: usize = 0;
+        while (off < blob.len) {
+            const id_dec = try varint.decode(blob[off..]);
+            off += id_dec.len;
+            const len_dec = try varint.decode(blob[off..]);
+            off += len_dec.len;
+            const value_len: usize = @intCast(len_dec.value);
+            if (off + value_len > blob.len) return error.InvalidTransportParam;
+            const value = blob[off .. off + value_len];
+            off += value_len;
+
+            switch (id_dec.value) {
+                TpId.original_destination_connection_id => {
+                    self.original_destination_connection_id = types.ConnectionId.init(value);
+                },
+                TpId.max_idle_timeout => {
+                    self.max_idle_timeout = (try varint.decode(value)).value;
+                },
+                TpId.max_udp_payload_size => {
+                    self.max_udp_payload_size = (try varint.decode(value)).value;
+                },
+                TpId.initial_max_data => {
+                    self.initial_max_data = (try varint.decode(value)).value;
+                },
+                TpId.initial_max_stream_data_bidi_local => {
+                    self.initial_max_stream_data_bidi_local = (try varint.decode(value)).value;
+                },
+                TpId.initial_max_stream_data_bidi_remote => {
+                    self.initial_max_stream_data_bidi_remote = (try varint.decode(value)).value;
+                },
+                TpId.initial_max_stream_data_uni => {
+                    self.initial_max_stream_data_uni = (try varint.decode(value)).value;
+                },
+                TpId.initial_max_streams_bidi => {
+                    self.initial_max_streams_bidi = (try varint.decode(value)).value;
+                },
+                TpId.initial_max_streams_uni => {
+                    self.initial_max_streams_uni = (try varint.decode(value)).value;
+                },
+                TpId.ack_delay_exponent => {
+                    const v = (try varint.decode(value)).value;
+                    self.ack_delay_exponent = @intCast(@min(v, 20));
+                },
+                TpId.max_ack_delay => {
+                    self.max_ack_delay = (try varint.decode(value)).value;
+                },
+                TpId.disable_active_migration => {
+                    self.disable_active_migration = true;
+                },
+                TpId.active_connection_id_limit => {
+                    self.active_connection_id_limit = (try varint.decode(value)).value;
+                },
+                TpId.initial_source_connection_id => {
+                    self.initial_source_connection_id = types.ConnectionId.init(value);
+                },
+                else => {}, // ignore unknown
+            }
+        }
+    }
 };
 
 /// Flow control state
@@ -205,6 +355,61 @@ pub const PeerConnectionId = struct {
     retired: bool = false,
 };
 
+/// Per-encryption-level CRYPTO stream reassembly. CRYPTO frames in QUIC
+/// have absolute offsets and may arrive out of order. OpenSSL's TLS
+/// state machine requires the handshake bytes in offset order, so we
+/// buffer (offset, data) pairs and only release a contiguous prefix
+/// starting at `next_contiguous_offset`.
+///
+/// 16 KB per level is sized for a TLS 1.3 server cert flight; clients
+/// rarely need more than a few KB at the Initial / Handshake levels.
+pub const CryptoReassembly = struct {
+    pub const capacity: usize = 16 * 1024;
+
+    data: [capacity]u8 = undefined,
+    /// Bitmap: 1 bit per byte, indicating whether that byte has been received.
+    received: [capacity / 8]u8 = [_]u8{0} ** (capacity / 8),
+    /// The smallest offset that has not yet been delivered to TLS.
+    next_contiguous_offset: u64 = 0,
+    /// Highest offset+1 we've ever seen (helps bound the contiguous-scan).
+    high_water_offset: u64 = 0,
+
+    /// Record bytes received at `offset`. Returns error.OutOfBounds if
+    /// the data extends past the buffer capacity (which would indicate
+    /// either a malicious peer or a TLS handshake larger than expected).
+    pub fn write(self: *CryptoReassembly, offset: u64, src: []const u8) error{OutOfBounds}!void {
+        if (src.len == 0) return;
+        const end = offset + src.len;
+        if (end > capacity) return error.OutOfBounds;
+        @memcpy(self.data[@intCast(offset)..@intCast(end)], src);
+        // Mark each byte as received in the bitmap.
+        var i: u64 = 0;
+        while (i < src.len) : (i += 1) {
+            const bit_off = offset + i;
+            self.received[@intCast(bit_off / 8)] |= @as(u8, 1) << @intCast(bit_off & 7);
+        }
+        if (end > self.high_water_offset) self.high_water_offset = end;
+    }
+
+    /// Drain the longest contiguous prefix of newly-received bytes starting
+    /// at next_contiguous_offset and advance the cursor past it. Returns
+    /// an empty slice if there's nothing new to deliver.
+    pub fn drainContiguous(self: *CryptoReassembly) []const u8 {
+        const start = self.next_contiguous_offset;
+        var end = start;
+        while (end < self.high_water_offset) {
+            const byte_idx: usize = @intCast(end / 8);
+            const bit_idx: u3 = @intCast(end & 7);
+            if ((self.received[byte_idx] & (@as(u8, 1) << bit_idx)) == 0) break;
+            end += 1;
+        }
+        if (end == start) return &.{};
+        const slice = self.data[@intCast(start)..@intCast(end)];
+        self.next_contiguous_offset = end;
+        return slice;
+    }
+};
+
 /// QUIC Connection
 pub const Connection = struct {
     allocator: std.mem.Allocator,
@@ -250,12 +455,17 @@ pub const Connection = struct {
     recovery: recovery_mod.Recovery,
     /// Congestion controller (NewReno)
     congestion: congestion_mod.CongestionController = congestion_mod.CongestionController.init(),
-    /// TLS session for handshake and key derivation
+    /// TLS session for handshake and key derivation. In QUIC mode (the
+    /// only mode used here) this is bound to a tls.QuicState callback
+    /// adapter; outgoing CRYPTO bytes live in per-encryption-level queues
+    /// inside that QuicState, not in a single buffer here.
     tls_session: ?tls.Session = null,
-    /// Buffer for outgoing CRYPTO data
-    tls_out_buffer: [4096]u8 = undefined,
-    /// Amount of data in tls_out_buffer
-    tls_out_len: usize = 0,
+    /// Per-encryption-level CRYPTO stream reassembly. CRYPTO frames may
+    /// arrive out of offset order; we hold them here until we have a
+    /// contiguous prefix to feed into TLS.
+    crypto_reasm_initial: CryptoReassembly = .{},
+    crypto_reasm_handshake: CryptoReassembly = .{},
+    crypto_reasm_application: CryptoReassembly = .{},
     /// Stream manager for this connection
     stream_manager: ?stream.StreamManager = null,
     /// HTTP/3 protocol stack
@@ -449,88 +659,171 @@ pub const Connection = struct {
         return null;
     }
 
+    /// Map a quic-stack PacketNumberSpace to the tls.QuicLevel used by the
+    /// callback adapter. (They're separate enum types deliberately —
+    /// PacketNumberSpace is RFC 9000 §12.3, QuicLevel is the OpenSSL
+    /// protection-level enum from the SSL_set_quic_tls_cbs API.)
+    fn levelFromSpace(space: types.PacketNumberSpace) tls.QuicLevel {
+        return switch (space) {
+            .initial => .initial,
+            .handshake => .handshake,
+            .application => .application,
+        };
+    }
+
+    /// Populate local_params with sane server defaults derived from this
+    /// connection's CIDs. Called during initTls before transport params are
+    /// installed on the SSL session.
+    fn populateDefaultLocalParams(self: *Connection) void {
+        // Connection-level flow control: 1 MiB receive window
+        self.local_params.initial_max_data = 1024 * 1024;
+        // Stream-level flow control: 256 KiB per stream
+        self.local_params.initial_max_stream_data_bidi_local = 256 * 1024;
+        self.local_params.initial_max_stream_data_bidi_remote = 256 * 1024;
+        self.local_params.initial_max_stream_data_uni = 256 * 1024;
+        // Stream limits — generous for h3 (each request needs 1 bidi + several uni)
+        self.local_params.initial_max_streams_bidi = 100;
+        self.local_params.initial_max_streams_uni = 100;
+        // Idle timeout 30s
+        self.local_params.max_idle_timeout = 30_000;
+        // ACK delay exponent (default 3 = 8μs units, RFC 9000 §18.2)
+        self.local_params.ack_delay_exponent = 3;
+        // Max ACK delay 25ms
+        self.local_params.max_ack_delay = 25;
+        // Active CID limit
+        self.local_params.active_connection_id_limit = 4;
+        // CID-related identifiers (server only)
+        if (self.is_server) {
+            self.local_params.original_destination_connection_id = self.original_dcid;
+        }
+        self.local_params.initial_source_connection_id = self.our_cid;
+        // Initialize the connection-level recv flow control window from local_params
+        self.flow_control.max_data_recv = self.local_params.initial_max_data;
+    }
+
     /// Initialize TLS session for this connection.
     /// Must be called after init() to enable TLS 1.3 handshake.
+    /// Populates local QUIC transport parameters and installs them on the
+    /// SSL session via SSL_set_quic_tls_transport_params.
     pub fn initTls(self: *Connection, provider: *tls.Provider) Error!void {
-        self.tls_session = provider.createSession(self.is_server) catch return Error.TlsError;
-    }
-
-    /// Feed incoming CRYPTO frame data to TLS.
-    /// This data comes from CRYPTO frames in Initial/Handshake packets.
-    pub fn feedCryptoData(self: *Connection, data: []const u8) Error!void {
+        self.tls_session = provider.createQuicSession(self.is_server) catch return Error.TlsError;
+        self.populateDefaultLocalParams();
+        // Encode local transport params and hand to OpenSSL.
+        var tp_buf: [512]u8 = undefined;
+        const tp_len = self.local_params.encode(&tp_buf) catch return Error.TlsError;
         if (self.tls_session) |*session| {
-            _ = session.feedCryptoData(data) catch return Error.TlsError;
+            session.setQuicTransportParams(tp_buf[0..tp_len]) catch return Error.TlsError;
         }
     }
 
-    /// Advance the TLS handshake and collect outgoing CRYPTO data.
-    /// Returns true if handshake is complete.
+    /// Feed incoming CRYPTO frame data to TLS at the given encryption level.
+    /// Caller derives the level from the packet header (Initial/Handshake/1-RTT).
+    pub fn feedCryptoData(self: *Connection, space: types.PacketNumberSpace, data: []const u8) Error!void {
+        if (self.tls_session) |*session| {
+            session.feedQuicCryptoData(levelFromSpace(space), data) catch return Error.TlsError;
+        }
+    }
+
+    /// Get the per-level reassembly buffer.
+    fn cryptoReassembly(self: *Connection, space: types.PacketNumberSpace) *CryptoReassembly {
+        return switch (space) {
+            .initial => &self.crypto_reasm_initial,
+            .handshake => &self.crypto_reasm_handshake,
+            .application => &self.crypto_reasm_application,
+        };
+    }
+
+    /// Ingest a single CRYPTO frame at (offset, data) and feed any newly-
+    /// contiguous prefix into TLS. Called by handler.processCryptoFrames
+    /// for each parsed CRYPTO frame.
+    pub fn ingestCryptoFrame(self: *Connection, space: types.PacketNumberSpace, offset: u64, data: []const u8) Error!void {
+        const reasm = self.cryptoReassembly(space);
+        reasm.write(offset, data) catch return Error.ProtocolViolation;
+        const ready = reasm.drainContiguous();
+        if (ready.len > 0) {
+            try self.feedCryptoData(space, ready);
+        }
+    }
+
+    /// Advance the TLS handshake. After OpenSSL processes any newly-fed
+    /// CRYPTO data, drain any newly-installed traffic secrets and convert
+    /// them into QUIC packet protection keys (key/iv/hp via HKDF-Expand-Label
+    /// per RFC 9001 §5.1). Returns true once the handshake completes.
     pub fn advanceTlsHandshake(self: *Connection) Error!bool {
-        if (self.tls_session) |*session| {
-            // Try to advance the handshake
-            const result = session.doHandshake();
+        const session = if (self.tls_session) |*s| s else return Error.TlsError;
 
-            // Read any outgoing crypto data
-            const read_len = session.readCryptoData(&self.tls_out_buffer) catch |err| switch (err) {
-                error.NoBio => 0,
-                else => return Error.TlsError,
+        const result = session.doHandshake();
+
+        // Drain any newly-installed (direction, level) secrets and turn them
+        // into AEAD/HP keys at the matching crypto_ctx slot. yield_secret
+        // fires up to 4 times during the handshake (handshake/app × read/write).
+        var pending: [8]tls.quic_session.QuicState.SecretReady = undefined;
+        const n = session.takePendingQuicSecrets(&pending);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const ready = pending[i];
+            const secret_slice = session.getQuicSecret(ready.dir, ready.level) orelse continue;
+            // Currently locked to TLS_AES_128_GCM_SHA256 → 32-byte secrets.
+            // SHA-384 / 48-byte secrets are a follow-up; see crypto.deriveKeysFromSecret.
+            if (secret_slice.len != 32) return Error.CryptoError;
+            var secret_buf: [32]u8 = undefined;
+            @memcpy(&secret_buf, secret_slice[0..32]);
+            const keys = crypto.deriveKeysFromSecret(&secret_buf);
+            const target_set = switch (ready.level) {
+                .initial => &self.crypto_ctx.initial,
+                .early_data => &self.crypto_ctx.early_data,
+                .handshake => &self.crypto_ctx.handshake,
+                .application => &self.crypto_ctx.application,
             };
-            self.tls_out_len = read_len;
-
-            return switch (result) {
-                .complete => blk: {
-                    // Handshake complete - derive keys from TLS
-                    try self.deriveHandshakeKeys();
-                    try self.deriveApplicationKeys();
-                    break :blk true;
-                },
-                .in_progress => false,
-                .failed => Error.HandshakeFailed,
-            };
+            // direction=read means we decrypt (peer's traffic): client keys
+            // for a server, server keys for a client. direction=write is the
+            // opposite.
+            const peer_keys_field = if (self.is_server) ready.dir == .read else ready.dir == .write;
+            if (peer_keys_field) {
+                target_set.client = keys;
+            } else {
+                target_set.server = keys;
+            }
         }
-        return Error.TlsError;
-    }
 
-    /// Get pending outgoing CRYPTO data to send in CRYPTO frames.
-    pub fn getPendingCryptoData(self: *Connection) ?[]const u8 {
-        if (self.tls_out_len > 0) {
-            return self.tls_out_buffer[0..self.tls_out_len];
+        // If the peer's QUIC transport parameters arrived, parse them and
+        // populate peer_params. The got_transport_params callback fired
+        // during SSL_do_handshake will have buffered them in QuicState.
+        if (session.peerQuicTransportParams()) |blob| {
+            // Only parse once: if our peer_params is still all-default-zero,
+            // try to populate it. (We could track a "parsed" bool more
+            // explicitly; for now, idempotent parsing is fine since the
+            // blob doesn't change after the first ServerHello / ClientHello.)
+            if (self.peer_params.initial_max_data == 0) {
+                self.peer_params.decode(blob) catch return Error.ProtocolViolation;
+                // Hook the negotiated send window into flow control.
+                self.flow_control.max_data_send = self.peer_params.initial_max_data;
+            }
         }
-        return null;
+
+        return switch (result) {
+            .complete => true,
+            .in_progress => false,
+            .failed => Error.HandshakeFailed,
+        };
     }
 
-    /// Clear pending CRYPTO data after it has been sent.
-    pub fn clearPendingCryptoData(self: *Connection) void {
-        self.tls_out_len = 0;
-    }
-
-    /// Derive handshake keys from TLS session.
-    fn deriveHandshakeKeys(self: *Connection) Error!void {
+    /// Get pending outgoing CRYPTO data at a given encryption level. The
+    /// returned slice is a borrow into the QuicState's per-level outbound
+    /// queue and remains valid until consumePendingCryptoData is called.
+    pub fn getPendingCryptoData(self: *Connection, space: types.PacketNumberSpace) []const u8 {
         if (self.tls_session) |*session| {
-            var client_secret: [32]u8 = undefined;
-            var server_secret: [32]u8 = undefined;
-
-            session.exportKeyingMaterial(&client_secret, tls.QuicKeyLabels.client_handshake, null) catch return Error.CryptoError;
-            session.exportKeyingMaterial(&server_secret, tls.QuicKeyLabels.server_handshake, null) catch return Error.CryptoError;
-
-            // Derive keys from secrets
-            self.crypto_ctx.handshake.client = deriveKeysFromTlsSecret(&client_secret);
-            self.crypto_ctx.handshake.server = deriveKeysFromTlsSecret(&server_secret);
+            return session.pendingQuicOutgoing(levelFromSpace(space));
         }
+        return &.{};
     }
 
-    /// Derive application (1-RTT) keys from TLS session.
-    fn deriveApplicationKeys(self: *Connection) Error!void {
+    /// Mark `n` bytes from the head of the outgoing CRYPTO queue at `space`
+    /// as sent. Call this after copying the bytes into a CRYPTO frame and
+    /// queueing the packet for transmission.
+    pub fn consumePendingCryptoData(self: *Connection, space: types.PacketNumberSpace, n: usize) void {
         if (self.tls_session) |*session| {
-            var client_secret: [32]u8 = undefined;
-            var server_secret: [32]u8 = undefined;
-
-            session.exportKeyingMaterial(&client_secret, tls.QuicKeyLabels.client_application, null) catch return Error.CryptoError;
-            session.exportKeyingMaterial(&server_secret, tls.QuicKeyLabels.server_application, null) catch return Error.CryptoError;
-
-            // Derive keys from secrets
-            self.crypto_ctx.application.client = deriveKeysFromTlsSecret(&client_secret);
-            self.crypto_ctx.application.server = deriveKeysFromTlsSecret(&server_secret);
+            session.consumeQuicOutgoing(levelFromSpace(space), n);
         }
     }
 
@@ -1093,57 +1386,9 @@ pub const Connection = struct {
     }
 };
 
-/// Derive QUIC keys from a TLS traffic secret.
-/// Uses HKDF-Expand-Label with "quic key", "quic iv", "quic hp" labels.
-fn deriveKeysFromTlsSecret(secret: *const [32]u8) crypto.Keys {
-    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
-
-    // HKDF-Expand-Label helper (inline since crypto module's is private)
-    const hkdfExpandLabel = struct {
-        fn expand(prk: *const [32]u8, label: []const u8, out: []u8) void {
-            // Build HkdfLabel: length || "tls13 " || label || context(empty)
-            var info: [64]u8 = undefined;
-            var info_len: usize = 0;
-
-            // Length (2 bytes, big-endian)
-            info[0] = @intCast((out.len >> 8) & 0xff);
-            info[1] = @intCast(out.len & 0xff);
-            info_len = 2;
-
-            // Label: length + "tls13 " + label
-            const prefix = "tls13 ";
-            const full_len = prefix.len + label.len;
-            info[info_len] = @intCast(full_len);
-            info_len += 1;
-            @memcpy(info[info_len .. info_len + prefix.len], prefix);
-            info_len += prefix.len;
-            @memcpy(info[info_len .. info_len + label.len], label);
-            info_len += label.len;
-
-            // Context length (0)
-            info[info_len] = 0;
-            info_len += 1;
-
-            // HKDF-Expand
-            var hmac = HmacSha256.init(prk);
-            hmac.update(info[0..info_len]);
-            hmac.update(&[_]u8{1});
-            var result: [32]u8 = undefined;
-            hmac.final(&result);
-            @memcpy(out, result[0..out.len]);
-        }
-    }.expand;
-
-    var key: [16]u8 = undefined;
-    var iv: [12]u8 = undefined;
-    var hp: [16]u8 = undefined;
-
-    hkdfExpandLabel(secret, "quic key", &key);
-    hkdfExpandLabel(secret, "quic iv", &iv);
-    hkdfExpandLabel(secret, "quic hp", &hp);
-
-    return crypto.Keys.init128(key, iv, hp);
-}
+// Note: the file-local deriveKeysFromTlsSecret was a duplicate of
+// crypto.deriveKeysFromSecret. Now that crypto.deriveKeysFromSecret is
+// public, callers (advanceTlsHandshake) use it directly.
 
 // Tests
 test "connection initialization" {
@@ -1247,16 +1492,13 @@ test "flow control" {
 }
 
 test "derive keys from TLS secret" {
-    // Test that key derivation produces valid keys
     const secret = [_]u8{0x42} ** 32;
-    const keys = deriveKeysFromTlsSecret(&secret);
+    const keys = crypto.deriveKeysFromSecret(&secret);
 
-    // Keys should be deterministic
     try std.testing.expectEqual(@as(u8, 16), keys.key_len);
     try std.testing.expectEqual(@as(u8, 16), keys.hp_len);
 
-    // Different secret should produce different keys
     const secret2 = [_]u8{0x43} ** 32;
-    const keys2 = deriveKeysFromTlsSecret(&secret2);
+    const keys2 = crypto.deriveKeysFromSecret(&secret2);
     try std.testing.expect(!std.mem.eql(u8, keys.key[0..16], keys2.key[0..16]));
 }

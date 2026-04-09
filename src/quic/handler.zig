@@ -12,6 +12,7 @@ const http3 = @import("../protocol/http3.zig");
 const metrics_mw = @import("../middleware/metrics_mw.zig");
 const build_options = @import("build_options");
 const test_utils = @import("test_utils.zig");
+const tls = @import("../tls/provider.zig");
 
 /// QUIC packet handler
 ///
@@ -47,12 +48,18 @@ pub const metrics = @import("metrics.zig");
 pub const Handler = struct {
     allocator: std.mem.Allocator,
     pool: connection_pool.ConnectionPool,
-    /// Buffer for building response packets
-    response_buffer: [2048]u8 = undefined,
+    /// Buffer for building outgoing UDP datagrams. Sized to fit a coalesced
+    /// Initial + Handshake flight with a typical TLS 1.3 cert chain
+    /// (ServerHello ~120B, EE+Cert+CertVerify+Finished ~2-3 KiB).
+    response_buffer: [16 * 1024]u8 = undefined,
     /// Is this a server handler?
     is_server: bool,
     /// Server-wide metrics
     server_metrics: metrics.ServerMetrics = .{},
+    /// TLS provider used to bootstrap a TLS session for each new QUIC
+    /// connection (server: handshake processing, key derivation). Null
+    /// when TLS is disabled at build time or no cert was configured.
+    tls_provider: ?*tls.Provider = null,
 
     pub fn init(allocator: std.mem.Allocator, is_server: bool, max_connections: usize) Handler {
         return .{
@@ -60,6 +67,13 @@ pub const Handler = struct {
             .pool = connection_pool.ConnectionPool.init(allocator, is_server, max_connections),
             .is_server = is_server,
         };
+    }
+
+    /// Wire a TLS provider into the handler. Must be called before the
+    /// first incoming Initial packet for h3 to work — otherwise
+    /// connection.tls_session stays null and no TLS handshake runs.
+    pub fn setTlsProvider(self: *Handler, provider: *tls.Provider) void {
+        self.tls_provider = provider;
     }
 
     /// Get server-wide metrics
@@ -103,6 +117,16 @@ pub const Handler = struct {
                             else => Error.ConnectionNotFound,
                         };
                     };
+                    // Bootstrap the TLS session so the QUIC TLS handshake
+                    // can produce a server flight. Without this the
+                    // connection would have no tls_session and TLS would
+                    // never run, so the server would only ever ack.
+                    if (self.tls_provider) |provider| {
+                        conn.initTls(provider) catch |err| {
+                            std.log.warn("h3: initTls failed: {}", .{err});
+                            return Error.HandshakeFailed;
+                        };
+                    }
                     result.new_connection = true;
                     // Record new QUIC connection attempt
                     metrics_mw.getStore().recordQuicConnectionAttempt();
@@ -207,7 +231,7 @@ pub const Handler = struct {
         else
             conn.crypto_ctx.handshake.server;
         const keys = keys_opt orelse {
-            // No handshake keys yet - this is expected early in handshake
+            // No handshake keys yet — expected very early in handshake
             return Error.HandshakeFailed;
         };
 
@@ -289,7 +313,13 @@ pub const Handler = struct {
         try processCryptoFrames(conn, payload, pn_space);
     }
 
-    /// Process CRYPTO frames from Initial/Handshake packets
+    /// Process CRYPTO frames from Initial/Handshake packets.
+    ///
+    /// CRYPTO frames within a packet may arrive out of offset order
+    /// (curl/ngtcp2 deliberately fragments and reorders for interop testing).
+    /// We feed them through the connection's per-level reassembly buffer,
+    /// which only emits contiguous prefixes to TLS — that lets OpenSSL parse
+    /// the handshake messages correctly.
     fn processCryptoFrames(conn: *connection.Connection, payload: []const u8, space: types.PacketNumberSpace) Error!void {
         var offset: usize = 0;
 
@@ -304,9 +334,11 @@ pub const Handler = struct {
                     conn.processAckFrame(ack, space);
                 },
                 .crypto => |crypto_frame| {
-                    // Feed CRYPTO data to TLS session
-                    conn.feedCryptoData(crypto_frame.data) catch |err| {
-                        std.log.debug("QUIC crypto data processing failed: {}", .{err});
+                    // Hand the (offset, bytes) tuple to the connection's
+                    // per-level reassembly buffer; it will feed any new
+                    // contiguous prefix to TLS via feedCryptoData.
+                    conn.ingestCryptoFrame(space, crypto_frame.offset, crypto_frame.data) catch |err| {
+                        std.log.debug("QUIC crypto reassembly failed: {}", .{err});
                     };
                 },
                 else => {}, // Ignore other frame types in Initial/Handshake
@@ -322,9 +354,11 @@ pub const Handler = struct {
     ) Error!void {
         _ = self;
 
-        // Connection must be in connected state
+        // Connection must be in connected state — clients can race their
+        // 1-RTT data ahead of our handshake completion. Drop silently so
+        // they retransmit; we'll process it once handshake_complete fires.
         if (conn.state != .connected) {
-            return Error.ProtocolError;
+            return;
         }
 
         // Get application keys for decryption
@@ -477,121 +511,69 @@ pub const Handler = struct {
         return &.{};
     }
 
+    /// Build a coalesced response datagram for a server-side connection in
+    /// the handshake phase. Drains any pending CRYPTO bytes from the TLS
+    /// adapter at the Initial and Handshake encryption levels and emits
+    /// the corresponding QUIC packets back-to-back in a single datagram
+    /// (RFC 9000 §12.2 packet coalescing).
+    ///
+    /// Layout:
+    ///   [Initial packet] [Handshake packet?]
+    ///
+    /// The Initial packet is always padded to make the *datagram* at least
+    /// 1200 bytes (RFC 9000 §14.1). When a Handshake packet is also being
+    /// sent, the padding requirement applies to the combined size.
     fn buildInitialResponse(self: *Handler, conn: *connection.Connection) Error![]const u8 {
-        // Get server Initial keys
-        const keys = conn.crypto_ctx.initial.server orelse return error.HandshakeFailed;
-
         var offset: usize = 0;
 
-        // Build Initial packet header
-        // First byte: Long header (0x80) | Fixed (0x40) | Initial type (0x00) | PN length (0x00 = 1 byte)
-        self.response_buffer[offset] = 0xc0;
-        offset += 1;
+        // ---- Initial packet (always emitted in the response to a client Initial) ----
+        const initial_keys = conn.crypto_ctx.initial.server orelse return Error.HandshakeFailed;
+        const initial_crypto = conn.getPendingCryptoData(types.PacketNumberSpace.initial);
 
-        // Version (QUIC v1)
-        self.response_buffer[offset] = 0x00;
-        self.response_buffer[offset + 1] = 0x00;
-        self.response_buffer[offset + 2] = 0x00;
-        self.response_buffer[offset + 3] = 0x01;
-        offset += 4;
+        // We need to know whether a Handshake packet will follow so we can
+        // decide how much PADDING to put inside the Initial. To make that
+        // decision we have to peek at the Handshake outbound queue.
+        const handshake_crypto = conn.getPendingCryptoData(types.PacketNumberSpace.handshake);
+        const will_emit_handshake = handshake_crypto.len > 0 and conn.crypto_ctx.handshake.server != null;
 
-        // DCID length and value (peer's CID)
-        self.response_buffer[offset] = conn.peer_cid.len;
-        offset += 1;
-        if (conn.peer_cid.len > 0) {
-            @memcpy(self.response_buffer[offset .. offset + conn.peer_cid.len], conn.peer_cid.slice());
-            offset += conn.peer_cid.len;
-        }
-
-        // SCID length and value (our CID)
-        self.response_buffer[offset] = conn.our_cid.len;
-        offset += 1;
-        if (conn.our_cid.len > 0) {
-            @memcpy(self.response_buffer[offset .. offset + conn.our_cid.len], conn.our_cid.slice());
-            offset += conn.our_cid.len;
-        }
-
-        // Token length (0 for server Initial)
-        self.response_buffer[offset] = 0x00;
-        offset += 1;
-
-        // Length field placeholder (will be filled after encryption)
-        const length_offset = offset;
-        offset += 2; // 2-byte varint for length
-
-        // Packet number offset (for header protection)
-        const pn_offset = offset;
-
-        // Packet number (1 byte)
-        const pn = conn.initial_space.allocatePacketNumber();
-        self.response_buffer[offset] = @truncate(pn);
-        offset += 1;
-
-        const header_len = offset;
-
-        // Build plaintext payload
-        // ACK frame for packet 0
-        self.response_buffer[offset] = 0x02; // ACK frame type
-        offset += 1;
-        self.response_buffer[offset] = 0x00; // Largest Acknowledged (0)
-        offset += 1;
-        self.response_buffer[offset] = 0x00; // ACK Delay (0)
-        offset += 1;
-        self.response_buffer[offset] = 0x00; // ACK Range Count (0)
-        offset += 1;
-        self.response_buffer[offset] = 0x00; // First ACK Range (0)
-        offset += 1;
-
-        // Calculate padding needed for minimum 1200 bytes after encryption
-        // Need: header_len + plaintext + 16 (tag) >= 1200
-        const min_plaintext = 1200 - header_len - crypto.AEAD_TAG_LEN;
-        const current_plaintext = offset - header_len;
-
-        while (offset - header_len < min_plaintext) {
-            self.response_buffer[offset] = 0x00; // PADDING frame
-            offset += 1;
-        }
-
-        const plaintext_len = offset - header_len;
-
-        // Encrypt payload
-        var ciphertext_buf: [2048]u8 = undefined;
-        const ciphertext_len = crypto.protectPayload(
-            &keys,
-            pn,
-            self.response_buffer[0..header_len],
-            self.response_buffer[header_len..offset],
-            &ciphertext_buf,
-        ) catch return error.HandshakeFailed;
-
-        // Copy ciphertext back
-        @memcpy(self.response_buffer[header_len .. header_len + ciphertext_len], ciphertext_buf[0..ciphertext_len]);
-        offset = header_len + ciphertext_len;
-
-        // Fill in length field (includes PN length + ciphertext)
-        const length_value = 1 + ciphertext_len; // 1 byte PN + ciphertext
-        self.response_buffer[length_offset] = @intCast(0x40 | ((length_value >> 8) & 0x3f));
-        self.response_buffer[length_offset + 1] = @intCast(length_value & 0xff);
-
-        // Apply header protection (required for Initial packets per RFC 9001)
-        // Sample starts 4 bytes after packet number and needs 16 bytes
-        const sample_offset = pn_offset + 4;
-        if (sample_offset + 16 > offset) {
-            // Packet too small for header protection - this should never happen
-            // with proper padding to 1200 bytes
-            return error.HandshakeFailed;
-        }
-
-        const sample: *const [16]u8 = @ptrCast(self.response_buffer[sample_offset .. sample_offset + 16]);
-        crypto.applyHeaderProtection(
-            keys.hp[0..keys.hp_len],
-            sample,
-            &self.response_buffer[0],
-            self.response_buffer[pn_offset .. pn_offset + 1],
+        // Build the Initial packet header into response_buffer[offset..]
+        const initial_built = try buildHandshakePacket(
+            self.response_buffer[offset..],
+            .{
+                .packet_type = .initial,
+                .conn = conn,
+                .crypto_data = initial_crypto,
+                .keys = &initial_keys,
+                .pad_datagram_to = if (will_emit_handshake) 0 else 1200,
+                .datagram_bytes_so_far = offset,
+                .ack_largest = if (conn.initial_space.ack_needed) conn.initial_space.largest_received else null,
+            },
         );
+        offset += initial_built.bytes_written;
+        if (initial_crypto.len > 0) {
+            conn.consumePendingCryptoData(types.PacketNumberSpace.initial, initial_crypto.len);
+        }
+        if (conn.initial_space.ack_needed) conn.initial_space.ack_needed = false;
 
-        _ = plaintext_len;
-        _ = current_plaintext;
+        // ---- Handshake packet (only if there's pending Handshake CRYPTO data) ----
+        if (will_emit_handshake) {
+            const handshake_keys = conn.crypto_ctx.handshake.server.?;
+            const handshake_built = try buildHandshakePacket(
+                self.response_buffer[offset..],
+                .{
+                    .packet_type = .handshake,
+                    .conn = conn,
+                    .crypto_data = handshake_crypto,
+                    .keys = &handshake_keys,
+                    .pad_datagram_to = 1200,
+                    .datagram_bytes_so_far = offset,
+                    .ack_largest = if (conn.handshake_space.ack_needed) conn.handshake_space.largest_received else null,
+                },
+            );
+            offset += handshake_built.bytes_written;
+            conn.consumePendingCryptoData(types.PacketNumberSpace.handshake, handshake_crypto.len);
+            if (conn.handshake_space.ack_needed) conn.handshake_space.ack_needed = false;
+        }
 
         return self.response_buffer[0..offset];
     }
@@ -630,6 +612,158 @@ pub const Handler = struct {
         metrics_mw.getStore().recordQuicPackets(0, 0, 1);
     }
 };
+
+/// Build a single QUIC long-header packet (Initial or Handshake) into `out`.
+/// Lays down the header, an optional ACK frame, a CRYPTO frame carrying the
+/// caller-supplied handshake bytes, optional PADDING to satisfy the RFC 9000
+/// §14.1 1200-byte minimum on the *datagram*, then runs AEAD packet
+/// protection + header protection over the result.
+const BuildPacketOptions = struct {
+    packet_type: types.PacketType,
+    conn: *connection.Connection,
+    crypto_data: []const u8,
+    keys: *const crypto.Keys,
+    /// If non-zero, pad so the total datagram (this packet + everything
+    /// already in the buffer up to `datagram_bytes_so_far`) reaches at least
+    /// this many bytes.
+    pad_datagram_to: usize,
+    datagram_bytes_so_far: usize,
+    /// If non-null, emit an ACK frame acking this largest_received packet
+    /// number in the matching number space.
+    ack_largest: ?u64,
+};
+
+const BuildPacketResult = struct {
+    bytes_written: usize,
+};
+
+fn buildHandshakePacket(out: []u8, opts: BuildPacketOptions) Error!BuildPacketResult {
+    const conn_ref = opts.conn;
+
+    // ---- Header ----
+    var off: usize = 0;
+
+    // First byte: long header (0x80) | fixed (0x40) | type (00=Initial, 10=Handshake)
+    // | reserved 00 | PN length 00 (1 byte)
+    const type_bits: u8 = switch (opts.packet_type) {
+        .initial => 0x00,
+        .handshake => 0x20,
+        else => return Error.InvalidPacket,
+    };
+    if (off >= out.len) return Error.HandshakeFailed;
+    out[off] = 0xc0 | type_bits;
+    off += 1;
+
+    // Version (QUIC v1)
+    if (off + 4 > out.len) return Error.HandshakeFailed;
+    out[off] = 0x00;
+    out[off + 1] = 0x00;
+    out[off + 2] = 0x00;
+    out[off + 3] = 0x01;
+    off += 4;
+
+    // DCID length + DCID
+    if (off + 1 + conn_ref.peer_cid.len > out.len) return Error.HandshakeFailed;
+    out[off] = conn_ref.peer_cid.len;
+    off += 1;
+    if (conn_ref.peer_cid.len > 0) {
+        @memcpy(out[off .. off + conn_ref.peer_cid.len], conn_ref.peer_cid.slice());
+        off += conn_ref.peer_cid.len;
+    }
+
+    // SCID length + SCID
+    if (off + 1 + conn_ref.our_cid.len > out.len) return Error.HandshakeFailed;
+    out[off] = conn_ref.our_cid.len;
+    off += 1;
+    if (conn_ref.our_cid.len > 0) {
+        @memcpy(out[off .. off + conn_ref.our_cid.len], conn_ref.our_cid.slice());
+        off += conn_ref.our_cid.len;
+    }
+
+    // Token length (Initial only, always 0 for server-side response)
+    if (opts.packet_type == .initial) {
+        if (off >= out.len) return Error.HandshakeFailed;
+        out[off] = 0x00;
+        off += 1;
+    }
+
+    // Length field placeholder — encoded as a 2-byte varint (0x4000 | value).
+    // We'll fill it in once we know the payload+tag size.
+    if (off + 2 > out.len) return Error.HandshakeFailed;
+    const length_offset = off;
+    off += 2;
+
+    // Packet number — 1 byte for now (sufficient for low PN values during handshake)
+    const pn_offset = off;
+    const pn_len: u8 = 1;
+    const space_kind: types.PacketNumberSpace = switch (opts.packet_type) {
+        .initial => .initial,
+        .handshake => .handshake,
+        else => return Error.InvalidPacket,
+    };
+    const space = conn_ref.getPacketSpace(space_kind);
+    const pn = space.allocatePacketNumber();
+    if (off >= out.len) return Error.HandshakeFailed;
+    out[off] = @truncate(pn);
+    off += 1;
+
+    const header_len = off;
+
+    // ---- Plaintext payload ----
+    // Optional ACK frame
+    if (opts.ack_largest) |largest| {
+        const acked = frame.writeAck(out[off..], largest, 0) catch return Error.HandshakeFailed;
+        off += acked;
+    }
+
+    // CRYPTO frame carrying the TLS handshake bytes (if any)
+    if (opts.crypto_data.len > 0) {
+        // CRYPTO offset is per-encryption-level, monotonically increasing.
+        // For now we always emit at offset 0 because we drain the entire
+        // queue in one go and only ever build one packet per level per
+        // server flight. (Multi-packet handshake flights would need an
+        // out-of-line offset cursor.)
+        const written = frame.writeCrypto(out[off..], 0, opts.crypto_data) catch return Error.HandshakeFailed;
+        off += written;
+    }
+
+    // PADDING to satisfy the datagram minimum (RFC 9000 §14.1)
+    if (opts.pad_datagram_to > 0) {
+        // Required total datagram size minus what's already in the buffer
+        // before this packet. The current packet contributes `off` plain
+        // bytes plus AEAD_TAG_LEN once protected.
+        const target = opts.pad_datagram_to;
+        const bytes_before = opts.datagram_bytes_so_far;
+        const min_packet_size = if (target > bytes_before) target - bytes_before else 0;
+        // Account for the AEAD tag that protectPacket will append.
+        while (off + crypto.AEAD_TAG_LEN < min_packet_size) {
+            if (off >= out.len) return Error.HandshakeFailed;
+            out[off] = 0x00; // PADDING frame (frame type 0x00)
+            off += 1;
+        }
+    }
+
+    // ---- Length field fixup ----
+    const payload_len = off - header_len;
+    const length_value: u64 = pn_len + payload_len + crypto.AEAD_TAG_LEN;
+    // 2-byte varint: 0x40 | high6 || low8
+    if (length_value > 0x3fff) return Error.HandshakeFailed;
+    out[length_offset] = @intCast(0x40 | ((length_value >> 8) & 0x3f));
+    out[length_offset + 1] = @intCast(length_value & 0xff);
+
+    // ---- AEAD packet protection + header protection ----
+    const protected_len = crypto.protectPacket(
+        opts.keys,
+        pn,
+        header_len,
+        pn_offset,
+        pn_len,
+        out,
+        off,
+    ) catch return Error.HandshakeFailed;
+
+    return .{ .bytes_written = protected_len };
+}
 
 // Tests
 test "handler initialization" {

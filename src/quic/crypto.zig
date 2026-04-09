@@ -218,8 +218,11 @@ fn hkdfExpandLabel(secret: *const [32]u8, label: []const u8, context: []const u8
     hkdfExpand(secret, info[0..info_len], out);
 }
 
-/// Derive AEAD key, IV, and HP key from a traffic secret
-fn deriveKeysFromSecret(secret: *const [32]u8) Keys {
+/// Derive AEAD key, IV, and HP key from a TLS 1.3 traffic secret.
+/// Per RFC 9001 §5.1: key/iv/hp = HKDF-Expand-Label(secret, "quic key"/"quic iv"/"quic hp", "", L).
+/// Currently produces AES-128-GCM keys (16-byte key, 12-byte IV, 16-byte HP);
+/// callers must ensure the SHA-256 cipher suite is negotiated (32-byte secrets).
+pub fn deriveKeysFromSecret(secret: *const [32]u8) Keys {
     var key: [16]u8 = undefined;
     var iv: [12]u8 = undefined;
     var hp: [16]u8 = undefined;

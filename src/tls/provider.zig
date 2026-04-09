@@ -36,6 +36,22 @@ pub const Provider = struct {
         };
     }
 
+    /// Initialize a TLS provider for QUIC: TLS 1.3 only, AES-128-GCM
+    /// ciphersuite, h3 ALPN. Use this instead of init() when the resulting
+    /// Provider will create QUIC sessions via createQuicSession().
+    pub fn initQuic(allocator: std.mem.Allocator, cert_path: [:0]const u8, key_path: [:0]const u8) Error!Provider {
+        const ctx = ffi.createQuicContext(true) catch return error.ContextCreationFailed;
+        errdefer ffi.freeContext(ctx);
+
+        ffi.loadCertificateChain(ctx, cert_path) catch return error.CertificateLoadFailed;
+        ffi.loadPrivateKey(ctx, key_path) catch return error.PrivateKeyLoadFailed;
+
+        return .{
+            .ctx = ctx,
+            .allocator = allocator,
+        };
+    }
+
     /// Initialize a TLS provider for TCP connections (TLS 1.2+, ALPN h2/http1.1).
     pub fn initTcp(allocator: std.mem.Allocator, cert_path: [:0]const u8, key_path: [:0]const u8) Error!Provider {
         const ctx = ffi.createTcpContext(true) catch return error.ContextCreationFailed;

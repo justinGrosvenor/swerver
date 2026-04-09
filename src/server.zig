@@ -91,9 +91,11 @@ pub const Server = struct {
             }
         else
             null;
-        // TLS for QUIC (TLS 1.3 only, memory BIO)
+        // TLS for QUIC: TLS 1.3 only, AES-128-GCM ciphersuite, h3 ALPN.
+        // Uses the OpenSSL 3.5+ SSL_set_quic_tls_cbs callback API instead of
+        // memory BIOs — see src/tls/quic_session.zig.
         const tls_provider: ?tls.Provider = if (build_options.enable_tls and cfg.quic.enabled)
-            try tls.Provider.init(allocator, cfg.quic.cert_path, cfg.quic.key_path)
+            try tls.Provider.initQuic(allocator, cfg.quic.cert_path, cfg.quic.key_path)
         else
             null;
         const http2_stack: ?http2.Stack = if (build_options.enable_http2) http2.Stack.initWithConfig(.{
@@ -150,6 +152,14 @@ pub const Server = struct {
             .alt_svc_value = undefined,
             .alt_svc_len = 0,
         };
+
+        // Wire the (now stable-addressed) tls_provider into the QUIC handler
+        // so each new connection can bootstrap a TLS session via initTls.
+        // This must happen after self.* assignment so we can take a pointer
+        // into self.tls_provider.
+        if (self.quic) |*q| {
+            if (self.tls_provider) |*p| q.setTlsProvider(p);
+        }
 
         // Pre-compute Alt-Svc header if QUIC is enabled
         if (cfg.quic.enabled) {
