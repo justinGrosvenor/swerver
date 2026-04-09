@@ -41,6 +41,7 @@ pub const Server = struct {
     app_router: router.Router,
     listener_fd: ?std.posix.fd_t,
     udp_fd: ?std.posix.fd_t,
+    tcp_tls_provider: ?tls.Provider,
     tls_provider: ?tls.Provider,
     http2_stack: ?http2.Stack,
     http3_stack: ?http3.Stack,
@@ -78,6 +79,15 @@ pub const Server = struct {
     pub fn initInPlace(self: *Server, allocator: std.mem.Allocator, cfg: config.ServerConfig, app_router: router.Router) !void {
         if (cfg.limits.max_header_count > connection.HeaderCapacity) return error.InvalidHeaderTable;
         const io_runtime = try runtime.IoRuntime.init(allocator, cfg);
+        // TLS for TCP (HTTP/1.1 + HTTP/2): separate from QUIC
+        const tcp_tls_provider: ?tls.Provider = if (build_options.enable_tls and cfg.tls.cert_path.len > 0)
+            tls.Provider.initTcp(allocator, cfg.tls.cert_path, cfg.tls.key_path) catch |err| {
+                std.log.err("TLS init failed: {}", .{err});
+                return error.TlsInitFailed;
+            }
+        else
+            null;
+        // TLS for QUIC (TLS 1.3 only, memory BIO)
         const tls_provider: ?tls.Provider = if (build_options.enable_tls and cfg.quic.enabled)
             try tls.Provider.init(allocator, cfg.quic.cert_path, cfg.quic.key_path)
         else
@@ -102,6 +112,7 @@ pub const Server = struct {
             .app_router = app_router,
             .listener_fd = null,
             .udp_fd = null,
+            .tcp_tls_provider = tcp_tls_provider,
             .tls_provider = tls_provider,
             .http2_stack = http2_stack,
             .http3_stack = http3_stack,
@@ -118,6 +129,7 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Server) void {
+        if (self.tcp_tls_provider) |*p| p.deinit();
         if (self.listener_fd) |fd| clock.closeFd(fd);
         if (self.udp_fd) |fd| clock.closeFd(fd);
         if (self.quic) |*q| q.deinit();
@@ -167,6 +179,13 @@ pub const Server = struct {
         };
         std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
         std.posix.sigaction(std.posix.SIG.INT, &sa, null);
+        // Ignore SIGPIPE — SSL_shutdown/SSL_write on a closed socket triggers it
+        const pipe_sa = std.posix.Sigaction{
+            .handler = .{ .handler = std.posix.SIG.IGN },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.PIPE, &pipe_sa, null);
         // Install SIGHUP handler for config hot reload
         const reload_sa = std.posix.Sigaction{
             .handler = .{ .handler = handleReloadSignal },
@@ -199,10 +218,7 @@ pub const Server = struct {
         }
         const deadline = if (run_for_ms) |ms| self.io.nowMs() + ms else null;
         while (true) {
-            if (shutdown_requested.load(.acquire)) {
-                std.log.info("Shutdown requested, stopping server", .{});
-                return;
-            }
+            if (shutdown_requested.load(.acquire)) return;
             if (reload_requested.swap(false, .acq_rel)) {
                 self.applyReload();
             }
@@ -239,7 +255,6 @@ pub const Server = struct {
                         };
                     },
                     .datagram => {
-                        // UDP datagram received - QUIC packet handling
                         try self.handleDatagram();
                     },
                     .read, .write, .err => {
@@ -251,9 +266,24 @@ pub const Server = struct {
                         // be null (freed) or the connection state will be closed/accept.
                         const conn = self.io.getConnection(index) orelse continue;
                         if (conn.fd == null or conn.state == .closed or conn.state == .accept) continue;
+                        // TLS handshake in progress — any I/O event continues it
+                        if (conn.state == .handshake) {
+                            self.handleTlsHandshake(conn) catch {
+                                self.closeConnection(conn);
+                            };
+                            continue;
+                        }
                         switch (event.kind) {
-                            .read => self.handleRead(index) catch |err| {
-                                std.log.debug("handleRead conn={} failed: {}", .{ index, err });
+                            .read => {
+                                self.handleRead(index) catch |err| {
+                                    std.log.debug("handleRead conn={} failed: {}", .{ index, err });
+                                };
+                                // Edge-triggered epoll: EPOLLOUT may have been consumed earlier
+                                // (e.g., sending h2 SETTINGS). Flush any responses queued by handleRead.
+                                const rconn = self.io.getConnection(index) orelse continue;
+                                if (rconn.write_count > 0) {
+                                    self.handleWrite(index) catch {};
+                                }
                             },
                             .write => self.handleWrite(index) catch |err| {
                                 std.log.debug("handleWrite conn={} failed: {}", .{ index, err });
@@ -299,27 +329,106 @@ pub const Server = struct {
                 conn.cached_peer_ip6 = ip6;
             }
         }
-        conn.transition(.active, now_ms) catch {
-            // Invalid state transition - close connection
-            if (conn.read_buffer) |buf| self.io.releaseBuffer(buf);
-            self.io.releaseConnection(conn);
-            clock.closeFd(client_fd);
-            return;
+        // If TLS is configured, start handshake before going active
+        if (self.tcp_tls_provider) |*provider| {
+            conn.tls_session = provider.createSocketSession(client_fd) catch {
+                if (conn.read_buffer) |buf| self.io.releaseBuffer(buf);
+                self.io.releaseConnection(conn);
+                clock.closeFd(client_fd);
+                return;
+            };
+            conn.is_tls = true;
+            conn.transition(.handshake, now_ms) catch {
+                conn.cleanupTls();
+                if (conn.read_buffer) |buf| self.io.releaseBuffer(buf);
+                self.io.releaseConnection(conn);
+                clock.closeFd(client_fd);
+                return;
+            };
+            self.io.setTimeoutPhase(conn, .header);
+            self.io.registerConnection(conn.index, client_fd) catch |err| {
+                conn.cleanupTls();
+                if (conn.read_buffer) |buf| self.io.releaseBuffer(buf);
+                self.io.releaseConnection(conn);
+                clock.closeFd(client_fd);
+                return err;
+            };
+            // Try handshake immediately (may complete in one round-trip)
+            self.handleTlsHandshake(conn) catch {
+                self.closeConnection(conn);
+                return;
+            };
+        } else {
+            conn.transition(.active, now_ms) catch {
+                // Invalid state transition - close connection
+                if (conn.read_buffer) |buf| self.io.releaseBuffer(buf);
+                self.io.releaseConnection(conn);
+                clock.closeFd(client_fd);
+                return;
+            };
+            self.io.setTimeoutPhase(conn, .header);
+            self.io.registerConnection(conn.index, client_fd) catch |err| {
+                if (conn.read_buffer) |buf| self.io.releaseBuffer(buf);
+                self.io.releaseConnection(conn);
+                clock.closeFd(client_fd);
+                return err;
+            };
+            // With edge-triggered epoll, we must try to read immediately after accept
+            // because data may have arrived before we registered the socket.
+            // If we don't do this, we'll miss the EPOLLIN notification.
+            self.handleRead(conn.index) catch {
+                self.closeConnection(conn);
+                return;
+            };
+        }
+    }
+
+    fn handleTlsHandshake(self: *Server, conn: *connection.Connection) !void {
+        var session = &(conn.tls_session orelse return error.NoTlsSession);
+        const accepted = session.accept() catch {
+            return error.TlsHandshakeFailed;
         };
-        self.io.setTimeoutPhase(conn, .header);
-        self.io.registerConnection(conn.index, client_fd) catch |err| {
-            if (conn.read_buffer) |buf| self.io.releaseBuffer(buf);
-            self.io.releaseConnection(conn);
-            clock.closeFd(client_fd);
-            return err;
-        };
-        // With edge-triggered epoll, we must try to read immediately after accept
-        // because data may have arrived before we registered the socket.
-        // If we don't do this, we'll miss the EPOLLIN notification.
-        self.handleRead(conn.index) catch {
-            self.closeConnection(conn);
-            return;
-        };
+        if (accepted) {
+            // Handshake complete — check ALPN for h2 and transition to active
+            conn.transition(.active, self.io.nowMs()) catch return error.InvalidTransition;
+            if (build_options.enable_http2) {
+                if (session.getAlpn()) |alpn| {
+                    if (std.mem.eql(u8, alpn, "h2")) {
+                        if (conn.http2_stack == null) {
+                            const stack_ptr = try self.allocator.create(http2.Stack);
+                            stack_ptr.* = http2.Stack.initWithConfig(.{
+                                .max_streams = self.cfg.http2.max_streams,
+                                .max_header_list_size = self.cfg.http2.max_header_list_size,
+                                .initial_window_size = self.cfg.http2.initial_window_size,
+                                .max_frame_size = self.cfg.http2.max_frame_size,
+                                .max_dynamic_table_size = self.cfg.http2.max_dynamic_table_size,
+                            });
+                            conn.http2_stack = stack_ptr;
+                        }
+                        conn.protocol = .http2;
+                        self.sendHttp2ServerPreface(conn) catch {
+                            return error.Http2PrefaceFailed;
+                        };
+                    }
+                }
+            }
+            // For HTTP/2 over TLS, flush the server preface (SETTINGS) before
+            // reading. The client won't send its h2 preface until it receives ours.
+            if (conn.protocol == .http2) {
+                self.handleWrite(conn.index) catch {};
+            }
+            // Try to read immediately (data may already be buffered by TLS/kernel)
+            self.handleRead(conn.index) catch {
+                self.closeConnection(conn);
+                return;
+            };
+            // Flush any response queued by handleRead (the event loop also does
+            // this after read events, but we need it here for the initial handshake)
+            if (conn.write_count > 0) {
+                self.handleWrite(conn.index) catch {};
+            }
+        }
+        // If not accepted, handshake needs more I/O — wait for next event
     }
 
     fn handleDatagram(self: *Server) !void {
@@ -627,7 +736,7 @@ pub const Server = struct {
 
     fn handleRead(self: *Server, index: u32) !void {
         const conn = self.io.getConnection(index) orelse return;
-        const fd = conn.fd orelse return;
+        if (conn.fd == null) return;
         if (!self.io.canRead(conn)) return;
         if (conn.timeout_phase == .idle) self.io.setTimeoutPhase(conn, .header);
         const buffer_handle = conn.read_buffer orelse return;
@@ -643,22 +752,19 @@ pub const Server = struct {
                     return;
                 }
                 const slice = accum_buf.bytes[acc_offset..];
-                const bytes_read = std.posix.system.read(fd, slice.ptr, slice.len);
-                if (bytes_read == 0) {
-                    self.abortBodyAccumulation(conn, 400);
-                    return;
-                }
-                if (bytes_read < 0) {
-                    switch (std.posix.errno(bytes_read)) {
-                        .AGAIN, .INTR => return,
-                        else => {
-                            self.cleanupBodyAccumulation(conn);
-                            self.closeConnection(conn);
-                            return;
-                        },
-                    }
-                }
-                const count: usize = @intCast(bytes_read);
+                const count = switch (self.connRead(conn, slice)) {
+                    .bytes => |n| n,
+                    .eof => {
+                        self.abortBodyAccumulation(conn, 400);
+                        return;
+                    },
+                    .again => return,
+                    .err => {
+                        self.cleanupBodyAccumulation(conn);
+                        self.closeConnection(conn);
+                        return;
+                    },
+                };
                 self.io.onReadBuffered(conn, count);
                 conn.markActive(self.io.nowMs());
                 self.continueBodyAccumulation(conn) catch {
@@ -715,21 +821,18 @@ pub const Server = struct {
             return;
         }
         const slice = buffer_handle.bytes[offset..];
-        const bytes_read = std.posix.system.read(fd, slice.ptr, slice.len);
-        if (bytes_read == 0) {
-            self.closeConnection(conn);
-            return;
-        }
-        if (bytes_read < 0) {
-            switch (std.posix.errno(bytes_read)) {
-                .AGAIN, .INTR => return, // Not ready or interrupted, retry on next event
-                else => {
-                    self.closeConnection(conn);
-                    return;
-                },
-            }
-        }
-        const count: usize = @intCast(bytes_read);
+        const count = switch (self.connRead(conn, slice)) {
+            .bytes => |n| n,
+            .eof => {
+                self.closeConnection(conn);
+                return;
+            },
+            .again => return,
+            .err => {
+                self.closeConnection(conn);
+                return;
+            },
+        };
         self.io.onReadBuffered(conn, count);
         conn.markActive(self.io.nowMs());
 
@@ -893,6 +996,7 @@ pub const Server = struct {
 
             var mw_ctx = middleware.Context{
                 .protocol = .http1,
+                .is_tls = conn.is_tls,
                 .buffer_ops = .{
                     .ctx = &self.io,
                     .acquire = acquireBufferOpaque,
@@ -933,15 +1037,15 @@ pub const Server = struct {
         if (conn.read_buffered_bytes == 0 and conn.canEnqueueWrite() and !conn.close_after_write) {
             conn.read_offset = 0;
             const drain_buf = conn.read_buffer orelse return;
-            const more = std.posix.system.read(fd, drain_buf.bytes.ptr, drain_buf.bytes.len);
-            if (more > 0) {
-                const drain_count: usize = @intCast(more);
-                self.io.onReadBuffered(conn, drain_count);
-                conn.markActive(self.io.nowMs());
-                // Re-enter handleRead to process the newly read data
-                return self.handleRead(index);
+            switch (self.connRead(conn, drain_buf.bytes)) {
+                .bytes => |drain_count| {
+                    self.io.onReadBuffered(conn, drain_count);
+                    conn.markActive(self.io.nowMs());
+                    return self.handleRead(index);
+                },
+                .eof, .again, .err => {},
             }
-            // EAGAIN or error — no more data available, continue normally
+            // No more data available, continue normally
         }
     }
 
@@ -1008,6 +1112,7 @@ pub const Server = struct {
                     .headers => |hdr| {
                         var mw_ctx = middleware.Context{
                             .protocol = .http2,
+                            .is_tls = conn.is_tls,
                             .stream_id = hdr.stream_id,
                             .buffer_ops = .{
                                 .ctx = &self.io,
@@ -1088,90 +1193,121 @@ pub const Server = struct {
         const conn = self.io.getConnection(index) orelse return;
         const socket_fd = conn.fd orelse return;
 
-        // Process buffer writes using writev to gather multiple entries per syscall.
-        // Edge-triggered epoll requires draining until EAGAIN.
-        while (conn.write_count > 0) {
-            // Gather consecutive write queue entries into an iovec array
-            var iov: [16]std.posix.iovec_const = undefined;
-            var iov_count: u32 = 0;
-
-            {
-                var scan_head = conn.write_head;
-                var scan_remaining = conn.write_count;
-                while (scan_remaining > 0 and iov_count < 16) {
-                    const e = &conn.write_queue[scan_head];
-                    const s = e.handle.bytes[e.offset..e.len];
-                    iov[iov_count] = .{ .base = s.ptr, .len = s.len };
-                    iov_count += 1;
-                    scan_head = if (scan_head + 1 >= conn.write_queue.len) 0 else scan_head + 1;
-                    scan_remaining -= 1;
+        if (conn.is_tls) {
+            // TLS: write one buffer at a time through SSL_write
+            while (conn.write_count > 0) {
+                const entry = conn.peekWrite() orelse break;
+                const data = entry.handle.bytes[entry.offset..entry.len];
+                if (data.len == 0) {
+                    self.io.releaseBuffer(entry.handle);
+                    conn.popWrite();
+                    continue;
                 }
-            }
-
-            if (iov_count == 0) break;
-
-            const bytes_written = std.c.writev(socket_fd, &iov, @intCast(iov_count));
-            if (bytes_written < 0) {
-                switch (std.posix.errno(bytes_written)) {
-                    .AGAIN => return,
-                    .INTR => continue,
-                    else => {
+                switch (self.connWrite(conn, data)) {
+                    .bytes => |n| {
+                        conn.markActive(self.io.nowMs());
+                        if (n >= data.len) {
+                            self.io.onWriteCompleted(conn, data.len);
+                            self.io.releaseBuffer(entry.handle);
+                            conn.popWrite();
+                            if (conn.hasPendingBody()) {
+                                self.streamBodyChunks(conn, conn.pending_body);
+                            }
+                        } else {
+                            entry.offset += n;
+                            self.io.onWriteCompleted(conn, n);
+                        }
+                    },
+                    .again => return,
+                    .err => {
                         self.closeConnection(conn);
                         return;
                     },
                 }
             }
-            if (bytes_written == 0) return;
-            var written: usize = @intCast(bytes_written);
-            conn.markActive(self.io.nowMs());
-
-            // Walk through entries consumed by this write
-            while (written > 0) {
-                const entry = conn.peekWrite() orelse break;
-                const remaining_in_entry = entry.len - entry.offset;
-                if (written >= remaining_in_entry) {
-                    // Fully consumed this entry
-                    written -= remaining_in_entry;
-                    self.io.onWriteCompleted(conn, remaining_in_entry);
-                    self.io.releaseBuffer(entry.handle);
-                    conn.popWrite();
-
-                    // Continue streaming pending body if there's more data
-                    if (conn.hasPendingBody()) {
-                        self.streamBodyChunks(conn, conn.pending_body);
+        } else {
+            // Plain TCP: use writev to gather multiple entries per syscall
+            while (conn.write_count > 0) {
+                var iov: [16]std.posix.iovec_const = undefined;
+                var iov_count: u32 = 0;
+                {
+                    var scan_head = conn.write_head;
+                    var scan_remaining = conn.write_count;
+                    while (scan_remaining > 0 and iov_count < 16) {
+                        const e = &conn.write_queue[scan_head];
+                        const s = e.handle.bytes[e.offset..e.len];
+                        iov[iov_count] = .{ .base = s.ptr, .len = s.len };
+                        iov_count += 1;
+                        scan_head = if (scan_head + 1 >= conn.write_queue.len) 0 else scan_head + 1;
+                        scan_remaining -= 1;
                     }
-                } else {
-                    // Partial write within this entry
-                    entry.offset += written;
-                    self.io.onWriteCompleted(conn, written);
-                    written = 0;
+                }
+                if (iov_count == 0) break;
+
+                const bytes_written = std.c.writev(socket_fd, &iov, @intCast(iov_count));
+                if (bytes_written < 0) {
+                    switch (std.posix.errno(bytes_written)) {
+                        .AGAIN => return,
+                        .INTR => continue,
+                        else => {
+                            self.closeConnection(conn);
+                            return;
+                        },
+                    }
+                }
+                if (bytes_written == 0) return;
+                var written: usize = @intCast(bytes_written);
+                conn.markActive(self.io.nowMs());
+
+                while (written > 0) {
+                    const entry = conn.peekWrite() orelse break;
+                    const remaining_in_entry = entry.len - entry.offset;
+                    if (written >= remaining_in_entry) {
+                        written -= remaining_in_entry;
+                        self.io.onWriteCompleted(conn, remaining_in_entry);
+                        self.io.releaseBuffer(entry.handle);
+                        conn.popWrite();
+                        if (conn.hasPendingBody()) {
+                            self.streamBodyChunks(conn, conn.pending_body);
+                        }
+                    } else {
+                        entry.offset += written;
+                        self.io.onWriteCompleted(conn, written);
+                        written = 0;
+                    }
                 }
             }
         }
 
         // All buffer writes done, try sendfile if file is pending.
-        // Loop until WouldBlock or completion — edge-triggered epoll won't re-fire
-        // EPOLLOUT if socket stays writable.
-        while (conn.hasPendingFile()) {
-            const file_fd = conn.pending_file_fd.?;
-            const result = net.sendfile(socket_fd, file_fd, &conn.pending_file_offset, conn.pending_file_remaining) catch |err| {
-                switch (err) {
-                    error.WouldBlock => return,
-                    error.Closed, error.Failed => {
-                        conn.cleanupPendingFile();
-                        self.closeConnection(conn);
-                        return;
-                    },
-                }
-            };
-            if (result.bytes_sent == 0) return;
-            conn.pending_file_remaining -= result.bytes_sent;
-            conn.markActive(self.io.nowMs());
+        // Note: sendfile bypasses TLS — for TLS connections with pending files,
+        // we'd need to read the file and write through SSL. Skip for now (static
+        // files over TLS will use regular buffered path via response body).
+        if (!conn.is_tls) {
+            while (conn.hasPendingFile()) {
+                const file_fd = conn.pending_file_fd.?;
+                const result = net.sendfile(socket_fd, file_fd, &conn.pending_file_offset, conn.pending_file_remaining) catch |err| {
+                    switch (err) {
+                        error.WouldBlock => return,
+                        error.Closed, error.Failed => {
+                            conn.cleanupPendingFile();
+                            self.closeConnection(conn);
+                            return;
+                        },
+                    }
+                };
+                if (result.bytes_sent == 0) return;
+                conn.pending_file_remaining -= result.bytes_sent;
+                conn.markActive(self.io.nowMs());
 
-            if (conn.pending_file_remaining == 0) {
-                conn.cleanupPendingFile();
-                break;
+                if (conn.pending_file_remaining == 0) {
+                    conn.cleanupPendingFile();
+                    break;
+                }
             }
+        } else if (conn.hasPendingFile()) {
+            // TLS: sendfile not supported, clean up and close
+            conn.cleanupPendingFile();
         }
 
         // Check if all writes are complete
@@ -2438,6 +2574,8 @@ pub const Server = struct {
     }
 
     fn closeConnection(self: *Server, conn: *connection.Connection) void {
+        // Clean up TLS session before closing the socket
+        conn.cleanupTls();
         if (conn.fd) |fd| {
             _ = self.io.unregister(fd) catch {};
             clock.closeFd(fd);
@@ -2463,6 +2601,64 @@ pub const Server = struct {
         conn.cleanupPendingFile();
         conn.pending_body = &[_]u8{};
         self.io.releaseConnection(conn);
+    }
+
+    /// Read from a connection, using TLS if enabled. Returns bytes read, or error.
+    const ReadResult = union(enum) {
+        bytes: usize,
+        eof: void,
+        again: void,
+        err: void,
+    };
+
+    fn connRead(_: *Server, conn: *connection.Connection, buf: []u8) ReadResult {
+        if (conn.is_tls) {
+            var session = &(conn.tls_session orelse return .err);
+            const n = session.read(buf) catch |err| return switch (err) {
+                error.WouldBlock => .again,
+                error.ConnectionClosed => .eof,
+                else => .err,
+            };
+            if (n == 0) return .eof;
+            return .{ .bytes = n };
+        }
+        const fd = conn.fd orelse return .err;
+        const raw = std.posix.system.read(fd, buf.ptr, buf.len);
+        if (raw == 0) return .eof;
+        if (raw < 0) {
+            return switch (std.posix.errno(raw)) {
+                .AGAIN, .INTR => .again,
+                else => .err,
+            };
+        }
+        return .{ .bytes = @intCast(raw) };
+    }
+
+    /// Write to a connection, using TLS if enabled. Returns bytes written, or error.
+    const WriteResult = union(enum) {
+        bytes: usize,
+        again: void,
+        err: void,
+    };
+
+    fn connWrite(_: *Server, conn: *connection.Connection, data: []const u8) WriteResult {
+        if (conn.is_tls) {
+            var session = &(conn.tls_session orelse return .err);
+            const n = session.write(data) catch |err| return switch (err) {
+                error.WouldBlock => .again,
+                else => .err,
+            };
+            return .{ .bytes = n };
+        }
+        const fd = conn.fd orelse return .err;
+        const raw = std.c.write(fd, data.ptr, data.len);
+        if (raw < 0) {
+            return switch (std.posix.errno(raw)) {
+                .AGAIN, .INTR => .again,
+                else => .err,
+            };
+        }
+        return .{ .bytes = @intCast(raw) };
     }
 
     fn matchesHttp2Preface(candidate: []const u8) bool {

@@ -32,6 +32,20 @@ pub const Provider = struct {
         };
     }
 
+    /// Initialize a TLS provider for TCP connections (TLS 1.2+, ALPN h2/http1.1).
+    pub fn initTcp(allocator: std.mem.Allocator, cert_path: [:0]const u8, key_path: [:0]const u8) Error!Provider {
+        const ctx = ffi.createTcpContext(true) catch return error.ContextCreationFailed;
+        errdefer ffi.freeContext(ctx);
+
+        ffi.loadCertificateChain(ctx, cert_path) catch return error.CertificateLoadFailed;
+        ffi.loadPrivateKey(ctx, key_path) catch return error.PrivateKeyLoadFailed;
+
+        return .{
+            .ctx = ctx,
+            .allocator = allocator,
+        };
+    }
+
     /// Initialize a TLS provider for client connections (no certificates needed).
     pub fn initClient(allocator: std.mem.Allocator) Error!Provider {
         const ctx = ffi.createContext(false) catch return error.ContextCreationFailed;

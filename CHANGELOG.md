@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- TLS for TCP connections (HTTPS for HTTP/1.1 and HTTP/2)
+  - `--cert` / `--key` CLI flags and `tls` config section
+  - Non-blocking TLS handshake with automatic HTTP/2 upgrade via ALPN
+  - TLS-aware read/write path (SSL_read/SSL_write), plain TCP retains writev
+  - SIGPIPE ignored for clean TLS connection teardown
+- Fix HTTP/2 response headers sent with mixed case (RFC 9113 §8.2 requires lowercase)
+- Fix edge-triggered epoll not flushing h2 responses queued during read dispatch
 - Streaming request body support (bodies up to 8MB via buffer accumulation)
 - Buffer size increased from 16KB to 64KB
 - Fix edge-triggered epoll stall on large body uploads

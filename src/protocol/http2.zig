@@ -1612,7 +1612,15 @@ pub fn encodeResponseHeaders(
         if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
         // Skip date (already added above)
         if (std.ascii.eqlIgnoreCase(header.name, "date")) continue;
-        idx += try encodeLiteralHeader(buf[idx..], header.name, header.value);
+        // RFC 9113 §8.2: header field names MUST be lowercase in HTTP/2
+        var lower_buf: [128]u8 = undefined;
+        const name = if (header.name.len <= lower_buf.len) blk: {
+            for (header.name, 0..) |c, i| {
+                lower_buf[i] = std.ascii.toLower(c);
+            }
+            break :blk lower_buf[0..header.name.len];
+        } else header.name;
+        idx += try encodeLiteralHeader(buf[idx..], name, header.value);
     }
     return idx;
 }

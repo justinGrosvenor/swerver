@@ -10,6 +10,7 @@ pub const ServerConfig = struct {
     buffer_pool: BufferPoolConfig,
     x402: X402Config,
     http2: Http2Config,
+    tls: TlsConfig,
     quic: QuicConfig,
     /// Root directory for static file serving. Empty means disabled.
     static_root: []const u8,
@@ -30,6 +31,7 @@ pub const ServerConfig = struct {
             .buffer_pool = .{},
             .x402 = .{},
             .http2 = .{},
+            .tls = .{},
             .quic = .{},
             .static_root = "",
             .allowed_hosts = &.{},
@@ -64,6 +66,8 @@ pub const ServerConfig = struct {
         if (self.timeouts.write_ms > self.timeouts.idle_ms) return error.InvalidTimeouts;
         if (self.limits.max_header_count == 0) return error.InvalidHeaderTable;
         if (self.http2.max_frame_size < 16384 or self.http2.max_frame_size > 16777215) return error.InvalidHttp2Config;
+        // TLS: both cert and key must be provided or both empty
+        if ((self.tls.cert_path.len == 0) != (self.tls.key_path.len == 0)) return error.InvalidTlsConfig;
         if (self.x402.enabled and self.x402.payment_required_b64.len == 0) return error.InvalidX402Config;
         if (self.quic.enabled) {
             if (self.quic.cert_path.len == 0 or self.quic.key_path.len == 0) return error.InvalidQuicConfig;
@@ -125,6 +129,13 @@ pub const Http2Config = struct {
     max_dynamic_table_size: usize = 4096,
 };
 
+pub const TlsConfig = struct {
+    /// Path to PEM certificate file (empty = TLS disabled on TCP)
+    cert_path: [:0]const u8 = "",
+    /// Path to PEM private key file
+    key_path: [:0]const u8 = "",
+};
+
 pub const QuicConfig = struct {
     enabled: bool = false,
     port: u16 = 443,
@@ -158,6 +169,7 @@ pub const ConfigError = error{
     InvalidTimeouts,
     InvalidHeaderTable,
     InvalidHttp2Config,
+    InvalidTlsConfig,
     InvalidX402Config,
     InvalidQuicConfig,
     InvalidStaticRoot,

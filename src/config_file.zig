@@ -86,6 +86,12 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
         if (l.max_header_count) |v| cfg.limits.max_header_count = v;
     }
 
+    // TLS
+    if (file_cfg.tls) |t| {
+        if (t.cert_path) |c| cfg.tls.cert_path = c;
+        if (t.key_path) |k| cfg.tls.key_path = k;
+    }
+
     // HTTP/2
     if (file_cfg.http2) |h2| {
         if (h2.max_streams) |v| cfg.http2.max_streams = v;
@@ -222,6 +228,7 @@ const FileConfig = struct {
     server: ?ServerJson = null,
     timeouts: ?TimeoutsJson = null,
     limits: ?LimitsJson = null,
+    tls: ?TlsJson = null,
     http2: ?Http2Json = null,
     upstreams: ?[]const UpstreamJson = null,
     routes: ?[]const RouteJson = null,
@@ -247,6 +254,11 @@ const LimitsJson = struct {
     max_header_bytes: ?usize = null,
     max_body_bytes: ?usize = null,
     max_header_count: ?usize = null,
+};
+
+const TlsJson = struct {
+    cert_path: ?[:0]const u8 = null,
+    key_path: ?[:0]const u8 = null,
 };
 
 const Http2Json = struct {

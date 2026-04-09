@@ -32,6 +32,8 @@ pub fn main(init: std.process.Init) !void {
     // CLI args override config file
     if (args.static_root.len > 0) cfg.static_root = args.static_root;
     if (args.workers_override) |w| cfg.workers = w;
+    if (args.cert_path) |c| cfg.tls.cert_path = c;
+    if (args.key_path) |k| cfg.tls.key_path = k;
     try cfg.validate();
 
     var app_router = swerver.router.Router.init(.{
@@ -79,6 +81,8 @@ const Args = struct {
     static_root: []const u8,
     workers_override: ?u16,
     config_path: ?[]const u8,
+    cert_path: ?[:0]const u8,
+    key_path: ?[:0]const u8,
 };
 
 fn parseArgs(args: std.process.Args, allocator: std.mem.Allocator) !Args {
@@ -87,6 +91,8 @@ fn parseArgs(args: std.process.Args, allocator: std.mem.Allocator) !Args {
         .static_root = "",
         .workers_override = null,
         .config_path = null,
+        .cert_path = null,
+        .key_path = null,
     };
     var it = try std.process.Args.Iterator.initAllocator(args, allocator);
     defer it.deinit();
@@ -115,6 +121,16 @@ fn parseArgs(args: std.process.Args, allocator: std.mem.Allocator) !Args {
             result.config_path = std.mem.sliceTo(value, 0);
         } else if (std.mem.startsWith(u8, arg, "--config=")) {
             result.config_path = arg["--config=".len..];
+        } else if (std.mem.eql(u8, arg, "--cert")) {
+            const value = it.next() orelse return error.InvalidCertPath;
+            result.cert_path = std.mem.sliceTo(value, 0);
+        } else if (std.mem.startsWith(u8, arg, "--cert=")) {
+            result.cert_path = @ptrCast(arg["--cert=".len..]);
+        } else if (std.mem.eql(u8, arg, "--key")) {
+            const value = it.next() orelse return error.InvalidKeyPath;
+            result.key_path = std.mem.sliceTo(value, 0);
+        } else if (std.mem.startsWith(u8, arg, "--key=")) {
+            result.key_path = @ptrCast(arg["--key=".len..]);
         }
     }
     return result;

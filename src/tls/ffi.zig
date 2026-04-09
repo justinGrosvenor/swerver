@@ -33,6 +33,9 @@ pub const TLS1_3_VERSION: c_int = 0x0304;
 pub const SSL_MODE_ENABLE_PARTIAL_WRITE: c_long = 0x00000001;
 pub const SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER: c_long = 0x00000002;
 
+// TLS 1.2 version
+pub const TLS1_2_VERSION: c_int = 0x0303;
+
 // SSL control options
 pub const SSL_CTRL_SET_MIN_PROTO_VERSION: c_int = 123;
 pub const SSL_CTRL_SET_MAX_PROTO_VERSION: c_int = 124;
@@ -142,6 +145,68 @@ pub fn createContext(is_server: bool) !*SSL_CTX {
     _ = SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MAX_PROTO_VERSION, TLS1_3_VERSION, null);
 
     return ctx;
+}
+
+/// Create a TLS context for TCP connections (TLS 1.2+, sets ALPN for h2/http1.1).
+/// Unlike createContext() which forces TLS 1.3 for QUIC, this uses library defaults
+/// which support TLS 1.2+ on both OpenSSL and LibreSSL.
+pub fn createTcpContext(is_server: bool) !*SSL_CTX {
+    if (!tls_enabled) return error.TlsNotAvailable;
+    const method = if (is_server) TLS_server_method() else TLS_client_method();
+    const ctx = SSL_CTX_new(method) orelse return error.ContextCreationFailed;
+
+    // Library defaults allow TLS 1.2+ which is correct for TCP.
+    // No explicit version pinning needed (unlike QUIC which requires 1.3).
+
+    // Set ALPN callback for server to negotiate h2 or http/1.1
+    if (is_server) {
+        SSL_CTX_set_alpn_select_cb(ctx, tcpAlpnSelectCallback, null);
+    }
+
+    return ctx;
+}
+
+/// ALPN selection callback for TCP TLS: prefer h2, fall back to http/1.1
+fn tcpAlpnSelectCallback(
+    _: *SSL,
+    out: *[*]const u8,
+    outlen: *u8,
+    in_data: [*]const u8,
+    inlen: c_uint,
+    _: ?*anyopaque,
+) callconv(.c) c_int {
+    // Wire format: each protocol is length-prefixed (1 byte length + protocol bytes)
+    const client_list = in_data[0..inlen];
+    // First pass: look for "h2"
+    var i: usize = 0;
+    while (i < client_list.len) {
+        const proto_len = client_list[i];
+        i += 1;
+        if (i + proto_len > client_list.len) break;
+        const proto = client_list[i .. i + proto_len];
+        if (std.mem.eql(u8, proto, "h2")) {
+            out.* = @ptrCast(client_list[i..].ptr);
+            outlen.* = proto_len;
+            return SSL_TLSEXT_ERR_OK;
+        }
+        i += proto_len;
+    }
+    // Second pass: look for "http/1.1"
+    i = 0;
+    while (i < client_list.len) {
+        const proto_len = client_list[i];
+        i += 1;
+        if (i + proto_len > client_list.len) break;
+        const proto = client_list[i .. i + proto_len];
+        if (std.mem.eql(u8, proto, "http/1.1")) {
+            out.* = @ptrCast(client_list[i..].ptr);
+            outlen.* = proto_len;
+            return SSL_TLSEXT_ERR_OK;
+        }
+        i += proto_len;
+    }
+    // No matching protocol — accept anyway (will default to HTTP/1.1)
+    return SSL_TLSEXT_ERR_NOACK;
 }
 
 pub fn freeContext(ctx: *SSL_CTX) void {
