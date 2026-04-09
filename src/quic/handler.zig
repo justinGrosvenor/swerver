@@ -256,11 +256,17 @@ pub const Handler = struct {
         pn_space: types.PacketNumberSpace,
     ) Error!void {
         const pn_offset = header.packet_number_offset;
+        // RFC 9000 §17.2: Length field covers (Packet Number + Payload).
+        // The full Initial/Handshake packet ends at pn_offset + payload_length.
+        // Any bytes beyond are coalesced packets or trailing data, NOT part of
+        // this packet's AEAD-protected ciphertext.
+        const packet_len = pn_offset + header.payload_length;
+        if (packet_len > data.len) return Error.InvalidPacket;
 
         // Copy packet to mutable buffer for decryption
         var decrypt_buf: [65536]u8 = undefined;
-        if (data.len > decrypt_buf.len) return Error.InvalidPacket;
-        @memcpy(decrypt_buf[0..data.len], data);
+        if (packet_len > decrypt_buf.len) return Error.InvalidPacket;
+        @memcpy(decrypt_buf[0..packet_len], data[0..packet_len]);
 
         // Get largest PN for this space
         const space = conn.getPacketSpace(pn_space);
@@ -272,7 +278,7 @@ pub const Handler = struct {
             largest_pn,
             pn_offset,
             &decrypt_buf,
-            data.len,
+            packet_len,
         ) catch return Error.InvalidPacket;
 
         // Record packet received

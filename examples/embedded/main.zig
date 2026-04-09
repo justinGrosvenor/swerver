@@ -34,7 +34,7 @@ fn echo(ctx: *swerver.router.HandlerContext) swerver.response.Response {
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
 
     var state = AppState{ .greeting = "hello, galaxy" };

@@ -383,7 +383,7 @@ pub const Recovery = struct {
 
 // Tests
 test "RTT estimator initialization" {
-    var rtt = RttEstimator.init();
+    const rtt = RttEstimator.init();
 
     try std.testing.expectEqual(Constants.initial_rtt_ms * std.time.ns_per_ms, rtt.smoothed_rtt);
     try std.testing.expect(rtt.first_sample);

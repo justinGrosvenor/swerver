@@ -229,7 +229,7 @@ pub const Stack = struct {
             .peer_settings_received = false,
             .settings = .{},
             .streams = std.AutoHashMap(u64, StreamState).init(allocator),
-            .events = .{},
+            .events = .empty,
             .is_server = is_server,
             .request_bodies = std.AutoHashMap(u64, std.ArrayList(u8)).init(allocator),
         };
@@ -718,7 +718,7 @@ pub const Stack = struct {
             body_list.appendSlice(self.allocator, data) catch return error.BufferTooSmall;
         } else {
             // Create new body accumulator
-            var body_list: std.ArrayList(u8) = .{};
+            var body_list: std.ArrayList(u8) = .empty;
             body_list.appendSlice(self.allocator, data) catch return error.BufferTooSmall;
             self.request_bodies.put(stream_id, body_list) catch return error.BufferTooSmall;
         }

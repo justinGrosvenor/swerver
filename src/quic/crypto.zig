@@ -335,10 +335,21 @@ pub fn decodePacketNumber(truncated: u64, pn_len: u8, largest_pn: u64) u64 {
     // The candidate value
     const candidate = (expected_pn & ~pn_mask) | truncated;
 
-    if (candidate <= expected_pn -| pn_half and candidate + pn_win <= types.Constants.max_packet_number) {
+    // First branch: candidate_pn <= expected_pn - pn_hwin (signed math).
+    // If expected_pn < pn_half, the subtraction would be negative and no
+    // non-negative candidate_pn satisfies the condition — skip this branch.
+    if (expected_pn >= pn_half and
+        candidate <= expected_pn - pn_half and
+        candidate + pn_win <= types.Constants.max_packet_number)
+    {
         return candidate + pn_win;
     }
-    if (candidate > expected_pn + pn_half and candidate >= pn_win) {
+    // Second branch: candidate_pn > expected_pn + pn_hwin.
+    // Guard against expected_pn + pn_half overflowing.
+    if (expected_pn <= max_pn - pn_half and
+        candidate > expected_pn + pn_half and
+        candidate >= pn_win)
+    {
         return candidate - pn_win;
     }
     return candidate;
@@ -560,6 +571,190 @@ test "derive initial keys from DCID" {
     const client = ctx.initial.client.?;
     const server = ctx.initial.server.?;
     try std.testing.expect(!std.mem.eql(u8, client.key[0..16], server.key[0..16]));
+}
+
+test "roundtrip protect/unprotect Initial packet with curl-style 16-byte DCID, 20-byte SCID" {
+    // Simulate a curl-style Initial packet: dcid=16, scid=20, small payload.
+    // Verifies full protect+unprotect round-trip for the same layout curl uses.
+    var ctx = CryptoContext.init();
+    const dcid = [_]u8{
+        0x17, 0xa2, 0x89, 0xad, 0xa0, 0xef, 0x84, 0x76,
+        0x58, 0x37, 0x72, 0x7c, 0xf2, 0xea, 0x84, 0xa6,
+    };
+    ctx.deriveInitialKeys(&dcid, @intFromEnum(types.Version.quic_v1));
+    const client = ctx.initial.client.?;
+
+    // Build a plaintext Initial packet matching curl's header layout:
+    //   first_byte | version | dcid_len | dcid(16) | scid_len | scid(20)
+    //   | token_len(0) | length(varint=PN_len + payload_len + tag_len) | PN | payload
+    var plaintext: [512]u8 = undefined;
+    var p: usize = 0;
+    plaintext[p] = 0xc3; // long header, fixed bit, initial, pn_len=4
+    p += 1;
+    // version v1
+    plaintext[p] = 0x00; plaintext[p+1] = 0x00; plaintext[p+2] = 0x00; plaintext[p+3] = 0x01;
+    p += 4;
+    plaintext[p] = 16; p += 1;
+    @memcpy(plaintext[p..p+16], &dcid); p += 16;
+    const scid = [_]u8{
+        0x43, 0x26, 0x86, 0xd0, 0x40, 0x4f, 0x9e, 0x40,
+        0xa5, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0a, 0x0b,
+    };
+    plaintext[p] = 20; p += 1;
+    @memcpy(plaintext[p..p+20], &scid); p += 20;
+    plaintext[p] = 0x00; p += 1; // token_len = 0 (1-byte varint)
+
+    // Compute length = pn_len(4) + payload_len + tag_len(16)
+    const actual_payload = [_]u8{ 0x06, 0x00, 0x40, 0x10, 0xaa, 0xbb, 0xcc, 0xdd }; // fake CRYPTO frame bytes
+    const pn_len: u8 = 4;
+    const tag_len: usize = 16;
+    const length_value: u64 = pn_len + actual_payload.len + tag_len;
+    // Encode length as 2-byte varint (fits since length < 16383)
+    plaintext[p] = @intCast(0x40 | ((length_value >> 8) & 0x3f));
+    plaintext[p+1] = @intCast(length_value & 0xff);
+    p += 2;
+    const pn_offset = p;
+    // Packet number = 0 (4 bytes)
+    plaintext[p] = 0; plaintext[p+1] = 0; plaintext[p+2] = 0; plaintext[p+3] = 0;
+    p += 4;
+    const header_len = p;
+    @memcpy(plaintext[p..p+actual_payload.len], &actual_payload);
+    p += actual_payload.len;
+    // packet_len is header + plaintext only; protectPacket appends the tag
+    const unprotected_len = p;
+    const expected_protected_len = unprotected_len + tag_len;
+
+    // Protect the packet (AEAD encrypt + header protection)
+    const protected_len = try protectPacket(
+        &client,
+        0, // packet number
+        header_len,
+        pn_offset,
+        pn_len,
+        plaintext[0..],
+        unprotected_len,
+    );
+    try std.testing.expectEqual(expected_protected_len, protected_len);
+
+    // Now unprotect it
+    const result = try unprotectPacket(
+        &client,
+        0, // largest_pn
+        pn_offset,
+        plaintext[0..],
+        protected_len,
+    );
+    try std.testing.expectEqual(@as(u64, 0), result.pn);
+    try std.testing.expectEqual(header_len, result.header_len);
+    try std.testing.expectEqual(actual_payload.len, result.payload_len);
+    // Verify payload round-tripped correctly
+    try std.testing.expectEqualSlices(u8, &actual_payload, plaintext[header_len..header_len+actual_payload.len]);
+}
+
+test "RFC 9001 Appendix A.2 - unprotect client Initial packet" {
+    // RFC 9001 §A.2: a full Client Initial packet, protected, with known result.
+    // Verifies full unprotectPacket path: header protection removal + AEAD decrypt.
+    var ctx = CryptoContext.init();
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    ctx.deriveInitialKeys(&dcid, @intFromEnum(types.Version.quic_v1));
+    const client_keys = ctx.initial.client.?;
+
+    // First 64 bytes of the protected packet from RFC 9001 §A.2
+    // Full packet is 1200 bytes but we need at least ~50 for the sample window.
+    // Using the first part of the RFC's hex dump:
+    const protected = [_]u8{
+        0xc0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x83, 0x94,
+        0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08, 0x00, 0x00,
+        0x44, 0x9e, 0x7b, 0x9a, 0xec, 0x34, 0xd1, 0xb1,
+        0xc9, 0x8d, 0xd7, 0x68, 0x9f, 0xb8, 0xec, 0x11,
+        0xd2, 0x42, 0xb1, 0x23, 0xdc, 0x9b, 0xd8, 0xba,
+        0xb9, 0x36, 0xb4, 0x7d, 0x92, 0xec, 0x35, 0x6c,
+        0x0b, 0xab, 0x7d, 0xf5, 0x97, 0x6d, 0x27, 0xcd,
+        0x44, 0x9f, 0x63, 0x30, 0x00, 0x99, 0xf3, 0x99,
+    };
+    // pn_offset per the packet layout:
+    //   1 (first) + 4 (version) + 1 (dcid_len) + 8 (dcid) + 1 (scid_len)
+    //   + 0 (scid) + 1 (token_len) + 0 (token) + 2 (length varint) = 18
+    const pn_offset: usize = 18;
+
+    // We only have 64 bytes here but the RFC packet is 1200; at minimum we
+    // need enough for the 16-byte sample at pn_offset+4 = 22..38.
+    // That requires at least 38 bytes — we have 64. Sample window is fine.
+    // But AEAD decryption needs the full Length-covered region including tag.
+    // For this test we just verify that header protection removal unprotects
+    // the first byte and packet number to their expected RFC A.2 values.
+    var packet_bytes: [64]u8 = undefined;
+    @memcpy(&packet_bytes, &protected);
+
+    // Apply header protection removal manually to verify just that step.
+    const sample_offset = pn_offset + 4;
+    const sample: *const [16]u8 = @ptrCast(packet_bytes[sample_offset .. sample_offset + 16]);
+
+    var first_byte = packet_bytes[0];
+    var pn_bytes: [4]u8 = undefined;
+    @memcpy(&pn_bytes, packet_bytes[pn_offset .. pn_offset + 4]);
+    applyHeaderProtection(client_keys.hp[0..client_keys.hp_len], sample, &first_byte, &pn_bytes);
+
+    // RFC A.2: unprotected first byte is 0xc3 (pn length = 4 → low 2 bits = 0b11)
+    try std.testing.expectEqual(@as(u8, 0xc3), first_byte);
+    // RFC A.2: unprotected packet number is 0x00000002
+    try std.testing.expectEqual(@as(u8, 0x00), pn_bytes[0]);
+    try std.testing.expectEqual(@as(u8, 0x00), pn_bytes[1]);
+    try std.testing.expectEqual(@as(u8, 0x00), pn_bytes[2]);
+    try std.testing.expectEqual(@as(u8, 0x02), pn_bytes[3]);
+}
+
+test "RFC 9001 Appendix A.1 - initial keys match spec" {
+    // RFC 9001 Appendix A.1: keys derived from DCID 0x8394c8f03e515708
+    var ctx = CryptoContext.init();
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    ctx.deriveInitialKeys(&dcid, @intFromEnum(types.Version.quic_v1));
+
+    const client = ctx.initial.client.?;
+    const server = ctx.initial.server.?;
+
+    // Client key: 1f369613dd76d5467730efcbe3b1a22d
+    const expected_client_key = [_]u8{
+        0x1f, 0x36, 0x96, 0x13, 0xdd, 0x76, 0xd5, 0x46,
+        0x77, 0x30, 0xef, 0xcb, 0xe3, 0xb1, 0xa2, 0x2d,
+    };
+    try std.testing.expectEqualSlices(u8, &expected_client_key, client.key[0..16]);
+
+    // Client IV: fa044b2f42a3fd3b46fb255c
+    const expected_client_iv = [_]u8{
+        0xfa, 0x04, 0x4b, 0x2f, 0x42, 0xa3, 0xfd, 0x3b,
+        0x46, 0xfb, 0x25, 0x5c,
+    };
+    try std.testing.expectEqualSlices(u8, &expected_client_iv, &client.iv);
+
+    // Client HP key: 9f50449e04a0e810283a1e9933adedd2
+    const expected_client_hp = [_]u8{
+        0x9f, 0x50, 0x44, 0x9e, 0x04, 0xa0, 0xe8, 0x10,
+        0x28, 0x3a, 0x1e, 0x99, 0x33, 0xad, 0xed, 0xd2,
+    };
+    try std.testing.expectEqualSlices(u8, &expected_client_hp, client.hp[0..16]);
+
+    // Server key: cf3a5331653c364c88f0f379b6067e37
+    const expected_server_key = [_]u8{
+        0xcf, 0x3a, 0x53, 0x31, 0x65, 0x3c, 0x36, 0x4c,
+        0x88, 0xf0, 0xf3, 0x79, 0xb6, 0x06, 0x7e, 0x37,
+    };
+    try std.testing.expectEqualSlices(u8, &expected_server_key, server.key[0..16]);
+
+    // Server IV: 0ac1493ca1905853b0bba03e
+    const expected_server_iv = [_]u8{
+        0x0a, 0xc1, 0x49, 0x3c, 0xa1, 0x90, 0x58, 0x53,
+        0xb0, 0xbb, 0xa0, 0x3e,
+    };
+    try std.testing.expectEqualSlices(u8, &expected_server_iv, &server.iv);
+
+    // Server HP key: c206b8d9b9f0f37644430b490eeaa314
+    const expected_server_hp = [_]u8{
+        0xc2, 0x06, 0xb8, 0xd9, 0xb9, 0xf0, 0xf3, 0x76,
+        0x44, 0x43, 0x0b, 0x49, 0x0e, 0xea, 0xa3, 0x14,
+    };
+    try std.testing.expectEqualSlices(u8, &expected_server_hp, server.hp[0..16]);
 }
 
 test "compute nonce" {

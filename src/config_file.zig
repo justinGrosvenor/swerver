@@ -100,6 +100,17 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
         if (h2.max_frame_size) |v| cfg.http2.max_frame_size = v;
     }
 
+    // QUIC / HTTP/3
+    if (file_cfg.quic) |q| {
+        if (q.enabled) |v| cfg.quic.enabled = v;
+        if (q.port) |v| cfg.quic.port = v;
+        if (q.cert_path) |v| cfg.quic.cert_path = v;
+        if (q.key_path) |v| cfg.quic.key_path = v;
+        if (q.max_idle_timeout_ms) |v| cfg.quic.max_idle_timeout_ms = v;
+        if (q.max_streams_bidi) |v| cfg.quic.max_streams_bidi = v;
+        if (q.max_streams_uni) |v| cfg.quic.max_streams_uni = v;
+    }
+
     // Upstreams
     const upstream_defs = file_cfg.upstreams orelse &[_]UpstreamJson{};
     const upstreams_out = try alloc.alloc(upstream_mod.Upstream, upstream_defs.len);
@@ -230,6 +241,7 @@ const FileConfig = struct {
     limits: ?LimitsJson = null,
     tls: ?TlsJson = null,
     http2: ?Http2Json = null,
+    quic: ?QuicJson = null,
     upstreams: ?[]const UpstreamJson = null,
     routes: ?[]const RouteJson = null,
 };
@@ -266,6 +278,16 @@ const Http2Json = struct {
     max_header_list_size: ?usize = null,
     initial_window_size: ?u32 = null,
     max_frame_size: ?u32 = null,
+};
+
+const QuicJson = struct {
+    enabled: ?bool = null,
+    port: ?u16 = null,
+    cert_path: ?[:0]const u8 = null,
+    key_path: ?[:0]const u8 = null,
+    max_idle_timeout_ms: ?u32 = null,
+    max_streams_bidi: ?u64 = null,
+    max_streams_uni: ?u64 = null,
 };
 
 const UpstreamJson = struct {
