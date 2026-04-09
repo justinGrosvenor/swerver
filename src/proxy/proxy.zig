@@ -47,6 +47,8 @@ pub const Proxy = struct {
     request_bufs: [][REQUEST_BUF_SIZE]u8,
     /// Response buffer pool
     response_bufs: [][RESPONSE_BUF_SIZE]u8,
+    /// Stable header storage paired with each response buffer slot
+    response_header_bufs: [][64]response.Header,
     /// Free buffer index stack
     free_request_stack: []usize,
     free_response_stack: []usize,
@@ -80,6 +82,9 @@ pub const Proxy = struct {
         const response_bufs = try allocator.alloc([RESPONSE_BUF_SIZE]u8, BUFFER_POOL_SIZE);
         errdefer allocator.free(response_bufs);
 
+        const response_header_bufs = try allocator.alloc([64]response.Header, BUFFER_POOL_SIZE);
+        errdefer allocator.free(response_header_bufs);
+
         // Initialize free stacks with all indices
         for (0..BUFFER_POOL_SIZE) |i| {
             free_request_stack[i] = BUFFER_POOL_SIZE - 1 - i;
@@ -96,6 +101,7 @@ pub const Proxy = struct {
             .upstreams_by_name = std.StringHashMap(*const upstream.Upstream).init(allocator),
             .request_bufs = request_bufs,
             .response_bufs = response_bufs,
+            .response_header_bufs = response_header_bufs,
             .free_request_stack = free_request_stack,
             .free_response_stack = free_response_stack,
             .free_request_count = BUFFER_POOL_SIZE,
@@ -153,6 +159,7 @@ pub const Proxy = struct {
         self.allocator.free(self.free_response_stack);
         self.allocator.free(self.request_bufs);
         self.allocator.free(self.response_bufs);
+        self.allocator.free(self.response_header_bufs);
     }
 
     /// Find a matching proxy route for a request.
@@ -409,19 +416,20 @@ pub const Proxy = struct {
                     continue;
                 }
 
-                // Success — return the body from the upstream response buffer.
-                // The response body lives in self.response_bufs[resp_buf_idx].
+                const normalized = forward.normalizeUpstreamResponse(
+                    &parsed,
+                    self.response_bufs[resp_buf_idx][0..],
+                    route,
+                    self.response_header_bufs[resp_buf_idx][0..],
+                ) catch {
+                    pool.markConnectionFailed(c, now_ms, selection.server.max_fails);
+                    continue;
+                };
                 pool.markServerSuccess(selection.server_index);
                 pool.release(c, now_ms, parsed.keep_alive);
 
-                const body = self.response_bufs[resp_buf_idx][parsed.body_start..parsed.body_end];
-
                 return .{
-                    .resp = .{
-                        .status = parsed.status,
-                        .headers = parsed.headers(),
-                        .body = .{ .bytes = body },
-                    },
+                    .resp = normalized,
                     .proxy = self,
                     .resp_buf_idx = resp_buf_idx,
                 };
@@ -630,17 +638,20 @@ pub const Proxy = struct {
                     continue;
                 }
 
+                const normalized = forward.normalizeUpstreamResponse(
+                    &parsed,
+                    self.response_bufs[resp_buf_idx][0..],
+                    route,
+                    self.response_header_bufs[resp_buf_idx][0..],
+                ) catch {
+                    pool.markConnectionFailed(c, now_ms, selection.server.max_fails);
+                    continue;
+                };
                 pool.markServerSuccess(selection.server_index);
                 pool.release(c, now_ms, parsed.keep_alive);
 
-                const body = self.response_bufs[resp_buf_idx][parsed.body_start..parsed.body_end];
-
                 return .{
-                    .resp = .{
-                        .status = parsed.status,
-                        .headers = parsed.headers(),
-                        .body = .{ .bytes = body },
-                    },
+                    .resp = normalized,
                     .proxy = self,
                     .resp_buf_idx = resp_buf_idx,
                 };
@@ -795,6 +806,7 @@ test "Proxy route matching" {
         .upstreams_by_name = std.StringHashMap(*const upstream.Upstream).init(allocator),
         .request_bufs = &.{},
         .response_bufs = &.{},
+        .response_header_bufs = &.{},
         .free_request_stack = &.{},
         .free_response_stack = &.{},
         .free_request_count = 0,
