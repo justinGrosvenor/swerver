@@ -269,15 +269,28 @@ export ZIG_LOCAL_CACHE_DIR="$(pwd)/.zig-cache"
 | GET /json | 100 | **267,543** | 335us | 34.5 MB/s |
 | GET /blob (1MB) | 50 | **6,811** | 7.35ms | 6.65 GB/s |
 
-### Docker k6 (100 VUs, 30s, 2 CPU / 512MB per container)
+### Docker k6 (100 VUs, 30s, 2 CPU / 512MB per container, April 2026)
 
-| Scenario | swerver | actix (Rust) | nginx |
-|----------|---------|-------------|-------|
-| **Throughput** (req/s) | **168,588** | 129,903 | 121,745 |
-| **Concurrent** ramp to 1000 VUs (req/s) | **196,990** | 159,399 | 132,025 |
-| **Connections** new conn/req (conn/s) | **86,971** | 64,733 | 23,928 |
-| **Latency** p99 (ms) | **5.02** | 5.52 | 5.18 |
-| **Mixed** GET+POST+blob (req/s) | **36,405** | 35,970 | 34,781 |
+Tested against nginx, actix (Rust/Tokio), Apache APISIX (nginx + LuaJIT gateway), and http-zig (Zig stdlib).
+
+| Scenario | swerver | actix | nginx | apisix |
+|----------|---------|-------|-------|--------|
+| **Throughput** (req/s) | **147,435** | 133,691 | 118,061 | 91,522 |
+| **Concurrent** ramp to 1000 VUs (req/s) | **156,854** | 149,558 | 120,577 | 92,751 |
+| **Connections** new conn/req (conn/s) | **90,657** | 66,019 | 19,206 | 22,916 |
+| **Spike** 50→1000 VUs (req/s) | **147,136** | 137,189 | 114,119 | 95,129 |
+| **Rapid-fire** 200 VUs (req/s) | **143,437** | 128,155 | 125,346 | 94,279 |
+| **Error path** p99 (ms) | **2.02** | 2.65 | 34.97 | 35.48 |
+
+### Docker k6 TLS + HTTP/2 (100 VUs, 30s, April 2026)
+
+HTTPS and HTTP/2-over-TLS workloads. See [benchmarks repo](https://github.com/justinGrosvenor/swerver-benchmarks/tree/main/scenarios/tls-http2).
+
+| Scenario | swerver | actix | nginx | apisix |
+|----------|---------|-------|-------|--------|
+| **TLS throughput** (req/s) | 161,781 | **171,726** | 107,741 | 71,851 |
+| **H2 throughput** (req/s) | 111,698 | **129,428** | 95,878 | 68,731 |
+| **TLS handshake** (req/s, 0% err) | **1,829** | 2,765 | 1,578 (34% err) | 1,552 (32% err) |
 
 ### Microbenchmarks
 
