@@ -881,6 +881,30 @@ pub const Server = struct {
 
         if (conn.protocol == .http2) {
             try self.handleHttp2Read(conn);
+            // For TLS h2, OpenSSL can have more decrypted records buffered
+            // internally. Drain the SSL buffer by looping until WouldBlock —
+            // epoll is edge-triggered on the kernel socket and won't fire
+            // EPOLLIN for data that's already in SSL's buffer.
+            if (conn.is_tls) {
+                while (true) {
+                    const drain_buf = conn.read_buffer orelse break;
+                    const drain_offset = conn.read_offset + conn.read_buffered_bytes;
+                    if (drain_offset >= drain_buf.bytes.len) break;
+                    const drain_slice = drain_buf.bytes[drain_offset..];
+                    switch (self.connRead(conn, drain_slice)) {
+                        .bytes => |n| {
+                            self.io.onReadBuffered(conn, n);
+                            conn.markActive(self.io.nowMs());
+                            try self.handleHttp2Read(conn);
+                        },
+                        .eof => {
+                            self.closeConnection(conn);
+                            return;
+                        },
+                        .again, .err => break,
+                    }
+                }
+            }
             return;
         }
 

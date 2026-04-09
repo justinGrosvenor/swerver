@@ -11,6 +11,10 @@
 - Fix edge-triggered epoll not flushing h2 responses queued during read dispatch
 - Fix edge-triggered epoll dropping pending TCP connections (drain accept queue in loop)
 - Fix h2 ingest stranding frames when 16-slot frames buffer fills mid-batch
+- Fix TLS read path stranding data in OpenSSL's internal buffer (drain until
+  WouldBlock — epoll's edge-triggered mode can't signal SSL-layer buffering)
+- Fix SSL_read error handling: ret=0 now distinguishes close_notify from
+  transient errors via SSL_get_error (was incorrectly treating WANT_READ as EOF)
 - Set TCP_NODELAY on accepted sockets (eliminates 40ms Nagle delay for h2 multi-frame writes)
 - Increase per-connection write queue from 32 to 128 entries for h2 multiplexing
 - Streaming request body support (bodies up to 8MB via buffer accumulation)

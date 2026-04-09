@@ -298,13 +298,14 @@ pub fn sslRead(ssl: *SSL, buf: []u8) !usize {
     if (!tls_enabled) return error.TlsNotAvailable;
     const ret = SSL_read(ssl, buf.ptr, @intCast(buf.len));
     if (ret > 0) return @intCast(ret);
-    if (ret == 0) return 0; // Connection closed
-
+    // For ret <= 0, MUST check SSL_get_error to distinguish WANT_READ
+    // from actual EOF — returning 0 directly treats transient errors as EOF.
     const err = SSL_get_error(ssl, ret);
     return switch (err) {
         SSL_ERROR_WANT_READ => error.WouldBlock,
         SSL_ERROR_WANT_WRITE => error.WouldBlock,
         SSL_ERROR_ZERO_RETURN => error.ConnectionClosed,
+        SSL_ERROR_SYSCALL => if (ret == 0) error.ConnectionClosed else error.TlsError,
         else => error.TlsError,
     };
 }
