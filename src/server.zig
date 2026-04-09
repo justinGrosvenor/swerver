@@ -468,7 +468,6 @@ pub const Server = struct {
 
         // Process the QUIC packet
         const result = quic.processPacket(self.udp_recv_buf[0..recv_result.bytes_read], peer_addr) catch |err| {
-            // Log error but don't crash
             std.log.debug("QUIC packet error: {}", .{err});
             return;
         };
@@ -545,78 +544,44 @@ pub const Server = struct {
         peer_addr: net.SockAddrStorage,
         body: []const u8,
     ) void {
-        // Extract pseudo-headers (:method, :path, :scheme, :authority)
-        var method: ?[]const u8 = null;
-        var path: ?[]const u8 = null;
-        var regular_headers: [64]http3.Header = undefined;
-        var regular_count: usize = 0;
+        var req_headers: [65]request.Header = undefined;
+        const req_view = buildHttp3RequestView(headers_event, body, req_headers[0..]) orelse return;
 
-        for (headers_event.headers) |hdr| {
-            if (std.mem.eql(u8, hdr.name, ":method")) {
-                method = hdr.value;
-            } else if (std.mem.eql(u8, hdr.name, ":path")) {
-                path = hdr.value;
-            } else if (hdr.name.len > 0 and hdr.name[0] != ':') {
-                // Regular header (not pseudo-header)
-                if (regular_count < regular_headers.len) {
-                    regular_headers[regular_count] = hdr;
-                    regular_count += 1;
-                }
-            }
+        var resp = badRequestResponse();
+        var managed_handle: ?buffer_pool.BufferHandle = null;
+
+        if (self.isAllowedHost(req_view)) {
+            var mw_ctx = middleware.Context{
+                .protocol = .http3,
+                .buffer_ops = .{
+                    .ctx = &self.io,
+                    .acquire = acquireBufferOpaque,
+                    .release = releaseBufferOpaque,
+                },
+            };
+            var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
+            var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
+            const arena_handle = self.io.acquireBuffer();
+            var empty_arena: [0]u8 = undefined;
+            const arena_buf = if (arena_handle) |handle| handle.bytes else empty_arena[0..];
+            var scratch = router.HandlerScratch{
+                .response_buf = response_buf[0..],
+                .response_headers = response_headers[0..],
+                .arena_buf = arena_buf,
+                .arena_handle = arena_handle,
+                .buffer_ops = mw_ctx.buffer_ops,
+            };
+            const result = self.app_router.handle(req_view, &mw_ctx, &scratch);
+            if (scratch.arena_handle) |handle| self.io.releaseBuffer(handle);
+            resp = result.resp;
+            managed_handle = switch (resp.body) {
+                .managed => |managed| managed.handle,
+                else => null,
+            };
         }
-
-        // Validate required pseudo-headers
-        const method_str = method orelse return;
-        const path_str = path orelse return;
-
-        const parsed_method = request.Method.fromStringExtended(method_str) orelse return;
-
-        // Convert HTTP/3 headers to request headers
-        var req_headers: [64]request.Header = undefined;
-        for (regular_headers[0..regular_count], 0..) |hdr, i| {
-            req_headers[i] = .{ .name = hdr.name, .value = hdr.value };
-        }
-
-        // Build RequestView
-        const req_view = request.RequestView{
-            .method = parsed_method,
-            .path = path_str,
-            .headers = req_headers[0..regular_count],
-            .body = body,
-        };
-
-        // Route the request
-        var mw_ctx = middleware.Context{
-            .protocol = .http3,
-            .buffer_ops = .{
-                .ctx = &self.io,
-                .acquire = acquireBufferOpaque,
-                .release = releaseBufferOpaque,
-            },
-        };
-        var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
-        var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
-        const arena_handle = self.io.acquireBuffer();
-        var empty_arena: [0]u8 = undefined;
-        const arena_buf = if (arena_handle) |handle| handle.bytes else empty_arena[0..];
-        var scratch = router.HandlerScratch{
-            .response_buf = response_buf[0..],
-            .response_headers = response_headers[0..],
-            .arena_buf = arena_buf,
-            .arena_handle = arena_handle,
-            .buffer_ops = mw_ctx.buffer_ops,
-        };
-        const result = self.app_router.handle(req_view, &mw_ctx, &scratch);
-        if (scratch.arena_handle) |handle| self.io.releaseBuffer(handle);
-        const body_bytes = result.resp.bodyBytes();
-        const body_len = result.resp.bodyLen();
-        const managed_body = switch (result.resp.body) {
-            .managed => |managed| managed,
-            else => null,
-        };
-        if (managed_body) |managed| {
-            defer self.io.releaseBuffer(managed.handle);
-        }
+        defer if (managed_handle) |handle| self.io.releaseBuffer(handle);
+        const body_bytes = resp.bodyBytes();
+        const body_len = resp.bodyLen();
         // Note: QUIC backpressure is handled at the transport layer via flow control,
         // not by pausing reads like TCP. The 429 response is sufficient.
 
@@ -624,8 +589,8 @@ pub const Server = struct {
         var encoded_response_buf: [16384]u8 = undefined;
         const resp_len = conn.encodeHttp3Response(
             &encoded_response_buf,
-            result.resp.status,
-            @ptrCast(result.resp.headers),
+            resp.status,
+            @ptrCast(resp.headers),
             if (body_len > 0) body_bytes else null,
         ) catch return;
 
@@ -966,26 +931,10 @@ pub const Server = struct {
             if (!parse.keep_alive) conn.close_after_write = true;
             self.io.onReadConsumed(conn, parse.consumed_bytes);
 
-            // Validate Host header against allowed_hosts if configured
-            if (self.cfg.allowed_hosts.len > 0) {
-                const host_value = parse.view.getHeader("Host") orelse "";
-                // Strip port from host for comparison
-                const host_name = if (std.mem.indexOfScalar(u8, host_value, ':')) |colon|
-                    host_value[0..colon]
-                else
-                    host_value;
-                var host_allowed = false;
-                for (self.cfg.allowed_hosts) |allowed| {
-                    if (std.ascii.eqlIgnoreCase(host_name, allowed)) {
-                        host_allowed = true;
-                        break;
-                    }
-                }
-                if (!host_allowed) {
-                    conn.close_after_write = true;
-                    try self.queueResponse(conn, badRequestResponse());
-                    return;
-                }
+            if (!self.isAllowedHost(parse.view)) {
+                conn.close_after_write = true;
+                try self.queueResponse(conn, badRequestResponse());
+                return;
             }
 
             // Check for static file requests - use sendfile for zero-copy
@@ -1157,47 +1106,51 @@ pub const Server = struct {
             for (events[0..ingest.event_count]) |event| {
                 switch (event) {
                     .headers => |hdr| {
-                        var mw_ctx = middleware.Context{
-                            .protocol = .http2,
-                            .is_tls = conn.is_tls,
-                            .stream_id = hdr.stream_id,
-                            .buffer_ops = .{
-                                .ctx = &self.io,
-                                .acquire = acquireBufferOpaque,
-                                .release = releaseBufferOpaque,
-                            },
-                        };
-                        // Use cached client IP for rate limiting and logging
-                        if (conn.cached_peer_ip) |ip4| {
-                            mw_ctx.client_ip = ip4;
-                        } else if (conn.cached_peer_ip6) |ip6| {
-                            mw_ctx.client_ip6 = ip6;
-                        }
-                        var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
-                        var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
-                        const arena_handle = self.io.acquireBuffer();
-                        var empty_arena: [0]u8 = undefined;
-                        const arena_buf = if (arena_handle) |handle| handle.bytes else empty_arena[0..];
-                        var scratch = router.HandlerScratch{
-                            .response_buf = response_buf[0..],
-                            .response_headers = response_headers[0..],
-                            .arena_buf = arena_buf,
-                            .arena_handle = arena_handle,
-                            .buffer_ops = mw_ctx.buffer_ops,
-                        };
-                        const resp = if (hdr.end_stream) blk: {
+                        var resp: response_mod.Response = undefined;
+                        if (!self.isAllowedHost(hdr.request)) {
+                            resp = badRequestResponse();
+                        } else if (hdr.end_stream) {
+                            var mw_ctx = middleware.Context{
+                                .protocol = .http2,
+                                .is_tls = conn.is_tls,
+                                .stream_id = hdr.stream_id,
+                                .buffer_ops = .{
+                                    .ctx = &self.io,
+                                    .acquire = acquireBufferOpaque,
+                                    .release = releaseBufferOpaque,
+                                },
+                            };
+                            // Use cached client IP for rate limiting and logging
+                            if (conn.cached_peer_ip) |ip4| {
+                                mw_ctx.client_ip = ip4;
+                            } else if (conn.cached_peer_ip6) |ip6| {
+                                mw_ctx.client_ip6 = ip6;
+                            }
+                            var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
+                            var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
+                            const arena_handle = self.io.acquireBuffer();
+                            var empty_arena: [0]u8 = undefined;
+                            const arena_buf = if (arena_handle) |handle| handle.bytes else empty_arena[0..];
+                            var scratch = router.HandlerScratch{
+                                .response_buf = response_buf[0..],
+                                .response_headers = response_headers[0..],
+                                .arena_buf = arena_buf,
+                                .arena_handle = arena_handle,
+                                .buffer_ops = mw_ctx.buffer_ops,
+                            };
                             const result = self.app_router.handle(hdr.request, &mw_ctx, &scratch);
-                            // Apply rate limit backpressure if signaled
+                            if (scratch.arena_handle) |handle| self.io.releaseBuffer(handle);
                             if (result.pause_reads_ms) |pause_ms| {
                                 conn.setRateLimitPause(self.io.nowMs(), pause_ms);
                             }
-                            break :blk result.resp;
-                        } else response_mod.Response{
-                            .status = 501,
-                            .headers = &[_]response_mod.Header{},
-                            .body = .{ .bytes = "Not Implemented\n" },
-                        };
-                        if (scratch.arena_handle) |handle| self.io.releaseBuffer(handle);
+                            resp = result.resp;
+                        } else {
+                            resp = response_mod.Response{
+                                .status = 501,
+                                .headers = &[_]response_mod.Header{},
+                                .body = .{ .bytes = "Not Implemented\n" },
+                            };
+                        }
                         try self.queueHttp2Response(conn, hdr.stream_id, resp, hdr.request.method == .HEAD);
                     },
                     .data => |data| {
@@ -1240,96 +1193,100 @@ pub const Server = struct {
         const conn = self.io.getConnection(index) orelse return;
         const socket_fd = conn.fd orelse return;
 
-        if (conn.is_tls) {
-            // TLS: write one buffer at a time through SSL_write
-            while (conn.write_count > 0) {
-                const entry = conn.peekWrite() orelse break;
-                const data = entry.handle.bytes[entry.offset..entry.len];
-                if (data.len == 0) {
-                    self.io.releaseBuffer(entry.handle);
-                    conn.popWrite();
+        while (true) {
+            if (conn.is_tls) {
+                // TLS: write one buffer at a time through SSL_write
+                while (conn.write_count > 0) {
+                    const entry = conn.peekWrite() orelse break;
+                    const data = entry.handle.bytes[entry.offset..entry.len];
+                    if (data.len == 0) {
+                        self.io.releaseBuffer(entry.handle);
+                        conn.popWrite();
+                        continue;
+                    }
+                    switch (self.connWrite(conn, data)) {
+                        .bytes => |n| {
+                            conn.markActive(self.io.nowMs());
+                            if (n >= data.len) {
+                                self.io.onWriteCompleted(conn, data.len);
+                                self.io.releaseBuffer(entry.handle);
+                                conn.popWrite();
+                                if (conn.hasPendingBody()) {
+                                    self.streamBodyChunks(conn, conn.pending_body);
+                                }
+                            } else {
+                                entry.offset += n;
+                                self.io.onWriteCompleted(conn, n);
+                            }
+                        },
+                        .again => return,
+                        .err => {
+                            self.closeConnection(conn);
+                            return;
+                        },
+                    }
+                }
+                if (conn.write_count == 0 and conn.hasPendingFile() and self.bufferPendingFileWrites(conn)) {
                     continue;
                 }
-                switch (self.connWrite(conn, data)) {
-                    .bytes => |n| {
-                        conn.markActive(self.io.nowMs());
-                        if (n >= data.len) {
-                            self.io.onWriteCompleted(conn, data.len);
+                if (conn.state == .closed) return;
+            } else {
+                // Plain TCP: use writev to gather multiple entries per syscall
+                while (conn.write_count > 0) {
+                    var iov: [16]std.posix.iovec_const = undefined;
+                    var iov_count: u32 = 0;
+                    {
+                        var scan_head = conn.write_head;
+                        var scan_remaining = conn.write_count;
+                        while (scan_remaining > 0 and iov_count < 16) {
+                            const e = &conn.write_queue[scan_head];
+                            const s = e.handle.bytes[e.offset..e.len];
+                            iov[iov_count] = .{ .base = s.ptr, .len = s.len };
+                            iov_count += 1;
+                            scan_head = if (scan_head + 1 >= conn.write_queue.len) 0 else scan_head + 1;
+                            scan_remaining -= 1;
+                        }
+                    }
+                    if (iov_count == 0) break;
+
+                    const bytes_written = std.c.writev(socket_fd, &iov, @intCast(iov_count));
+                    if (bytes_written < 0) {
+                        switch (std.posix.errno(bytes_written)) {
+                            .AGAIN => return,
+                            .INTR => continue,
+                            else => {
+                                self.closeConnection(conn);
+                                return;
+                            },
+                        }
+                    }
+                    if (bytes_written == 0) return;
+                    var written: usize = @intCast(bytes_written);
+                    conn.markActive(self.io.nowMs());
+
+                    while (written > 0) {
+                        const entry = conn.peekWrite() orelse break;
+                        const remaining_in_entry = entry.len - entry.offset;
+                        if (written >= remaining_in_entry) {
+                            written -= remaining_in_entry;
+                            self.io.onWriteCompleted(conn, remaining_in_entry);
                             self.io.releaseBuffer(entry.handle);
                             conn.popWrite();
                             if (conn.hasPendingBody()) {
                                 self.streamBodyChunks(conn, conn.pending_body);
                             }
                         } else {
-                            entry.offset += n;
-                            self.io.onWriteCompleted(conn, n);
+                            entry.offset += written;
+                            self.io.onWriteCompleted(conn, written);
+                            written = 0;
                         }
-                    },
-                    .again => return,
-                    .err => {
-                        self.closeConnection(conn);
-                        return;
-                    },
-                }
-            }
-        } else {
-            // Plain TCP: use writev to gather multiple entries per syscall
-            while (conn.write_count > 0) {
-                var iov: [16]std.posix.iovec_const = undefined;
-                var iov_count: u32 = 0;
-                {
-                    var scan_head = conn.write_head;
-                    var scan_remaining = conn.write_count;
-                    while (scan_remaining > 0 and iov_count < 16) {
-                        const e = &conn.write_queue[scan_head];
-                        const s = e.handle.bytes[e.offset..e.len];
-                        iov[iov_count] = .{ .base = s.ptr, .len = s.len };
-                        iov_count += 1;
-                        scan_head = if (scan_head + 1 >= conn.write_queue.len) 0 else scan_head + 1;
-                        scan_remaining -= 1;
-                    }
-                }
-                if (iov_count == 0) break;
-
-                const bytes_written = std.c.writev(socket_fd, &iov, @intCast(iov_count));
-                if (bytes_written < 0) {
-                    switch (std.posix.errno(bytes_written)) {
-                        .AGAIN => return,
-                        .INTR => continue,
-                        else => {
-                            self.closeConnection(conn);
-                            return;
-                        },
-                    }
-                }
-                if (bytes_written == 0) return;
-                var written: usize = @intCast(bytes_written);
-                conn.markActive(self.io.nowMs());
-
-                while (written > 0) {
-                    const entry = conn.peekWrite() orelse break;
-                    const remaining_in_entry = entry.len - entry.offset;
-                    if (written >= remaining_in_entry) {
-                        written -= remaining_in_entry;
-                        self.io.onWriteCompleted(conn, remaining_in_entry);
-                        self.io.releaseBuffer(entry.handle);
-                        conn.popWrite();
-                        if (conn.hasPendingBody()) {
-                            self.streamBodyChunks(conn, conn.pending_body);
-                        }
-                    } else {
-                        entry.offset += written;
-                        self.io.onWriteCompleted(conn, written);
-                        written = 0;
                     }
                 }
             }
+            break;
         }
 
         // All buffer writes done, try sendfile if file is pending.
-        // Note: sendfile bypasses TLS — for TLS connections with pending files,
-        // we'd need to read the file and write through SSL. Skip for now (static
-        // files over TLS will use regular buffered path via response body).
         if (!conn.is_tls) {
             while (conn.hasPendingFile()) {
                 const file_fd = conn.pending_file_fd.?;
@@ -1352,12 +1309,10 @@ pub const Server = struct {
                     break;
                 }
             }
-        } else if (conn.hasPendingFile()) {
-            // TLS: sendfile not supported, clean up and close
-            conn.cleanupPendingFile();
         }
 
         // Check if all writes are complete
+        if (conn.state == .closed) return;
         if (conn.write_count == 0 and !conn.hasPendingBody() and !conn.hasPendingFile()) {
             self.io.setTimeoutPhase(conn, .idle);
             if (conn.close_after_write) self.closeConnection(conn);
@@ -2171,6 +2126,130 @@ pub const Server = struct {
         };
     }
 
+    fn buildHttp3RequestView(headers_event: http3.HeadersEvent, body: []const u8, headers_out: []request.Header) ?request.RequestView {
+        var method: ?[]const u8 = null;
+        var path: ?[]const u8 = null;
+        var authority: ?[]const u8 = null;
+        var header_count: usize = 0;
+        var saw_host = false;
+
+        for (headers_event.headers) |hdr| {
+            if (std.mem.eql(u8, hdr.name, ":method")) {
+                method = hdr.value;
+            } else if (std.mem.eql(u8, hdr.name, ":path")) {
+                path = hdr.value;
+            } else if (std.mem.eql(u8, hdr.name, ":authority")) {
+                authority = hdr.value;
+            } else if (hdr.name.len > 0 and hdr.name[0] != ':') {
+                if (header_count >= headers_out.len) return null;
+                headers_out[header_count] = .{ .name = hdr.name, .value = hdr.value };
+                saw_host = saw_host or std.ascii.eqlIgnoreCase(hdr.name, "host");
+                header_count += 1;
+            }
+        }
+
+        const method_str = method orelse return null;
+        const path_str = path orelse return null;
+        const parsed_method = request.Method.fromStringExtended(method_str) orelse return null;
+
+        if (!saw_host) {
+            if (authority) |authority_value| {
+                if (header_count >= headers_out.len) return null;
+                headers_out[header_count] = .{ .name = "host", .value = authority_value };
+                header_count += 1;
+            }
+        }
+
+        return .{
+            .method = parsed_method,
+            .method_raw = if (parsed_method == .OTHER) method_str else "",
+            .path = path_str,
+            .headers = headers_out[0..header_count],
+            .body = body,
+        };
+    }
+
+    fn isAllowedHost(self: *const Server, req_view: request.RequestView) bool {
+        if (self.cfg.allowed_hosts.len == 0) return true;
+
+        const host_value = req_view.getHeader("Host") orelse return false;
+        const host_name = allowlistHostName(host_value);
+        if (host_name.len == 0) return false;
+
+        for (self.cfg.allowed_hosts) |allowed| {
+            if (std.ascii.eqlIgnoreCase(host_name, allowed)) return true;
+        }
+        return false;
+    }
+
+    fn allowlistHostName(host_value: []const u8) []const u8 {
+        const trimmed = std.mem.trim(u8, host_value, " \t");
+        if (trimmed.len == 0) return "";
+
+        if (trimmed[0] == '[') {
+            const end = std.mem.indexOfScalar(u8, trimmed, ']') orelse return "";
+            return trimmed[1..end];
+        }
+
+        if (std.mem.indexOfScalar(u8, trimmed, ':')) |colon| {
+            if (std.mem.indexOfScalar(u8, trimmed[colon + 1 ..], ':') == null) {
+                return trimmed[0..colon];
+            }
+        }
+
+        return trimmed;
+    }
+
+    fn bufferPendingFileWrites(self: *Server, conn: *connection.Connection) bool {
+        var queued_any = false;
+
+        while (conn.hasPendingFile() and conn.writeQueueAvailable() > 0) {
+            const body_buf = self.io.acquireBuffer() orelse {
+                if (!queued_any) {
+                    conn.cleanupPendingFile();
+                    self.closeConnection(conn);
+                }
+                return queued_any;
+            };
+
+            const max_read: usize = @intCast(@min(conn.pending_file_remaining, @as(u64, body_buf.bytes.len)));
+            const read_result = std.c.pread(conn.pending_file_fd.?, body_buf.bytes.ptr, max_read, @intCast(conn.pending_file_offset));
+            if (read_result < 0) {
+                self.io.releaseBuffer(body_buf);
+                switch (std.posix.errno(read_result)) {
+                    .INTR => continue,
+                    else => {
+                        conn.cleanupPendingFile();
+                        self.closeConnection(conn);
+                        return queued_any;
+                    },
+                }
+            }
+            const bytes_read: usize = @intCast(read_result);
+            if (bytes_read == 0) {
+                self.io.releaseBuffer(body_buf);
+                conn.cleanupPendingFile();
+                break;
+            }
+            if (!conn.enqueueWrite(body_buf, bytes_read)) {
+                self.io.releaseBuffer(body_buf);
+                return queued_any;
+            }
+
+            self.io.onWriteBuffered(conn, bytes_read);
+            conn.pending_file_offset += bytes_read;
+            conn.pending_file_remaining -= bytes_read;
+            queued_any = true;
+
+            if (conn.pending_file_remaining == 0) {
+                conn.cleanupPendingFile();
+                break;
+            }
+        }
+
+        return queued_any;
+    }
+
     /// Initialize body accumulation for a request whose body exceeds the read buffer.
     /// Allocates BodyAccumState, seeds it with any body bytes already in the read buffer,
     /// and transitions the connection to body-accumulation mode.
@@ -2403,27 +2482,12 @@ pub const Server = struct {
                 .body = body_mem[0..total_len],
             };
 
-            // Validate Host header against allowed_hosts if configured
-            if (self.cfg.allowed_hosts.len > 0) {
-                const host_value = req_view.getHeader("Host") orelse "";
-                const host_name = if (std.mem.indexOfScalar(u8, host_value, ':')) |colon|
-                    host_value[0..colon]
-                else
-                    host_value;
-                var host_allowed = false;
-                for (self.cfg.allowed_hosts) |allowed| {
-                    if (std.ascii.eqlIgnoreCase(host_name, allowed)) {
-                        host_allowed = true;
-                        break;
-                    }
-                }
-                if (!host_allowed) {
-                    conn.close_after_write = true;
-                    self.cleanupBodyAccumulation(conn);
-                    self.queueResponse(conn, badRequestResponse()) catch {};
-                    self.allocator.free(body_mem);
-                    return;
-                }
+            if (!self.isAllowedHost(req_view)) {
+                conn.close_after_write = true;
+                self.cleanupBodyAccumulation(conn);
+                self.queueResponse(conn, badRequestResponse()) catch {};
+                self.allocator.free(body_mem);
+                return;
             }
 
             // Dispatch to router, but check result before queueing to detect echo responses
@@ -2503,25 +2567,10 @@ pub const Server = struct {
 
     /// Dispatch a fully-formed request to the router (extracted for reuse).
     fn dispatchToRouter(self: *Server, conn: *connection.Connection, req_view: request.RequestView, _: std.posix.fd_t) void {
-        // Validate Host header against allowed_hosts if configured
-        if (self.cfg.allowed_hosts.len > 0) {
-            const host_value = req_view.getHeader("Host") orelse "";
-            const host_name = if (std.mem.indexOfScalar(u8, host_value, ':')) |colon|
-                host_value[0..colon]
-            else
-                host_value;
-            var host_allowed = false;
-            for (self.cfg.allowed_hosts) |allowed| {
-                if (std.ascii.eqlIgnoreCase(host_name, allowed)) {
-                    host_allowed = true;
-                    break;
-                }
-            }
-            if (!host_allowed) {
-                conn.close_after_write = true;
-                self.queueResponse(conn, badRequestResponse()) catch {};
-                return;
-            }
+        if (!self.isAllowedHost(req_view)) {
+            conn.close_after_write = true;
+            self.queueResponse(conn, badRequestResponse()) catch {};
+            return;
         }
 
         var mw_ctx = middleware.Context{
