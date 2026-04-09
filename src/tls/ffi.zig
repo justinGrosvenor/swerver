@@ -133,6 +133,209 @@ extern fn SSL_shutdown(ssl: *SSL) c_int;
 extern fn ERR_get_error() c_ulong;
 extern fn ERR_error_string_n(e: c_ulong, buf: [*]u8, len: usize) void;
 
+// ============================================================
+// QUIC TLS callback API (OpenSSL 3.5+, BoringSSL-compatible)
+// ============================================================
+//
+// Lets a third-party QUIC stack drive OpenSSL's TLS 1.3 state machine.
+// Instead of TLS records over a BIO, the QUIC stack feeds raw handshake
+// bytes via crypto_recv_rcd and reads outgoing handshake bytes via
+// crypto_send. Traffic secrets at each protection level are reported
+// via yield_secret. Peer's QUIC transport parameters arrive via
+// got_transport_params (and we set ours via SSL_set_quic_tls_transport_params
+// before SSL_do_handshake).
+//
+// See `man 3ssl SSL_set_quic_tls_cbs` (OpenSSL 3.5+) for the contract.
+
+/// OSSL_DISPATCH function id constants from <openssl/core_dispatch.h>
+pub const OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_SEND: c_int = 2001;
+pub const OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_RECV_RCD: c_int = 2002;
+pub const OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_RELEASE_RCD: c_int = 2003;
+pub const OSSL_FUNC_SSL_QUIC_TLS_YIELD_SECRET: c_int = 2004;
+pub const OSSL_FUNC_SSL_QUIC_TLS_GOT_TRANSPORT_PARAMS: c_int = 2005;
+pub const OSSL_FUNC_SSL_QUIC_TLS_ALERT: c_int = 2006;
+
+/// TLS protection level constants reported by yield_secret.
+/// These match RFC 9001 encryption levels (Initial / 0-RTT / Handshake / Application).
+pub const OSSL_RECORD_PROTECTION_LEVEL_NONE: u32 = 0;
+pub const OSSL_RECORD_PROTECTION_LEVEL_EARLY: u32 = 1;
+pub const OSSL_RECORD_PROTECTION_LEVEL_HANDSHAKE: u32 = 2;
+pub const OSSL_RECORD_PROTECTION_LEVEL_APPLICATION: u32 = 3;
+
+/// Direction passed to yield_secret: 0 = read (decrypt), 1 = write (encrypt).
+pub const OSSL_QUIC_DIRECTION_READ: c_int = 0;
+pub const OSSL_QUIC_DIRECTION_WRITE: c_int = 1;
+
+/// OSSL_DISPATCH entry: a {function_id, function pointer} pair, NULL-terminated.
+pub const OSSL_DISPATCH = extern struct {
+    function_id: c_int,
+    function: ?*const fn () callconv(.c) void,
+};
+
+// Callback function pointer types. All callbacks return 1 on success, 0 on
+// failure. A failure response is fatal to the connection.
+
+pub const QuicTlsCryptoSendFn = *const fn (
+    ssl: *SSL,
+    buf: [*]const u8,
+    buf_len: usize,
+    consumed: *usize,
+    arg: ?*anyopaque,
+) callconv(.c) c_int;
+
+pub const QuicTlsCryptoRecvRcdFn = *const fn (
+    ssl: *SSL,
+    buf: *[*]const u8,
+    bytes_read: *usize,
+    arg: ?*anyopaque,
+) callconv(.c) c_int;
+
+pub const QuicTlsCryptoReleaseRcdFn = *const fn (
+    ssl: *SSL,
+    bytes_read: usize,
+    arg: ?*anyopaque,
+) callconv(.c) c_int;
+
+pub const QuicTlsYieldSecretFn = *const fn (
+    ssl: *SSL,
+    prot_level: u32,
+    direction: c_int,
+    secret: [*]const u8,
+    secret_len: usize,
+    arg: ?*anyopaque,
+) callconv(.c) c_int;
+
+pub const QuicTlsGotTransportParamsFn = *const fn (
+    ssl: *SSL,
+    params: [*]const u8,
+    params_len: usize,
+    arg: ?*anyopaque,
+) callconv(.c) c_int;
+
+pub const QuicTlsAlertFn = *const fn (
+    ssl: *SSL,
+    alert_code: u8,
+    arg: ?*anyopaque,
+) callconv(.c) c_int;
+
+/// A bundle of optional callbacks; pass into buildQuicDispatchTable to get
+/// a NULL-terminated OSSL_DISPATCH array suitable for SSL_set_quic_tls_cbs.
+pub const QuicTlsCallbacks = struct {
+    crypto_send: ?QuicTlsCryptoSendFn = null,
+    crypto_recv_rcd: ?QuicTlsCryptoRecvRcdFn = null,
+    crypto_release_rcd: ?QuicTlsCryptoReleaseRcdFn = null,
+    yield_secret: ?QuicTlsYieldSecretFn = null,
+    got_transport_params: ?QuicTlsGotTransportParamsFn = null,
+    alert: ?QuicTlsAlertFn = null,
+};
+
+/// Maximum number of OSSL_DISPATCH entries (6 callbacks + terminator).
+pub const QUIC_DISPATCH_MAX_ENTRIES: usize = 7;
+
+extern fn SSL_set_quic_tls_cbs(
+    ssl: *SSL,
+    qtdis: [*]const OSSL_DISPATCH,
+    arg: ?*anyopaque,
+) c_int;
+
+extern fn SSL_set_quic_tls_transport_params(
+    ssl: *SSL,
+    params: [*]const u8,
+    params_len: usize,
+) c_int;
+
+extern fn SSL_set_quic_tls_early_data_enabled(
+    ssl: *SSL,
+    enabled: c_int,
+) c_int;
+
+/// Populate a NULL-terminated OSSL_DISPATCH table from a QuicTlsCallbacks struct.
+/// `table` must have room for QUIC_DISPATCH_MAX_ENTRIES entries; the storage must
+/// remain valid for the SSL's lifetime (OpenSSL keeps a pointer to it).
+pub fn buildQuicDispatchTable(
+    table: *[QUIC_DISPATCH_MAX_ENTRIES]OSSL_DISPATCH,
+    cbs: QuicTlsCallbacks,
+) void {
+    var idx: usize = 0;
+    if (cbs.crypto_send) |fn_ptr| {
+        table[idx] = .{
+            .function_id = OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_SEND,
+            .function = @ptrCast(fn_ptr),
+        };
+        idx += 1;
+    }
+    if (cbs.crypto_recv_rcd) |fn_ptr| {
+        table[idx] = .{
+            .function_id = OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_RECV_RCD,
+            .function = @ptrCast(fn_ptr),
+        };
+        idx += 1;
+    }
+    if (cbs.crypto_release_rcd) |fn_ptr| {
+        table[idx] = .{
+            .function_id = OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_RELEASE_RCD,
+            .function = @ptrCast(fn_ptr),
+        };
+        idx += 1;
+    }
+    if (cbs.yield_secret) |fn_ptr| {
+        table[idx] = .{
+            .function_id = OSSL_FUNC_SSL_QUIC_TLS_YIELD_SECRET,
+            .function = @ptrCast(fn_ptr),
+        };
+        idx += 1;
+    }
+    if (cbs.got_transport_params) |fn_ptr| {
+        table[idx] = .{
+            .function_id = OSSL_FUNC_SSL_QUIC_TLS_GOT_TRANSPORT_PARAMS,
+            .function = @ptrCast(fn_ptr),
+        };
+        idx += 1;
+    }
+    if (cbs.alert) |fn_ptr| {
+        table[idx] = .{
+            .function_id = OSSL_FUNC_SSL_QUIC_TLS_ALERT,
+            .function = @ptrCast(fn_ptr),
+        };
+        idx += 1;
+    }
+    // NULL terminator
+    table[idx] = .{ .function_id = 0, .function = null };
+}
+
+/// Install QUIC TLS callbacks on an SSL session. The dispatch table and arg
+/// must remain valid for the SSL's lifetime — OpenSSL keeps the pointers.
+/// Switches the SSL to TLS 1.3 record-layer-bypass mode.
+pub fn setQuicTlsCallbacks(
+    ssl: *SSL,
+    dispatch: [*]const OSSL_DISPATCH,
+    arg: ?*anyopaque,
+) !void {
+    if (!tls_enabled) return error.TlsNotAvailable;
+    if (SSL_set_quic_tls_cbs(ssl, dispatch, arg) != 1) {
+        return error.QuicTlsCallbackInstallFailed;
+    }
+}
+
+/// Set the local QUIC transport parameters blob. The bytes must remain valid
+/// until they are sent (i.e. until SSL_do_handshake produces the ClientHello
+/// or ServerHello flight). For a server, this can also be set inside the
+/// got_transport_params callback before the response flight is built.
+pub fn setQuicTlsTransportParams(ssl: *SSL, params: []const u8) !void {
+    if (!tls_enabled) return error.TlsNotAvailable;
+    if (SSL_set_quic_tls_transport_params(ssl, params.ptr, params.len) != 1) {
+        return error.QuicTlsTransportParamsFailed;
+    }
+}
+
+/// Enable or disable TLS 0-RTT (early data) for QUIC.
+pub fn setQuicTlsEarlyDataEnabled(ssl: *SSL, enabled: bool) !void {
+    if (!tls_enabled) return error.TlsNotAvailable;
+    if (SSL_set_quic_tls_early_data_enabled(ssl, if (enabled) 1 else 0) != 1) {
+        return error.QuicTlsEarlyDataFailed;
+    }
+}
+
 // Zig wrapper functions for safer usage
 
 pub fn createContext(is_server: bool) !*SSL_CTX {
@@ -252,6 +455,20 @@ pub fn createSession(ctx: *SSL_CTX, is_server: bool) !*SSL {
     };
 
     SSL_set_bio(ssl, rbio, wbio);
+    return ssl;
+}
+
+/// Create a bare SSL session for QUIC callback mode — no BIOs are set up.
+/// The caller must follow up with SSL_set_quic_tls_cbs (via setQuicTlsCallbacks)
+/// before calling SSL_do_handshake.
+pub fn createBareSession(ctx: *SSL_CTX, is_server: bool) !*SSL {
+    if (!tls_enabled) return error.TlsNotAvailable;
+    const ssl = SSL_new(ctx) orelse return error.SessionCreationFailed;
+    if (is_server) {
+        SSL_set_accept_state(ssl);
+    } else {
+        SSL_set_connect_state(ssl);
+    }
     return ssl;
 }
 

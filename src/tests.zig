@@ -19,6 +19,7 @@ const quic_congestion = @import("quic/congestion.zig");
 const quic_metrics = @import("quic/metrics.zig");
 const http3_frame = @import("protocol/http3/frame.zig");
 const http3_qpack = @import("protocol/http3/qpack.zig");
+const tls_quic_session = @import("tls/quic_session.zig");
 const metrics_mw = @import("middleware/metrics_mw.zig");
 const access_log = @import("middleware/access_log.zig");
 const server = @import("server.zig");
@@ -53,6 +54,7 @@ comptime {
     _ = quic_metrics;
     _ = http3_frame;
     _ = http3_qpack;
+    _ = tls_quic_session;
     _ = metrics_mw;
     _ = access_log;
     _ = server;

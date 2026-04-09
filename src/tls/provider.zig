@@ -1,6 +1,10 @@
 const std = @import("std");
 const ffi = @import("ffi.zig");
 const build_options = @import("build_options");
+pub const quic_session = @import("quic_session.zig");
+pub const QuicState = quic_session.QuicState;
+pub const QuicLevel = quic_session.Level;
+pub const QuicDirection = quic_session.Direction;
 
 /// TLS 1.3 provider for QUIC handshake and key derivation.
 /// Uses OpenSSL/BoringSSL via C FFI.
@@ -60,10 +64,36 @@ pub const Provider = struct {
         ffi.freeContext(self.ctx);
     }
 
-    /// Create a new TLS session for a connection (memory BIO for QUIC).
+    /// Create a new TLS session for a connection (memory BIO — legacy path).
+    /// New QUIC code should use createQuicSession instead, which uses the
+    /// SSL_set_quic_tls_cbs callback API rather than memory BIOs.
     pub fn createSession(self: *Provider, is_server: bool) Error!Session {
         const ssl = ffi.createSession(self.ctx, is_server) catch return error.SessionCreationFailed;
         return Session{ .ssl = ssl, .is_socket = false };
+    }
+
+    /// Create a new TLS session bound to a QuicState callback adapter.
+    /// Allocates and pins a QuicState (the dispatch table inside it must
+    /// outlive the SSL), installs the QUIC TLS callbacks, and returns a
+    /// Session in `quic` mode.
+    ///
+    /// Caller must call deinit on the returned Session, which frees the
+    /// QuicState.
+    pub fn createQuicSession(self: *Provider, is_server: bool) Error!Session {
+        const ssl = ffi.createBareSession(self.ctx, is_server) catch return error.SessionCreationFailed;
+        errdefer ffi.freeSession(ssl);
+
+        const state = QuicState.init(self.allocator) catch return error.SessionCreationFailed;
+        errdefer state.deinit(self.allocator);
+
+        state.install(ssl) catch return error.SessionCreationFailed;
+
+        return Session{
+            .ssl = ssl,
+            .is_socket = false,
+            .quic = state,
+            .quic_allocator = self.allocator,
+        };
     }
 
     /// Create a new TLS session for a TCP socket connection.
@@ -80,6 +110,10 @@ pub const Session = struct {
     ssl: *ffi.SSL,
     is_socket: bool = false,
     handshake_complete: bool = false,
+    /// Set when the session was created via createQuicSession (callback mode).
+    /// The QuicState is heap-pinned and owned by this Session.
+    quic: ?*QuicState = null,
+    quic_allocator: ?std.mem.Allocator = null,
 
     pub const Error = error{
         HandshakeFailed,
@@ -90,6 +124,7 @@ pub const Session = struct {
         WouldBlock,
         ConnectionClosed,
         TlsError,
+        TransportParamsTooLarge,
     };
 
     pub const HandshakeState = enum {
@@ -103,6 +138,56 @@ pub const Session = struct {
             ffi.sslShutdown(self.ssl);
         }
         ffi.freeSession(self.ssl);
+        if (self.quic) |state| {
+            if (self.quic_allocator) |alloc| state.deinit(alloc);
+        }
+    }
+
+    /// Set the local QUIC transport parameters blob. Must be called before
+    /// the first SSL_do_handshake. Only valid in QUIC mode.
+    pub fn setQuicTransportParams(self: *Session, params: []const u8) Error!void {
+        const state = self.quic orelse return error.TlsError;
+        state.setLocalTransportParams(self.ssl, params) catch return error.TransportParamsTooLarge;
+    }
+
+    /// Feed CRYPTO frame bytes received at the given encryption level into
+    /// the TLS state machine. The QUIC stack calls this before doHandshake.
+    pub fn feedQuicCryptoData(self: *Session, level: QuicLevel, data: []const u8) Error!void {
+        const state = self.quic orelse return error.TlsError;
+        state.feedCryptoData(level, data) catch return error.BioWriteFailed;
+    }
+
+    /// Drain pending outgoing CRYPTO bytes at the given encryption level.
+    /// Returns a slice valid until consumeQuicOutgoing is called.
+    pub fn pendingQuicOutgoing(self: *Session, level: QuicLevel) []const u8 {
+        const state = self.quic orelse return &.{};
+        return state.pendingOutgoing(level);
+    }
+
+    pub fn consumeQuicOutgoing(self: *Session, level: QuicLevel, n: usize) void {
+        const state = self.quic orelse return;
+        state.consumeOutgoing(level, n);
+    }
+
+    /// Get the installed traffic secret at (direction, level), or null if
+    /// not yet derived. Used by QUIC to compute packet protection keys.
+    pub fn getQuicSecret(self: *Session, dir: QuicDirection, level: QuicLevel) ?[]const u8 {
+        const state = self.quic orelse return null;
+        return state.getSecret(dir, level);
+    }
+
+    /// Drain the list of (direction, level) tuples for which a secret was
+    /// installed since the last call. Returns count written to `out`.
+    pub fn takePendingQuicSecrets(self: *Session, out: *[8]quic_session.QuicState.SecretReady) usize {
+        const state = self.quic orelse return 0;
+        return state.takePendingSecrets(out);
+    }
+
+    /// The peer's QUIC transport parameters TLV blob (or null if not yet
+    /// received).
+    pub fn peerQuicTransportParams(self: *Session) ?[]const u8 {
+        const state = self.quic orelse return null;
+        return state.peerTransportParams();
     }
 
     /// Accept TLS handshake on a socket connection (server-side).
