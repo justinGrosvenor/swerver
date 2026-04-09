@@ -41,6 +41,10 @@ pub const Server = struct {
     app_router: router.Router,
     listener_fd: ?std.posix.fd_t,
     udp_fd: ?std.posix.fd_t,
+    /// Directory fd for static_root, opened once at init. All per-request file
+    /// lookups use openat() relative to this fd so the root cannot be moved out
+    /// from under us, and so we don't pay realpath cost on the hot path.
+    static_root_fd: ?std.posix.fd_t,
     tcp_tls_provider: ?tls.Provider,
     tls_provider: ?tls.Provider,
     http2_stack: ?http2.Stack,
@@ -105,6 +109,31 @@ pub const Server = struct {
         else
             null;
 
+        // Open static_root as a directory fd once. All per-request file lookups
+        // use openat() relative to this fd, which:
+        //   - eliminates per-request realpath/stat overhead on the hot path,
+        //   - pins the root inode so swapping static_root at the filesystem
+        //     level after startup cannot redirect lookups, and
+        //   - combined with rejecting ".." in file_path and opening the leaf
+        //     with O_NOFOLLOW, contains lookups to the configured directory
+        //     on macOS. On Linux, openat2() with RESOLVE_BENEATH can close
+        //     the intermediate-symlink gap; see queueFileResponse.
+        const static_root_fd: ?std.posix.fd_t = blk: {
+            if (cfg.static_root.len == 0) break :blk null;
+            if (cfg.static_root.len >= 4096) break :blk null;
+            var root_z: [4096]u8 = undefined;
+            @memcpy(root_z[0..cfg.static_root.len], cfg.static_root);
+            root_z[cfg.static_root.len] = 0;
+            var o_flags: std.posix.O = .{ .DIRECTORY = true };
+            if (@hasField(std.posix.O, "CLOEXEC")) o_flags.CLOEXEC = true;
+            const root_z_ptr: [*:0]const u8 = @ptrCast(&root_z);
+            const fd = std.posix.openatZ(std.posix.AT.FDCWD, root_z_ptr, o_flags, 0) catch {
+                std.log.warn("static_root '{s}' could not be opened; static file serving disabled", .{cfg.static_root});
+                break :blk null;
+            };
+            break :blk fd;
+        };
+
         self.* = .{
             .allocator = allocator,
             .cfg = cfg,
@@ -112,6 +141,7 @@ pub const Server = struct {
             .app_router = app_router,
             .listener_fd = null,
             .udp_fd = null,
+            .static_root_fd = static_root_fd,
             .tcp_tls_provider = tcp_tls_provider,
             .tls_provider = tls_provider,
             .http2_stack = http2_stack,
@@ -132,6 +162,7 @@ pub const Server = struct {
         if (self.tcp_tls_provider) |*p| p.deinit();
         if (self.listener_fd) |fd| clock.closeFd(fd);
         if (self.udp_fd) |fd| clock.closeFd(fd);
+        if (self.static_root_fd) |fd| clock.closeFd(fd);
         if (self.quic) |*q| q.deinit();
         self.io.deinit();
     }
@@ -1545,6 +1576,8 @@ pub const Server = struct {
     /// Queue a file response using sendfile for zero-copy transfer.
     /// Sends HTTP headers first, then sets up the connection for sendfile.
     fn queueFileResponse(self: *Server, conn: *connection.Connection, static_root: []const u8, file_path: []const u8, content_type: []const u8) !void {
+        _ = static_root; // No longer used at request time — we use the cached dirfd.
+
         // Reject paths containing percent-encoded sequences to prevent URL-encoded
         // path traversal (e.g., %2e%2e bypassing the ".." check below)
         if (std.mem.indexOfScalar(u8, file_path, '%') != null) {
@@ -1561,24 +1594,37 @@ pub const Server = struct {
             try self.queueResponse(conn, notFoundResponse());
             return;
         }
-
-        // Build full path: static_root + "/" + file_path
-        var path_buf: [4096]u8 = undefined;
-        const full_path_len = static_root.len + 1 + file_path.len;
-        if (full_path_len >= path_buf.len) {
+        // Reject absolute paths — the root is the cached dirfd, not "/"
+        if (file_path.len > 0 and file_path[0] == '/') {
             try self.queueResponse(conn, notFoundResponse());
             return;
         }
-        @memcpy(path_buf[0..static_root.len], static_root);
-        path_buf[static_root.len] = '/';
-        @memcpy(path_buf[static_root.len + 1 ..][0..file_path.len], file_path);
-        path_buf[full_path_len] = 0;
+
+        // Resolve against the cached static_root dirfd. This avoids realpath
+        // on the hot path and pins the root directory against post-startup
+        // renames. If static_root is unset or failed to open at init, serve 404.
+        const root_fd = self.static_root_fd orelse {
+            try self.queueResponse(conn, notFoundResponse());
+            return;
+        };
+
+        // Build null-terminated relative path.
+        var path_buf: [4096]u8 = undefined;
+        if (file_path.len >= path_buf.len) {
+            try self.queueResponse(conn, notFoundResponse());
+            return;
+        }
+        @memcpy(path_buf[0..file_path.len], file_path);
+        path_buf[file_path.len] = 0;
         const path_z: [*:0]const u8 = @ptrCast(&path_buf);
 
-        // Open file using posix APIs — use NOFOLLOW to prevent symlink traversal
+        // Open with NOFOLLOW on the leaf. Intermediate-component symlinks
+        // under static_root can still escape — operators should not place
+        // arbitrary symlinks inside the static tree. Linux-only full
+        // containment via openat2(RESOLVE_BENEATH) is a future enhancement.
         var o_flags: std.posix.O = .{};
         if (@hasField(std.posix.O, "NOFOLLOW")) o_flags.NOFOLLOW = true;
-        const file_fd = std.posix.openatZ(std.posix.AT.FDCWD, path_z, o_flags, 0) catch {
+        const file_fd = std.posix.openatZ(root_fd, path_z, o_flags, 0) catch {
             try self.queueResponse(conn, notFoundResponse());
             return;
         };
