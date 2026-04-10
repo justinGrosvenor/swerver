@@ -433,6 +433,15 @@ pub const EncoderStreamResult = struct {
 /// QPACK Decoder
 pub const Decoder = struct {
     dynamic_table: DynamicTable,
+    /// Upper bound on the dynamic table capacity as advertised in
+    /// the local `SETTINGS_QPACK_MAX_TABLE_CAPACITY`. Peer is
+    /// forbidden from issuing `Set Dynamic Table Capacity` with a
+    /// value that exceeds this, and — when this is 0 — all insert
+    /// and duplicate instructions are forbidden too (RFC 9204 §4.3
+    /// / §2.1.3). Enforcement lives in `processEncoderStream`; any
+    /// violation returns `error.InvalidEncoding`, which propagates
+    /// up to an h3 connection error.
+    max_allowed_capacity: usize,
     /// Decoded headers buffer
     headers: [64]HeaderField = undefined,
     /// Name storage for literals
@@ -449,11 +458,25 @@ pub const Decoder = struct {
     pub fn init(max_table_size: usize) Decoder {
         return .{
             .dynamic_table = DynamicTable.init(max_table_size),
+            .max_allowed_capacity = max_table_size,
         };
     }
 
     /// Process encoder stream instructions (RFC 9204 Section 4.3)
-    /// These instructions update the decoder's dynamic table
+    /// These instructions update the decoder's dynamic table.
+    ///
+    /// Enforces the `max_allowed_capacity` bound captured at init:
+    /// - `Set Dynamic Table Capacity` values that exceed the bound
+    ///   are rejected (RFC 9204 §4.3.1).
+    /// - When the bound is 0, all insert and duplicate instructions
+    ///   are rejected — a peer ignoring our advertised
+    ///   `SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0` cannot sneak
+    ///   entries into our dynamic table. `Set Dynamic Table Capacity
+    ///   0` is still accepted as a no-op acknowledgment.
+    ///
+    /// Any violation returns `error.InvalidEncoding`, which
+    /// `http3.Stack.processQpackEncoderStream` translates into an
+    /// h3 connection error (H3_QPACK_ENCODER_STREAM_ERROR).
     pub fn processEncoderStream(self: *Decoder, data: []const u8) Error!EncoderStreamResult {
         var offset: usize = 0;
         var instructions: usize = 0;
@@ -463,11 +486,13 @@ pub const Decoder = struct {
 
             if ((first_byte & 0x80) != 0) {
                 // 1xxxxxxx - Insert With Name Reference
+                if (self.max_allowed_capacity == 0) return error.InvalidEncoding;
                 const consumed = try self.processInsertNameRef(data[offset..]);
                 offset += consumed;
                 instructions += 1;
             } else if ((first_byte & 0x40) != 0) {
                 // 01xxxxxx - Insert Without Name Reference (literal name)
+                if (self.max_allowed_capacity == 0) return error.InvalidEncoding;
                 const consumed = try self.processInsertLiteral(data[offset..]);
                 offset += consumed;
                 instructions += 1;
@@ -475,10 +500,13 @@ pub const Decoder = struct {
                 // 001xxxxx - Set Dynamic Table Capacity
                 const result = try decodeInteger(data[offset..], 5);
                 offset += result.len;
-                self.dynamic_table.max_size = @intCast(result.value);
+                const new_cap: usize = @intCast(result.value);
+                if (new_cap > self.max_allowed_capacity) return error.InvalidEncoding;
+                self.dynamic_table.max_size = new_cap;
                 instructions += 1;
             } else {
                 // 000xxxxx - Duplicate
+                if (self.max_allowed_capacity == 0) return error.InvalidEncoding;
                 const result = try decodeInteger(data[offset..], 5);
                 offset += result.len;
                 try self.processDuplicate(result.value);

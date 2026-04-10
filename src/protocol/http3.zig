@@ -207,7 +207,15 @@ pub const Stack = struct {
     pub fn init(allocator: std.mem.Allocator, is_server: bool) Stack {
         return .{
             .allocator = allocator,
-            .qpack_decoder = qpack.Decoder.init(4096),
+            // Decoder capacity matches our advertised
+            // SETTINGS_QPACK_MAX_TABLE_CAPACITY. Advertising 0 and
+            // initializing at 4096 is a latent bug — a peer can
+            // ignore SETTINGS and still get us to accept inserts
+            // up to 4096 bytes. With max_allowed_capacity = 0 at
+            // decoder init, `processEncoderStream` rejects any
+            // insert/duplicate instruction and any `Set Capacity`
+            // with a non-zero value.
+            .qpack_decoder = qpack.Decoder.init(0),
             .qpack_encoder = qpack.Encoder.init(4096),
             .peer_control_stream = null,
             .our_control_stream = null,
@@ -1074,6 +1082,65 @@ test "control stream: GOAWAY after SETTINGS accepted (RFC 9114 §7.2.6)" {
     }
     try std.testing.expect(saw_settings);
     try std.testing.expect(saw_goaway);
+}
+
+test "qpack encoder stream: Insert rejected under zero capacity (RFC 9204 §4.3)" {
+    const allocator = std.testing.allocator;
+    var stack = Stack.init(allocator, true);
+    defer stack.deinit();
+
+    // Build a valid Insert With Literal Name instruction using an
+    // untethered Encoder (the Stack's decoder must reject it).
+    var encoder = qpack.Encoder.init(4096);
+    var payload: [256]u8 = undefined;
+    const enc_len = try encoder.buildInsertLiteral(&payload, "x-custom", "value");
+
+    // Claim the peer QPACK encoder stream (client uni id 6) with
+    // the type byte, followed immediately by the Insert instruction.
+    var buf: [260]u8 = undefined;
+    buf[0] = 0x02; // UniStreamType.qpack_encoder
+    @memcpy(buf[1 .. 1 + enc_len], payload[0..enc_len]);
+    const total = 1 + enc_len;
+
+    // The Stack advertises qpack_max_table_capacity = 0, so its
+    // decoder is initialized with max_allowed_capacity = 0 and
+    // processEncoderStream returns error.InvalidEncoding on any
+    // Insert — which the Stack translates to error.QpackError.
+    try std.testing.expectError(error.QpackError, stack.ingest(6, buf[0..total], false));
+}
+
+test "qpack encoder stream: Set Capacity 0 is an accepted no-op" {
+    const allocator = std.testing.allocator;
+    var stack = Stack.init(allocator, true);
+    defer stack.deinit();
+
+    // Build "Set Dynamic Table Capacity 0" — 001xxxxx with 5-bit
+    // prefix value 0, which fits in the prefix → single byte 0x20.
+    var buf: [4]u8 = undefined;
+    buf[0] = 0x02; // UniStreamType.qpack_encoder
+    buf[1] = 0x20; // Set Dynamic Table Capacity 0
+
+    // Should succeed (no-op).
+    _ = try stack.ingest(6, buf[0..2], false);
+    try std.testing.expectEqual(@as(?u64, 6), stack.peer_qpack_encoder);
+}
+
+test "qpack encoder stream: Set Capacity > 0 rejected under zero advertised capacity" {
+    const allocator = std.testing.allocator;
+    var stack = Stack.init(allocator, true);
+    defer stack.deinit();
+
+    // Build "Set Dynamic Table Capacity 2048" via the Encoder helper.
+    var encoder = qpack.Encoder.init(4096);
+    var payload: [16]u8 = undefined;
+    const enc_len = try encoder.buildSetCapacity(&payload, 2048);
+
+    var buf: [32]u8 = undefined;
+    buf[0] = 0x02; // UniStreamType.qpack_encoder
+    @memcpy(buf[1 .. 1 + enc_len], payload[0..enc_len]);
+    const total = 1 + enc_len;
+
+    try std.testing.expectError(error.QpackError, stack.ingest(6, buf[0..total], false));
 }
 
 // Build a minimal h3 HEADERS frame for a request. Writes into `buf`
