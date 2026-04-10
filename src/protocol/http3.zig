@@ -212,9 +212,13 @@ pub const Stack = struct {
     body_storage_used: [16]bool = .{false} ** 16,
 
     pub const Settings = struct {
-        qpack_max_table_capacity: u64 = 4096,
+        // Our QPACK encoder doesn't use the dynamic table yet (everything
+        // is static-or-literal), so advertise 0 capacity / 0 blocked streams.
+        // Until we wire up dynamic-table support, advertising non-zero
+        // values would mislead the peer.
+        qpack_max_table_capacity: u64 = 0,
         max_field_section_size: u64 = 16384,
-        qpack_blocked_streams: u64 = 100,
+        qpack_blocked_streams: u64 = 0,
     };
 
     pub fn init(allocator: std.mem.Allocator, is_server: bool) Stack {

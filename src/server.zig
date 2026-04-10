@@ -515,9 +515,11 @@ pub const Server = struct {
 
         // Send response if any (handshake responses)
         if (result.response) |resp| {
-            _ = net.sendto(udp_fd, resp, recv_result.peer_addr) catch |err| {
-                std.log.debug("Failed to send QUIC response: {}", .{err});
-            };
+            if (resp.len > 0) {
+                _ = net.sendto(udp_fd, resp, recv_result.peer_addr) catch |err| {
+                    std.log.debug("Failed to send QUIC response: {}", .{err});
+                };
+            }
         }
 
         // Process HTTP/3 events (headers, data, end_stream).

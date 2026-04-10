@@ -565,51 +565,92 @@ pub const Connection = struct {
 
     /// Initialize HTTP/3 control streams.
     /// Creates control stream and queues SETTINGS frame.
-    fn initHttp3ControlStreams(self: *Connection) void {
-        // Server uses stream ID 3 for control, client uses stream ID 2
-        // (Unidirectional streams: client=2,6,10..., server=3,7,11...)
-        const control_stream_id: u64 = if (self.is_server) 3 else 2;
+    /// HTTP/3 stream-type bytes (RFC 9114 §6.2 / RFC 9204 §4.2)
+    const H3_STREAM_TYPE_CONTROL: u8 = 0x00;
+    const H3_STREAM_TYPE_PUSH: u8 = 0x01;
+    const H3_STREAM_TYPE_QPACK_ENCODER: u8 = 0x02;
+    const H3_STREAM_TYPE_QPACK_DECODER: u8 = 0x03;
 
-        // Create the control stream
+    /// Per-spec stream IDs for the server's three required unidirectional
+    /// streams. Server-initiated unidirectional stream IDs are of the form
+    /// 4n+3 (RFC 9000 §2.1): 3, 7, 11, 15, ...
+    pub const H3_SERVER_CONTROL_STREAM_ID: u64 = 3;
+    pub const H3_SERVER_QPACK_ENCODER_STREAM_ID: u64 = 7;
+    pub const H3_SERVER_QPACK_DECODER_STREAM_ID: u64 = 11;
+
+    fn initHttp3ControlStreams(self: *Connection) void {
+        if (!self.is_server) return; // client side initialization is a follow-up
+
+        // Open all three required server uni streams. The QPACK encoder
+        // and decoder streams (0x02 / 0x03) must exist per RFC 9204 §4.2;
+        // even if we never use the dynamic table, the type byte must be
+        // delivered or the peer treats the connection as malformed.
+        const stream_ids = [_]u64{
+            H3_SERVER_CONTROL_STREAM_ID,
+            H3_SERVER_QPACK_ENCODER_STREAM_ID,
+            H3_SERVER_QPACK_DECODER_STREAM_ID,
+        };
+        const stream_types = [_]u8{
+            H3_STREAM_TYPE_CONTROL,
+            H3_STREAM_TYPE_QPACK_ENCODER,
+            H3_STREAM_TYPE_QPACK_DECODER,
+        };
+
         if (self.stream_manager) |*mgr| {
-            const ctrl_stream = mgr.getOrCreateStream(control_stream_id) catch return;
-            ctrl_stream.send_max_offset = 65536; // Allow sending
+            for (stream_ids) |sid| {
+                const s = mgr.getOrCreateStream(sid) catch continue;
+                s.send_max_offset = 65536;
+            }
         }
 
-        // Set control stream in HTTP/3 stack and build SETTINGS
         if (self.http3_stack) |*stack| {
-            stack.our_control_stream = control_stream_id;
+            stack.our_control_stream = H3_SERVER_CONTROL_STREAM_ID;
 
-            // Build SETTINGS frame data to queue for sending
-            var settings_buf: [256]u8 = undefined;
+            // Control stream: type byte + SETTINGS frame.
+            var ctrl_buf: [256]u8 = undefined;
+            ctrl_buf[0] = H3_STREAM_TYPE_CONTROL;
+            const settings_len = stack.buildSettings(ctrl_buf[1..]) catch return;
+            const ctrl_total = 1 + settings_len;
 
-            // Control stream type byte (0x00 for control)
-            settings_buf[0] = 0x00;
-            var offset: usize = 1;
-
-            // Build SETTINGS frame
-            const settings_len = stack.buildSettings(settings_buf[offset..]) catch return;
-            offset += settings_len;
-
-            // Queue the control stream data
             if (self.stream_manager) |*mgr| {
-                if (mgr.getStream(control_stream_id)) |ctrl_stream| {
-                    ctrl_stream.send(settings_buf[0..offset], false) catch {};
+                if (mgr.getStream(H3_SERVER_CONTROL_STREAM_ID)) |s| {
+                    s.send(ctrl_buf[0..ctrl_total], false) catch {};
+                }
+            }
+        }
+
+        // QPACK encoder and decoder streams: just the type byte. They'll
+        // remain otherwise empty until we add dynamic-table support.
+        if (self.stream_manager) |*mgr| {
+            for (stream_ids[1..], stream_types[1..]) |sid, st| {
+                if (mgr.getStream(sid)) |s| {
+                    var byte = [_]u8{st};
+                    s.send(byte[0..], false) catch {};
                 }
             }
         }
     }
 
-    /// Get pending control stream data to send
-    pub fn getPendingControlStreamData(self: *Connection) ?struct { stream_id: u64, data: []const u8 } {
-        if (self.http3_stack) |*stack| {
-            if (stack.our_control_stream) |ctrl_id| {
-                if (self.stream_manager) |*mgr| {
-                    if (mgr.getStream(ctrl_id)) |ctrl_stream| {
-                        const data = ctrl_stream.send_buffer.items;
-                        if (data.len > 0) {
-                            return .{ .stream_id = ctrl_id, .data = data };
-                        }
+    /// One pending uni-stream's bytes-on-the-wire. Used by the packet
+    /// builder to drain server-side control / QPACK encoder / QPACK
+    /// decoder streams into STREAM frames.
+    pub const PendingUniStream = struct { stream_id: u64, data: []const u8 };
+
+    /// Get pending bytes for one of the server's three uni streams (control,
+    /// QPACK encoder, QPACK decoder), in the order they should appear on
+    /// the wire. Returns null when none have pending data. Caller copies
+    /// the bytes into a STREAM frame and then calls clearPendingUniStream.
+    pub fn nextPendingUniStream(self: *Connection) ?PendingUniStream {
+        const stream_ids = [_]u64{
+            H3_SERVER_CONTROL_STREAM_ID,
+            H3_SERVER_QPACK_ENCODER_STREAM_ID,
+            H3_SERVER_QPACK_DECODER_STREAM_ID,
+        };
+        if (self.stream_manager) |*mgr| {
+            for (stream_ids) |sid| {
+                if (mgr.getStream(sid)) |s| {
+                    if (s.send_buffer.items.len > 0) {
+                        return .{ .stream_id = sid, .data = s.send_buffer.items };
                     }
                 }
             }
@@ -617,15 +658,12 @@ pub const Connection = struct {
         return null;
     }
 
-    /// Clear pending control stream data after it has been sent
-    pub fn clearPendingControlStreamData(self: *Connection) void {
-        if (self.http3_stack) |*stack| {
-            if (stack.our_control_stream) |ctrl_id| {
-                if (self.stream_manager) |*mgr| {
-                    if (mgr.getStream(ctrl_id)) |ctrl_stream| {
-                        ctrl_stream.send_buffer.clearRetainingCapacity();
-                    }
-                }
+    /// Mark a uni stream's pending bytes as sent. Call after copying the
+    /// bytes into a STREAM frame.
+    pub fn clearPendingUniStream(self: *Connection, stream_id: u64) void {
+        if (self.stream_manager) |*mgr| {
+            if (mgr.getStream(stream_id)) |s| {
+                s.send_buffer.clearRetainingCapacity();
             }
         }
     }
@@ -729,12 +767,14 @@ pub const Connection = struct {
         }
     }
 
-    /// Stub: do we have any HTTP/3 stream data waiting to be flushed in a
-    /// 1-RTT packet? (false until the h3 response path is wired up). For
-    /// now we send 1-RTT packets only when we have an ACK or HANDSHAKE_DONE
-    /// to send, not for stream data.
-    pub fn has1RttPayloadPending(self: *const Connection) bool {
-        _ = self;
+    /// Do we have any HTTP/3 stream data waiting to be flushed in a 1-RTT
+    /// packet? Currently this checks the server's three required uni
+    /// streams (control / QPACK encoder / QPACK decoder), which carry the
+    /// SETTINGS frame and stream-type bytes that the peer needs before it
+    /// will accept any response data. Request-response stream data still
+    /// goes via the older buildStreamPacket path in server.zig.
+    pub fn has1RttPayloadPending(self: *Connection) bool {
+        if (self.nextPendingUniStream()) |_| return true;
         return false;
     }
 

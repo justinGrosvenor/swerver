@@ -866,6 +866,18 @@ fn buildShortPacket(out: []u8, opts: BuildShortPacketOptions) Error!BuildPacketR
         off += written;
     }
 
+    // Drain pending bytes from the server's three required uni streams
+    // (control / QPACK encoder / QPACK decoder). The control stream
+    // carries the SETTINGS frame; the QPACK streams carry just their
+    // type byte (until we add dynamic-table support). The h3 client
+    // (curl/ngtcp2) waits for all three streams to be opened before
+    // accepting response data on request streams.
+    while (conn_ref.nextPendingUniStream()) |uni| {
+        const written = frame.writeStream(out[off..], uni.stream_id, 0, uni.data, false) catch return Error.HandshakeFailed;
+        off += written;
+        conn_ref.clearPendingUniStream(uni.stream_id);
+    }
+
     // Need at least one byte of plaintext (a PING frame, type 0x01) so
     // header protection has a sample to work on. RFC 9001 §5.4.2: the
     // packet must have at least 4 bytes of payload after the packet
