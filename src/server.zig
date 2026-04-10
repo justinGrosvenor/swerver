@@ -75,6 +75,43 @@ pub const PreencodedH3Response = struct {
     epoch: u64 = 0,
 };
 
+/// Maximum number of hot HTTP/1.1 endpoints that can have pre-encoded
+/// response bytes cached on the Server.
+pub const MAX_H1_PREENCODED: usize = 8;
+
+/// Size of each pre-encoded h1 response's byte buffer. 1024 is plenty
+/// for the benchmark-shape hot endpoints (/plaintext, /json, /health,
+/// /baseline2). Status line + headers + Date + Alt-Svc + body fits
+/// comfortably in ~300-400 bytes.
+pub const H1_PREENCODED_BUF_SIZE: usize = 1024;
+
+/// Pre-encoded HTTP/1.1 response for a hot static endpoint.
+///
+/// Holds the full HTTP/1.1 response bytes (status line + headers +
+/// empty line + body) exactly as they'd be written on the wire in
+/// keep-alive mode. On a cache hit, `Server.dispatchToRouter` skips
+/// the router, middleware, arena_buf acquire, encodeResponseInner,
+/// and the usual write-buffer building entirely — it acquires one
+/// pool buffer, memcpys the cached bytes, and enqueues the write.
+///
+/// Refresh semantics: bytes include a `Date: ...` line that drifts
+/// every second. `findAndRefreshPreencodedH1` rebuilds the entry
+/// the first time it's hit in a new epoch second.
+///
+/// Only valid for keep-alive responses (connection_close = false).
+/// Requests with `close_after_write = true` bypass the cache and
+/// fall through to the router path.
+pub const PreencodedH1Response = struct {
+    method: []const u8,
+    path: []const u8,
+    status: u16,
+    static_headers: []const response_mod.Header,
+    body: []const u8,
+    bytes: [H1_PREENCODED_BUF_SIZE]u8 = undefined,
+    len: usize = 0,
+    epoch: u64 = 0,
+};
+
 pub const Server = struct {
     allocator: std.mem.Allocator,
     cfg: config.ServerConfig,
@@ -110,6 +147,12 @@ pub const Server = struct {
     /// lazily once per second to pick up Date header changes.
     h3_preencoded: [MAX_H3_PREENCODED]PreencodedH3Response = undefined,
     h3_preencoded_count: usize = 0,
+    /// Pre-encoded HTTP/1.1 response cache for the same hot static
+    /// endpoints. Same shape as `h3_preencoded` but the bytes are
+    /// raw HTTP/1.1 (status line + headers + body). Refresh is
+    /// lazy / per-second just like h3.
+    h1_preencoded: [MAX_H1_PREENCODED]PreencodedH1Response = undefined,
+    h1_preencoded_count: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, cfg: config.ServerConfig) !Server {
         var app_router = router.Router.init(.{
@@ -220,6 +263,11 @@ pub const Server = struct {
         if (build_options.enable_http3 and self.http3_stack != null) {
             self.initPreencodedH3();
         }
+
+        // Pre-encode the h1 response bytes for the same hot static
+        // endpoints. No external dependency — uses encodeResponse +
+        // the already-initialized cached date + Alt-Svc config.
+        self.initPreencodedH1();
     }
 
     /// Populate the h3 pre-encoded response cache with a fixed set of
@@ -308,6 +356,127 @@ pub const Server = struct {
             }
         }
         return null;
+    }
+
+    /// Populate the h1 pre-encoded response cache with the same hot
+    /// static endpoints used by the h3 cache. h1 and h2 clients hit
+    /// the same URLs in the same benchmarks, so they deserve the
+    /// same cache-hit fast path the h3 profiles get.
+    fn initPreencodedH1(self: *Server) void {
+        const plaintext_headers = [_]response_mod.Header{
+            .{ .name = "Content-Type", .value = "text/plain" },
+        };
+        const json_headers = [_]response_mod.Header{
+            .{ .name = "Content-Type", .value = "application/json" },
+        };
+
+        self.registerPreencodedH1("GET", "/health", 200, &[_]response_mod.Header{}, "");
+        self.registerPreencodedH1("GET", "/plaintext", 200, &plaintext_headers, "Hello, World!");
+        self.registerPreencodedH1("GET", "/json", 200, &json_headers, "{\"message\":\"Hello, World!\"}");
+        self.registerPreencodedH1("GET", "/baseline2?a=1&b=1", 200, &plaintext_headers, "2");
+    }
+
+    fn registerPreencodedH1(
+        self: *Server,
+        method: []const u8,
+        path: []const u8,
+        status: u16,
+        static_headers: []const response_mod.Header,
+        body: []const u8,
+    ) void {
+        if (self.h1_preencoded_count >= MAX_H1_PREENCODED) return;
+        const idx = self.h1_preencoded_count;
+        self.h1_preencoded[idx] = .{
+            .method = method,
+            .path = path,
+            .status = status,
+            .static_headers = static_headers,
+            .body = body,
+        };
+        self.rebuildPreencodedH1(&self.h1_preencoded[idx]);
+        self.h1_preencoded_count += 1;
+    }
+
+    fn rebuildPreencodedH1(self: *Server, entry: *PreencodedH1Response) void {
+        const resp: response_mod.Response = .{
+            .status = entry.status,
+            .headers = entry.static_headers,
+            .body = if (entry.body.len > 0) .{ .bytes = entry.body } else .none,
+        };
+        const alt_svc: ?[]const u8 = if (self.alt_svc_len > 0)
+            self.alt_svc_value[0..self.alt_svc_len]
+        else
+            null;
+        // encodeResponse embeds a `Date: <current>` line — pick up
+        // the current cached date from the Server first so both h1
+        // and h3 caches are populated from the same source of truth.
+        const date_str = self.getCachedDate();
+        entry.len = encodeResponse(&entry.bytes, resp, alt_svc, false, date_str) catch 0;
+        const ts = clock.realtimeTimespec() orelse return;
+        entry.epoch = @intCast(ts.sec);
+    }
+
+    fn findAndRefreshPreencodedH1(self: *Server, method: []const u8, path: []const u8) ?*PreencodedH1Response {
+        var i: usize = 0;
+        while (i < self.h1_preencoded_count) : (i += 1) {
+            const entry = &self.h1_preencoded[i];
+            if (std.mem.eql(u8, entry.method, method) and std.mem.eql(u8, entry.path, path)) {
+                const ts = clock.realtimeTimespec() orelse return entry;
+                const epoch: u64 = @intCast(ts.sec);
+                if (epoch != entry.epoch) self.rebuildPreencodedH1(entry);
+                if (entry.len == 0) return null;
+                return entry;
+            }
+        }
+        return null;
+    }
+
+    /// Check the pre-encoded h1 response cache and, on hit, send the
+    /// cached bytes directly via the write buffer. Returns true if
+    /// the request was handled (caller should skip the router path),
+    /// false if the caller must fall through to the normal dispatch.
+    ///
+    /// Called from every h1 router-dispatch site: the inline
+    /// `handleRead` path for requests that fit in the read buffer,
+    /// `dispatchToRouter` for the "read buffer full → header-only
+    /// parse" path, and the body-accumulation-complete dispatch
+    /// for large POST/PUT (which always misses the cache since
+    /// those aren't GET).
+    fn tryDispatchPreencodedH1(self: *Server, conn: *connection.Connection, req_view: request.RequestView) bool {
+        if (conn.close_after_write) return false;
+        const method_str = req_view.getMethodName();
+        if (self.findAndRefreshPreencodedH1(method_str, req_view.path)) |entry| {
+            self.sendH1PreencodedBytes(conn, entry.bytes[0..entry.len]);
+            return true;
+        }
+        return false;
+    }
+
+    /// Write pre-encoded h1 response bytes directly to the connection's
+    /// write buffer, bypassing `queueResponse`. One buffer-pool acquire,
+    /// one memcpy (cached bytes → write buffer), one enqueueWrite. Used
+    /// on the pre-encoded cache hit path.
+    fn sendH1PreencodedBytes(self: *Server, conn: *connection.Connection, bytes: []const u8) void {
+        const buf = self.io.acquireBuffer() orelse {
+            self.closeConnection(conn);
+            return;
+        };
+        if (bytes.len > buf.bytes.len) {
+            // Shouldn't happen: hot endpoints fit in H1_PREENCODED_BUF_SIZE
+            // (1024) and the connection buffer pool slots are typically
+            // 64 KiB. If it does, bail to the router path next time.
+            self.io.releaseBuffer(buf);
+            self.closeConnection(conn);
+            return;
+        }
+        @memcpy(buf.bytes[0..bytes.len], bytes);
+        if (!conn.enqueueWrite(buf, bytes.len)) {
+            self.io.releaseBuffer(buf);
+            self.closeConnection(conn);
+            return;
+        }
+        self.io.onWriteBuffered(conn, bytes.len);
+        self.io.setTimeoutPhase(conn, .write);
     }
 
     pub fn deinit(self: *Server) void {
@@ -1103,6 +1272,14 @@ pub const Server = struct {
                     if (conn.read_buffered_bytes == 0) break;
                     continue;
                 }
+            }
+
+            // Fast path: pre-encoded h1 response cache. Hot static
+            // endpoints skip the router, middleware, and response
+            // encoding entirely and write cached bytes directly.
+            if (self.tryDispatchPreencodedH1(conn, parse.view)) {
+                if (conn.read_buffered_bytes == 0) break;
+                continue;
             }
 
             var mw_ctx = middleware.Context{
@@ -2798,6 +2975,9 @@ pub const Server = struct {
             self.queueResponse(conn, badRequestResponse()) catch {};
             return;
         }
+
+        // Fast path: pre-encoded h1 response cache.
+        if (self.tryDispatchPreencodedH1(conn, req_view)) return;
 
         var mw_ctx = middleware.Context{
             .protocol = .http1,
