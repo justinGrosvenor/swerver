@@ -1,0 +1,8 @@
+.zig-cache/
+.zig-global-cache/
+zig-out/
+.git/
+node_modules/
+*.log
+.DS_Store
+httparena/.local-test/

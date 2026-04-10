@@ -56,4 +56,4 @@ coverage/
 *.sublime-workspace
 test_getaddrinfo
 .claude
-test
+testhttparena/.local-test/
