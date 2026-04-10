@@ -551,8 +551,56 @@ pub const Handler = struct {
 
     /// Process a STREAM frame
     fn processStreamFrame(conn: *connection.Connection, stream_frame: frame.StreamFrame) Error!void {
-        // Check if this is a NEW peer-initiated bidi stream (client bidi
-        // IDs have id % 4 == 0). If so, track it for MAX_STREAMS emission.
+        // ---- Fast path: single-frame GET with FIN ----
+        //
+        // For the overwhelmingly common case — a new peer-initiated bidi
+        // stream (client GET) that fits entirely in one STREAM frame with
+        // FIN — bypass Stream creation, recv_buffer management, and the
+        // reassembly machinery entirely. Parse h3 frames directly on the
+        // decrypted STREAM frame bytes and let the Stack emit a
+        // RequestReadyEvent inline. This is the path /baseline2 always
+        // takes and where HttpArena's throughput benchmark spends its
+        // time.
+        //
+        // Shape: new stream ID, client-initiated bidi (id % 4 == 0),
+        // offset 0, FIN set.
+        const is_client_bidi = (stream_frame.stream_id % 4 == 0);
+        if (is_client_bidi and stream_frame.offset == 0 and stream_frame.fin) {
+            const is_new = if (conn.stream_manager) |*mgr|
+                mgr.getStream(stream_frame.stream_id) == null
+            else
+                true;
+
+            if (is_new) {
+                // Track for MAX_STREAMS
+                conn.onPeerBidiStreamOpened();
+
+                // Credit connection flow control
+                conn.flow_control.onDataReceived(stream_frame.data.len) catch {
+                    return Error.ProtocolError;
+                };
+
+                // Feed directly to h3 stack — no Stream object needed.
+                // The data slice points into the decrypted packet buffer
+                // and stays valid for the duration of this synchronous
+                // call chain (processPacket → handleDatagram → handler).
+                _ = conn.processHttp3Stream(
+                    stream_frame.stream_id,
+                    stream_frame.data,
+                    true, // FIN
+                ) catch |err| {
+                    std.log.debug("HTTP/3 fast-path failed: stream={} err={}", .{ stream_frame.stream_id, err });
+                };
+                return;
+            }
+        }
+
+        // ---- Slow path: reassembly needed ----
+        //
+        // Multi-frame, out-of-order, or body-bearing requests go through
+        // the full Stream.receive → reassemble → Stack.ingest pipeline.
+
+        // Check if this is a NEW peer-initiated bidi stream.
         const is_new = if (conn.stream_manager) |*mgr|
             mgr.getStream(stream_frame.stream_id) == null
         else
@@ -569,7 +617,7 @@ pub const Handler = struct {
         };
 
         // Track new peer-initiated bidi streams for MAX_STREAMS.
-        if (is_new and stream_frame.stream_id % 4 == 0) {
+        if (is_new and is_client_bidi) {
             conn.onPeerBidiStreamOpened();
         }
 
