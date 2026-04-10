@@ -1025,20 +1025,42 @@ pub const Server = struct {
         // If not accepted, handshake needs more I/O — wait for next event
     }
 
+    /// Maximum datagrams to drain per handleDatagram call before
+    /// yielding back to the event loop. Prevents starvation of TCP
+    /// connections when the UDP socket has a burst of queued packets.
+    const MAX_DATAGRAMS_PER_DRAIN = 64;
+
     fn handleDatagram(self: *Server) !void {
         const udp_fd = self.udp_fd orelse return;
-        var quic = &(self.quic orelse return);
+        const quic = &(self.quic orelse return);
 
-        // Receive datagram
-        const recv_result = net.recvfrom(udp_fd, &self.udp_recv_buf) catch |err| {
-            switch (err) {
-                error.WouldBlock => return,
-                else => return,
-            }
-        };
+        // Drain all available datagrams in one event-loop iteration
+        // (edge-triggered drain). Each recvfrom returns one datagram;
+        // we loop until WouldBlock or the drain cap. This saves re-
+        // entering the event loop per datagram and is the first step
+        // toward recvmmsg batching (PR PERF-2 follow-up).
+        var drained: usize = 0;
+        while (drained < MAX_DATAGRAMS_PER_DRAIN) : (drained += 1) {
+            const recv_result = net.recvfrom(udp_fd, &self.udp_recv_buf) catch |err| {
+                switch (err) {
+                    error.WouldBlock => return,
+                    else => return,
+                }
+            };
+            if (recv_result.bytes_read == 0) return;
 
-        if (recv_result.bytes_read == 0) return;
+            self.processOneDatagram(udp_fd, quic, recv_result);
+        }
+    }
 
+    /// Process a single received UDP datagram through the QUIC stack,
+    /// dispatch any HTTP/3 events, and send any resulting response.
+    fn processOneDatagram(
+        self: *Server,
+        udp_fd: std.posix.fd_t,
+        quic: *quic_handler.Handler,
+        recv_result: net.RecvFromResult,
+    ) void {
         // Convert peer address to our internal format (zero-init to avoid undefined bytes)
         var peer_addr: quic_handler.connection_pool.SockAddrStorage = undefined;
         @memset(std.mem.asBytes(&peer_addr), 0);
@@ -1183,15 +1205,23 @@ pub const Server = struct {
         self.sendHttp3ResponseBytes(udp_fd, conn, stream_id, peer_addr, encoded_response_buf[0..resp_len]);
     }
 
+    /// GSO segment size — the maximum UDP payload we pad each QUIC
+    /// packet to when batching via `sendGso`. 1280 is the QUIC minimum
+    /// MTU; every segment except the last is padded to this size so the
+    /// kernel can split the buffer evenly.
+    const GSO_SEGMENT_SIZE: u16 = 1280;
+
     /// Send already-encoded h3 response bytes over the wire for a
     /// given QUIC stream. Splits into MTU-sized chunks and feeds each
     /// chunk through the unified `quic.handler::buildShortPacket`
     /// builder (PR PERF-0). Shared hot-path / cold-path helper.
     ///
-    /// QUIC packet overhead: 1 (header) + 20 (max CID) + 4 (max PN) +
-    /// ~10 (frame header) + 16 (AEAD tag) ≈ 51 bytes. Use a
-    /// conservative 1200-byte max payload to stay within the 1280-
-    /// byte QUIC minimum MTU.
+    /// On Linux with GSO support, all packets are built contiguously
+    /// into a batch buffer and sent in a single `sendmsg()` syscall
+    /// with `UDP_SEGMENT`. This eliminates N-1 syscalls for multi-
+    /// packet responses (e.g., a 10 KiB response = ~8 packets = 1
+    /// syscall instead of 8). On macOS or non-GSO kernels, falls
+    /// back to one `sendto()` per packet.
     fn sendHttp3ResponseBytes(
         self: *Server,
         udp_fd: std.posix.fd_t,
@@ -1203,14 +1233,47 @@ pub const Server = struct {
         _ = self;
         const keys = conn.crypto_ctx.application.server orelse return;
         const max_stream_payload = 1200;
-        var stream_offset: u64 = 0;
-        var remaining = h3_bytes;
-        while (remaining.len > 0) {
-            const chunk_len = @min(remaining.len, max_stream_payload);
-            const is_last = (chunk_len == remaining.len);
+
+        // Fast path: single packet — no batching needed.
+        if (h3_bytes.len <= max_stream_payload) {
             var packet_buf: [2048]u8 = undefined;
             const built = quic_handler.buildShortPacket(
                 &packet_buf,
+                .{
+                    .conn = conn,
+                    .keys = &keys,
+                    .stream_data = .{
+                        .stream_id = stream_id,
+                        .offset = 0,
+                        .data = h3_bytes,
+                        .fin = true,
+                    },
+                },
+            ) catch return;
+            _ = net.sendto(udp_fd, packet_buf[0..built.bytes_written], peer_addr) catch return;
+            return;
+        }
+
+        // Multi-packet path: build all packets into a contiguous batch
+        // buffer. On Linux, send via GSO in one syscall. On other
+        // platforms, send each packet individually.
+        //
+        // Max batch: 65536 / 1280 = 51 segments. More than enough for
+        // even large responses. If the response exceeds the batch
+        // buffer, flush mid-way and start a new batch.
+        var batch_buf: [65536]u8 = undefined;
+        var batch_offset: usize = 0;
+        var stream_offset: u64 = 0;
+        var remaining = h3_bytes;
+        var pkt_count: usize = 0;
+
+        while (remaining.len > 0) {
+            const chunk_len = @min(remaining.len, max_stream_payload);
+            const is_last = (chunk_len == remaining.len);
+
+            // Build the packet into the batch buffer at the current offset.
+            const built = quic_handler.buildShortPacket(
+                batch_buf[batch_offset..],
                 .{
                     .conn = conn,
                     .keys = &keys,
@@ -1223,12 +1286,73 @@ pub const Server = struct {
                 },
             ) catch return;
 
-            _ = net.sendto(udp_fd, packet_buf[0..built.bytes_written], peer_addr) catch |err| {
-                std.log.debug("Failed to send HTTP/3 response: {}", .{err});
-                return;
-            };
+            // Pad non-final packets to the GSO segment size so the
+            // kernel splits evenly. Final packet can be shorter.
+            if (!is_last and built.bytes_written < GSO_SEGMENT_SIZE) {
+                const pad = GSO_SEGMENT_SIZE - built.bytes_written;
+                if (batch_offset + GSO_SEGMENT_SIZE <= batch_buf.len) {
+                    @memset(batch_buf[batch_offset + built.bytes_written .. batch_offset + built.bytes_written + pad], 0);
+                }
+                batch_offset += GSO_SEGMENT_SIZE;
+            } else {
+                batch_offset += built.bytes_written;
+            }
+            pkt_count += 1;
             remaining = remaining[chunk_len..];
             stream_offset += chunk_len;
+
+            // If the batch buffer is nearly full, flush now and start
+            // a new batch. (Safety margin: leave room for one more
+            // max-sized packet.)
+            if (!is_last and batch_offset + GSO_SEGMENT_SIZE > batch_buf.len) {
+                flushGsoBatch(udp_fd, batch_buf[0..batch_offset], peer_addr, pkt_count);
+                batch_offset = 0;
+                pkt_count = 0;
+            }
+        }
+
+        // Flush whatever remains in the batch buffer.
+        if (batch_offset > 0) {
+            flushGsoBatch(udp_fd, batch_buf[0..batch_offset], peer_addr, pkt_count);
+        }
+    }
+
+    /// Flush a batch of contiguously-built QUIC packets. Tries GSO
+    /// first (one `sendmsg` syscall for all packets on Linux). Falls
+    /// back to one `sendto` per GSO_SEGMENT_SIZE chunk on macOS or
+    /// if GSO fails.
+    fn flushGsoBatch(
+        udp_fd: std.posix.fd_t,
+        buf: []const u8,
+        peer: net.SockAddrStorage,
+        pkt_count: usize,
+    ) void {
+        if (buf.len == 0) return;
+
+        // Single packet — sendto is sufficient.
+        if (pkt_count <= 1) {
+            _ = net.sendto(udp_fd, buf, peer) catch return;
+            return;
+        }
+
+        // Try GSO. On macOS this compiles to a plain sendto (no GSO
+        // support), which will likely fail for oversized buffers, so
+        // we fall through to the per-packet loop. On Linux, sendGso
+        // uses sendmsg + UDP_SEGMENT to send the whole batch in one
+        // syscall.
+        if (net.sendGso(udp_fd, buf, peer, GSO_SEGMENT_SIZE)) |_| {
+            return; // GSO succeeded — all packets sent in one call.
+        } else |_| {
+            // GSO failed — fall through to per-packet loop.
+        }
+
+        // Per-packet fallback: split the batch buffer into segments
+        // and send each one individually.
+        var offset: usize = 0;
+        while (offset < buf.len) {
+            const end = @min(offset + GSO_SEGMENT_SIZE, buf.len);
+            _ = net.sendto(udp_fd, buf[offset..end], peer) catch return;
+            offset = end;
         }
     }
 

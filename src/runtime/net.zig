@@ -252,6 +252,160 @@ pub fn sendto(fd: std.posix.fd_t, buf: []const u8, peer: SockAddrStorage) UdpErr
     return @intCast(rc);
 }
 
+/// Linux UDP GSO (Generic Segmentation Offload) via UDP_SEGMENT.
+///
+/// Sends a large buffer as multiple same-segment-sized UDP datagrams
+/// in a single `sendmsg()` syscall. The kernel splits the buffer into
+/// `segment_size`-byte datagrams; the last datagram may be shorter.
+///
+/// On platforms without UDP GSO (macOS, older Linux), falls back to
+/// sending one datagram of the full buffer. The caller is responsible
+/// for ensuring the buffer is correctly structured for either path.
+///
+/// Returns the number of bytes accepted by the kernel (which may be
+/// less than `buf.len` under backpressure).
+pub fn sendGso(
+    fd: std.posix.fd_t,
+    buf: []const u8,
+    peer: SockAddrStorage,
+    segment_size: u16,
+) UdpError!usize {
+    if (!isSupportedPlatform()) return error.SendFailed;
+
+    const sockaddr_ptr: *const std.posix.sockaddr = switch (peer) {
+        .ip4 => |*sa| @ptrCast(sa),
+        .ip6 => |*sa| @ptrCast(sa),
+    };
+    const addr_len: std.posix.socklen_t = switch (peer) {
+        .ip4 => @intCast(@sizeOf(SockAddrIn)),
+        .ip6 => @intCast(@sizeOf(SockAddrIn6)),
+    };
+
+    // On Linux, use sendmsg + cmsg(SOL_UDP, UDP_SEGMENT) for GSO.
+    if (comptime builtin.os.tag == .linux) {
+        return sendGsoLinux(fd, buf, sockaddr_ptr, addr_len, segment_size);
+    }
+
+    // Fallback: send as a single datagram (no segmentation).
+    // The caller should only pass a single packet's worth of data on
+    // non-GSO platforms, or loop externally.
+    const rc = std.posix.system.sendto(
+        fd,
+        buf.ptr,
+        buf.len,
+        0,
+        sockaddr_ptr,
+        addr_len,
+    );
+    if (rc < 0) {
+        switch (std.posix.errno(rc)) {
+            .AGAIN, .INTR => return error.WouldBlock,
+            else => return error.SendFailed,
+        }
+    }
+    return @intCast(rc);
+}
+
+/// Linux-specific GSO sendmsg implementation.
+fn sendGsoLinux(
+    fd: std.posix.fd_t,
+    buf: []const u8,
+    sockaddr_ptr: *const std.posix.sockaddr,
+    addr_len: std.posix.socklen_t,
+    segment_size: u16,
+) UdpError!usize {
+    if (comptime builtin.os.tag != .linux) return error.SendFailed;
+
+    const SOL_UDP = 17;
+    const UDP_SEGMENT = 103;
+
+    var iov = [_]std.posix.iovec_const{.{
+        .base = buf.ptr,
+        .len = buf.len,
+    }};
+
+    // Build cmsg manually for portability across Zig stdlib versions.
+    // cmsghdr on Linux: { usize len, c_int level, c_int type } then
+    // the payload (u16 segment_size), padded to usize alignment.
+    // Use a generous 32-byte buffer which covers every 64-bit alignment.
+    var cmsg_buf: [32]u8 align(8) = [_]u8{0} ** 32;
+    var cmsg_off: usize = 0;
+
+    // cmsg_len (usize): header size + payload size (no alignment tail)
+    const hdr_size = @sizeOf(usize) + @sizeOf(c_int) + @sizeOf(c_int);
+    const cmsg_len: usize = hdr_size + @sizeOf(u16);
+    @memcpy(cmsg_buf[cmsg_off..][0..@sizeOf(usize)], std.mem.asBytes(&cmsg_len));
+    cmsg_off += @sizeOf(usize);
+
+    // cmsg_level (c_int): SOL_UDP
+    const level: c_int = SOL_UDP;
+    @memcpy(cmsg_buf[cmsg_off..][0..@sizeOf(c_int)], std.mem.asBytes(&level));
+    cmsg_off += @sizeOf(c_int);
+
+    // cmsg_type (c_int): UDP_SEGMENT
+    const cmsg_type: c_int = UDP_SEGMENT;
+    @memcpy(cmsg_buf[cmsg_off..][0..@sizeOf(c_int)], std.mem.asBytes(&cmsg_type));
+    cmsg_off += @sizeOf(c_int);
+
+    // payload (u16): segment size
+    @memcpy(cmsg_buf[cmsg_off..][0..@sizeOf(u16)], std.mem.asBytes(&segment_size));
+    cmsg_off += @sizeOf(u16);
+
+    // Round up to usize alignment for controllen
+    const controllen: usize = (cmsg_off + @alignOf(usize) - 1) & ~(@as(usize, @alignOf(usize)) - 1);
+
+    const msg = std.posix.msghdr_const{
+        .name = sockaddr_ptr,
+        .namelen = addr_len,
+        .iov = &iov,
+        .iovlen = 1,
+        .control = &cmsg_buf,
+        .controllen = controllen,
+        .flags = 0,
+    };
+
+    const rc = std.posix.system.sendmsg(fd, &msg, 0);
+    if (rc < 0) {
+        const e = std.posix.errno(rc);
+        switch (e) {
+            .AGAIN, .INTR => return error.WouldBlock,
+            // EIO / EINVAL can mean the kernel doesn't support GSO on
+            // this socket. Caller should fall back to individual sends.
+            .IO, .INVAL => return error.SendFailed,
+            else => return error.SendFailed,
+        }
+    }
+    return @intCast(rc);
+}
+
+/// CMSG_ALIGN: round up to the alignment of usize (usually 8 on 64-bit).
+fn cmsgAlign(len: usize) usize {
+    const mask: usize = @alignOf(usize) - 1;
+    return (len + mask) & ~mask;
+}
+
+/// Check at runtime whether the current platform supports UDP GSO.
+/// On macOS this is always false; on Linux it's true if the kernel
+/// accepts the UDP_SEGMENT socket option.
+pub fn supportsGso() bool {
+    if (comptime builtin.os.tag != .linux) return false;
+    // Quick probe: try setting UDP_SEGMENT on a throwaway socket.
+    const SOL_UDP = 17;
+    const UDP_SEGMENT = 103;
+    const fd = std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP);
+    if (fd < 0) return false;
+    defer clock.closeFd(fd);
+    var val: u16 = 1280;
+    const rc = std.posix.system.setsockopt(
+        fd,
+        SOL_UDP,
+        UDP_SEGMENT,
+        @ptrCast(&val),
+        @sizeOf(u16),
+    );
+    return rc == 0;
+}
+
 fn buildSockaddr(address: std.Io.net.IpAddress) SockAddrStorage {
     return switch (address) {
         .ip4 => |ip4| .{ .ip4 = buildSockaddr4(ip4) },
