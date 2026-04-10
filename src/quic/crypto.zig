@@ -454,6 +454,18 @@ pub fn unprotectPayload(
 /// Full packet protection: protect header and encrypt payload.
 /// Input packet format: [header][plaintext_payload]
 /// Output format: [protected_header][ciphertext][tag]
+///
+/// The AEAD encryption runs in-place: the plaintext at
+/// `packet_bytes[header_len..packet_len]` is overwritten with
+/// ciphertext of the same length, and the authentication tag is
+/// appended at `packet_bytes[packet_len..packet_len+AEAD_TAG_LEN]`.
+/// The caller's buffer must therefore have at least
+/// `packet_len + AEAD_TAG_LEN` bytes of capacity.
+///
+/// This avoids the pre-PR-PERF-4 pattern of allocating a 64 KiB
+/// stack scratch and copying the ciphertext back — one memcpy and
+/// ~64 KiB of L1-cache thrash eliminated per encrypt. See
+/// `docs/design/8.0-h3-performance-plan.md` PR PERF-4.
 pub fn protectPacket(
     keys: *const Keys,
     packet_number: u64,
@@ -464,17 +476,25 @@ pub fn protectPacket(
     packet_len: usize,
 ) Error!usize {
     if (packet_len < header_len) return error.BufferTooSmall;
+    // Need room for the AEAD tag after the plaintext.
+    if (packet_bytes.len < packet_len + AEAD_TAG_LEN) return error.BufferTooSmall;
 
     const header = packet_bytes[0..header_len];
-    const plaintext = packet_bytes[header_len..packet_len];
+    const plaintext_len = packet_len - header_len;
 
-    // Encrypt payload in-place (need temp buffer for tag)
-    var ciphertext_buf: [65536]u8 = undefined;
-    const ciphertext_len = try protectPayload(keys, packet_number, header, plaintext, &ciphertext_buf);
-
-    // Copy ciphertext back
-    if (header_len + ciphertext_len > packet_bytes.len) return error.BufferTooSmall;
-    @memcpy(packet_bytes[header_len .. header_len + ciphertext_len], ciphertext_buf[0..ciphertext_len]);
+    // Encrypt in-place: `out` and `plaintext` overlap on the same
+    // bytes. Aes128Gcm supports this (verified by the "AEAD in-place
+    // encrypt/decrypt — dst.ptr == src.ptr is safe" test below).
+    // We pass `plaintext` as a slice of the same region we're
+    // writing to; protectPayload's internal `Aes128Gcm.encrypt` call
+    // handles src == dst correctly.
+    const ciphertext_len = try protectPayload(
+        keys,
+        packet_number,
+        header,
+        packet_bytes[header_len .. header_len + plaintext_len],
+        packet_bytes[header_len .. header_len + plaintext_len + AEAD_TAG_LEN],
+    );
 
     // Apply header protection
     const sample_offset = getSampleOffset(pn_offset);
@@ -492,6 +512,17 @@ pub fn protectPacket(
 /// Full packet unprotection: remove header protection and decrypt payload.
 /// Input format: [protected_header][ciphertext][tag]
 /// Output format: [header][plaintext_payload]
+///
+/// The AEAD decryption runs in-place: the ciphertext at
+/// `packet_bytes[header_len..packet_len]` is overwritten with the
+/// recovered plaintext. The tag at the tail of the ciphertext is
+/// captured into a local before decrypt runs (unprotectPayload does
+/// this), so there's no read-after-write hazard.
+///
+/// Pre-PR-PERF-4 this function allocated a 64 KiB stack scratch,
+/// decrypted into it, then memcpy'd back. That's eliminated now —
+/// one memcpy and ~64 KiB of L1-cache thrash gone per decrypt. See
+/// `docs/design/8.0-h3-performance-plan.md` PR PERF-4.
 pub fn unprotectPacket(
     keys: *const Keys,
     largest_pn: u64,
@@ -530,14 +561,18 @@ pub fn unprotectPacket(
 
     // Header ends after packet number
     const header_len = pn_offset + pn_len;
-    const ciphertext = packet_bytes[header_len..packet_len];
 
-    // Decrypt payload
-    var plaintext_buf: [65536]u8 = undefined;
-    const payload_len = try unprotectPayload(keys, full_pn, packet_bytes[0..header_len], ciphertext, &plaintext_buf);
-
-    // Copy plaintext back
-    @memcpy(packet_bytes[header_len .. header_len + payload_len], plaintext_buf[0..payload_len]);
+    // Decrypt in-place: both `ciphertext` and `out` slice the same
+    // region of `packet_bytes`. unprotectPayload extracts the tag
+    // into a local before the Aes128Gcm.decrypt call, so no
+    // read-after-write hazard. Aes128Gcm supports src == dst.
+    const payload_len = try unprotectPayload(
+        keys,
+        full_pn,
+        packet_bytes[0..header_len],
+        packet_bytes[header_len..packet_len],
+        packet_bytes[header_len..packet_len],
+    );
 
     return .{
         .pn = full_pn,
@@ -867,4 +902,41 @@ test "AEAD authentication failure" {
     // Decrypt should fail
     var decrypted: [128]u8 = undefined;
     try std.testing.expectError(error.AuthenticationFailed, unprotectPayload(&keys, pn, &header, ciphertext[0..ct_len], &decrypted));
+}
+
+test "AEAD in-place encrypt/decrypt — dst.ptr == src.ptr is safe" {
+    // PR PERF-4 premise check: the refactored protectPacket /
+    // unprotectPacket pass `out = packet_bytes[header_len..]` directly
+    // to the inner AEAD primitives, overlapping with the source
+    // slice. This test locks in that std.crypto.aead.aes_gcm.Aes128Gcm
+    // supports that overlap end-to-end. If this test ever starts
+    // failing, the outer wrappers need to fall back to a per-worker
+    // scratch buffer instead.
+    const key = [_]u8{0x2a} ** 16;
+    const iv = [_]u8{0x5c} ** 12;
+    const hp = [_]u8{0x71} ** 16;
+    const keys = Keys.init128(key, iv, hp);
+
+    const header = [_]u8{ 0xc0, 0x00, 0x00, 0x01, 0x05, 0x42 };
+    const pn: u64 = 42;
+    const plaintext = "Hello in-place QUIC payload — this must round-trip cleanly through dst==src.";
+
+    // Encrypt in-place: allocate a buffer big enough for plaintext +
+    // tag, copy plaintext into it, then encrypt with src == dst on
+    // the plaintext portion. The tag is appended by protectPayload.
+    var buf: [256]u8 = undefined;
+    @memcpy(buf[0..plaintext.len], plaintext);
+    const ct_len = try protectPayload(&keys, pn, &header, buf[0..plaintext.len], buf[0 .. plaintext.len + AEAD_TAG_LEN]);
+    try std.testing.expectEqual(plaintext.len + AEAD_TAG_LEN, ct_len);
+
+    // The first `plaintext.len` bytes of buf are now ciphertext, and
+    // the next 16 bytes are the tag. Verify they differ from the
+    // original plaintext (encryption actually happened).
+    try std.testing.expect(!std.mem.eql(u8, buf[0..plaintext.len], plaintext));
+
+    // Decrypt in-place: pass the same ciphertext slice as both src
+    // and dst. The plaintext should overwrite the ciphertext bytes.
+    const pt_len = try unprotectPayload(&keys, pn, &header, buf[0..ct_len], buf[0..plaintext.len]);
+    try std.testing.expectEqual(plaintext.len, pt_len);
+    try std.testing.expectEqualStrings(plaintext, buf[0..pt_len]);
 }
