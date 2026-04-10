@@ -1225,58 +1225,85 @@ pub const Server = struct {
                 return;
             }
             self.io.onReadConsumed(conn, ingest.consumed_bytes);
+
+            // Pending headers table: h2 POST/PUT with a body sends a
+            // HEADERS frame (end_stream=false) followed by one or more
+            // DATA frames. We stash the headers here and match them
+            // up with the next DATA(end_stream=true) for the same
+            // stream_id so the router sees a complete request with
+            // a non-empty body. Before this PR, the .data arm was
+            // `_ = data;` and body-bearing requests were silently
+            // dropped — visible on the Mixed GET+POST benchmark
+            // where swerver was at 12K vs actix's 33K.
+            //
+            // Scope: single-ingest-batch. For small POST bodies
+            // (curl-sized, benchmark-sized) the HEADERS and DATA
+            // frames fit in one TCP read and one ingest call, so
+            // they're both in this events array together. Large
+            // POST bodies that span multiple TCP reads still fall
+            // through to 501 — tracked as a follow-up alongside
+            // Connection-level pending state.
+            var pending_headers: [16]?http2.HeadersEvent = [_]?http2.HeadersEvent{null} ** 16;
+            var pending_count: usize = 0;
+
             for (events[0..ingest.event_count]) |event| {
                 switch (event) {
                     .headers => |hdr| {
-                        var resp: response_mod.Response = undefined;
                         if (!self.isAllowedHost(hdr.request)) {
-                            resp = badRequestResponse();
+                            try self.queueHttp2Response(conn, hdr.stream_id, badRequestResponse(), hdr.request.method == .HEAD);
                         } else if (hdr.end_stream) {
-                            var mw_ctx = middleware.Context{
-                                .protocol = .http2,
-                                .is_tls = conn.is_tls,
-                                .stream_id = hdr.stream_id,
-                                .buffer_ops = .{
-                                    .ctx = &self.io,
-                                    .acquire = acquireBufferOpaque,
-                                    .release = releaseBufferOpaque,
-                                },
-                            };
-                            // Use cached client IP for rate limiting and logging
-                            if (conn.cached_peer_ip) |ip4| {
-                                mw_ctx.client_ip = ip4;
-                            } else if (conn.cached_peer_ip6) |ip6| {
-                                mw_ctx.client_ip6 = ip6;
-                            }
-                            var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
-                            var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
-                            const arena_handle = self.io.acquireBuffer();
-                            var empty_arena: [0]u8 = undefined;
-                            const arena_buf = if (arena_handle) |handle| handle.bytes else empty_arena[0..];
-                            var scratch = router.HandlerScratch{
-                                .response_buf = response_buf[0..],
-                                .response_headers = response_headers[0..],
-                                .arena_buf = arena_buf,
-                                .arena_handle = arena_handle,
-                                .buffer_ops = mw_ctx.buffer_ops,
-                            };
-                            const result = self.app_router.handle(hdr.request, &mw_ctx, &scratch);
-                            if (scratch.arena_handle) |handle| self.io.releaseBuffer(handle);
-                            if (result.pause_reads_ms) |pause_ms| {
-                                conn.setRateLimitPause(self.io.nowMs(), pause_ms);
-                            }
-                            resp = result.resp;
+                            // GET/HEAD/DELETE or any no-body request —
+                            // dispatch immediately, no body needed.
+                            try self.dispatchHttp2Request(conn, hdr.stream_id, hdr.request, "");
                         } else {
-                            resp = response_mod.Response{
-                                .status = 501,
-                                .headers = &[_]response_mod.Header{},
-                                .body = .{ .bytes = "Not Implemented\n" },
-                            };
+                            // Body-bearing request. Stash the HEADERS
+                            // until a matching DATA(end_stream=true)
+                            // arrives in this batch.
+                            if (pending_count < pending_headers.len) {
+                                pending_headers[pending_count] = hdr;
+                                pending_count += 1;
+                            } else {
+                                // Pending table full — fall back to
+                                // the legacy 501 path for this stream.
+                                try self.queueHttp2Response(conn, hdr.stream_id, notImplementedResponse(), hdr.request.method == .HEAD);
+                            }
                         }
-                        try self.queueHttp2Response(conn, hdr.stream_id, resp, hdr.request.method == .HEAD);
                     },
-                    .data => |data| {
-                        _ = data;
+                    .data => |data_ev| {
+                        // Find matching stashed HEADERS for this stream_id.
+                        var matched: ?usize = null;
+                        var i: usize = 0;
+                        while (i < pending_count) : (i += 1) {
+                            if (pending_headers[i]) |p| {
+                                if (p.stream_id == data_ev.stream_id) {
+                                    matched = i;
+                                    break;
+                                }
+                            }
+                        }
+                        if (matched) |idx| {
+                            const hdr_opt = pending_headers[idx];
+                            pending_headers[idx] = null;
+                            if (hdr_opt) |hdr| {
+                                if (data_ev.end_stream) {
+                                    // Single-DATA-frame body complete —
+                                    // dispatch the request with the body slice.
+                                    // DataEvent.data is a slice into the
+                                    // connection's read buffer, valid for the
+                                    // synchronous handler call.
+                                    try self.dispatchHttp2Request(conn, hdr.stream_id, hdr.request, data_ev.data);
+                                } else {
+                                    // Multi-DATA-frame body not supported in
+                                    // this fix. Return 501 instead of silently
+                                    // buffering across DATA events.
+                                    try self.queueHttp2Response(conn, hdr.stream_id, notImplementedResponse(), hdr.request.method == .HEAD);
+                                }
+                            }
+                        }
+                        // Data frame with no matching pending HEADERS: drop.
+                        // Either the headers were already dispatched (impossible
+                        // for a well-formed client, HEADERS come before DATA) or
+                        // the pending table was full. Either way nothing to do.
                     },
                     .settings => |settings_event| {
                         if (!settings_event.ack) {
@@ -2207,6 +2234,68 @@ pub const Server = struct {
             .headers = &[_]response_mod.Header{},
             .body = .{ .bytes = "Bad Request\n" },
         };
+    }
+
+    fn notImplementedResponse() response_mod.Response {
+        return .{
+            .status = 501,
+            .headers = &[_]response_mod.Header{},
+            .body = .{ .bytes = "Not Implemented\n" },
+        };
+    }
+
+    /// Dispatch an HTTP/2 request to the router and queue its response.
+    /// Shared helper for the HEADERS-only and HEADERS+DATA dispatch
+    /// paths in handleHttp2Read. `body` is an empty slice for GET/HEAD
+    /// requests or a slice into the connection's read buffer for
+    /// POST/PUT requests (valid for the duration of this synchronous
+    /// call).
+    fn dispatchHttp2Request(
+        self: *Server,
+        conn: *connection.Connection,
+        stream_id: u32,
+        hdr_request: request.RequestView,
+        body: []const u8,
+    ) !void {
+        var mw_ctx = middleware.Context{
+            .protocol = .http2,
+            .is_tls = conn.is_tls,
+            .stream_id = stream_id,
+            .buffer_ops = .{
+                .ctx = &self.io,
+                .acquire = acquireBufferOpaque,
+                .release = releaseBufferOpaque,
+            },
+        };
+        if (conn.cached_peer_ip) |ip4| {
+            mw_ctx.client_ip = ip4;
+        } else if (conn.cached_peer_ip6) |ip6| {
+            mw_ctx.client_ip6 = ip6;
+        }
+        // Inject the body into the request view. HEADERS events from
+        // the h2 stack carry request.body = "" because the body arrives
+        // in separate DATA frames; we patch it here at dispatch time.
+        var request_with_body = hdr_request;
+        request_with_body.body = body;
+
+        var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
+        var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
+        const arena_handle = self.io.acquireBuffer();
+        var empty_arena: [0]u8 = undefined;
+        const arena_buf = if (arena_handle) |handle| handle.bytes else empty_arena[0..];
+        var scratch = router.HandlerScratch{
+            .response_buf = response_buf[0..],
+            .response_headers = response_headers[0..],
+            .arena_buf = arena_buf,
+            .arena_handle = arena_handle,
+            .buffer_ops = mw_ctx.buffer_ops,
+        };
+        const result = self.app_router.handle(request_with_body, &mw_ctx, &scratch);
+        if (scratch.arena_handle) |handle| self.io.releaseBuffer(handle);
+        if (result.pause_reads_ms) |pause_ms| {
+            conn.setRateLimitPause(self.io.nowMs(), pause_ms);
+        }
+        try self.queueHttp2Response(conn, stream_id, result.resp, hdr_request.method == .HEAD);
     }
 
     /// Guess Content-Type from file extension
