@@ -1020,9 +1020,14 @@ pub const Connection = struct {
         // Initialize HTTP/3 control streams
         self.initHttp3ControlStreams();
 
-        // Discard Initial and Handshake keys
+        // Discard Initial and Handshake keys per RFC 9001 §4.9.
+        // Null both the space-level keys AND the crypto_ctx keyset so
+        // the send/receive paths can no longer decrypt or produce
+        // packets at these encryption levels.
         self.initial_space.keys = null;
         self.handshake_space.keys = null;
+        self.crypto_ctx.initial = .{ .client = null, .server = null };
+        self.crypto_ctx.handshake = .{ .client = null, .server = null };
     }
 
     /// Initiate connection close

@@ -624,7 +624,9 @@ pub const Handler = struct {
         const want_initial = initial_keys_opt != null and (initial_crypto.len > 0 or conn.initial_space.ack_needed);
         const want_handshake = handshake_keys_opt != null and (handshake_crypto.len > 0 or conn.handshake_space.ack_needed);
         const want_one_rtt = application_keys_opt != null and conn.state == .connected and
-            (conn.application_space.ack_needed or !conn.handshake_done_sent or conn.has1RttPayloadPending());
+            (conn.application_space.ack_needed or !conn.handshake_done_sent or
+            conn.has1RttPayloadPending() or conn.needsMaxData() or
+            conn.getStreamNeedingFlowControl() != null or conn.hasPendingPathResponse());
 
         // Pre-handshake datagrams must be padded to 1200 bytes (RFC 9000
         // §14.1). After handshake-complete this no longer applies.
@@ -980,6 +982,35 @@ pub fn buildShortPacket(out: []u8, opts: BuildShortPacketOptions) Error!BuildPac
         const written = frame.writeStream(out[off..], uni.stream_id, 0, uni.data, false) catch return Error.HandshakeFailed;
         off += written;
         conn_ref.clearPendingUniStream(uni.stream_id);
+    }
+
+    // ---- Transport control frames (RFC 9000 §19) ----
+    //
+    // These are computed lazily by Connection when flow-control
+    // thresholds are crossed or PATH_CHALLENGE is received, but they
+    // were never emitted on the wire until now.
+
+    // MAX_DATA: grow the connection-level receive window.
+    if (conn_ref.needsMaxData()) {
+        const written = conn_ref.buildMaxDataFrame(out[off..]) catch 0;
+        off += written;
+    }
+
+    // MAX_STREAM_DATA: grow per-stream receive windows.
+    // Emit up to 4 per packet to limit frame bloat.
+    {
+        var max_sd_count: usize = 0;
+        while (max_sd_count < 4) : (max_sd_count += 1) {
+            const sid = conn_ref.getStreamNeedingFlowControl() orelse break;
+            const written = conn_ref.buildMaxStreamDataFrame(out[off..], sid) catch break;
+            off += written;
+        }
+    }
+
+    // PATH_RESPONSE: reply to a received PATH_CHALLENGE.
+    if (conn_ref.takePendingPathResponse()) |path_data| {
+        const written = frame.writePathResponse(out[off..], path_data) catch 0;
+        off += written;
     }
 
     // Optional response STREAM frame for the h3 data path. The Server

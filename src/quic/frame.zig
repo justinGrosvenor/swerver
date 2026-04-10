@@ -813,6 +813,23 @@ pub fn writeMaxStreamData(buf: []u8, stream_id: u64, max_data: u64) WriteError!u
     return off;
 }
 
+/// Write a MAX_STREAMS frame (type 0x12 for bidi, 0x13 for uni)
+pub fn writeMaxStreams(buf: []u8, max_streams: u64, bidirectional: bool) WriteError!usize {
+    var off: usize = 0;
+    const frame_type: u64 = if (bidirectional) 0x12 else 0x13;
+    off += try varint.encode(buf[off..], frame_type);
+    off += try varint.encode(buf[off..], max_streams);
+    return off;
+}
+
+/// Write a PATH_RESPONSE frame (type 0x1b, 8-byte payload)
+pub fn writePathResponse(buf: []u8, data: [8]u8) WriteError!usize {
+    if (buf.len < 9) return error.BufferTooSmall;
+    buf[0] = 0x1b;
+    @memcpy(buf[1..9], &data);
+    return 9;
+}
+
 /// Write a HANDSHAKE_DONE frame
 /// Returns bytes written
 pub fn writeHandshakeDone(buf: []u8) WriteError!usize {

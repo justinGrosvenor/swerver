@@ -287,14 +287,34 @@ pub const ConnectionPool = struct {
         }
     }
 
-    /// Clean up closed and timed-out connections
+    /// Clean up closed and timed-out connections. Connections in the
+    /// draining state are retained until their draining period expires
+    /// (3 × PTO per RFC 9000 §10.2) — this prevents the peer from
+    /// sending packets to a CID we've already freed.
     pub fn cleanup(self: *ConnectionPool) void {
         var i: usize = 0;
         while (i < self.entries.items.len) {
             const entry = self.entries.items[i];
             const conn = entry.conn;
 
-            if (!conn.isAlive() or conn.isIdleTimedOut()) {
+            const should_remove = blk: {
+                if (conn.isIdleTimedOut()) break :blk true;
+                if (conn.state == .closed) break :blk true;
+                // Draining connections must wait for the draining period
+                // to expire before removal (RFC 9000 §10.2.2).
+                if (conn.state == .draining) {
+                    break :blk conn.isDrainingComplete();
+                }
+                // Closing connections: we've sent CONNECTION_CLOSE. Keep
+                // them until the draining timer runs out too so retransmits
+                // of the close frame don't re-create the connection.
+                if (conn.state == .closing) {
+                    break :blk conn.isDrainingComplete();
+                }
+                break :blk false;
+            };
+
+            if (should_remove) {
                 // Remove from indices
                 _ = self.by_cid.remove(.{ .cid = conn.our_cid });
                 _ = self.by_cid.remove(.{ .cid = entry.original_dcid });
