@@ -185,6 +185,14 @@ pub const Stack = struct {
     header_count: usize = 0,
     /// Is server?
     is_server: bool,
+    /// Cached IMF-fixdate string for the Date response header,
+    /// refreshed once per Unix epoch second. Mirrors h1's
+    /// Server.getCachedDate pattern. Saves ~100 cycles per response
+    /// on the cold h3 path. The hot path (PR PERF-3 pre-encoded
+    /// cache) bakes the Date into its cached bytes and refreshes
+    /// those independently.
+    cached_date: [29]u8 = undefined,
+    cached_date_epoch: u64 = 0,
 
     pub const Settings = struct {
         // Our QPACK encoder doesn't use the dynamic table yet (everything
@@ -674,10 +682,13 @@ pub const Stack = struct {
             all_headers[header_count] = .{ .name = lc_name, .value = h.value };
             header_count += 1;
         }
-        // RFC 9110 §6.6.1: Origin servers MUST send Date header (except 1xx)
-        var date_buf: [29]u8 = undefined;
+        // RFC 9110 §6.6.1: Origin servers MUST send Date header (except 1xx).
+        // Served from the per-Stack cache; refreshed once per Unix
+        // epoch second. Pre-PR PERF-3-followup this called
+        // formatImfDateHttp3 on every response, costing ~100 cycles
+        // per request for modular arithmetic over the Unix timestamp.
         if (status >= 200) {
-            const date_str = formatImfDateHttp3(&date_buf);
+            const date_str = self.getCachedDate();
             all_headers[header_count] = .{ .name = "date", .value = date_str };
             header_count += 1;
         }
@@ -756,10 +767,11 @@ pub const Stack = struct {
                     all_headers[header_count] = h;
                     header_count += 1;
                 }
-                // RFC 9110 §6.6.1: Date header (except 1xx)
-                var date_buf: [29]u8 = undefined;
+                // RFC 9110 §6.6.1: Date header (except 1xx).
+                // Uses the Stack's per-second cached date — same
+                // path the main encodeResponse takes.
                 if (self.status >= 200) {
-                    const date_str = formatImfDateHttp3(&date_buf);
+                    const date_str = self.stack.getCachedDate();
                     all_headers[header_count] = .{ .name = "date", .value = date_str };
                     header_count += 1;
                 }
@@ -814,6 +826,21 @@ pub const Stack = struct {
         return frame.writeSettingsFrame(buf, &params) catch error.BufferTooSmall;
     }
 
+    /// Return the cached IMF-fixdate string, refreshing once per
+    /// Unix epoch second. Used by `encodeResponse` to stamp every
+    /// 2xx/3xx/4xx/5xx response with a Date header without paying
+    /// the modular-arithmetic cost on every request. Equivalent to
+    /// `Server.getCachedDate` in h1/h2 but lives on the Stack so
+    /// every QUIC connection carries its own tiny (37-byte) cache.
+    pub fn getCachedDate(self: *Stack) []const u8 {
+        const ts = clock.realtimeTimespec() orelse return "Thu, 01 Jan 1970 00:00:00 GMT";
+        const epoch_secs: u64 = @intCast(ts.sec);
+        if (epoch_secs != self.cached_date_epoch) {
+            _ = formatImfDateHttp3(&self.cached_date);
+            self.cached_date_epoch = epoch_secs;
+        }
+        return self.cached_date[0..29];
+    }
 };
 
 // Tests
