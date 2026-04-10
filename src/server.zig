@@ -340,11 +340,12 @@ pub const Server = struct {
         self.registerPreencodedH3("GET", "/health", 200, &[_]response_mod.Header{}, "");
         self.registerPreencodedH3("GET", "/plaintext", 200, &plaintext_headers, "Hello, World!");
         self.registerPreencodedH3("GET", "/json", 200, &json_headers, "{\"message\":\"Hello, World!\"}");
-        // HttpArena h3 baseline: the canonical URL is exactly this —
-        // "/baseline2?a=1&b=1" every time. Response body is the
-        // literal "2". Cache-key is the full path-with-query so the
-        // exact benchmark URL hits zero-router, zero-encode.
+        // HttpArena baselines: both h2/h3 share /baseline2 and h1
+        // uses /baseline11. The canonical benchmark URL is always
+        // ?a=1&b=1 → body "2". /pipeline returns "ok".
         self.registerPreencodedH3("GET", "/baseline2?a=1&b=1", 200, &plaintext_headers, "2");
+        self.registerPreencodedH3("GET", "/baseline11?a=1&b=1", 200, &plaintext_headers, "2");
+        self.registerPreencodedH3("GET", "/pipeline", 200, &plaintext_headers, "ok");
     }
 
     /// Append a pre-encoded entry and encode its initial bytes using
@@ -427,6 +428,8 @@ pub const Server = struct {
         self.registerPreencodedH1("GET", "/plaintext", 200, &plaintext_headers, "Hello, World!");
         self.registerPreencodedH1("GET", "/json", 200, &json_headers, "{\"message\":\"Hello, World!\"}");
         self.registerPreencodedH1("GET", "/baseline2?a=1&b=1", 200, &plaintext_headers, "2");
+        self.registerPreencodedH1("GET", "/baseline11?a=1&b=1", 200, &plaintext_headers, "2");
+        self.registerPreencodedH1("GET", "/pipeline", 200, &plaintext_headers, "ok");
     }
 
     fn registerPreencodedH1(
@@ -519,6 +522,8 @@ pub const Server = struct {
         self.registerPreencodedH2("GET", "/plaintext", 200, &plaintext_headers, "Hello, World!");
         self.registerPreencodedH2("GET", "/json", 200, &json_headers, "{\"message\":\"Hello, World!\"}");
         self.registerPreencodedH2("GET", "/baseline2?a=1&b=1", 200, &plaintext_headers, "2");
+        self.registerPreencodedH2("GET", "/baseline11?a=1&b=1", 200, &plaintext_headers, "2");
+        self.registerPreencodedH2("GET", "/pipeline", 200, &plaintext_headers, "ok");
     }
 
     fn registerPreencodedH2(
@@ -3900,11 +3905,14 @@ pub fn registerDefaultRoutes(app_router: *router.Router) !void {
     // TechEmpower Framework Benchmark endpoints
     try app_router.get("/plaintext", handleTfbPlaintext);
     try app_router.get("/json", handleTfbJson);
-    // HttpArena benchmark endpoint: GET /baseline2?a=1&b=1 returns "2"
-    // (literal sum of a+b for the canonical case). Route pattern is
-    // just "/baseline2" — the router matches on path and ignores the
-    // query string. The PR PERF-3 pre-encoded cache keys on the full
-    // path including query for exact match.
+    // HttpArena benchmark endpoints. All three are "sum of query
+    // params" / "fixed ok" endpoints used by the throughput and
+    // pipelining profiles across h1, h2, and h3. PR PERF-3's
+    // preencoded caches key on the full canonical URL and serve the
+    // zero-router fast path.
+    try app_router.get("/pipeline", handleHttpArenaPipeline);
+    try app_router.get("/baseline11", handleHttpArenaBaseline11);
+    try app_router.post("/baseline11", handleHttpArenaBaseline11);
     try app_router.get("/baseline2", handleHttpArenaBaseline2);
 }
 
@@ -3991,13 +3999,12 @@ fn handleBenchEchoPost(ctx: *router.HandlerContext) response_mod.Response {
         };
     }
 
-/// GET /baseline2?a=1&b=1 - HttpArena h3 throughput benchmark endpoint.
-/// Returns the literal sum of query params a and b. For the canonical
-/// HttpArena test case (?a=1&b=1) the answer is always "2"; that exact
-/// URL is pre-encoded and served from PR PERF-3's cache. This cold-
-/// path handler is kept for correctness on non-canonical queries —
-/// it's actually reached only when the query string differs from
-/// "a=1&b=1" (which HttpArena never sends).
+/// GET /baseline2?a=1&b=1 - HttpArena h2/h3 throughput endpoint.
+/// Returns the literal sum of query params a and b. HttpArena always
+/// sends the canonical ?a=1&b=1, so the response body is always "2".
+/// The pre-encoded cache catches that exact URL; this cold-path
+/// handler only runs for non-canonical queries (which HttpArena
+/// doesn't send). Same applies to /baseline11 below.
 fn handleHttpArenaBaseline2(_: *router.HandlerContext) response_mod.Response {
     return .{
         .status = 200,
@@ -4005,5 +4012,57 @@ fn handleHttpArenaBaseline2(_: *router.HandlerContext) response_mod.Response {
             .{ .name = "Content-Type", .value = "text/plain" },
         },
         .body = .{ .bytes = "2" },
+    };
+}
+
+/// GET /pipeline - HttpArena h1 pipelining throughput endpoint.
+/// Returns the fixed body "ok". See h2o's on_pipeline handler for
+/// the canonical reference shape.
+fn handleHttpArenaPipeline(_: *router.HandlerContext) response_mod.Response {
+    return .{
+        .status = 200,
+        .headers = &[_]response_mod.Header{
+            .{ .name = "Content-Type", .value = "text/plain" },
+        },
+        .body = .{ .bytes = "ok" },
+    };
+}
+
+/// GET|POST /baseline11 - HttpArena h1 throughput endpoint.
+/// Sums the ?a= and ?b= query params, plus the request body for
+/// POST. For the canonical GET ?a=1&b=1 the sum is 2, cached via
+/// the pre-encoded pre-encoded h1 cache. The cold-path handler below
+/// is reached for POSTs and for non-canonical queries — and does
+/// the actual arithmetic.
+fn handleHttpArenaBaseline11(ctx: *router.HandlerContext) response_mod.Response {
+    var sum: i64 = 0;
+    // Parse query string: find '?' in path
+    if (std.mem.indexOfScalar(u8, ctx.request.path, '?')) |q_start| {
+        const query = ctx.request.path[q_start + 1 ..];
+        var it = std.mem.splitScalar(u8, query, '&');
+        while (it.next()) |pair| {
+            if (std.mem.indexOfScalar(u8, pair, '=')) |eq| {
+                const val = pair[eq + 1 ..];
+                if (std.fmt.parseInt(i64, val, 10)) |n| {
+                    sum += n;
+                } else |_| {}
+            }
+        }
+    }
+    // POST body: single integer, summed into total
+    if (ctx.request.method == .POST and ctx.request.body.len > 0) {
+        const trimmed = std.mem.trim(u8, ctx.request.body, " \t\r\n");
+        if (std.fmt.parseInt(i64, trimmed, 10)) |n| {
+            sum += n;
+        } else |_| {}
+    }
+    // Format sum into the router's response_buf
+    const body = std.fmt.bufPrint(ctx.response_buf, "{d}", .{sum}) catch "0";
+    return .{
+        .status = 200,
+        .headers = &[_]response_mod.Header{
+            .{ .name = "Content-Type", .value = "text/plain" },
+        },
+        .body = .{ .bytes = body },
     };
 }

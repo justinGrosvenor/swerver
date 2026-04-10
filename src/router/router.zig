@@ -580,7 +580,18 @@ pub const Router = struct {
         _ = self;
         ctx.param_count = 0;
 
-        var path_it = std.mem.splitScalar(u8, path, '/');
+        // Strip the query string before segment matching. RFC 3986
+        // §3.3: the path ends at the first `?` or `#`. Pre-this-fix
+        // the router did literal segment compare on the full
+        // request-target so `/baseline2?a=1&b=1` failed to match
+        // a route registered as `/baseline2`.
+        const path_only = blk: {
+            if (std.mem.indexOfScalar(u8, path, '?')) |q| break :blk path[0..q];
+            if (std.mem.indexOfScalar(u8, path, '#')) |f| break :blk path[0..f];
+            break :blk path;
+        };
+
+        var path_it = std.mem.splitScalar(u8, path_only, '/');
         var seg_idx: u8 = 0;
 
         while (path_it.next()) |path_seg| {
