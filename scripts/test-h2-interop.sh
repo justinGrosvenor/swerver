@@ -148,6 +148,7 @@ check /health                  200 ""
 check /echo                    200 '{"status":"ok"}'
 check /plaintext               200 "Hello, World!"
 check /json                    200 '{"message":"Hello, World!"}'
+check "/baseline2?a=1&b=1"     200 "2"
 check_post /echo "hello h2 body"        200 "hello h2 body"
 check_post /echo "{\"msg\":\"ship it\"}" 200 "{\"msg\":\"ship it\"}"
 

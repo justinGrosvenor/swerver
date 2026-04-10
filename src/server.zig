@@ -112,6 +112,48 @@ pub const PreencodedH1Response = struct {
     epoch: u64 = 0,
 };
 
+pub const MAX_H2_PREENCODED: usize = 8;
+pub const H2_PREENCODED_BUF_SIZE: usize = 512;
+
+/// Pre-encoded HTTP/2 response for a hot static endpoint.
+///
+/// Layout of `bytes[0..len]` (the wire template):
+///
+///     [HEADERS frame header (9 bytes)]
+///     [HPACK-encoded response header block]
+///     if body present:
+///         [DATA frame header (9 bytes)]
+///         [body bytes]
+///
+/// The HEADERS frame header's flags are pre-baked: `0x5`
+/// (END_HEADERS | END_STREAM) when the response has no body,
+/// `0x4` (END_HEADERS) when a DATA frame follows. The DATA frame
+/// header (when present) has flags `0x1` (END_STREAM).
+///
+/// Stream IDs are patched at send time — the HEADERS frame's
+/// stream_id is at byte offset 5, and the DATA frame's stream_id
+/// (if present) is at byte offset `data_offset + 5`. All other
+/// bytes are stable per-second and are shared across every concurrent
+/// h2 stream hitting the same endpoint.
+///
+/// Refresh is lazy / per-second just like the h1 and h3 caches —
+/// the HPACK block embeds a Date header value that drifts, so
+/// `findAndRefreshPreencodedH2` re-runs the h2 encoder when it
+/// notices an epoch second change.
+pub const PreencodedH2Response = struct {
+    method: []const u8,
+    path: []const u8,
+    status: u16,
+    static_headers: []const response_mod.Header,
+    body: []const u8,
+    bytes: [H2_PREENCODED_BUF_SIZE]u8 = undefined,
+    len: usize = 0,
+    /// Offset of the DATA frame's stream_id byte range in `bytes`.
+    /// Zero when `body.len == 0` (no DATA frame emitted).
+    data_offset: u32 = 0,
+    epoch: u64 = 0,
+};
+
 pub const Server = struct {
     allocator: std.mem.Allocator,
     cfg: config.ServerConfig,
@@ -153,6 +195,12 @@ pub const Server = struct {
     /// lazy / per-second just like h3.
     h1_preencoded: [MAX_H1_PREENCODED]PreencodedH1Response = undefined,
     h1_preencoded_count: usize = 0,
+    /// Pre-encoded HTTP/2 response cache. Holds a stream-id-agnostic
+    /// template — HEADERS frame header + HPACK block + optional DATA
+    /// frame header + body. Send-time patches stream_id bytes in
+    /// place and enqueues the write.
+    h2_preencoded: [MAX_H2_PREENCODED]PreencodedH2Response = undefined,
+    h2_preencoded_count: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, cfg: config.ServerConfig) !Server {
         var app_router = router.Router.init(.{
@@ -268,6 +316,11 @@ pub const Server = struct {
         // endpoints. No external dependency — uses encodeResponse +
         // the already-initialized cached date + Alt-Svc config.
         self.initPreencodedH1();
+
+        // Pre-encode the h2 response templates. Uses http2.encodeResponseHeaders
+        // to build a stream-id-agnostic HPACK block + frame headers that
+        // are patched per-request.
+        if (build_options.enable_http2) self.initPreencodedH2();
     }
 
     /// Populate the h3 pre-encoded response cache with a fixed set of
@@ -450,6 +503,174 @@ pub const Server = struct {
             return true;
         }
         return false;
+    }
+
+    /// Populate the h2 pre-encoded response cache with the same hot
+    /// static endpoints used by h1 and h3.
+    fn initPreencodedH2(self: *Server) void {
+        const plaintext_headers = [_]response_mod.Header{
+            .{ .name = "Content-Type", .value = "text/plain" },
+        };
+        const json_headers = [_]response_mod.Header{
+            .{ .name = "Content-Type", .value = "application/json" },
+        };
+
+        self.registerPreencodedH2("GET", "/health", 200, &[_]response_mod.Header{}, "");
+        self.registerPreencodedH2("GET", "/plaintext", 200, &plaintext_headers, "Hello, World!");
+        self.registerPreencodedH2("GET", "/json", 200, &json_headers, "{\"message\":\"Hello, World!\"}");
+        self.registerPreencodedH2("GET", "/baseline2?a=1&b=1", 200, &plaintext_headers, "2");
+    }
+
+    fn registerPreencodedH2(
+        self: *Server,
+        method: []const u8,
+        path: []const u8,
+        status: u16,
+        static_headers: []const response_mod.Header,
+        body: []const u8,
+    ) void {
+        if (self.h2_preencoded_count >= MAX_H2_PREENCODED) return;
+        const idx = self.h2_preencoded_count;
+        self.h2_preencoded[idx] = .{
+            .method = method,
+            .path = path,
+            .status = status,
+            .static_headers = static_headers,
+            .body = body,
+        };
+        self.rebuildPreencodedH2(&self.h2_preencoded[idx]);
+        self.h2_preencoded_count += 1;
+    }
+
+    /// Rebuild the h2 response template for `entry`. Runs HPACK
+    /// encoding over the static headers + current cached Date and
+    /// lays down the HEADERS (+ optional DATA) frame headers with
+    /// stream_id = 0 placeholders. Stream IDs are patched at send
+    /// time.
+    fn rebuildPreencodedH2(self: *Server, entry: *PreencodedH2Response) void {
+        // Build headers_with_alt_svc array just like queueHttp2Response
+        // does — the cache must match what the cold path would emit.
+        var headers_with_alt_svc: [65]response_mod.Header = undefined;
+        var header_count: usize = entry.static_headers.len;
+        if (header_count > headers_with_alt_svc.len) {
+            entry.len = 0;
+            return;
+        }
+        for (entry.static_headers, 0..) |h, i| headers_with_alt_svc[i] = h;
+        if (self.alt_svc_len > 0 and header_count < headers_with_alt_svc.len) {
+            headers_with_alt_svc[header_count] = .{
+                .name = "alt-svc",
+                .value = self.alt_svc_value[0..self.alt_svc_len],
+            };
+            header_count += 1;
+        }
+
+        // HPACK-encode the response headers into bytes[9..] (leaving
+        // room for the HEADERS frame header at bytes[0..9]).
+        const hpack_dst = entry.bytes[9..];
+        const hpack_len = http2.encodeResponseHeaders(hpack_dst, entry.status, headers_with_alt_svc[0..header_count], entry.body.len) catch {
+            entry.len = 0;
+            return;
+        };
+
+        // HEADERS frame header. Flags: END_HEADERS always; add
+        // END_STREAM when there's no DATA frame following. stream_id
+        // placeholder (0) — patched at send time.
+        const headers_flags: u8 = if (entry.body.len == 0) 0x5 else 0x4;
+        http2.writeFrameHeader(entry.bytes[0..9], .headers, headers_flags, 0, hpack_len) catch {
+            entry.len = 0;
+            return;
+        };
+
+        if (entry.body.len == 0) {
+            entry.len = 9 + hpack_len;
+            entry.data_offset = 0;
+        } else {
+            const data_off = 9 + hpack_len;
+            if (data_off + 9 + entry.body.len > entry.bytes.len) {
+                entry.len = 0;
+                return;
+            }
+            // DATA frame header with END_STREAM.
+            http2.writeFrameHeader(entry.bytes[data_off .. data_off + 9], .data, 0x1, 0, entry.body.len) catch {
+                entry.len = 0;
+                return;
+            };
+            @memcpy(entry.bytes[data_off + 9 .. data_off + 9 + entry.body.len], entry.body);
+            entry.len = data_off + 9 + entry.body.len;
+            entry.data_offset = @intCast(data_off);
+        }
+
+        const ts = clock.realtimeTimespec() orelse return;
+        entry.epoch = @intCast(ts.sec);
+    }
+
+    fn findAndRefreshPreencodedH2(self: *Server, method: []const u8, path: []const u8) ?*PreencodedH2Response {
+        var i: usize = 0;
+        while (i < self.h2_preencoded_count) : (i += 1) {
+            const entry = &self.h2_preencoded[i];
+            if (std.mem.eql(u8, entry.method, method) and std.mem.eql(u8, entry.path, path)) {
+                const ts = clock.realtimeTimespec() orelse return entry;
+                const epoch: u64 = @intCast(ts.sec);
+                if (epoch != entry.epoch) self.rebuildPreencodedH2(entry);
+                if (entry.len == 0) return null;
+                return entry;
+            }
+        }
+        return null;
+    }
+
+    /// Write pre-encoded h2 response bytes for `stream_id` — acquires
+    /// a pool buffer, copies the template, patches both frame headers'
+    /// stream_id bytes in place, enqueues the write, and closes the
+    /// h2 stream. Mirrors the flow at the end of `queueHttp2Response`
+    /// but without re-running HPACK encoding or header building.
+    fn sendH2PreencodedBytes(
+        self: *Server,
+        conn: *connection.Connection,
+        stream_id: u32,
+        entry: *const PreencodedH2Response,
+    ) void {
+        const out = self.io.acquireBuffer() orelse {
+            self.closeConnection(conn);
+            return;
+        };
+        if (entry.len > out.bytes.len) {
+            self.io.releaseBuffer(out);
+            self.closeConnection(conn);
+            return;
+        }
+        @memcpy(out.bytes[0..entry.len], entry.bytes[0..entry.len]);
+
+        // Patch HEADERS frame stream_id (bytes 5..9).
+        patchH2StreamId(out.bytes[0..9], stream_id);
+        // Patch DATA frame stream_id (if present).
+        if (entry.data_offset != 0) {
+            const off = entry.data_offset;
+            patchH2StreamId(out.bytes[off .. off + 9], stream_id);
+        }
+
+        if (!conn.enqueueWrite(out, entry.len)) {
+            self.io.releaseBuffer(out);
+            self.closeConnection(conn);
+            return;
+        }
+        self.io.onWriteBuffered(conn, entry.len);
+        self.io.setTimeoutPhase(conn, .write);
+
+        // Release the stream state — the h2 stack's per-stream
+        // tracking would otherwise leak.
+        if (conn.http2_stack) |stack| stack.closeStream(stream_id);
+    }
+
+    /// Write a stream_id into the reserved-bit + 31-bit stream_id
+    /// field of an h2 frame header (bytes 5..9). Top bit of byte 5
+    /// is the R bit, which MUST be 0 on send per RFC 9113 §4.1.
+    fn patchH2StreamId(frame_header: []u8, stream_id: u32) void {
+        frame_header[5] = @intCast((stream_id >> 24) & 0x7f);
+        frame_header[6] = @intCast((stream_id >> 16) & 0xff);
+        frame_header[7] = @intCast((stream_id >> 8) & 0xff);
+        frame_header[8] = @intCast(stream_id & 0xff);
     }
 
     /// Write pre-encoded h1 response bytes directly to the connection's
@@ -1430,8 +1651,15 @@ pub const Server = struct {
                             try self.queueHttp2Response(conn, hdr.stream_id, badRequestResponse(), hdr.request.method == .HEAD);
                         } else if (hdr.end_stream) {
                             // GET/HEAD/DELETE or any no-body request —
-                            // dispatch immediately, no body needed.
-                            try self.dispatchHttp2Request(conn, hdr.stream_id, hdr.request, "");
+                            // hot endpoints skip the router via the
+                            // pre-encoded cache; otherwise dispatch
+                            // normally.
+                            const method_str = hdr.request.getMethodName();
+                            if (self.findAndRefreshPreencodedH2(method_str, hdr.request.path)) |entry| {
+                                self.sendH2PreencodedBytes(conn, hdr.stream_id, entry);
+                            } else {
+                                try self.dispatchHttp2Request(conn, hdr.stream_id, hdr.request, "");
+                            }
                         } else {
                             // Body-bearing request. Stash the HEADERS
                             // until a matching DATA(end_stream=true)
