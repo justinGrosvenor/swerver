@@ -157,7 +157,7 @@ pub const Recovery = struct {
         self.lost_packets.deinit(self.allocator);
     }
 
-    fn getState(self: *Recovery, space: types.PacketNumberSpace) *PnSpaceLossState {
+    pub fn getState(self: *Recovery, space: types.PacketNumberSpace) *PnSpaceLossState {
         return switch (space) {
             .initial => &self.initial_state,
             .handshake => &self.handshake_state,

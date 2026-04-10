@@ -15,6 +15,7 @@ const quic_frame = @import("quic/frame.zig");
 const quic_crypto = @import("quic/crypto.zig");
 const quic_stream = @import("quic/stream.zig");
 const quic_recovery = @import("quic/recovery.zig");
+const quic_sent_ring = @import("quic/sent_ring.zig");
 const quic_congestion = @import("quic/congestion.zig");
 const quic_metrics = @import("quic/metrics.zig");
 const http3_frame = @import("protocol/http3/frame.zig");
@@ -50,6 +51,7 @@ comptime {
     _ = quic_crypto;
     _ = quic_stream;
     _ = quic_recovery;
+    _ = quic_sent_ring;
     _ = quic_congestion;
     _ = quic_metrics;
     _ = http3_frame;

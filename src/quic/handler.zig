@@ -757,6 +757,7 @@ const BuildPacketOptions = struct {
 
 const BuildPacketResult = struct {
     bytes_written: usize,
+    packet_number: u64 = 0,
 };
 
 fn buildHandshakePacket(out: []u8, opts: BuildPacketOptions) Error!BuildPacketResult {
@@ -885,7 +886,13 @@ fn buildHandshakePacket(out: []u8, opts: BuildPacketOptions) Error!BuildPacketRe
         off,
     ) catch return Error.HandshakeFailed;
 
-    return .{ .bytes_written = protected_len };
+    // Record the sent packet in the zero-alloc ring buffer for loss
+    // detection and RTT estimation (RFC 9002).
+    const has_crypto = opts.crypto_data.len > 0;
+    const has_ack = opts.ack_largest != null;
+    conn_ref.recordPacketSent(pn, space_kind, protected_len, has_crypto or !has_ack);
+
+    return .{ .bytes_written = protected_len, .packet_number = pn };
 }
 
 /// Options for building a short-header (1-RTT) packet.
@@ -1046,7 +1053,16 @@ pub fn buildShortPacket(out: []u8, opts: BuildShortPacketOptions) Error!BuildPac
         off,
     ) catch return Error.HandshakeFailed;
 
-    return .{ .bytes_written = protected_len };
+    // Record the sent packet for loss detection (RFC 9002). A packet
+    // is ACK-eliciting if it contains anything other than just an ACK.
+    const ack_eliciting = opts.send_handshake_done or
+        (opts.stream_data != null) or
+        conn_ref.has1RttPayloadPending() or
+        conn_ref.needsMaxData() or
+        conn_ref.hasPendingPathResponse();
+    conn_ref.recordPacketSent(pn, .application, protected_len, ack_eliciting);
+
+    return .{ .bytes_written = protected_len, .packet_number = pn };
 }
 
 // Tests
