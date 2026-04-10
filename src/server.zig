@@ -1234,6 +1234,16 @@ pub const Server = struct {
         const keys = conn.crypto_ctx.application.server orelse return;
         const max_stream_payload = 1200;
 
+        // Piggyback any pending ACK onto the FIRST response packet.
+        // This coalesces ACK + STREAM data into one UDP datagram
+        // instead of two (processPacket deferred the ACK when h3
+        // events were present — see the comment in handler.zig).
+        const pending_ack = if (conn.application_space.ack_needed)
+            conn.application_space.largest_received
+        else
+            null;
+        const pending_ack_range = conn.application_space.firstAckRange();
+
         // Fast path: single packet — no batching needed.
         if (h3_bytes.len <= max_stream_payload) {
             var packet_buf: [2048]u8 = undefined;
@@ -1242,6 +1252,8 @@ pub const Server = struct {
                 .{
                     .conn = conn,
                     .keys = &keys,
+                    .ack_largest = pending_ack,
+                    .ack_first_range = pending_ack_range,
                     .stream_data = .{
                         .stream_id = stream_id,
                         .offset = 0,
@@ -1250,6 +1262,7 @@ pub const Server = struct {
                     },
                 },
             ) catch return;
+            conn.application_space.ack_needed = false;
             _ = net.sendto(udp_fd, packet_buf[0..built.bytes_written], peer_addr) catch return;
             return;
         }
@@ -1266,6 +1279,7 @@ pub const Server = struct {
         var stream_offset: u64 = 0;
         var remaining = h3_bytes;
         var pkt_count: usize = 0;
+        var ack_sent = false;
 
         while (remaining.len > 0) {
             // Congestion control gate (RFC 9002 §7): don't send if the
@@ -1276,12 +1290,18 @@ pub const Server = struct {
             const chunk_len = @min(remaining.len, max_stream_payload);
             const is_last = (chunk_len == remaining.len);
 
+            // Piggyback pending ACK onto the FIRST packet only.
+            const ack_for_this_pkt = if (!ack_sent) pending_ack else null;
+            const ack_range_for_this_pkt = if (!ack_sent) pending_ack_range else 0;
+
             // Build the packet into the batch buffer at the current offset.
             const built = quic_handler.buildShortPacket(
                 batch_buf[batch_offset..],
                 .{
                     .conn = conn,
                     .keys = &keys,
+                    .ack_largest = ack_for_this_pkt,
+                    .ack_first_range = ack_range_for_this_pkt,
                     .stream_data = .{
                         .stream_id = stream_id,
                         .offset = stream_offset,
@@ -1290,6 +1310,10 @@ pub const Server = struct {
                     },
                 },
             ) catch return;
+            if (!ack_sent and pending_ack != null) {
+                conn.application_space.ack_needed = false;
+                ack_sent = true;
+            }
 
             // Pad non-final packets to the GSO segment size so the
             // kernel splits evenly. Final packet can be shorter.

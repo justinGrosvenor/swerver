@@ -194,9 +194,21 @@ pub const Handler = struct {
                 // Collect HTTP/3 events after processing
                 result.http3_events = getHttp3Events(conn);
 
-                // Build outgoing 1-RTT response (ACK + HANDSHAKE_DONE +
-                // any HTTP/3 stream data the application produced).
-                result.response = try self.buildResponseFlight(conn);
+                // If h3 request events are pending, DEFER the ACK to the
+                // response packet (handleH3Request will send it immediately
+                // after). This coalesces ACK + STREAM data into one UDP
+                // datagram instead of two, halving the sendto count for the
+                // common GET request-response cycle.
+                //
+                // If there are NO events (e.g., ACK-only reply, control
+                // stream data, or uni-stream setup), send the flight now.
+                if (result.http3_events.len == 0) {
+                    result.response = try self.buildResponseFlight(conn);
+                }
+                // When events ARE present, ack_needed stays set and the
+                // response path in sendHttp3ResponseBytes will piggyback
+                // the ACK onto the first response packet via
+                // BuildShortPacketOptions.ack_largest.
             },
         }
 
