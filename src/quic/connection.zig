@@ -1638,3 +1638,138 @@ test "derive keys from TLS secret" {
     const keys2 = crypto.deriveKeysFromSecret(&secret2);
     try std.testing.expect(!std.mem.eql(u8, keys.key[0..16], keys2.key[0..16]));
 }
+
+test "PacketNumberSpace: receive bitmap dedupe" {
+    var space = PacketNumberSpace{};
+
+    // First packet anchors the window
+    space.onPacketReceived(0);
+    try std.testing.expect(space.isDuplicate(0));
+    try std.testing.expect(!space.isDuplicate(1));
+
+    // Sequential packets
+    space.onPacketReceived(1);
+    space.onPacketReceived(2);
+    try std.testing.expect(space.isDuplicate(0));
+    try std.testing.expect(space.isDuplicate(1));
+    try std.testing.expect(space.isDuplicate(2));
+    try std.testing.expect(!space.isDuplicate(3));
+
+    // Skipped packet (3 missing) is not a duplicate; 4 received
+    space.onPacketReceived(4);
+    try std.testing.expect(!space.isDuplicate(3));
+    try std.testing.expect(space.isDuplicate(4));
+
+    // Re-receiving 3 fills the gap
+    space.onPacketReceived(3);
+    try std.testing.expect(space.isDuplicate(3));
+}
+
+test "PacketNumberSpace: firstAckRange skips gaps" {
+    var space = PacketNumberSpace{};
+
+    // No packets → range 0
+    try std.testing.expectEqual(@as(u64, 0), space.firstAckRange());
+
+    // Single packet → range 0 (just the largest)
+    space.onPacketReceived(0);
+    try std.testing.expectEqual(@as(u64, 0), space.firstAckRange());
+
+    // Contiguous run → range = (largest - smallest)
+    space.onPacketReceived(1);
+    space.onPacketReceived(2);
+    space.onPacketReceived(3);
+    try std.testing.expectEqual(@as(u64, 3), space.firstAckRange());
+
+    // Gap at packet 4: 0,1,2,3, _, 5 — range from 5 is just 0 (5 alone)
+    space.onPacketReceived(5);
+    try std.testing.expectEqual(@as(u64, 0), space.firstAckRange());
+
+    // Fill the gap: 0..5 all received → range from 5 is 5 (acks 0..5)
+    space.onPacketReceived(4);
+    try std.testing.expectEqual(@as(u64, 5), space.firstAckRange());
+}
+
+test "PacketNumberSpace: bitmap window slides forward" {
+    var space = PacketNumberSpace{};
+
+    // Receive packet at the very start of the window
+    space.onPacketReceived(0);
+    try std.testing.expect(space.isDuplicate(0));
+
+    // Receive a packet far beyond the 64-bit window
+    space.onPacketReceived(100);
+    try std.testing.expect(space.isDuplicate(100));
+    // Old packets that fell out of the window are now considered duplicates
+    // (assumed seen) — single-range ACK is correct as long as we never act
+    // on this assumption beyond the ACK contents.
+    try std.testing.expect(space.isDuplicate(0));
+    // A new packet at 99 is still in the window and not seen yet
+    try std.testing.expect(!space.isDuplicate(99));
+    space.onPacketReceived(99);
+    try std.testing.expect(space.isDuplicate(99));
+}
+
+test "TransportParams: encode round-trips through decode" {
+    var src: TransportParams = .{
+        .max_idle_timeout = 30000,
+        .max_udp_payload_size = 1500,
+        .initial_max_data = 1024 * 1024,
+        .initial_max_stream_data_bidi_local = 256 * 1024,
+        .initial_max_stream_data_bidi_remote = 256 * 1024,
+        .initial_max_stream_data_uni = 256 * 1024,
+        .initial_max_streams_bidi = 100,
+        .initial_max_streams_uni = 100,
+        .ack_delay_exponent = 3,
+        .max_ack_delay = 25,
+        .active_connection_id_limit = 4,
+        .initial_source_connection_id = types.ConnectionId.init(&[_]u8{ 0xaa, 0xbb, 0xcc, 0xdd }),
+    };
+
+    var buf: [512]u8 = undefined;
+    const written = try src.encode(&buf);
+    try std.testing.expect(written > 0);
+
+    var dst: TransportParams = .{};
+    try dst.decode(buf[0..written]);
+
+    try std.testing.expectEqual(src.max_idle_timeout, dst.max_idle_timeout);
+    try std.testing.expectEqual(src.initial_max_data, dst.initial_max_data);
+    try std.testing.expectEqual(src.initial_max_stream_data_bidi_local, dst.initial_max_stream_data_bidi_local);
+    try std.testing.expectEqual(src.initial_max_streams_bidi, dst.initial_max_streams_bidi);
+    try std.testing.expectEqual(src.ack_delay_exponent, dst.ack_delay_exponent);
+    try std.testing.expectEqual(src.max_ack_delay, dst.max_ack_delay);
+    try std.testing.expectEqual(src.active_connection_id_limit, dst.active_connection_id_limit);
+    const src_cid = src.initial_source_connection_id.?;
+    const dst_cid = dst.initial_source_connection_id.?;
+    try std.testing.expectEqualSlices(u8, src_cid.slice(), dst_cid.slice());
+}
+
+test "CryptoReassembly: in-order writes" {
+    var r: CryptoReassembly = .{};
+    try r.write(0, "hello");
+    try std.testing.expectEqualStrings("hello", r.drainContiguous());
+    try std.testing.expectEqual(@as(u64, 5), r.next_contiguous_offset);
+    // Subsequent in-order data
+    try r.write(5, " world");
+    try std.testing.expectEqualStrings(" world", r.drainContiguous());
+}
+
+test "CryptoReassembly: out-of-order writes wait for in-order prefix" {
+    var r: CryptoReassembly = .{};
+    // Write the back half first
+    try r.write(5, " world");
+    // Nothing to drain — there's still a hole at offset 0..5
+    try std.testing.expectEqualStrings("", r.drainContiguous());
+    // Now write the front half
+    try r.write(0, "hello");
+    // Both halves should drain together
+    try std.testing.expectEqualStrings("hello world", r.drainContiguous());
+}
+
+test "CryptoReassembly: rejects writes past capacity" {
+    var r: CryptoReassembly = .{};
+    var big: [CryptoReassembly.capacity + 1]u8 = undefined;
+    @memset(&big, 'x');
+    try std.testing.expectError(error.OutOfBounds, r.write(0, &big));
+}

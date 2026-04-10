@@ -836,6 +836,53 @@ test "encode response" {
     try std.testing.expect(len > 0);
 }
 
+test "encode response: lowercases header field names (RFC 9114 §4.2)" {
+    const allocator = std.testing.allocator;
+    var stack = Stack.init(allocator, true);
+    defer stack.deinit();
+
+    var buf: [4096]u8 = undefined;
+
+    // Application code returns mixed-case names — encoder must lowercase
+    // them before QPACK encoding. Without this, ngtcp2/curl close the
+    // connection with INTERNAL_ERROR after parsing the HEADERS frame.
+    //
+    // Note: well-known names like "content-type" hit the QPACK static
+    // table and are encoded as an index, so they don't appear as literal
+    // bytes in the output. We use a non-standard "X-Custom-Header" name
+    // that goes through the literal-name encoding path so we can grep
+    // for the actual ASCII bytes in the encoded HEADERS frame.
+    const headers = [_]Header{
+        .{ .name = "Content-Type", .value = "application/json" },
+        .{ .name = "X-Custom-Header", .value = "value" },
+    };
+
+    const len = try stack.encodeResponse(&buf, 200, &headers, "{}");
+    try std.testing.expect(len > 0);
+
+    const encoded = buf[0..len];
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "x-custom-header") != null);
+    try std.testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, encoded, "X-Custom-Header"));
+}
+
+test "encode response: preserves :status pseudo-header literal" {
+    const allocator = std.testing.allocator;
+    var stack = Stack.init(allocator, true);
+    defer stack.deinit();
+
+    var buf: [4096]u8 = undefined;
+    const headers = [_]Header{};
+    const len = try stack.encodeResponse(&buf, 200, &headers, null);
+    try std.testing.expect(len > 0);
+    // :status 200 maps to QPACK static table index 25 → encoded as 0xd9
+    // (indexed field line, static, T=1, idx=25 fits in 6-bit prefix).
+    // We don't assert exact bytes since the encoder may pick different
+    // forms — but the response should not contain a literal ":status"
+    // string because static-table indexing replaces it.
+    const encoded = buf[0..len];
+    try std.testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, encoded, ":status"));
+}
+
 test "build settings" {
     const allocator = std.testing.allocator;
     var stack = Stack.init(allocator, true);
