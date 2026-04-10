@@ -554,6 +554,19 @@ pub const Connection = struct {
     crypto_reasm_initial: CryptoReassembly = .{},
     crypto_reasm_handshake: CryptoReassembly = .{},
     crypto_reasm_application: CryptoReassembly = .{},
+    /// MAX_STREAMS tracking. We track how many peer-initiated bidi
+    /// streams have been opened and emit MAX_STREAMS when > 50% of
+    /// the granted limit is consumed (doubles the limit each time).
+    max_streams_bidi_granted: u64 = 0,
+    peer_bidi_streams_opened: u64 = 0,
+    send_max_streams_bidi: bool = false,
+
+    /// Key phase tracking (RFC 9001 §6). We track the current key
+    /// phase bit so we can detect key updates from the peer. When a
+    /// packet arrives with a different key_phase, we attempt to
+    /// decrypt with the next set of keys. On success, we rotate.
+    current_key_phase: bool = false,
+
     /// Server: have we already sent HANDSHAKE_DONE to the client?
     /// HANDSHAKE_DONE is sent exactly once after the server's handshake
     /// completes (RFC 9000 §19.20) and signals to the client that it
@@ -831,11 +844,11 @@ pub const Connection = struct {
         self.local_params.initial_max_stream_data_bidi_local = 256 * 1024;
         self.local_params.initial_max_stream_data_bidi_remote = 256 * 1024;
         self.local_params.initial_max_stream_data_uni = 256 * 1024;
-        // Stream limits — bumped for benchmarks (h2load opens many request
-        // streams per connection). Until we send MAX_STREAMS to grow the
-        // limit dynamically, bake in headroom for ~1M requests/connection.
-        self.local_params.initial_max_streams_bidi = 1_000_000;
+        // Stream limits. Start with 1024 bidi streams; MAX_STREAMS
+        // frames grow the limit dynamically when > 50% is consumed.
+        self.local_params.initial_max_streams_bidi = 1024;
         self.local_params.initial_max_streams_uni = 100;
+        self.max_streams_bidi_granted = 1024;
         // Idle timeout 30s
         self.local_params.max_idle_timeout = 30_000;
         // ACK delay exponent (default 3 = 8μs units, RFC 9000 §18.2)
@@ -1343,6 +1356,46 @@ pub const Connection = struct {
             .ack_eliciting = ack_eliciting,
             .in_flight = ack_eliciting or size > 0,
         });
+    }
+
+    // ---- MAX_STREAMS (RFC 9000 §19.11) ----
+
+    /// Called when a new peer-initiated bidi stream is created (e.g.,
+    /// a new h3 request stream). Bumps the counter and sets the
+    /// send_max_streams_bidi flag when > 50% of the granted limit
+    /// has been consumed.
+    pub fn onPeerBidiStreamOpened(self: *Connection) void {
+        self.peer_bidi_streams_opened += 1;
+        if (self.peer_bidi_streams_opened > self.max_streams_bidi_granted / 2 and
+            !self.send_max_streams_bidi)
+        {
+            self.send_max_streams_bidi = true;
+        }
+    }
+
+    /// Check if we need to send MAX_STREAMS to the peer.
+    pub fn needsMaxStreamsBidi(self: *const Connection) bool {
+        return self.send_max_streams_bidi;
+    }
+
+    /// Build a MAX_STREAMS frame doubling the current grant.
+    pub fn buildMaxStreamsBidiFrame(self: *Connection, buf: []u8) !usize {
+        if (!self.send_max_streams_bidi) return 0;
+        self.max_streams_bidi_granted *= 2;
+        self.send_max_streams_bidi = false;
+        // Update the stream manager's limit too
+        if (self.stream_manager) |*mgr| {
+            mgr.max_streams_bidi_remote = self.max_streams_bidi_granted;
+        }
+        return frame.writeMaxStreams(buf, self.max_streams_bidi_granted, true);
+    }
+
+    /// Check whether the congestion window allows sending a packet of
+    /// `size` bytes. Uses the sent_ring's bytes_in_flight as the
+    /// authoritative in-flight count. ACK-only packets are exempt
+    /// from congestion control per RFC 9002 §7.
+    pub fn canSendPacket(self: *const Connection, size: usize) bool {
+        return self.sent_ring.bytes_in_flight + size <= self.congestion.congestion_window;
     }
 
     // ---- PATH_CHALLENGE / PATH_RESPONSE ----

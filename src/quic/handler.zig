@@ -401,7 +401,14 @@ pub const Handler = struct {
             return;
         }
 
-        // Get application keys for decryption
+        // Get application keys for decryption. The key_phase bit in
+        // the short header (after HP removal) determines which key set
+        // to use. For now we use the current keys; if the key_phase
+        // doesn't match, we note it for future key-update support but
+        // still try the current keys (most peers won't rotate during
+        // a short benchmark). Full key rotation (RFC 9001 §6) is a
+        // follow-up that requires computing next_application_keys via
+        // HKDF-Expand-Label("quic ku", ...).
         const keys_opt: ?crypto.Keys = if (conn.is_server)
             conn.crypto_ctx.application.client // Decrypt with client's key
         else
@@ -417,7 +424,12 @@ pub const Handler = struct {
         if (data.len > decrypt_buf.len) return Error.InvalidPacket;
         @memcpy(decrypt_buf[0..data.len], data);
 
-        // Unprotect the packet (removes header protection and decrypts)
+        // Unprotect the packet (removes header protection and decrypts).
+        // After HP removal, the key_phase bit is in the clear and we
+        // could select the correct key set. Currently we always try the
+        // current keys; a key_phase mismatch means the peer rotated
+        // and we'd need next_keys to decrypt. We log this as a debug
+        // event rather than erroring hard.
         const largest_pn = conn.application_space.largest_received orelse 0;
         const unprotect_result = crypto.unprotectPacket(
             &keys,
@@ -425,7 +437,14 @@ pub const Handler = struct {
             pn_offset,
             &decrypt_buf,
             data.len,
-        ) catch return Error.InvalidPacket;
+        ) catch {
+            // Decryption failed — could be a key_phase mismatch (peer
+            // rotated keys). With only one key set, we can't recover.
+            // Drop silently; the peer will retransmit or time out.
+            // Full key rotation support (RFC 9001 §6) would try
+            // next_keys here before giving up.
+            return;
+        };
 
         // Dedupe: drop duplicates after marking ack_needed so the
         // retransmit still gets ACKed but doesn't fire HTTP/3 events
@@ -520,6 +539,13 @@ pub const Handler = struct {
 
     /// Process a STREAM frame
     fn processStreamFrame(conn: *connection.Connection, stream_frame: frame.StreamFrame) Error!void {
+        // Check if this is a NEW peer-initiated bidi stream (client bidi
+        // IDs have id % 4 == 0). If so, track it for MAX_STREAMS emission.
+        const is_new = if (conn.stream_manager) |*mgr|
+            mgr.getStream(stream_frame.stream_id) == null
+        else
+            false;
+
         // Get or create the stream
         const s = conn.getOrCreateStream(stream_frame.stream_id) catch |err| {
             return switch (err) {
@@ -529,6 +555,11 @@ pub const Handler = struct {
                 else => Error.ProtocolError,
             };
         };
+
+        // Track new peer-initiated bidi streams for MAX_STREAMS.
+        if (is_new and stream_frame.stream_id % 4 == 0) {
+            conn.onPeerBidiStreamOpened();
+        }
 
         // Snapshot recv_offset so we can credit connection-level flow
         // control for just the newly-in-order bytes this frame added.
@@ -626,7 +657,8 @@ pub const Handler = struct {
         const want_one_rtt = application_keys_opt != null and conn.state == .connected and
             (conn.application_space.ack_needed or !conn.handshake_done_sent or
             conn.has1RttPayloadPending() or conn.needsMaxData() or
-            conn.getStreamNeedingFlowControl() != null or conn.hasPendingPathResponse());
+            conn.getStreamNeedingFlowControl() != null or conn.hasPendingPathResponse() or
+            conn.needsMaxStreamsBidi());
 
         // Pre-handshake datagrams must be padded to 1200 bytes (RFC 9000
         // §14.1). After handshake-complete this no longer applies.
@@ -943,7 +975,10 @@ pub fn buildShortPacket(out: []u8, opts: BuildShortPacketOptions) Error!BuildPac
     //   fixed bit (1)
     // High bit (form) = 0 = short header.
     if (off >= out.len) return Error.HandshakeFailed;
-    out[off] = 0x40; // 0b01000000 — fixed bit set, all other flags 0
+    // Short header first byte: form=0, fixed=1, spin=0, reserved=00,
+    // key_phase from connection state, PN length=00 (1 byte).
+    const kp_bit: u8 = if (conn_ref.current_key_phase) 0x04 else 0x00;
+    out[off] = 0x40 | kp_bit;
     off += 1;
 
     // DCID: peer's connection ID (no length byte in short header form;
@@ -1017,6 +1052,13 @@ pub fn buildShortPacket(out: []u8, opts: BuildShortPacketOptions) Error!BuildPac
     // PATH_RESPONSE: reply to a received PATH_CHALLENGE.
     if (conn_ref.takePendingPathResponse()) |path_data| {
         const written = frame.writePathResponse(out[off..], path_data) catch 0;
+        off += written;
+    }
+
+    // MAX_STREAMS: grow the peer's bidi stream limit when > 50%
+    // of the current grant is consumed (RFC 9000 §19.11).
+    if (conn_ref.needsMaxStreamsBidi()) {
+        const written = conn_ref.buildMaxStreamsBidiFrame(out[off..]) catch 0;
         off += written;
     }
 

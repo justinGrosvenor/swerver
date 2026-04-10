@@ -1268,6 +1268,11 @@ pub const Server = struct {
         var pkt_count: usize = 0;
 
         while (remaining.len > 0) {
+            // Congestion control gate (RFC 9002 §7): don't send if the
+            // congestion window is full. Data-bearing packets count
+            // against the window; ACK-only packets are exempt.
+            if (!conn.canSendPacket(GSO_SEGMENT_SIZE)) break;
+
             const chunk_len = @min(remaining.len, max_stream_payload);
             const is_last = (chunk_len == remaining.len);
 
