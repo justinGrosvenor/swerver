@@ -342,15 +342,34 @@ pub const Stack = struct {
 
                 switch (@as(UniStreamType, @enumFromInt(uni_type.value))) {
                     .control => {
+                        // RFC 9114 §6.2.1: "Only one control stream per peer
+                        // is permitted; receipt of a second stream claiming
+                        // to be a control stream MUST be treated as a
+                        // connection error of type H3_STREAM_CREATION_ERROR."
+                        if (self.peer_control_stream) |existing| {
+                            if (existing != stream_id) return error.ConnectionError;
+                        }
                         self.peer_control_stream = stream_id;
                         return self.processControlStream(data[uni_type.len..]);
                     },
                     .qpack_encoder => {
+                        // RFC 9204 §4.2: "Only one encoder stream and one
+                        // decoder stream of each type is permitted in each
+                        // direction; receipt of a second instance of either
+                        // stream type MUST be treated as a connection error
+                        // of type H3_STREAM_CREATION_ERROR."
+                        if (self.peer_qpack_encoder) |existing| {
+                            if (existing != stream_id) return error.ConnectionError;
+                        }
                         self.peer_qpack_encoder = stream_id;
                         // Process encoder stream instructions (updates our decoder's table)
                         return self.processQpackEncoderStream(data[uni_type.len..]);
                     },
                     .qpack_decoder => {
+                        // RFC 9204 §4.2: see qpack_encoder comment above.
+                        if (self.peer_qpack_decoder) |existing| {
+                            if (existing != stream_id) return error.ConnectionError;
+                        }
                         self.peer_qpack_decoder = stream_id;
                         // Process decoder stream instructions (acknowledgments to our encoder)
                         return self.processQpackDecoderStream(data[uni_type.len..]);
@@ -475,6 +494,12 @@ pub const Stack = struct {
 
             switch (parse_result.frame) {
                 .settings => |s| {
+                    // RFC 9114 §7.2.4: "If an endpoint receives a second
+                    // SETTINGS frame on the control stream, the endpoint
+                    // MUST respond with a connection error of type
+                    // H3_FRAME_UNEXPECTED."
+                    if (self.peer_settings_received) return error.ConnectionError;
+
                     var event = SettingsEvent{
                         .qpack_max_table_capacity = 0,
                         .max_field_section_size = 16384,
@@ -493,13 +518,32 @@ pub const Stack = struct {
                     self.peer_settings_received = true;
                     self.events.append(self.allocator,.{ .settings = event }) catch return error.BufferTooSmall;
                 },
+                .data, .headers, .push_promise => {
+                    // RFC 9114 §7.2.1 / §7.2.2 / §7.2.5: DATA, HEADERS, and
+                    // PUSH_PROMISE frames are not permitted on the control
+                    // stream. Receipt MUST be treated as a connection error
+                    // of type H3_FRAME_UNEXPECTED.
+                    return error.ConnectionError;
+                },
                 .goaway => |g| {
+                    // RFC 9114 §6.2.1: SETTINGS must be the first frame on
+                    // the control stream; any other frame before it is
+                    // H3_MISSING_SETTINGS.
+                    if (!self.peer_settings_received) return error.ConnectionError;
+
                     self.events.append(self.allocator,.{
                         .goaway = .{ .stream_id = g.stream_id },
                     }) catch return error.BufferTooSmall;
                 },
-                else => {
-                    // Ignore unknown frames on control stream
+                .cancel_push, .max_push_id, .unknown => {
+                    // RFC 9114 §6.2.1: SETTINGS must be the first frame on
+                    // the control stream; any other frame that precedes it
+                    // is H3_MISSING_SETTINGS. After SETTINGS, unknown /
+                    // reserved frame types are allowed (for greasing, per
+                    // §7.2.8) and silently ignored; cancel_push and
+                    // max_push_id are valid control-stream frames that we
+                    // currently do not forward to the server.
+                    if (!self.peer_settings_received) return error.ConnectionError;
                 },
             }
         }
@@ -891,6 +935,141 @@ test "build settings" {
     var buf: [256]u8 = undefined;
     const len = try stack.buildSettings(&buf);
     try std.testing.expect(len > 0);
+}
+
+// Build a valid control-stream prologue: [uni_type=0x00] [SETTINGS frame].
+// The returned length includes both the 1-byte uni-stream type and the
+// full SETTINGS frame encoding.
+fn encodeControlStreamPrologue(buf: []u8) !usize {
+    buf[0] = 0x00; // UniStreamType.control
+    const params = [_]frame.SettingsParam{
+        .{ .id = @intFromEnum(frame.SettingsId.qpack_max_table_capacity), .value = 0 },
+        .{ .id = @intFromEnum(frame.SettingsId.max_field_section_size), .value = 16384 },
+        .{ .id = @intFromEnum(frame.SettingsId.qpack_blocked_streams), .value = 0 },
+    };
+    const settings_len = try frame.writeSettingsFrame(buf[1..], &params);
+    return 1 + settings_len;
+}
+
+test "ingest: duplicate peer control stream rejected (RFC 9114 §6.2.1)" {
+    const allocator = std.testing.allocator;
+    var stack = Stack.init(allocator, true);
+    defer stack.deinit();
+
+    var buf: [256]u8 = undefined;
+    const total = try encodeControlStreamPrologue(&buf);
+
+    // First control stream on client uni stream 2: accepted.
+    _ = try stack.ingest(2, buf[0..total], false);
+    try std.testing.expectEqual(@as(?u64, 2), stack.peer_control_stream);
+
+    // Second "control stream" on a different uni stream ID must be
+    // rejected as H3_STREAM_CREATION_ERROR.
+    try std.testing.expectError(error.ConnectionError, stack.ingest(6, buf[0..total], false));
+}
+
+test "ingest: duplicate peer QPACK encoder stream rejected (RFC 9204 §4.2)" {
+    const allocator = std.testing.allocator;
+    var stack = Stack.init(allocator, true);
+    defer stack.deinit();
+
+    // QPACK encoder stream: just the type byte with no payload is enough
+    // to claim the stream; processQpackEncoderStream returns need_more
+    // when data is empty after the type byte.
+    const encoder_type = [_]u8{0x02};
+
+    _ = try stack.ingest(6, &encoder_type, false);
+    try std.testing.expectEqual(@as(?u64, 6), stack.peer_qpack_encoder);
+
+    try std.testing.expectError(error.ConnectionError, stack.ingest(10, &encoder_type, false));
+}
+
+test "ingest: duplicate peer QPACK decoder stream rejected (RFC 9204 §4.2)" {
+    const allocator = std.testing.allocator;
+    var stack = Stack.init(allocator, true);
+    defer stack.deinit();
+
+    const decoder_type = [_]u8{0x03};
+
+    _ = try stack.ingest(10, &decoder_type, false);
+    try std.testing.expectEqual(@as(?u64, 10), stack.peer_qpack_decoder);
+
+    try std.testing.expectError(error.ConnectionError, stack.ingest(14, &decoder_type, false));
+}
+
+test "control stream: first frame must be SETTINGS (RFC 9114 §6.2.1)" {
+    const allocator = std.testing.allocator;
+    var stack = Stack.init(allocator, true);
+    defer stack.deinit();
+
+    // Build: [type=0x00] [GOAWAY frame] — no SETTINGS first.
+    var buf: [64]u8 = undefined;
+    buf[0] = 0x00;
+    const goaway_len = try frame.writeGoawayFrame(buf[1..], 0);
+    const total = 1 + goaway_len;
+
+    try std.testing.expectError(error.ConnectionError, stack.ingest(2, buf[0..total], false));
+}
+
+test "control stream: repeated SETTINGS rejected (RFC 9114 §7.2.4)" {
+    const allocator = std.testing.allocator;
+    var stack = Stack.init(allocator, true);
+    defer stack.deinit();
+
+    // Build: [type=0x00] [SETTINGS] [SETTINGS] — two SETTINGS frames.
+    var buf: [512]u8 = undefined;
+    buf[0] = 0x00;
+    const params = [_]frame.SettingsParam{
+        .{ .id = @intFromEnum(frame.SettingsId.qpack_max_table_capacity), .value = 0 },
+    };
+    const s1 = try frame.writeSettingsFrame(buf[1..], &params);
+    const s2 = try frame.writeSettingsFrame(buf[1 + s1 ..], &params);
+    const total = 1 + s1 + s2;
+
+    try std.testing.expectError(error.ConnectionError, stack.ingest(2, buf[0..total], false));
+}
+
+test "control stream: DATA frame rejected (RFC 9114 §7.2.1)" {
+    const allocator = std.testing.allocator;
+    var stack = Stack.init(allocator, true);
+    defer stack.deinit();
+
+    // Build: [type=0x00] [SETTINGS] [DATA] — DATA is forbidden on control.
+    var buf: [512]u8 = undefined;
+    const prologue_len = try encodeControlStreamPrologue(&buf);
+    const data_len = try frame.writeDataFrame(buf[prologue_len..], "payload");
+    const total = prologue_len + data_len;
+
+    try std.testing.expectError(error.ConnectionError, stack.ingest(2, buf[0..total], false));
+}
+
+test "control stream: GOAWAY after SETTINGS accepted (RFC 9114 §7.2.6)" {
+    const allocator = std.testing.allocator;
+    var stack = Stack.init(allocator, true);
+    defer stack.deinit();
+
+    // Build: [type=0x00] [SETTINGS] [GOAWAY] — valid control-stream sequence.
+    var buf: [512]u8 = undefined;
+    const prologue_len = try encodeControlStreamPrologue(&buf);
+    const goaway_len = try frame.writeGoawayFrame(buf[prologue_len..], 8);
+    const total = prologue_len + goaway_len;
+
+    const result = try stack.ingest(2, buf[0..total], false);
+    // Expect both a SETTINGS event and a GOAWAY event.
+    var saw_settings = false;
+    var saw_goaway = false;
+    for (result.events) |ev| {
+        switch (ev) {
+            .settings => saw_settings = true,
+            .goaway => |g| {
+                saw_goaway = true;
+                try std.testing.expectEqual(@as(u64, 8), g.stream_id);
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_settings);
+    try std.testing.expect(saw_goaway);
 }
 
 test "request body accumulation" {

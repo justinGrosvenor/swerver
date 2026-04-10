@@ -21,6 +21,9 @@
 - [3.10-file-io-zero-copy.md](3.10-file-io-zero-copy.md) - File-backed responses and zero-copy strategies.
 - [3.11-config-feature-flag-validation.md](3.11-config-feature-flag-validation.md) - Config validation and feature-flag rules.
 - [4.0-x402-payments.md](4.0-x402-payments.md) - HTTP 402 payment flow and x402 integration.
+- [5.0-reverse-proxy.md](5.0-reverse-proxy.md) - Reverse proxy architecture, forwarding flow, and upstream behavior.
+- [6.0-middleware.md](6.0-middleware.md) - Middleware chain, context propagation, and built-in middleware behavior.
+- [7.0-rfc-compliance-index.md](7.0-rfc-compliance-index.md) - RFC compliance tracking index for HTTP, proxy, and transport behavior.
 
 ## Subdirectories
 
