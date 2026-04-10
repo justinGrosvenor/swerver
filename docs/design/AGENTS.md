@@ -24,6 +24,7 @@
 - [5.0-reverse-proxy.md](5.0-reverse-proxy.md) - Reverse proxy architecture, forwarding flow, and upstream behavior.
 - [6.0-middleware.md](6.0-middleware.md) - Middleware chain, context propagation, and built-in middleware behavior.
 - [7.0-rfc-compliance-index.md](7.0-rfc-compliance-index.md) - RFC compliance tracking index for HTTP, proxy, and transport behavior.
+- [8.0-h3-performance-plan.md](8.0-h3-performance-plan.md) - h3 fast-path engineering plan targeting HttpArena submission.
 
 ## Subdirectories
 
