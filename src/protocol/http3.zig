@@ -556,12 +556,48 @@ pub const Stack = struct {
     ) Error!usize {
         var offset: usize = 0;
 
-        // Build header array with :status pseudo-header first
+        // Build header array with :status pseudo-header first.
+        // RFC 9114 §4.2: HTTP/3 field names MUST be lowercase. We
+        // normalize here so application code can use canonical mixed
+        // case ("Content-Type") without breaking interop.
         var all_headers: [66]Header = undefined;
         var status_buf: [3]u8 = undefined;
         _ = std.fmt.bufPrint(&status_buf, "{d}", .{status}) catch {
             return error.BufferTooSmall;
         };
+
+        // Per-header lowercase name buffer (max 64 headers × 64 bytes/name).
+        // 4 KB total — sized for typical response header sets.
+        var name_storage: [64][64]u8 = undefined;
+        var name_storage_idx: usize = 0;
+
+        const lowercaseName = struct {
+            fn call(
+                store: *[64][64]u8,
+                idx: *usize,
+                name: []const u8,
+            ) ![]const u8 {
+                if (name.len == 0) return name;
+                if (name[0] == ':') return name; // pseudo-headers stay literal
+                // Already lowercase? Avoid copying.
+                var all_lower = true;
+                for (name) |c| {
+                    if (c >= 'A' and c <= 'Z') {
+                        all_lower = false;
+                        break;
+                    }
+                }
+                if (all_lower) return name;
+                if (idx.* >= store.len) return error.BufferTooSmall;
+                if (name.len > store[idx.*].len) return error.BufferTooSmall;
+                for (name, 0..) |c, i| {
+                    store[idx.*][i] = if (c >= 'A' and c <= 'Z') c + 32 else c;
+                }
+                const slot = store[idx.*][0..name.len];
+                idx.* += 1;
+                return slot;
+            }
+        }.call;
 
         all_headers[0] = .{ .name = ":status", .value = &status_buf };
         // RFC 9110 §6.3: Suppress content-length for 1xx/204/304 (no message body)
@@ -569,7 +605,10 @@ pub const Stack = struct {
         var header_count: usize = 1;
         for (headers) |h| {
             if (suppress_body and std.ascii.eqlIgnoreCase(h.name, "content-length")) continue;
-            all_headers[header_count] = h;
+            const lc_name = lowercaseName(&name_storage, &name_storage_idx, h.name) catch {
+                return error.BufferTooSmall;
+            };
+            all_headers[header_count] = .{ .name = lc_name, .value = h.value };
             header_count += 1;
         }
         // RFC 9110 §6.6.1: Origin servers MUST send Date header (except 1xx)

@@ -662,7 +662,11 @@ pub const Server = struct {
         }
     }
 
-    /// Build a QUIC short header packet containing a STREAM frame
+    /// Build a QUIC 1-RTT (short header) packet containing a STREAM frame.
+    /// Mirrors quic/handler.zig::buildShortPacket: 1-byte PN, fixed-bit-only
+    /// flags byte, AEAD + header protection via crypto.protectPacket. The
+    /// older manual-HP version of this function had a subtle layout
+    /// difference that ngtcp2 rejected.
     fn buildStreamPacket(
         _: *Server,
         conn: *quic_connection.Connection,
@@ -674,88 +678,62 @@ pub const Server = struct {
         const crypto = @import("quic/crypto.zig");
         const varint = @import("quic/varint.zig");
 
-        // Get application keys
-        const keys_opt: ?crypto.Keys = if (conn.is_server)
-            conn.crypto_ctx.application.server
-        else
-            conn.crypto_ctx.application.client;
-        const keys = keys_opt orelse return error.NoKeys;
+        // Server side encrypts outgoing 1-RTT data with the server's
+        // application write key.
+        const keys = conn.crypto_ctx.application.server orelse return error.NoKeys;
 
         var offset: usize = 0;
 
-        // Short header — RFC 9000 §17.3
-        const pn = conn.application_space.allocatePacketNumber();
-
-        // Determine packet number encoding length (1–4 bytes) based on value
-        const pn_len: u2 = if (pn < 0x100) 0 else if (pn < 0x10000) 1 else if (pn < 0x1000000) 2 else 3;
-        const pn_bytes: u3 = @as(u3, pn_len) + 1;
-
-        // First byte: Fixed bit (0x40) | PN Length (lower 2 bits)
-        out[offset] = 0x40 | @as(u8, pn_len);
+        // Short header first byte (RFC 9000 §17.3.1):
+        //   0|1|S|R|R|K|P|P
+        //   form=0, fixed=1, spin=0, reserved=00, key_phase=0, PN length=00 (1 byte)
+        if (offset >= out.len) return error.BufferTooSmall;
+        out[offset] = 0x40;
         offset += 1;
 
-        // Destination Connection ID (peer's CID)
-        @memcpy(out[offset .. offset + conn.peer_cid.len], conn.peer_cid.slice());
-        offset += conn.peer_cid.len;
+        // Destination Connection ID (peer's CID).
+        if (offset + conn.peer_cid.len > out.len) return error.BufferTooSmall;
+        if (conn.peer_cid.len > 0) {
+            @memcpy(out[offset .. offset + conn.peer_cid.len], conn.peer_cid.slice());
+            offset += conn.peer_cid.len;
+        }
 
-        // Packet number offset
+        // Packet number — always 1 byte for now to match buildShortPacket.
         const pn_offset = offset;
-
-        // Encode packet number in network byte order (big-endian, 1–4 bytes)
-        const pn_be = std.mem.nativeToBig(u32, @truncate(pn));
-        const pn_be_bytes = std.mem.asBytes(&pn_be);
-        @memcpy(out[offset .. offset + pn_bytes], pn_be_bytes[4 - pn_bytes ..]);
-        offset += pn_bytes;
+        const pn_len: u8 = 1;
+        const pn = conn.application_space.allocatePacketNumber();
+        if (offset >= out.len) return error.BufferTooSmall;
+        out[offset] = @truncate(pn);
+        offset += 1;
 
         const header_len = offset;
 
-        // Build STREAM frame
-        // Frame type: 0x08 + OFF (0x04) + LEN (0x02) + FIN (0x01)
-        var frame_type: u8 = 0x08;
-        frame_type |= 0x02; // Has length
+        // STREAM frame — type byte (varint) | stream_id (varint) | length (varint) | data.
+        // Type bits: 0x08 base | 0x02 LEN | 0x01 FIN if applicable.
+        var frame_type: u8 = 0x08 | 0x02;
         if (fin) frame_type |= 0x01;
-
+        if (offset >= out.len) return error.BufferTooSmall;
         out[offset] = frame_type;
         offset += 1;
-
-        // Stream ID (varint)
         offset += varint.encode(out[offset..], stream_id) catch return error.BufferTooSmall;
-
-        // Length (varint)
         offset += varint.encode(out[offset..], data.len) catch return error.BufferTooSmall;
-
-        // Stream data — verify it fits (payload + 16-byte AEAD tag must not exceed buffer)
-        if (offset + data.len + 16 > out.len) return error.BufferTooSmall;
+        if (offset + data.len + crypto.AEAD_TAG_LEN > out.len) return error.BufferTooSmall;
         @memcpy(out[offset .. offset + data.len], data);
         offset += data.len;
 
-        // Encrypt payload
-        var ciphertext_buf: [16384]u8 = undefined;
-        const ciphertext_len = crypto.protectPayload(
+        // AEAD packet protection + header protection in one call (same path
+        // buildShortPacket uses for ACK / HANDSHAKE_DONE 1-RTT packets).
+        const protected_len = crypto.protectPacket(
             &keys,
             pn,
-            out[0..header_len],
-            out[header_len..offset],
-            &ciphertext_buf,
+            header_len,
+            pn_offset,
+            pn_len,
+            out,
+            offset,
         ) catch return error.EncryptionFailed;
 
-        // Copy ciphertext back
-        @memcpy(out[header_len .. header_len + ciphertext_len], ciphertext_buf[0..ciphertext_len]);
-        offset = header_len + ciphertext_len;
-
-        // Apply header protection — sample starts 4 bytes after PN start per RFC 9001 §5.4.2
-        const sample_offset = pn_offset + 4;
-        if (sample_offset + 16 <= offset) {
-            const sample: *const [16]u8 = @ptrCast(out[sample_offset .. sample_offset + 16]);
-            crypto.applyHeaderProtection(
-                keys.hp[0..keys.hp_len],
-                sample,
-                &out[0],
-                out[pn_offset .. pn_offset + pn_bytes],
-            );
-        }
-
-        return offset;
+        return protected_len;
     }
 
     fn handleRead(self: *Server, index: u32) !void {

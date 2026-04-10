@@ -748,9 +748,24 @@ pub fn writeStream(buf: []u8, stream_id: u64, offset_val: u64, data: []const u8,
     return off;
 }
 
-/// Write an ACK frame
+/// Write an ACK frame acknowledging a single packet number.
+/// Equivalent to writeAckRange(buf, largest_acked, 0, ack_delay).
 /// Returns bytes written
 pub fn writeAck(buf: []u8, largest_acked: u64, ack_delay: u64) WriteError!usize {
+    return writeAckRange(buf, largest_acked, 0, ack_delay);
+}
+
+/// Write an ACK frame acknowledging a contiguous range of packets ending
+/// at `largest_acked`. The First ACK Range field is the number of
+/// contiguous packets *preceding* largest_acked that are also being
+/// acknowledged (RFC 9000 §19.3.1). So `first_ack_range = N` means
+/// packets [largest_acked - N, largest_acked] (N+1 packets total) are
+/// acknowledged.
+///
+/// This single-range form is sufficient when we received every packet
+/// from 0 to largest_acked without gaps. For lossy paths we'd need
+/// ack_ranges support — a follow-up.
+pub fn writeAckRange(buf: []u8, largest_acked: u64, first_ack_range: u64, ack_delay: u64) WriteError!usize {
     var off: usize = 0;
 
     // Frame type 0x02 (simple ACK without ECN)
@@ -762,11 +777,11 @@ pub fn writeAck(buf: []u8, largest_acked: u64, ack_delay: u64) WriteError!usize 
     // ACK Delay
     off += try varint.encode(buf[off..], ack_delay);
 
-    // ACK Range Count (0 for simple case)
+    // ACK Range Count (0 — only the first range, no additional ranges)
     off += try varint.encode(buf[off..], 0);
 
-    // First ACK Range (0 means only largest_acked is being acked)
-    off += try varint.encode(buf[off..], 0);
+    // First ACK Range
+    off += try varint.encode(buf[off..], first_ack_range);
 
     return off;
 }

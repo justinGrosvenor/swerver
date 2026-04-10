@@ -57,6 +57,20 @@ pub const PacketNumberSpace = struct {
     largest_acked: ?u64 = null,
     /// Largest received packet number
     largest_received: ?u64 = null,
+    /// Smallest received packet number (set on the first onPacketReceived
+    /// call). Used together with largest_received to compute the
+    /// First ACK Range field for outgoing ACK frames — we ack
+    /// [smallest_received, largest_received] as one contiguous range.
+    /// This is correct as long as we never drop a packet in the middle
+    /// of the range; missing-packet handling is a follow-up that needs
+    /// real ack range tracking.
+    smallest_received: ?u64 = null,
+    /// Sliding-window receive bitmap for dedupe + ack-range building.
+    /// Bit i (set) means we received packet number `bitmap_base + i` and
+    /// have already processed it. Lets us drop duplicate retransmits
+    /// without reprocessing them through the application layer.
+    bitmap: u64 = 0,
+    bitmap_base: u64 = 0,
     /// Timestamp when largest packet was received (microseconds since epoch)
     largest_received_time: ?u64 = null,
     /// ACK ranges to send (simple: just track largest for now)
@@ -87,7 +101,75 @@ pub const PacketNumberSpace = struct {
             self.largest_received = pn;
             self.largest_received_time = time_us;
         }
+        // Track the smallest pn we've seen so we can build accurate ACK
+        // ranges when packet numbers don't start from 0 (e.g., 1-RTT pns
+        // that arrived before handshake completion were silently dropped).
+        if (self.smallest_received) |smallest| {
+            if (pn < smallest) self.smallest_received = pn;
+        } else {
+            self.smallest_received = pn;
+        }
+        self.markReceivedInBitmap(pn);
         self.ack_needed = true;
+    }
+
+    /// Mark a packet as received in the dedupe bitmap. The bitmap is a
+    /// 64-bit sliding window: bit i represents (bitmap_base + i). When a
+    /// packet arrives with pn beyond the window, slide the window forward.
+    fn markReceivedInBitmap(self: *PacketNumberSpace, pn: u64) void {
+        // First-ever packet: anchor the window at this pn
+        if (self.bitmap == 0 and self.bitmap_base == 0 and self.largest_received == pn) {
+            self.bitmap_base = pn;
+        }
+        if (pn < self.bitmap_base) return; // can't track packets older than the window
+        const offset_in_window = pn - self.bitmap_base;
+        if (offset_in_window >= 64) {
+            // Slide window so the new pn is the highest bit (63)
+            const slide = offset_in_window - 63;
+            if (slide >= 64) {
+                self.bitmap = 0;
+            } else {
+                self.bitmap >>= @intCast(slide);
+            }
+            self.bitmap_base += slide;
+        }
+        const new_offset = pn - self.bitmap_base;
+        self.bitmap |= @as(u64, 1) << @intCast(new_offset);
+    }
+
+    /// Has this packet number already been processed (i.e., is its bit
+    /// set in the receive bitmap, or is it older than the window)?
+    /// Lets the receive path skip re-processing duplicate retransmits.
+    pub fn isDuplicate(self: *const PacketNumberSpace, pn: u64) bool {
+        if (pn < self.bitmap_base) return true; // outside the window — assume seen
+        const offset_in_window = pn - self.bitmap_base;
+        if (offset_in_window >= 64) return false; // too new, not seen
+        return (self.bitmap & (@as(u64, 1) << @intCast(offset_in_window))) != 0;
+    }
+
+    /// Compute the First ACK Range field for an outgoing ACK frame:
+    /// the number of contiguous packets immediately preceding
+    /// largest_received that are also marked received in the bitmap.
+    /// We send only a single ACK range (no additional ranges) for now,
+    /// so curl will retransmit any earlier packets that aren't part of
+    /// this contiguous run, and we'll ACK those when they arrive.
+    pub fn firstAckRange(self: *const PacketNumberSpace) u64 {
+        const largest = self.largest_received orelse return 0;
+        if (largest < self.bitmap_base) return 0;
+        const largest_offset = largest - self.bitmap_base;
+        if (largest_offset >= 64) return 0;
+        // Walk backwards from the largest_received bit, counting set bits
+        // until we hit a clear bit (a gap) or run out of window.
+        var range: u64 = 0;
+        var i: i32 = @intCast(largest_offset);
+        // Skip the largest bit itself; start counting from i-1.
+        i -= 1;
+        while (i >= 0) : (i -= 1) {
+            const bit = self.bitmap & (@as(u64, 1) << @intCast(i));
+            if (bit == 0) break;
+            range += 1;
+        }
+        return range;
     }
 
     /// Record that an ACK was received
