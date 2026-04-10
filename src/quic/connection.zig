@@ -800,14 +800,16 @@ pub const Connection = struct {
     /// connection's CIDs. Called during initTls before transport params are
     /// installed on the SSL session.
     fn populateDefaultLocalParams(self: *Connection) void {
-        // Connection-level flow control: 1 MiB receive window
-        self.local_params.initial_max_data = 1024 * 1024;
+        // Connection-level flow control: 16 MiB receive window
+        self.local_params.initial_max_data = 16 * 1024 * 1024;
         // Stream-level flow control: 256 KiB per stream
         self.local_params.initial_max_stream_data_bidi_local = 256 * 1024;
         self.local_params.initial_max_stream_data_bidi_remote = 256 * 1024;
         self.local_params.initial_max_stream_data_uni = 256 * 1024;
-        // Stream limits — generous for h3 (each request needs 1 bidi + several uni)
-        self.local_params.initial_max_streams_bidi = 100;
+        // Stream limits — bumped for benchmarks (h2load opens many request
+        // streams per connection). Until we send MAX_STREAMS to grow the
+        // limit dynamically, bake in headroom for ~1M requests/connection.
+        self.local_params.initial_max_streams_bidi = 1_000_000;
         self.local_params.initial_max_streams_uni = 100;
         // Idle timeout 30s
         self.local_params.max_idle_timeout = 30_000;

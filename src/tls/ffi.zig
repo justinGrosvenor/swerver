@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const tls_enabled = build_options.enable_tls;
+const http3_enabled = build_options.enable_http3;
 
 /// C FFI bindings for OpenSSL/BoringSSL TLS 1.3 operations.
 /// Used by QUIC for handshake and key derivation.
@@ -308,12 +309,17 @@ pub fn buildQuicDispatchTable(
 /// Install QUIC TLS callbacks on an SSL session. The dispatch table and arg
 /// must remain valid for the SSL's lifetime — OpenSSL keeps the pointers.
 /// Switches the SSL to TLS 1.3 record-layer-bypass mode.
+///
+/// Compile-time gated on `enable_http3` so the SSL_set_quic_tls_cbs symbol
+/// (added in OpenSSL 3.5+) isn't pulled in by non-h3 builds linking
+/// against older OpenSSL — Debian Bookworm ships OpenSSL 3.0.x which
+/// doesn't have it.
 pub fn setQuicTlsCallbacks(
     ssl: *SSL,
     dispatch: [*]const OSSL_DISPATCH,
     arg: ?*anyopaque,
 ) !void {
-    if (!tls_enabled) return error.TlsNotAvailable;
+    if (!tls_enabled or !http3_enabled) return error.QuicTlsNotAvailable;
     if (SSL_set_quic_tls_cbs(ssl, dispatch, arg) != 1) {
         return error.QuicTlsCallbackInstallFailed;
     }
@@ -323,16 +329,20 @@ pub fn setQuicTlsCallbacks(
 /// until they are sent (i.e. until SSL_do_handshake produces the ClientHello
 /// or ServerHello flight). For a server, this can also be set inside the
 /// got_transport_params callback before the response flight is built.
+///
+/// Compile-time gated on `enable_http3` (see setQuicTlsCallbacks).
 pub fn setQuicTlsTransportParams(ssl: *SSL, params: []const u8) !void {
-    if (!tls_enabled) return error.TlsNotAvailable;
+    if (!tls_enabled or !http3_enabled) return error.QuicTlsNotAvailable;
     if (SSL_set_quic_tls_transport_params(ssl, params.ptr, params.len) != 1) {
         return error.QuicTlsTransportParamsFailed;
     }
 }
 
 /// Enable or disable TLS 0-RTT (early data) for QUIC.
+///
+/// Compile-time gated on `enable_http3` (see setQuicTlsCallbacks).
 pub fn setQuicTlsEarlyDataEnabled(ssl: *SSL, enabled: bool) !void {
-    if (!tls_enabled) return error.TlsNotAvailable;
+    if (!tls_enabled or !http3_enabled) return error.QuicTlsNotAvailable;
     if (SSL_set_quic_tls_early_data_enabled(ssl, if (enabled) 1 else 0) != 1) {
         return error.QuicTlsEarlyDataFailed;
     }

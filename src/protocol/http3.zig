@@ -319,7 +319,13 @@ pub const Stack = struct {
         data: []const u8,
         end_stream: bool,
     ) Error!IngestResult {
-        self.events.clearRetainingCapacity();
+        // NOTE: events are cleared once per QUIC packet by the caller
+        // (quic.handler::processPacket → clearEvents). Do NOT clear here:
+        // a single packet may contain multiple STREAM frames (e.g.
+        // h2load sends the request stream + 3 client uni streams in one
+        // packet), and clearing on each ingest call would clobber the
+        // events from the earlier frames before processPacket can return
+        // them to the caller.
 
         const stream_type = self.getStreamType(stream_id);
 
