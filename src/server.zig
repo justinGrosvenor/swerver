@@ -617,102 +617,47 @@ pub const Server = struct {
         ) catch return;
 
         // Send response in QUIC-MTU-sized chunks.
-        // QUIC packet overhead: 1 (header) + 20 (max CID) + 4 (max PN) + ~10 (frame header) + 16 (AEAD tag) ≈ 51 bytes.
-        // Use conservative max payload to stay within 1280-byte QUIC minimum MTU.
+        //
+        // Each chunk goes through the unified `quic.handler::buildShortPacket`
+        // builder (PR PERF-0) instead of a server-local parallel builder.
+        // That's the prerequisite for PR PERF-1 — GSO can batch multiple
+        // 1-RTT packets in one sendmsg only if they all share the same
+        // layout, which now means "every 1-RTT packet on the wire is
+        // built by `buildShortPacket`."
+        //
+        // QUIC packet overhead: 1 (header) + 20 (max CID) + 4 (max PN) +
+        // ~10 (frame header) + 16 (AEAD tag) ≈ 51 bytes. Use a
+        // conservative max payload to stay within the 1280-byte QUIC
+        // minimum MTU.
+        const keys = conn.crypto_ctx.application.server orelse return;
         const max_stream_payload = 1200;
+        var stream_offset: u64 = 0;
         var remaining = encoded_response_buf[0..resp_len];
         while (remaining.len > 0) {
             const chunk_len = @min(remaining.len, max_stream_payload);
             const is_last = (chunk_len == remaining.len);
             var packet_buf: [2048]u8 = undefined;
-            const packet_len = self.buildStreamPacket(
-                conn,
-                req.stream_id,
-                remaining[0..chunk_len],
-                is_last, // FIN only on last chunk
+            const built = quic_handler.buildShortPacket(
                 &packet_buf,
+                .{
+                    .conn = conn,
+                    .keys = &keys,
+                    .stream_data = .{
+                        .stream_id = req.stream_id,
+                        .offset = stream_offset,
+                        .data = remaining[0..chunk_len],
+                        .fin = is_last,
+                    },
+                },
             ) catch return;
 
-            _ = net.sendto(udp_fd, packet_buf[0..packet_len], peer_addr) catch |err| {
+            _ = net.sendto(udp_fd, packet_buf[0..built.bytes_written], peer_addr) catch |err| {
                 std.log.debug("Failed to send HTTP/3 response: {}", .{err});
                 return;
             };
             remaining = remaining[chunk_len..];
+            stream_offset += chunk_len;
         }
-    }
-
-    /// Build a QUIC 1-RTT (short header) packet containing a STREAM frame.
-    /// Mirrors quic/handler.zig::buildShortPacket: 1-byte PN, fixed-bit-only
-    /// flags byte, AEAD + header protection via crypto.protectPacket. The
-    /// older manual-HP version of this function had a subtle layout
-    /// difference that ngtcp2 rejected.
-    fn buildStreamPacket(
-        _: *Server,
-        conn: *quic_connection.Connection,
-        stream_id: u64,
-        data: []const u8,
-        fin: bool,
-        out: []u8,
-    ) !usize {
-        const crypto = @import("quic/crypto.zig");
-        const varint = @import("quic/varint.zig");
-
-        // Server side encrypts outgoing 1-RTT data with the server's
-        // application write key.
-        const keys = conn.crypto_ctx.application.server orelse return error.NoKeys;
-
-        var offset: usize = 0;
-
-        // Short header first byte (RFC 9000 §17.3.1):
-        //   0|1|S|R|R|K|P|P
-        //   form=0, fixed=1, spin=0, reserved=00, key_phase=0, PN length=00 (1 byte)
-        if (offset >= out.len) return error.BufferTooSmall;
-        out[offset] = 0x40;
-        offset += 1;
-
-        // Destination Connection ID (peer's CID).
-        if (offset + conn.peer_cid.len > out.len) return error.BufferTooSmall;
-        if (conn.peer_cid.len > 0) {
-            @memcpy(out[offset .. offset + conn.peer_cid.len], conn.peer_cid.slice());
-            offset += conn.peer_cid.len;
-        }
-
-        // Packet number — always 1 byte for now to match buildShortPacket.
-        const pn_offset = offset;
-        const pn_len: u8 = 1;
-        const pn = conn.application_space.allocatePacketNumber();
-        if (offset >= out.len) return error.BufferTooSmall;
-        out[offset] = @truncate(pn);
-        offset += 1;
-
-        const header_len = offset;
-
-        // STREAM frame — type byte (varint) | stream_id (varint) | length (varint) | data.
-        // Type bits: 0x08 base | 0x02 LEN | 0x01 FIN if applicable.
-        var frame_type: u8 = 0x08 | 0x02;
-        if (fin) frame_type |= 0x01;
-        if (offset >= out.len) return error.BufferTooSmall;
-        out[offset] = frame_type;
-        offset += 1;
-        offset += varint.encode(out[offset..], stream_id) catch return error.BufferTooSmall;
-        offset += varint.encode(out[offset..], data.len) catch return error.BufferTooSmall;
-        if (offset + data.len + crypto.AEAD_TAG_LEN > out.len) return error.BufferTooSmall;
-        @memcpy(out[offset .. offset + data.len], data);
-        offset += data.len;
-
-        // AEAD packet protection + header protection in one call (same path
-        // buildShortPacket uses for ACK / HANDSHAKE_DONE 1-RTT packets).
-        const protected_len = crypto.protectPacket(
-            &keys,
-            pn,
-            header_len,
-            pn_offset,
-            pn_len,
-            out,
-            offset,
-        ) catch return error.EncryptionFailed;
-
-        return protected_len;
     }
 
     fn handleRead(self: *Server, index: u32) !void {

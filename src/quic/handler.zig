@@ -887,21 +887,42 @@ fn buildHandshakePacket(out: []u8, opts: BuildPacketOptions) Error!BuildPacketRe
 }
 
 /// Options for building a short-header (1-RTT) packet.
-const BuildShortPacketOptions = struct {
+///
+/// Exposed so the Server's response path can call `buildShortPacket`
+/// directly instead of maintaining its own parallel 1-RTT builder
+/// (`server.zig::buildStreamPacket` pre-PR-PERF-0). Unifying on a
+/// single builder is the prerequisite for GSO batching in PR PERF-1:
+/// every 1-RTT packet needs the same layout so a run of them can be
+/// handed to `UDP_SEGMENT` in one sendmsg.
+pub const BuildShortPacketOptions = struct {
     conn: *connection.Connection,
     keys: *const crypto.Keys,
     /// If non-null, emit an ACK frame acking the contiguous range
     /// [ack_largest - ack_first_range, ack_largest] in the app space.
-    ack_largest: ?u64,
+    ack_largest: ?u64 = null,
     ack_first_range: u64 = 0,
     /// Should this packet include a HANDSHAKE_DONE frame?
-    send_handshake_done: bool,
+    send_handshake_done: bool = false,
+    /// Optional STREAM frame payload to include. When set the builder
+    /// writes a STREAM frame with the given stream_id / data / fin
+    /// after any ACK / HANDSHAKE_DONE / pending-uni-stream frames,
+    /// before padding-for-HP-sample and encryption. Used by the h3
+    /// response path to emit each 1200-byte response chunk through
+    /// the unified builder.
+    stream_data: ?StreamFramePayload = null,
+};
+
+pub const StreamFramePayload = struct {
+    stream_id: u64,
+    offset: u64 = 0,
+    data: []const u8,
+    fin: bool,
 };
 
 /// Build a single 1-RTT (short header) QUIC packet into `out`. Layout is
 /// much simpler than long-header: just flags byte + DCID + packet number,
 /// then frames, then AEAD + header protection.
-fn buildShortPacket(out: []u8, opts: BuildShortPacketOptions) Error!BuildPacketResult {
+pub fn buildShortPacket(out: []u8, opts: BuildShortPacketOptions) Error!BuildPacketResult {
     const conn_ref = opts.conn;
     var off: usize = 0;
 
@@ -959,6 +980,18 @@ fn buildShortPacket(out: []u8, opts: BuildShortPacketOptions) Error!BuildPacketR
         const written = frame.writeStream(out[off..], uni.stream_id, 0, uni.data, false) catch return Error.HandshakeFailed;
         off += written;
         conn_ref.clearPendingUniStream(uni.stream_id);
+    }
+
+    // Optional response STREAM frame for the h3 data path. The Server
+    // passes one of these per response chunk via `opts.stream_data`;
+    // pre-PR-PERF-0 each chunk went through a separate
+    // `server.zig::buildStreamPacket` builder that bypassed the ACK /
+    // HANDSHAKE_DONE / uni-stream path entirely. Now every 1-RTT
+    // packet is built through this single function.
+    if (opts.stream_data) |sd| {
+        if (off + sd.data.len + 16 > out.len) return Error.HandshakeFailed;
+        const written = frame.writeStream(out[off..], sd.stream_id, sd.offset, sd.data, sd.fin) catch return Error.HandshakeFailed;
+        off += written;
     }
 
     // Need at least one byte of plaintext (a PING frame, type 0x01) so
