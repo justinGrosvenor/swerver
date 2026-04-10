@@ -3,20 +3,17 @@ const types = @import("types.zig");
 
 /// Zero-allocation ring buffer for tracking sent QUIC packets.
 ///
-/// Replaces the `ArrayList(SentPacket)` in Recovery with a fixed-size
-/// ring that can record sent packets, mark ranges as ACKed, and detect
-/// lost packets — all without touching the heap. Sized to 512 entries
-/// (16 KiB per connection), which gives ~8× headroom over the typical
-/// congestion-window size of 64 packets.
+/// Sized to 512 entries (16 KiB per connection), which gives ~8×
+/// headroom over the typical congestion-window size of 64 packets.
 ///
-/// Overflow policy: if the ring is full when a new packet is recorded,
-/// the oldest entry is silently evicted. This is a correctness
-/// degradation (we lose the ability to detect loss for that packet)
-/// but preserves the zero-alloc invariant. In practice, 512 in-flight
-/// packets without a single ACK is only possible under extreme loss
-/// rates where the connection would be timed out anyway.
+/// All scans (markAckedRange, detectLost, findSentTime) iterate the
+/// bitmap at the WORD level — an empty 64-bit word skips 64 slots in
+/// one comparison. Within a word, only set bits are visited via @ctz.
+/// For a typical ring with ~10-20 in-flight packets out of 512 slots,
+/// this makes scans O(popcount ≈ 10) instead of O(512).
 
 pub const RING_SIZE: usize = 512;
+const WORDS: usize = RING_SIZE / 64;
 
 pub const SentPacket = struct {
     packet_number: u64,
@@ -27,10 +24,16 @@ pub const SentPacket = struct {
     in_flight: bool,
 };
 
+pub const LostPacket = struct {
+    packet_number: u64,
+    size: u16,
+    space: types.PacketNumberSpace,
+};
+
 pub const SentRing = struct {
     entries: [RING_SIZE]SentPacket = undefined,
     /// Bit per slot: 1 = occupied, 0 = free.
-    occupied: [RING_SIZE / 64]u64 = [_]u64{0} ** (RING_SIZE / 64),
+    occupied: [WORDS]u64 = [_]u64{0} ** WORDS,
     /// Next write position (wraps at RING_SIZE).
     tail: usize = 0,
     /// Number of occupied slots.
@@ -54,10 +57,9 @@ pub const SentRing = struct {
 
     // ---- Public API ----
 
-    /// Record a sent packet. O(1) amortized. If the ring is full, the
-    /// entry at `tail` is silently overwritten (evicted).
+    /// Record a sent packet. O(1). If the ring is full, the entry at
+    /// `tail` is silently overwritten (evicted).
     pub fn push(self: *SentRing, pkt: SentPacket) void {
-        // If this slot is occupied, evict it first.
         if (self.isOccupied(self.tail)) {
             self.evict(self.tail);
         }
@@ -71,6 +73,8 @@ pub const SentRing = struct {
     /// Mark all packets in [smallest, largest] for the given space as
     /// acknowledged and remove them from the ring. Returns the sent
     /// time of `largest` if found (for RTT calculation), or null.
+    ///
+    /// O(popcount of occupied bitmap) — skips empty 64-bit words.
     pub fn markAckedRange(
         self: *SentRing,
         space: types.PacketNumberSpace,
@@ -78,15 +82,28 @@ pub const SentRing = struct {
         largest: u64,
     ) ?u64 {
         var largest_sent_time: ?u64 = null;
-        for (0..RING_SIZE) |i| {
-            if (!self.isOccupied(i)) continue;
-            const pkt = &self.entries[i];
-            if (pkt.space != space) continue;
-            if (pkt.packet_number >= smallest and pkt.packet_number <= largest) {
-                if (pkt.packet_number == largest) {
-                    largest_sent_time = pkt.time_sent;
+        for (&self.occupied, 0..) |*word, word_idx| {
+            var bits = word.*;
+            if (bits == 0) continue;
+            while (bits != 0) {
+                const bit_idx: u6 = @intCast(@ctz(bits));
+                const idx = word_idx * 64 + bit_idx;
+                const pkt = &self.entries[idx];
+                if (pkt.space == space and
+                    pkt.packet_number >= smallest and
+                    pkt.packet_number <= largest)
+                {
+                    if (pkt.packet_number == largest) {
+                        largest_sent_time = pkt.time_sent;
+                    }
+                    if (pkt.in_flight) self.bytes_in_flight -|= pkt.size;
+                    self.count -|= 1;
+                    word.* &= ~(@as(u64, 1) << bit_idx);
+                    // Update bits for this iteration too
+                    bits &= bits - 1;
+                    continue;
                 }
-                self.evict(i);
+                bits &= bits - 1;
             }
         }
         return largest_sent_time;
@@ -94,9 +111,9 @@ pub const SentRing = struct {
 
     /// Detect lost packets using RFC 9002 time-threshold and packet-
     /// threshold algorithms. Returns the number of packets declared
-    /// lost (written into `out`). Also updates `loss_time` — the
-    /// earliest time at which a currently-unacked packet SHOULD be
-    /// declared lost if no ACK arrives.
+    /// lost (written into `out`).
+    ///
+    /// O(popcount of occupied bitmap).
     pub fn detectLost(
         self: *SentRing,
         space: types.PacketNumberSpace,
@@ -109,56 +126,70 @@ pub const SentRing = struct {
         var n: usize = 0;
         loss_time.* = null;
 
-        for (0..RING_SIZE) |i| {
-            if (!self.isOccupied(i)) continue;
-            const pkt = &self.entries[i];
-            if (pkt.space != space) continue;
+        for (&self.occupied, 0..) |*word, word_idx| {
+            var bits = word.*;
+            if (bits == 0) continue;
+            while (bits != 0) {
+                const bit_idx: u6 = @intCast(@ctz(bits));
+                const idx = word_idx * 64 + bit_idx;
+                const pkt = &self.entries[idx];
 
-            // Time-based loss: packet sent more than loss_delay ago
-            if (now >= pkt.time_sent + loss_delay_ns) {
-                if (n < out.len) {
-                    out[n] = .{
-                        .packet_number = pkt.packet_number,
-                        .size = pkt.size,
-                        .space = pkt.space,
-                    };
-                    n += 1;
+                if (pkt.space != space) {
+                    bits &= bits - 1;
+                    continue;
                 }
-                self.evict(i);
-                continue;
-            }
 
-            // Packet-threshold loss: 3+ newer packets have been acked
-            if (pkt.packet_number + 3 <= largest_acked) {
-                if (n < out.len) {
-                    out[n] = .{
-                        .packet_number = pkt.packet_number,
-                        .size = pkt.size,
-                        .space = pkt.space,
-                    };
-                    n += 1;
+                // Time-based loss
+                if (now >= pkt.time_sent + loss_delay_ns) {
+                    if (n < out.len) {
+                        out[n] = .{ .packet_number = pkt.packet_number, .size = pkt.size, .space = pkt.space };
+                        n += 1;
+                    }
+                    if (pkt.in_flight) self.bytes_in_flight -|= pkt.size;
+                    self.count -|= 1;
+                    word.* &= ~(@as(u64, 1) << bit_idx);
+                    bits &= bits - 1;
+                    continue;
                 }
-                self.evict(i);
-                continue;
-            }
 
-            // Update loss_time for the timer
-            const lt = pkt.time_sent + loss_delay_ns;
-            if (loss_time.* == null or lt < loss_time.*.?) {
-                loss_time.* = lt;
+                // Packet-threshold loss
+                if (pkt.packet_number + 3 <= largest_acked) {
+                    if (n < out.len) {
+                        out[n] = .{ .packet_number = pkt.packet_number, .size = pkt.size, .space = pkt.space };
+                        n += 1;
+                    }
+                    if (pkt.in_flight) self.bytes_in_flight -|= pkt.size;
+                    self.count -|= 1;
+                    word.* &= ~(@as(u64, 1) << bit_idx);
+                    bits &= bits - 1;
+                    continue;
+                }
+
+                // Update loss_time for the timer
+                const lt = pkt.time_sent + loss_delay_ns;
+                if (loss_time.* == null or lt < loss_time.*.?) {
+                    loss_time.* = lt;
+                }
+                bits &= bits - 1;
             }
         }
         return n;
     }
 
     /// Find the sent time of a specific packet number in a space.
-    /// Used for RTT calculation when the ACK arrives.
+    /// O(popcount of occupied bitmap).
     pub fn findSentTime(self: *const SentRing, space: types.PacketNumberSpace, pn: u64) ?u64 {
-        for (0..RING_SIZE) |i| {
-            if (!self.isOccupied(i)) continue;
-            const pkt = &self.entries[i];
-            if (pkt.space == space and pkt.packet_number == pn) {
-                return pkt.time_sent;
+        for (0..WORDS) |word_idx| {
+            var bits = self.occupied[word_idx];
+            if (bits == 0) continue;
+            while (bits != 0) {
+                const bit_idx: u6 = @intCast(@ctz(bits));
+                const idx = word_idx * 64 + bit_idx;
+                const pkt = &self.entries[idx];
+                if (pkt.space == space and pkt.packet_number == pn) {
+                    return pkt.time_sent;
+                }
+                bits &= bits - 1;
             }
         }
         return null;
@@ -173,12 +204,6 @@ pub const SentRing = struct {
         self.clearOccupied(idx);
         self.count -|= 1;
     }
-};
-
-pub const LostPacket = struct {
-    packet_number: u64,
-    size: u16,
-    space: types.PacketNumberSpace,
 };
 
 // ---- Tests ----
@@ -256,7 +281,6 @@ test "SentRing: detectLost with packet threshold" {
 
 test "SentRing: overflow evicts oldest" {
     var ring: SentRing = .{};
-    // Fill the ring
     for (0..RING_SIZE) |i| {
         ring.push(.{
             .packet_number = i,
@@ -269,7 +293,6 @@ test "SentRing: overflow evicts oldest" {
     }
     try std.testing.expectEqual(@as(usize, RING_SIZE), ring.count);
 
-    // Push one more — should evict slot 0 (the oldest)
     ring.push(.{
         .packet_number = RING_SIZE,
         .time_sent = 9999,
@@ -279,8 +302,6 @@ test "SentRing: overflow evicts oldest" {
         .in_flight = true,
     });
     try std.testing.expectEqual(@as(usize, RING_SIZE), ring.count);
-    // pn=0 was evicted
     try std.testing.expectEqual(@as(?u64, null), ring.findSentTime(.application, 0));
-    // pn=RING_SIZE is present
     try std.testing.expectEqual(@as(?u64, 9999), ring.findSentTime(.application, RING_SIZE));
 }
