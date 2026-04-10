@@ -635,14 +635,33 @@ pub const Connection = struct {
         }
     }
 
-    /// Process stream data through HTTP/3 stack.
-    /// Returns events produced by parsing HTTP/3 frames.
-    pub fn processHttp3Stream(self: *Connection, stream_id: u64, data: []const u8, end_stream: bool) Error![]http3.Event {
+    /// Process stream data through the HTTP/3 stack.
+    ///
+    /// Returns the full `IngestResult` so callers can observe
+    /// `consumed` and `need_more`. Before PR A the caller only needed
+    /// `events` and the other fields were silently dropped — one of
+    /// the root causes of the h3 request-stream buffering bugs tracked
+    /// in `docs/design/8.0-h3-performance-plan.md`.
+    pub fn processHttp3Stream(self: *Connection, stream_id: u64, data: []const u8, end_stream: bool) Error!http3.IngestResult {
         if (self.http3_stack) |*stack| {
-            const result = stack.ingest(stream_id, data, end_stream) catch return Error.ProtocolViolation;
-            return result.events;
+            return stack.ingest(stream_id, data, end_stream) catch return Error.ProtocolViolation;
         }
         return Error.InvalidState;
+    }
+
+    /// Reclaim a Stream's receive buffer after the application has
+    /// finished dispatching its `RequestReadyEvent`. Called by
+    /// `Server.handleDatagram` once the synchronous handler returns
+    /// and the `RequestReadyEvent.body` slice (which points into
+    /// `recv_buffer.items`) is no longer referenced. Keeps the
+    /// stream's memory footprint bounded without invalidating any
+    /// live slice during the handler's run.
+    pub fn clearH3RequestStream(self: *Connection, stream_id: u64) void {
+        if (self.stream_manager) |*mgr| {
+            if (mgr.getStream(stream_id)) |s| {
+                s.consumeRead(s.recv_buffer.items.len);
+            }
+        }
     }
 
     /// Initialize HTTP/3 control streams.

@@ -522,50 +522,23 @@ pub const Server = struct {
             }
         }
 
-        // Process HTTP/3 events (headers, data, end_stream).
-        // A single packet may carry headers + data + end_stream for the same stream,
-        // so we accumulate body data first, then dispatch completed requests.
+        // Process HTTP/3 events. Per the defer-until-FIN model in
+        // `src/protocol/http3.zig::processRequestStream`, request
+        // streams emit a single `request_ready` event once the stream
+        // has finished arriving. `req.body` and `req.headers` both
+        // point into buffers owned by the Stack / Stream and stay
+        // valid for the duration of the synchronous handler call.
+        // After dispatch we reclaim the Stream's receive buffer via
+        // `clearH3RequestStream` — that's the first point at which
+        // the body slice is no longer referenced.
         if (result.conn) |conn| {
-            // First pass: accumulate body data
             for (result.http3_events) |event| {
                 switch (event) {
-                    .data => |data_ev| {
-                        if (conn.http3_stack) |*stack| {
-                            stack.accumulateBody(data_ev.stream_id, data_ev.data) catch {};
-                        }
+                    .request_ready => |req| {
+                        self.handleHttp3Request(udp_fd, conn, req, recv_result.peer_addr);
+                        conn.clearH3RequestStream(req.stream_id);
                     },
-                    else => {},
-                }
-            }
-
-            // Second pass: dispatch completed requests and clean up body buffers
-            for (result.http3_events) |event| {
-                switch (event) {
-                    .headers => |hdrs| {
-                        if (hdrs.end_stream) {
-                            // No body expected (GET, HEAD, etc.) — dispatch immediately
-                            self.handleHttp3Request(udp_fd, conn, hdrs, recv_result.peer_addr, "");
-                        }
-                        // Requests with body: headers arrive first, body/end_stream follow
-                        // in subsequent packets. Body dispatch requires storing per-stream
-                        // header state which is not yet implemented — POST/PUT over HTTP/3
-                        // with multi-packet bodies will get a 501 from the router.
-                    },
-                    .data => |data_ev| {
-                        if (data_ev.end_stream) {
-                            // Body complete — clean up accumulated body buffer
-                            if (conn.http3_stack) |*stack| {
-                                stack.clearRequestBody(data_ev.stream_id);
-                            }
-                        }
-                    },
-                    .end_stream => |es| {
-                        // Clean up any accumulated body buffer for this stream
-                        if (conn.http3_stack) |*stack| {
-                            stack.clearRequestBody(es.stream_id);
-                        }
-                    },
-                    else => {},
+                    .settings, .goaway, .stream_error => {},
                 }
             }
         }
@@ -578,17 +551,23 @@ pub const Server = struct {
         }
     }
 
-    /// Handle an HTTP/3 request and send response
+    /// Handle an HTTP/3 request and send response.
+    ///
+    /// Invoked from the defer-until-FIN dispatch path in
+    /// `handleDatagram` when the Stack emits a `RequestReadyEvent`.
+    /// `req.headers` slices point into the Stack's fixed-size owned
+    /// storage and stay valid until the next `ingest` call; `req.body`
+    /// is a slice into the decrypted STREAM frame payload and stays
+    /// valid for the duration of this synchronous call.
     fn handleHttp3Request(
         self: *Server,
         udp_fd: std.posix.fd_t,
         conn: *quic_connection.Connection,
-        headers_event: http3.HeadersEvent,
+        req: http3.RequestReadyEvent,
         peer_addr: net.SockAddrStorage,
-        body: []const u8,
     ) void {
         var req_headers: [65]request.Header = undefined;
-        const req_view = buildHttp3RequestView(headers_event, body, req_headers[0..]) orelse return;
+        const req_view = buildHttp3RequestView(req, req_headers[0..]) orelse return;
 
         var resp = badRequestResponse();
         var managed_handle: ?buffer_pool.BufferHandle = null;
@@ -648,7 +627,7 @@ pub const Server = struct {
             var packet_buf: [2048]u8 = undefined;
             const packet_len = self.buildStreamPacket(
                 conn,
-                headers_event.stream_id,
+                req.stream_id,
                 remaining[0..chunk_len],
                 is_last, // FIN only on last chunk
                 &packet_buf,
@@ -2162,14 +2141,14 @@ pub const Server = struct {
         };
     }
 
-    fn buildHttp3RequestView(headers_event: http3.HeadersEvent, body: []const u8, headers_out: []request.Header) ?request.RequestView {
+    fn buildHttp3RequestView(req: http3.RequestReadyEvent, headers_out: []request.Header) ?request.RequestView {
         var method: ?[]const u8 = null;
         var path: ?[]const u8 = null;
         var authority: ?[]const u8 = null;
         var header_count: usize = 0;
         var saw_host = false;
 
-        for (headers_event.headers) |hdr| {
+        for (req.headers) |hdr| {
             if (std.mem.eql(u8, hdr.name, ":method")) {
                 method = hdr.value;
             } else if (std.mem.eql(u8, hdr.name, ":path")) {
@@ -2201,7 +2180,7 @@ pub const Server = struct {
             .method_raw = if (parsed_method == .OTHER) method_str else "",
             .path = path_str,
             .headers = headers_out[0..header_count],
-            .body = body,
+            .body = req.body,
         };
     }
 

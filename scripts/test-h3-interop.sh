@@ -154,11 +154,44 @@ check() {
     fi
 }
 
+# POST case: verify h3 body dispatch. PR A added defer-until-FIN parsing
+# with zero-copy single-DATA-frame bodies. POST /echo echoes the request
+# body in the response, so a 200 with matching body is proof that the
+# request body made it through the Stack → router → response path.
+check_post() {
+    local path="$1" post_body="$2" expected_status="$3" expected_body="$4"
+    local out
+    out=$("$CURL" --http3-only -k --max-time 5 -sS \
+        --resolve "localhost:$PORT:127.0.0.1" \
+        -o "$WORK_DIR/body" -w '%{http_code}' \
+        -X POST --data-binary "$post_body" \
+        "https://localhost:$PORT$path" 2>&1) || {
+        echo "  FAIL POST $path: curl exited non-zero — $out" >&2
+        fail=$((fail + 1))
+        return
+    }
+    if [[ "$out" != "$expected_status" ]]; then
+        echo "  FAIL POST $path: status $out, expected $expected_status" >&2
+        fail=$((fail + 1))
+        return
+    fi
+    local body
+    body=$(cat "$WORK_DIR/body")
+    if [[ "$body" == "$expected_body" ]]; then
+        echo "  OK   POST $path: status $out, body: $body"
+    else
+        echo "  FAIL POST $path: body '$body', expected '$expected_body'" >&2
+        fail=$((fail + 1))
+    fi
+}
+
 echo "==> Smoke testing h3 endpoints ..."
 check /health     200 ""
 check /echo       200 '{"status":"ok"}'
 check /plaintext  200 "Hello, World!"
 check /json       200 '{"message":"Hello, World!"}'
+check_post /echo "hello h3 body"        200 "hello h3 body"
+check_post /echo "{\"msg\":\"ship it\"}" 200 "{\"msg\":\"ship it\"}"
 
 if [[ $fail -gt 0 ]]; then
     echo "==> $fail HTTP/3 smoke test failure(s). Server log:"
