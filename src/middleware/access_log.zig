@@ -169,7 +169,7 @@ pub fn postResponseCombined(ctx: *middleware.Context, req: request.RequestView, 
     var buf: [2048]u8 = undefined;
     const line = formatCombined(&entry, &buf);
     if (line.len > 0) {
-        _ = std.posix.write(std.posix.STDERR_FILENO, line) catch {};
+        _ = std.posix.system.write(2, line.ptr, line.len);
     }
 }
 
@@ -179,7 +179,7 @@ pub fn postResponseJson(ctx: *middleware.Context, req: request.RequestView, resp
     var buf: [2048]u8 = undefined;
     const line = formatJson(&entry, &buf);
     if (line.len > 0) {
-        _ = std.posix.write(std.posix.STDERR_FILENO, line) catch {};
+        _ = std.posix.system.write(2, line.ptr, line.len);
     }
 }
 

@@ -4,6 +4,7 @@ const response = @import("../response/response.zig");
 const x402 = @import("../middleware/x402.zig");
 const middleware = @import("../middleware/middleware.zig");
 const buffer_pool = @import("../runtime/buffer_pool.zig");
+const clock = @import("../runtime/clock.zig");
 
 pub const RouterError = error{
     RouteLimitExceeded,
@@ -594,6 +595,15 @@ pub const Router = struct {
             .arena = std.heap.FixedBufferAllocator.init(scratch.arena_buf),
         };
 
+        // Capture the request start time for post-response elapsed
+        // calculation. Set it here (after pre-middleware) so elapsed
+        // reflects handler time, not middleware overhead.
+        mw_ctx.request_start = clock.Instant.now();
+
+        var result_resp: response.Response = undefined;
+        const result_pause: ?u64 = null;
+        var ran_handler = false;
+
         var path_matched = false;
         for (self.routes[0..self.route_count]) |r| {
             if (!self.matchRoute(&r, req.path, &ctx)) continue;
@@ -605,28 +615,51 @@ pub const Router = struct {
             if (r.middleware_chain) |chain| {
                 switch (chain.executePre(mw_ctx, req)) {
                     .allow => {},
-                    .reject => |resp| return .{ .resp = resp },
-                    .backpressure => |bp| return .{
-                        .resp = bp.resp,
-                        .pause_reads_ms = if (bp.pause_reads) bp.resume_after_ms else null,
+                    .reject => |resp| {
+                        result_resp = resp;
+                        return .{ .resp = result_resp };
+                    },
+                    .backpressure => |bp| {
+                        return .{
+                            .resp = bp.resp,
+                            .pause_reads_ms = if (bp.pause_reads) bp.resume_after_ms else null,
+                        };
                     },
                 }
             }
-            return .{ .resp = r.handler(&ctx) };
+            result_resp = r.handler(&ctx);
+            ran_handler = true;
+            break;
         }
 
-        // No route matched - 404
-        if (path_matched) {
-            if (self.method_not_allowed_handler) |handler| {
-                return .{ .resp = handler(&ctx) };
+        if (!ran_handler) {
+            // No route matched - 404 / 405
+            if (path_matched) {
+                result_resp = if (self.method_not_allowed_handler) |handler|
+                    handler(&ctx)
+                else
+                    self.defaultMethodNotAllowed(&ctx);
+            } else {
+                result_resp = if (self.not_found_handler) |handler|
+                    handler(&ctx)
+                else
+                    notFound();
             }
-            return .{ .resp = self.defaultMethodNotAllowed(&ctx) };
-        }
-        if (self.not_found_handler) |handler| {
-            return .{ .resp = handler(&ctx) };
         }
 
-        return .{ .resp = notFound() };
+        // Post-response hooks: access logging, structured logging,
+        // metrics recording. Runs for every request that made it past
+        // the pre-request middleware chain — including 404s and 405s
+        // from the router (those are real requests that deserve logs).
+        // Does NOT run for x402 rejects, rate-limit rejects, or
+        // bloom-filter fast-rejects (those exit before this point).
+        const elapsed_ns: u64 = if (mw_ctx.request_start) |start|
+            if (clock.Instant.now()) |now_inst| now_inst.since(start) else 0
+        else
+            0;
+        self.middleware_chain.executePost(mw_ctx, req, result_resp, elapsed_ns);
+
+        return .{ .resp = result_resp, .pause_reads_ms = result_pause };
     }
 
     /// Quick O(route_count) check: does ANY registered route's path

@@ -67,24 +67,44 @@ pub fn init(cfg: Config) void {
 const HeaderCache = struct {
     hsts: [128]u8 = undefined,
     hsts_len: usize = 0,
+    cors_max_age: [20]u8 = undefined,
+    cors_max_age_len: usize = 0,
 
     fn buildHsts(self: *HeaderCache, cfg: *const Config) void {
-        var fbs = std.io.fixedBufferStream(&self.hsts);
-        const writer = fbs.writer();
-
-        writer.print("max-age={d}", .{cfg.hsts_max_age}) catch return;
+        // Pre-format the HSTS header value at init time so it's a
+        // simple slice lookup on the hot path. Uses bufPrint instead
+        // of the removed std.io.fixedBufferStream API.
+        const base = std.fmt.bufPrint(&self.hsts, "max-age={d}", .{cfg.hsts_max_age}) catch return;
+        var len = base.len;
         if (cfg.hsts_include_subdomains) {
-            writer.writeAll("; includeSubDomains") catch return;
+            const suffix = "; includeSubDomains";
+            if (len + suffix.len <= self.hsts.len) {
+                @memcpy(self.hsts[len .. len + suffix.len], suffix);
+                len += suffix.len;
+            }
         }
         if (cfg.hsts_preload) {
-            writer.writeAll("; preload") catch return;
+            const suffix = "; preload";
+            if (len + suffix.len <= self.hsts.len) {
+                @memcpy(self.hsts[len .. len + suffix.len], suffix);
+                len += suffix.len;
+            }
         }
+        self.hsts_len = len;
+    }
 
-        self.hsts_len = fbs.pos;
+    fn buildCorsMaxAge(self: *HeaderCache, cfg: *const Config) void {
+        const result = std.fmt.bufPrint(&self.cors_max_age, "{d}", .{cfg.cors_max_age}) catch return;
+        self.cors_max_age_len = result.len;
     }
 
     fn getHsts(self: *const HeaderCache) []const u8 {
         return self.hsts[0..self.hsts_len];
+    }
+
+    fn getCorsMaxAge(self: *const HeaderCache) []const u8 {
+        if (self.cors_max_age_len == 0) return "86400";
+        return self.cors_max_age[0..self.cors_max_age_len];
     }
 };
 
@@ -100,6 +120,7 @@ threadlocal var tls_headers: [8]response.Header = undefined;
 /// Build header cache (call during init)
 pub fn buildCache() void {
     header_cache.buildHsts(&config);
+    header_cache.buildCorsMaxAge(&config);
 }
 
 /// Security headers middleware - adds headers to response
@@ -211,31 +232,83 @@ pub fn evaluate(ctx: *middleware.Context, req: request.RequestView) middleware.D
 }
 
 fn corsPreflightResponse() response.Response {
+    const max_age = header_cache.getCorsMaxAge();
     if (config.cors_allow_credentials and !std.mem.eql(u8, config.cors_allow_origin, "*")) {
-        return .{
-            .status = 204,
-            .headers = &[_]response.Header{
-                .{ .name = "Access-Control-Allow-Origin", .value = config.cors_allow_origin },
-                .{ .name = "Access-Control-Allow-Methods", .value = config.cors_allow_methods },
-                .{ .name = "Access-Control-Allow-Headers", .value = config.cors_allow_headers },
-                .{ .name = "Access-Control-Allow-Credentials", .value = "true" },
-                .{ .name = "Access-Control-Max-Age", .value = "86400" },
-                .{ .name = "Content-Length", .value = "0" },
-            },
-            .body = .none,
+        // Per-thread header buffer for the CORS preflight response.
+        // SAFETY: same contract as the main tls_headers — consumed
+        // before next call on the same thread.
+        const S = struct {
+            threadlocal var hdrs: [6]response.Header = undefined;
         };
-    }
-    return .{
-        .status = 204,
-        .headers = &[_]response.Header{
+        S.hdrs = .{
             .{ .name = "Access-Control-Allow-Origin", .value = config.cors_allow_origin },
             .{ .name = "Access-Control-Allow-Methods", .value = config.cors_allow_methods },
             .{ .name = "Access-Control-Allow-Headers", .value = config.cors_allow_headers },
-            .{ .name = "Access-Control-Max-Age", .value = "86400" },
+            .{ .name = "Access-Control-Allow-Credentials", .value = "true" },
+            .{ .name = "Access-Control-Max-Age", .value = max_age },
             .{ .name = "Content-Length", .value = "0" },
-        },
+        };
+        return .{
+            .status = 204,
+            .headers = &S.hdrs,
+            .body = .none,
+        };
+    }
+    const S2 = struct {
+        threadlocal var hdrs: [5]response.Header = undefined;
+    };
+    S2.hdrs = .{
+        .{ .name = "Access-Control-Allow-Origin", .value = config.cors_allow_origin },
+        .{ .name = "Access-Control-Allow-Methods", .value = config.cors_allow_methods },
+        .{ .name = "Access-Control-Allow-Headers", .value = config.cors_allow_headers },
+        .{ .name = "Access-Control-Max-Age", .value = max_age },
+        .{ .name = "Content-Length", .value = "0" },
+    };
+    return .{
+        .status = 204,
+        .headers = &S2.hdrs,
         .body = .none,
     };
+}
+
+/// Return the static security headers that should be present on every
+/// non-preflight response. These are the same headers that `evaluate()`
+/// would inject via the middleware chain's `.modify` path, but captured
+/// into a slice that's stable for the server's lifetime — suitable for
+/// baking into pre-encoded response caches at init time.
+///
+/// Does NOT include CORS origin/credentials (those depend on the request)
+/// or HSTS (only on TLS, and the caller knows whether TLS is active).
+/// Returns up to 4 headers: CSP, X-Content-Type-Options, X-Frame-Options,
+/// Referrer-Policy.
+pub fn getStaticSecurityHeaders() []const response.Header {
+    // Use a file-level static so the slice outlives the call.
+    const S = struct {
+        var hdrs: [6]response.Header = undefined;
+        var count: usize = 0;
+        var built = false;
+    };
+    if (S.built) return S.hdrs[0..S.count];
+
+    S.count = 0;
+    if (config.csp_enabled) {
+        S.hdrs[S.count] = .{ .name = "Content-Security-Policy", .value = config.csp_policy };
+        S.count += 1;
+    }
+    if (config.content_type_options) {
+        S.hdrs[S.count] = .{ .name = "X-Content-Type-Options", .value = "nosniff" };
+        S.count += 1;
+    }
+    if (config.frame_options) |fo| {
+        S.hdrs[S.count] = .{ .name = "X-Frame-Options", .value = fo };
+        S.count += 1;
+    }
+    if (config.referrer_policy) |rp| {
+        S.hdrs[S.count] = .{ .name = "Referrer-Policy", .value = rp };
+        S.count += 1;
+    }
+    S.built = true;
+    return S.hdrs[0..S.count];
 }
 
 fn badRequestResponse() response.Response {
@@ -268,6 +341,7 @@ test "security headers added on TLS" {
         .headers = &[_]request.Header{
             .{ .name = "Host", .value = "example.com" },
         },
+        .body = "",
     };
 
     const decision = evaluate(&ctx, req);
@@ -299,6 +373,7 @@ test "HSTS not added on non-TLS when tls_only" {
         .headers = &[_]request.Header{
             .{ .name = "Host", .value = "example.com" },
         },
+        .body = "",
     };
 
     const decision = evaluate(&ctx, req);
@@ -316,7 +391,11 @@ test "CORS preflight handled" {
     const req = request.RequestView{
         .method = .OPTIONS,
         .path = "/api/data",
-        .headers = &.{},
+        .headers = &[_]request.Header{
+            .{ .name = "Host", .value = "example.com" },
+            .{ .name = "Access-Control-Request-Method", .value = "POST" },
+        },
+        .body = "",
     };
 
     const decision = evaluate(&ctx, req);

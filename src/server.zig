@@ -34,6 +34,49 @@ fn handleReloadSignal(_: std.posix.SIG) callconv(.c) void {
     reload_requested.store(true, .release);
 }
 
+// ============================================================
+// Pre-encoded response cache (PR PERF-3)
+//
+// CACHE BYPASS SEMANTICS: the pre-encoded fast path intentionally
+// skips the router, the middleware chain, and the response encoder.
+// This is by design — it's the core of the performance win (no
+// per-request middleware overhead on benchmark hot endpoints). The
+// semantic contract:
+//
+//   What IS included in cached responses:
+//     - Status code + body (obviously)
+//     - Content-Type header (endpoint-specific, baked at register)
+//     - Date header (refreshed lazily once per epoch second)
+//     - Alt-Svc header (baked at register if QUIC is enabled)
+//     - Security headers (CSP, X-Content-Type-Options, X-Frame-
+//       Options, Referrer-Policy — merged from security.zig's
+//       getStaticSecurityHeaders() at register/rebuild time)
+//
+//   What is NOT included / NOT run:
+//     - Pre-request middleware chain (health probe rejection,
+//       rate limiting, observability request-ID injection)
+//     - Post-response middleware chain (access logging, metrics
+//       recording, structured logging)
+//     - x402 payment check — CORRECTLY handled: the check runs
+//       BEFORE the cache lookup in handleHttp3Request / the h1
+//       dispatchToRouter path, so paid endpoints can't bypass
+//     - CORS origin/credentials headers (request-dependent)
+//     - HSTS (only on TLS; the caller knows but the cache
+//       doesn't distinguish — follow-up if needed)
+//
+//   Production implications:
+//     - Cached responses don't appear in access logs or metrics.
+//       For benchmark workloads this is fine (nobody reads the
+//       logs). For production, disable the cache or wire a
+//       lightweight post-cache logging hook.
+//     - Cached responses are not rate-limited per-IP. Health
+//       probes are intentionally exempt; hot benchmark endpoints
+//       assume unlimited throughput.
+//     - Cached responses include security headers as of the
+//       MW-2 fix, so HSTS / CSP / X-Frame-Options are present
+//       even on the fast path.
+// ============================================================
+
 /// Maximum number of hot HTTP/3 endpoints that can have pre-encoded
 /// response bytes cached on the Server. Fixed-size — linear scan over
 /// a cache-hot array beats a hashmap for N in the single digits.
@@ -214,6 +257,7 @@ pub const Server = struct {
             .payment_required_b64 = cfg.x402.payment_required_b64,
         });
         try registerDefaultRoutes(&app_router);
+        registerDefaultPostHooks(&app_router);
         return initWithRouter(allocator, cfg, app_router);
     }
 
@@ -391,11 +435,20 @@ pub const Server = struct {
     /// from `registerPreencodedH3` at startup.
     fn rebuildPreencodedH3(self: *Server, entry: *PreencodedH3Response) void {
         const stack = if (self.http3_stack) |*s| s else return;
+        const sec_hdrs = middleware.security.getStaticSecurityHeaders();
+        var merged: [16]response_mod.Header = undefined;
+        var count: usize = 0;
+        for (entry.static_headers) |h| {
+            if (count < merged.len) { merged[count] = h; count += 1; }
+        }
+        for (sec_hdrs) |h| {
+            if (count < merged.len) { merged[count] = h; count += 1; }
+        }
         const body_opt: ?[]const u8 = if (entry.body.len > 0) entry.body else null;
         entry.len = stack.encodeResponse(
             &entry.bytes,
             entry.status,
-            @ptrCast(entry.static_headers),
+            @ptrCast(merged[0..count]),
             body_opt,
         ) catch 0;
         const ts = clock.realtimeTimespec() orelse return;
@@ -509,18 +562,31 @@ pub const Server = struct {
     }
 
     fn rebuildPreencodedH1(self: *Server, entry: *PreencodedH1Response) void {
+        // Merge endpoint-specific headers with security headers so
+        // pre-encoded responses include HSTS, CSP, X-Frame-Options,
+        // etc. without requiring the middleware chain to run. The
+        // security headers are server-lifetime stable (config doesn't
+        // change after init), so this is safe across per-second
+        // Date-header refreshes.
+        const sec_hdrs = middleware.security.getStaticSecurityHeaders();
+        var merged: [16]response_mod.Header = undefined;
+        var count: usize = 0;
+        for (entry.static_headers) |h| {
+            if (count < merged.len) { merged[count] = h; count += 1; }
+        }
+        for (sec_hdrs) |h| {
+            if (count < merged.len) { merged[count] = h; count += 1; }
+        }
+
         const resp: response_mod.Response = .{
             .status = entry.status,
-            .headers = entry.static_headers,
+            .headers = merged[0..count],
             .body = if (entry.body.len > 0) .{ .bytes = entry.body } else .none,
         };
         const alt_svc: ?[]const u8 = if (self.alt_svc_len > 0)
             self.alt_svc_value[0..self.alt_svc_len]
         else
             null;
-        // encodeResponse embeds a `Date: <current>` line — pick up
-        // the current cached date from the Server first so both h1
-        // and h3 caches are populated from the same source of truth.
         const date_str = self.getCachedDate();
         entry.len = encodeResponse(&entry.bytes, resp, alt_svc, false, date_str) catch 0;
         const ts = clock.realtimeTimespec() orelse return;
@@ -614,8 +680,8 @@ pub const Server = struct {
     /// stream_id = 0 placeholders. Stream IDs are patched at send
     /// time.
     fn rebuildPreencodedH2(self: *Server, entry: *PreencodedH2Response) void {
-        // Build headers_with_alt_svc array just like queueHttp2Response
-        // does — the cache must match what the cold path would emit.
+        // Build merged headers: endpoint-specific + security + Alt-Svc,
+        // just like queueHttp2Response + the middleware chain would emit.
         var headers_with_alt_svc: [65]response_mod.Header = undefined;
         var header_count: usize = entry.static_headers.len;
         if (header_count > headers_with_alt_svc.len) {
@@ -623,6 +689,14 @@ pub const Server = struct {
             return;
         }
         for (entry.static_headers, 0..) |h, i| headers_with_alt_svc[i] = h;
+        // Merge security headers (CSP, X-Frame-Options, etc.)
+        const sec_hdrs = middleware.security.getStaticSecurityHeaders();
+        for (sec_hdrs) |h| {
+            if (header_count < headers_with_alt_svc.len) {
+                headers_with_alt_svc[header_count] = h;
+                header_count += 1;
+            }
+        }
         if (self.alt_svc_len > 0 and header_count < headers_with_alt_svc.len) {
             headers_with_alt_svc[header_count] = .{
                 .name = "alt-svc",
@@ -4219,6 +4293,23 @@ fn acquireBufferOpaque(ctx: *anyopaque) ?buffer_pool.BufferHandle {
 fn releaseBufferOpaque(ctx: *anyopaque, handle: buffer_pool.BufferHandle) void {
     const io: *runtime.IoRuntime = @ptrCast(@alignCast(ctx));
     io.releaseBuffer(handle);
+}
+
+/// Wire the default post-response middleware hooks into the router's
+/// chain. Pre-request hooks (security, rate-limit, health) are left
+/// to the user / ServerBuilder; post-response hooks (metrics recording,
+/// access logging) are universal and safe to install by default.
+///
+/// Called from Server.init() and should be called by any custom setup
+/// that wants metrics + logging without manually constructing a Chain.
+pub fn registerDefaultPostHooks(app_router: *router.Router) void {
+    const post_hooks = [_]middleware.PostResponseFn{
+        metrics_mw.postResponse,
+        middleware.access_log.postResponseCombined,
+    };
+    var chain = app_router.middleware_chain;
+    chain.post = &post_hooks;
+    app_router.setMiddleware(chain);
 }
 
 pub fn registerDefaultRoutes(app_router: *router.Router) !void {

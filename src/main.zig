@@ -41,6 +41,7 @@ pub fn main(init: std.process.Init) !void {
         .payment_required_b64 = cfg.x402.payment_required_b64,
     });
     try swerver.registerDefaultRoutes(&app_router);
+    swerver.registerDefaultPostHooks(&app_router);
 
     // Build proxy from config file if upstreams/routes defined
     var proxy_instance: ?swerver.proxy.handler.Proxy = null;
