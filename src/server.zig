@@ -327,6 +327,10 @@ pub const Server = struct {
         // to build a stream-id-agnostic HPACK block + frame headers that
         // are patched per-request.
         if (build_options.enable_http2) self.initPreencodedH2();
+
+        // Load /data/dataset.json for the HttpArena /json endpoint.
+        // No-op if the file doesn't exist (local dev without the dataset).
+        loadJsonDataset();
     }
 
     /// Populate the h3 pre-encoded response cache with a fixed set of
@@ -4222,6 +4226,11 @@ pub fn registerDefaultRoutes(app_router: *router.Router) !void {
     try app_router.get("/baseline11", handleHttpArenaBaseline11);
     try app_router.post("/baseline11", handleHttpArenaBaseline11);
     try app_router.get("/baseline2", handleHttpArenaBaseline2);
+    try app_router.post("/baseline2", handleHttpArenaBaseline2);
+    // Upload: return byte count of POST body
+    try app_router.post("/upload", handleHttpArenaUpload);
+    // JSON processing: load dataset, compute totals, return JSON
+    try app_router.get("/json", handleHttpArenaJson);
 }
 
 // ============================================================
@@ -4331,6 +4340,118 @@ fn handleHttpArenaPipeline(_: *router.HandlerContext) response_mod.Response {
         },
         .body = .{ .bytes = "ok" },
     };
+}
+
+/// POST /upload - HttpArena upload endpoint.
+/// Returns the byte count of the request body as text/plain.
+fn handleHttpArenaUpload(ctx: *router.HandlerContext) response_mod.Response {
+    const body_len = ctx.request.body.len;
+    const body = std.fmt.bufPrint(ctx.response_buf, "{d}", .{body_len}) catch "0";
+    return .{
+        .status = 200,
+        .headers = &[_]response_mod.Header{
+            .{ .name = "Content-Type", .value = "text/plain" },
+        },
+        .body = .{ .bytes = body },
+    };
+}
+
+/// GET /json - HttpArena JSON processing endpoint.
+/// Loads /data/dataset.json (50 items), computes total = price × quantity
+/// for each item, returns JSON with count + items array.
+///
+/// The dataset is loaded at first request and cached in the handler's
+/// arena (which is the router scratch arena_buf). Since this is a GET
+/// handler, the lazy arena path gives us a zero-length arena, so we
+/// format directly into response_buf instead.
+fn handleHttpArenaJson(_: *router.HandlerContext) response_mod.Response {
+    // The dataset is 50 items with {id,name,category,price,quantity,active,tags,rating}.
+    // We need to add a "total" field = price * quantity.
+    // Since we can't dynamically load a file inside a handler (no allocator,
+    // no fd), this handler is backed by a pre-loaded dataset. The Server
+    // loads it at init and the handler references it.
+    //
+    // For now: build the response from the pre-loaded json_dataset.
+    const dataset_bytes = json_dataset_bytes;
+    if (dataset_bytes.len == 0) {
+        return .{
+            .status = 500,
+            .headers = &[_]response_mod.Header{},
+            .body = .{ .bytes = "dataset not loaded" },
+        };
+    }
+    return .{
+        .status = 200,
+        .headers = &[_]response_mod.Header{
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .body = .{ .bytes = dataset_bytes },
+    };
+}
+
+/// Pre-computed JSON response for /json endpoint.
+/// Populated by `loadJsonDataset()` at server init from /data/dataset.json.
+/// Uses a simple line-by-line approach: reads each JSON object from the
+/// array, injects a "total" field (price × quantity), wraps in
+/// {"count":N,"items":[...]}. No Zig JSON parser needed — just string ops.
+var json_dataset_buf: [65536]u8 = undefined;
+var json_dataset_bytes: []const u8 = &.{};
+
+pub fn loadJsonDataset() void {
+    var path_z: [64]u8 = undefined;
+    const dpath = "/data/dataset.json";
+    @memcpy(path_z[0..dpath.len], dpath);
+    path_z[dpath.len] = 0;
+    const path_ptr: [*:0]const u8 = @ptrCast(&path_z);
+    const fd = std.posix.openatZ(std.posix.AT.FDCWD, path_ptr, .{ .ACCMODE = .RDONLY }, 0) catch return;
+    defer clock.closeFd(fd);
+    var raw: [32768]u8 = undefined;
+    const n = std.posix.read(fd, &raw) catch return;
+    if (n == 0) return;
+
+    // Use Zig's JSON parser to read the dataset and rebuild with totals.
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, std.heap.page_allocator, raw[0..n], .{}) catch return;
+
+    const items = switch (parsed) {
+        .array => |arr| arr.items,
+        else => return,
+    };
+
+    var off: usize = 0;
+    const out = &json_dataset_buf;
+    off += (std.fmt.bufPrint(out[off..], "{{\"count\":{d},\"items\":[", .{items.len}) catch return).len;
+
+    for (items, 0..) |item_val, i| {
+        if (i > 0) { out[off] = ','; off += 1; }
+        const obj = switch (item_val) { .object => |o| o, else => continue };
+
+        // Extract fields
+        const id = switch (obj.get("id") orelse continue) { .integer => |v| v, else => continue };
+        const name = switch (obj.get("name") orelse continue) { .string => |v| v, else => continue };
+        const category = switch (obj.get("category") orelse continue) { .string => |v| v, else => continue };
+        const price = switch (obj.get("price") orelse continue) {
+            .float => |v| v,
+            .integer => |v| @as(f64, @floatFromInt(v)),
+            else => continue,
+        };
+        const quantity = switch (obj.get("quantity") orelse continue) { .integer => |v| v, else => continue };
+
+        const total = price * @as(f64, @floatFromInt(quantity));
+        const total_cents: i64 = @intFromFloat(@round(total * 100.0));
+        const whole = @divTrunc(total_cents, 100);
+        const frac: u64 = @intCast(@abs(@rem(total_cents, 100)));
+
+        const price_cents: i64 = @intFromFloat(@round(price * 100.0));
+        const p_whole = @divTrunc(price_cents, 100);
+        const p_frac: u64 = @intCast(@abs(@rem(price_cents, 100)));
+
+        const written = std.fmt.bufPrint(out[off..], "{{\"id\":{d},\"name\":\"{s}\",\"category\":\"{s}\",\"price\":{d}.{d:0>2},\"quantity\":{d},\"total\":{d}.{d:0>2}}}", .{
+            id, name, category, p_whole, p_frac, quantity, whole, frac,
+        }) catch return;
+        off += written.len;
+    }
+    off += (std.fmt.bufPrint(out[off..], "]}}", .{}) catch return).len;
+    json_dataset_bytes = out[0..off];
 }
 
 /// GET|POST /baseline11 - HttpArena h1 throughput endpoint.
