@@ -1242,6 +1242,16 @@ fn decodeChunkedInPlace(buf: []u8, body_start: usize) !ChunkedResult {
         if (line.len == 0) return error.InvalidChunk;
         src = line_end + 2;
         if (size == 0) {
+            // No-trailer fast path: just \r\n terminates (matches scanChunked)
+            if (src + 2 <= buf.len and buf[src] == '\r' and buf[src + 1] == '\n') {
+                return .{
+                    .complete = true,
+                    .body_start = body_start,
+                    .body_len = total,
+                    .consumed_bytes = src + 2,
+                };
+            }
+            // Trailers present or incomplete
             const trailer_end = std.mem.indexOfPos(u8, buf, src, "\r\n\r\n") orelse return ChunkedResult{
                 .complete = false,
                 .body_start = body_start,
