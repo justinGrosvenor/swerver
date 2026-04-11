@@ -2210,8 +2210,20 @@ pub const Server = struct {
         // Check if all writes are complete
         if (conn.state == .closed) return;
         if (conn.write_count == 0 and !conn.hasPendingBody() and !conn.hasPendingFile()) {
+            if (conn.close_after_write) {
+                self.closeConnection(conn);
+                return;
+            }
+            // If there's still data in the read buffer (from a pipelining
+            // backpressure break), re-enter the read handler now that
+            // writes have drained and buffers are free. With edge-triggered
+            // epoll, no new read event will fire since the data is already
+            // buffered — we must process it explicitly here.
+            if (conn.read_buffered_bytes > 0) {
+                self.handleRead(index) catch {};
+                return;
+            }
             self.io.setTimeoutPhase(conn, .idle);
-            if (conn.close_after_write) self.closeConnection(conn);
         }
     }
 
