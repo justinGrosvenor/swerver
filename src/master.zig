@@ -4,7 +4,6 @@ const ServerBuilder = @import("server_builder.zig").ServerBuilder;
 const router = @import("router/router.zig");
 const clock = @import("runtime/clock.zig");
 const proxy_mod = @import("proxy/proxy.zig");
-const net = @import("runtime/net.zig");
 
 const MAX_WORKERS = 256;
 
@@ -35,12 +34,6 @@ pub const Master = struct {
     last_crash_ms: []u64,
     /// Consecutive crash count per worker slot
     crash_count: []u8,
-    /// Shared listener fd created before fork — all workers inherit it
-    /// via the fork'd fd table. This gives natural accept() distribution
-    /// across workers instead of SO_REUSEPORT hash-based distribution.
-    listener_fd: ?std.posix.fd_t = null,
-    /// Shared UDP socket for QUIC (same principle)
-    udp_fd: ?std.posix.fd_t = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -79,24 +72,7 @@ pub const Master = struct {
 
         std.log.info("[master] starting {d} workers on :{d}", .{ self.worker_count, self.cfg.port });
 
-        // Create shared listener socket BEFORE forking so all workers
-        // inherit the same fd. The kernel's accept() queue naturally
-        // distributes connections across workers — much better scaling
-        // than SO_REUSEPORT's hash-based distribution with few connections.
-        self.listener_fd = net.listen(self.cfg.address, self.cfg.port, 4096) catch |err| {
-            std.log.err("[master] failed to bind :{d}: {}", .{ self.cfg.port, err });
-            return err;
-        };
-
-        // Create shared UDP socket for QUIC if enabled
-        if (self.cfg.quic.enabled and self.cfg.quic.port > 0) {
-            self.udp_fd = net.bindUdp(self.cfg.address, self.cfg.quic.port) catch |err| {
-                std.log.warn("[master] failed to bind UDP :{d}: {}", .{ self.cfg.quic.port, err });
-                return err;
-            };
-        }
-
-        // Fork all workers
+        // Fork all workers — each creates its own listener with SO_REUSEPORT
         for (0..self.worker_count) |i| {
             self.forkWorker(@intCast(i));
         }
@@ -162,10 +138,6 @@ pub const Master = struct {
                 srv.deinit();
                 self.allocator.destroy(srv);
             }
-
-            // Pass shared listener fds so workers skip creating their own
-            srv.listener_fd = self.listener_fd;
-            srv.udp_fd = self.udp_fd;
 
             srv.run(null) catch |err| {
                 std.log.err("[w{d}] server error: {}", .{ worker_id, err });
