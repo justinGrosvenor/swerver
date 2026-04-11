@@ -614,20 +614,29 @@ pub const Server = struct {
     /// parse" path, and the body-accumulation-complete dispatch
     /// for large POST/PUT (which always misses the cache since
     /// those aren't GET).
-    fn tryDispatchPreencodedH1(self: *Server, conn: *connection.Connection, req_view: request.RequestView) bool {
-        if (conn.close_after_write) return false;
-        // x402 gate: if payment is required, the pre-encoded cache must
-        // NOT bypass the payment check. Fall through to the router path
-        // which runs x402.evaluate before dispatching. Without this,
-        // cached endpoints (/echo, /health, etc.) would be accessible
-        // without paying even when require_payment = true.
-        if (self.app_router.x402_policy.require_payment) return false;
+    const PreencodedResult = enum {
+        /// Response sent from cache. Caller should continue pipelining.
+        dispatched,
+        /// No cache entry matched. Caller should fall through to router.
+        not_cached,
+        /// Cache entry matched but pool exhausted. Caller should BREAK
+        /// the pipelining loop (not fall through to router, which would
+        /// also fail). Writes will drain and free buffers; on the next
+        /// event-loop pass the loop resumes.
+        pool_exhausted,
+    };
+
+    fn tryDispatchPreencodedH1(self: *Server, conn: *connection.Connection, req_view: request.RequestView) PreencodedResult {
+        if (conn.close_after_write) return .not_cached;
+        if (self.app_router.x402_policy.require_payment) return .not_cached;
         const method_str = req_view.getMethodName();
         if (self.findAndRefreshPreencodedH1(method_str, req_view.path)) |entry| {
-            self.sendH1PreencodedBytes(conn, entry.bytes[0..entry.len]);
-            return true;
+            if (self.sendH1PreencodedBytes(conn, entry.bytes[0..entry.len]))
+                return .dispatched
+            else
+                return .pool_exhausted;
         }
-        return false;
+        return .not_cached;
     }
 
     /// Populate the h2 pre-encoded response cache with the same hot
@@ -807,27 +816,34 @@ pub const Server = struct {
     /// write buffer, bypassing `queueResponse`. One buffer-pool acquire,
     /// one memcpy (cached bytes → write buffer), one enqueueWrite. Used
     /// on the pre-encoded cache hit path.
-    fn sendH1PreencodedBytes(self: *Server, conn: *connection.Connection, bytes: []const u8) void {
+    /// Write pre-encoded h1 response bytes to the connection's write
+    /// buffer. Returns false if the buffer pool is exhausted — the
+    /// caller should break out of the pipelining loop and wait for
+    /// writes to drain (returning buffers to the pool) before
+    /// continuing. This is the fix for the pipelined-benchmark 0 req/s
+    /// bug: previously pool exhaustion called closeConnection, causing
+    /// 213K reconnects in 5 seconds.
+    fn sendH1PreencodedBytes(self: *Server, conn: *connection.Connection, bytes: []const u8) bool {
         const buf = self.io.acquireBuffer() orelse {
-            self.closeConnection(conn);
-            return;
+            // Pool exhausted — do NOT close the connection. The
+            // pipelining loop should break and wait for writes to
+            // flush (freeing buffers). On the next event-loop
+            // iteration the connection is still readable and the
+            // loop picks up where it left off.
+            return false;
         };
         if (bytes.len > buf.bytes.len) {
-            // Shouldn't happen: hot endpoints fit in H1_PREENCODED_BUF_SIZE
-            // (1024) and the connection buffer pool slots are typically
-            // 64 KiB. If it does, bail to the router path next time.
             self.io.releaseBuffer(buf);
-            self.closeConnection(conn);
-            return;
+            return false;
         }
         @memcpy(buf.bytes[0..bytes.len], bytes);
         if (!conn.enqueueWrite(buf, bytes.len)) {
             self.io.releaseBuffer(buf);
-            self.closeConnection(conn);
-            return;
+            return false;
         }
         self.io.onWriteBuffered(conn, bytes.len);
         self.io.setTimeoutPhase(conn, .write);
+        return true;
     }
 
     pub fn deinit(self: *Server) void {
@@ -1787,9 +1803,22 @@ pub const Server = struct {
             // Fast path: pre-encoded h1 response cache. Hot static
             // endpoints skip the router, middleware, and response
             // encoding entirely and write cached bytes directly.
-            if (self.tryDispatchPreencodedH1(conn, parse.view)) {
-                if (conn.read_buffered_bytes == 0) break;
-                continue;
+            switch (self.tryDispatchPreencodedH1(conn, parse.view)) {
+                .dispatched => {
+                    if (conn.read_buffered_bytes == 0) break;
+                    continue;
+                },
+                .pool_exhausted => {
+                    // Buffer pool is temporarily full. Break the
+                    // pipelining loop — do NOT fall through to the
+                    // router (it would also fail to acquire a buffer
+                    // and close the connection). Pending writes will
+                    // drain, return buffers to the pool, and the next
+                    // event-loop iteration picks up remaining pipelined
+                    // requests from the read buffer.
+                    break;
+                },
+                .not_cached => {},
             }
 
             var mw_ctx = middleware.Context{
@@ -2210,8 +2239,10 @@ pub const Server = struct {
             };
             if (is_simple_body) {
                 if (self.findPreencodedError(resp.status)) |entry| {
-                    self.sendH1PreencodedBytes(conn, entry.bytes[0..entry.len]);
-                    return;
+                    if (self.sendH1PreencodedBytes(conn, entry.bytes[0..entry.len])) return;
+                    // Pool exhausted — fall through to the normal encode path
+                    // which also acquires a buffer. If that also fails, the
+                    // connection is closed there (existing behavior).
                 }
             }
         }
@@ -3602,7 +3633,7 @@ pub const Server = struct {
         }
 
         // Fast path: pre-encoded h1 response cache.
-        if (self.tryDispatchPreencodedH1(conn, req_view)) return;
+        if (self.tryDispatchPreencodedH1(conn, req_view) == .dispatched) return;
 
         var mw_ctx = middleware.Context{
             .protocol = .http1,
