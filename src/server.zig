@@ -1877,6 +1877,15 @@ pub const Server = struct {
                             const method_str = hdr.request.getMethodName();
                             if (self.findAndRefreshPreencodedH2(method_str, hdr.request.path)) |entry| {
                                 self.sendH2PreencodedBytes(conn, hdr.stream_id, entry);
+                            } else if (self.cfg.static_root.len > 0 and std.mem.startsWith(u8, hdr.request.path, "/static/")) {
+                                // Static file serving over h2 — same
+                                // open+read path as h1 but the response
+                                // goes through queueHttp2Response.
+                                const file_path = hdr.request.path[8..];
+                                const content_type = guessContentType(file_path);
+                                self.queueFileResponseH2(conn, hdr.stream_id, self.cfg.static_root, file_path, content_type) catch {
+                                    try self.queueHttp2Response(conn, hdr.stream_id, notFoundResponse(), false);
+                                };
                             } else {
                                 try self.dispatchHttp2Request(conn, hdr.stream_id, hdr.request, "");
                             }
@@ -2338,6 +2347,56 @@ pub const Server = struct {
 
         // Store any remaining data for continuation in handleWrite
         conn.pending_body = remaining;
+    }
+
+    /// Serve a static file over HTTP/2. Opens the file, reads into a
+    /// managed buffer, and queues the response via queueHttp2Response.
+    /// Less efficient than the h1 sendfile path but correct for h2
+    /// multiplexed streams.
+    fn queueFileResponseH2(
+        self: *Server,
+        conn: *connection.Connection,
+        stream_id: u32,
+        static_root: []const u8,
+        file_path: []const u8,
+        content_type: []const u8,
+    ) !void {
+        _ = static_root;
+        // Path validation (same as h1)
+        if (std.mem.indexOfScalar(u8, file_path, '%') != null) return error.NotFound;
+        if (std.mem.indexOf(u8, file_path, "..") != null) return error.NotFound;
+        if (std.mem.indexOfScalar(u8, file_path, 0) != null) return error.NotFound;
+        if (file_path.len > 0 and file_path[0] == '/') return error.NotFound;
+
+        const root_fd = self.static_root_fd orelse return error.NotFound;
+
+        var path_buf: [4096]u8 = undefined;
+        if (file_path.len >= path_buf.len) return error.NotFound;
+        @memcpy(path_buf[0..file_path.len], file_path);
+        path_buf[file_path.len] = 0;
+        const path_z: [*:0]const u8 = @ptrCast(&path_buf);
+
+        var o_flags: std.posix.O = .{ .ACCMODE = .RDONLY };
+        if (@hasField(std.posix.O, "NOFOLLOW")) o_flags.NOFOLLOW = true;
+        if (@hasField(std.posix.O, "CLOEXEC")) o_flags.CLOEXEC = true;
+        const file_fd = std.posix.openatZ(root_fd, path_z, o_flags, 0) catch return error.NotFound;
+        defer clock.closeFd(file_fd);
+
+        // Read file into a managed buffer
+        const buf_handle = self.io.acquireBuffer() orelse return error.NotFound;
+        const n = std.posix.read(file_fd, buf_handle.bytes) catch {
+            self.io.releaseBuffer(buf_handle);
+            return error.NotFound;
+        };
+
+        const resp: response_mod.Response = .{
+            .status = 200,
+            .headers = &[_]response_mod.Header{
+                .{ .name = "Content-Type", .value = content_type },
+            },
+            .body = .{ .managed = .{ .handle = buf_handle, .len = n } },
+        };
+        try self.queueHttp2Response(conn, stream_id, resp, false);
     }
 
     /// Queue a file response using sendfile for zero-copy transfer.
@@ -2971,6 +3030,16 @@ pub const Server = struct {
             return "application/pdf";
         } else if (std.mem.endsWith(u8, path, ".wasm")) {
             return "application/wasm";
+        } else if (std.mem.endsWith(u8, path, ".webp")) {
+            return "image/webp";
+        } else if (std.mem.endsWith(u8, path, ".woff2")) {
+            return "font/woff2";
+        } else if (std.mem.endsWith(u8, path, ".woff")) {
+            return "font/woff";
+        } else if (std.mem.endsWith(u8, path, ".ico")) {
+            return "image/x-icon";
+        } else if (std.mem.endsWith(u8, path, ".xml")) {
+            return "application/xml";
         } else {
             return "application/octet-stream";
         }
@@ -4244,14 +4313,11 @@ fn handleBenchEchoPost(ctx: *router.HandlerContext) response_mod.Response {
 /// The pre-encoded cache catches that exact URL; this cold-path
 /// handler only runs for non-canonical queries (which HttpArena
 /// doesn't send). Same applies to /baseline11 below.
-fn handleHttpArenaBaseline2(_: *router.HandlerContext) response_mod.Response {
-    return .{
-        .status = 200,
-        .headers = &[_]response_mod.Header{
-            .{ .name = "Content-Type", .value = "text/plain" },
-        },
-        .body = .{ .bytes = "2" },
-    };
+fn handleHttpArenaBaseline2(ctx: *router.HandlerContext) response_mod.Response {
+    // Same logic as baseline11: parse a & b from query, sum them.
+    // The pre-encoded cache handles the hot case (a=1&b=1 → "2");
+    // this handler covers the anti-cheat path (random params).
+    return handleHttpArenaBaseline11(ctx);
 }
 
 /// GET /pipeline - HttpArena h1 pipelining throughput endpoint.

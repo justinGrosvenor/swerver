@@ -549,7 +549,10 @@ pub const Router = struct {
         // cuts the error-handling benchmark's 404 path from O(N
         // routes) to O(1).
         if (self.first_segment_bloom != 0) {
-            const seg = firstPathSegment(req.path);
+            // Strip query string before hashing — registered routes
+            // don't include query params, but request paths do.
+            const clean = if (std.mem.indexOfScalar(u8, req.path, '?')) |qi| req.path[0..qi] else req.path;
+            const seg = firstPathSegment(clean);
             if (seg.len > 0) {
                 const hash = std.hash.Wyhash.hash(0, seg);
                 const bit = @as(u64, 1) << @intCast(hash % 64);
