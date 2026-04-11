@@ -2,10 +2,10 @@
   <rect width="256" height="256" fill="#000000"/>
   <path d="M0 60 L256 20 L256 80 L0 120 Z" fill="#FFD60A"/>
   <path d="M0 140 L256 100 L256 160 L0 200 Z" fill="#FFD60A"/>
-  <text x="18" y="186"
+  <text x="14" y="178"
         font-family="JetBrains Mono, monospace"
-        font-size="28"
-        font-weight="600"
+        font-size="48"
+        font-weight="700"
         fill="#000000">
     s
   </text>
