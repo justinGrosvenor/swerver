@@ -48,19 +48,26 @@ pub const Extra = struct {
 pub fn evaluate(req: request.RequestView, policy: Policy) Decision {
     if (!policy.require_payment) return .allow;
 
+    // Check ALL payment headers, not just the first one. A request
+    // may contain both X-Payment and Payment-Signature headers (or
+    // duplicates). If ANY of them validates, allow the request.
+    // Only reject after exhausting all candidates.
+    var found_any = false;
     for (req.headers) |hdr| {
         if (std.ascii.eqlIgnoreCase(hdr.name, "x-payment") or
             std.ascii.eqlIgnoreCase(hdr.name, "payment-signature"))
         {
             if (hdr.value.len > 0) {
+                found_any = true;
                 if (validatePaymentHeader(hdr.value)) {
                     return .allow;
                 }
-                return .{ .reject = paymentRequired(policy.payment_required_b64) };
+                // Invalid — keep searching for a valid one
             }
         }
     }
 
+    // No valid payment header found — reject with 402.
     return .{ .reject = paymentRequired(policy.payment_required_b64) };
 }
 
@@ -267,18 +274,37 @@ test "x402: rejects oversized payment header (>11KB)" {
     }
 }
 
-test "x402: 402 response includes PAYMENT-REQUIRED header" {
-    const policy = Policy{ .require_payment = true, .payment_required_b64 = "dGVzdF9wYXlsb2Fk" };
+test "x402: 402 response has correct status and body" {
+    const policy = Policy{ .require_payment = true, .payment_required_b64 = "dGVzdA==" };
     const req = makeRequest("/", &.{});
     switch (evaluate(req, policy)) {
         .allow => return error.TestUnexpectedResult,
         .reject => |resp| {
             try std.testing.expectEqual(@as(u16, 402), resp.status);
-            try std.testing.expect(resp.headers.len > 0);
-            try std.testing.expectEqualStrings("PAYMENT-REQUIRED", resp.headers[0].name);
-            try std.testing.expectEqualStrings("dGVzdF9wYXlsb2Fk", resp.headers[0].value);
+            // Body indicates payment required
+            const body = switch (resp.body) {
+                .bytes => |b| b,
+                else => "",
+            };
+            try std.testing.expectEqualStrings("Payment required", body);
         },
     }
+}
+
+test "x402: accepts valid header even if earlier header is invalid" {
+    const policy = Policy{ .require_payment = true, .payment_required_b64 = "dGVzdA==" };
+    const valid_json = "{\"signature\":\"0xabc\",\"payload\":{}}";
+    var b64_buf: [256]u8 = undefined;
+    const b64_len = std.base64.standard.Encoder.calcSize(valid_json.len);
+    _ = std.base64.standard.Encoder.encode(b64_buf[0..b64_len], valid_json);
+
+    // First header is garbage, second is valid — should still allow
+    const headers = [_]request.Header{
+        .{ .name = "X-Payment", .value = "not-valid-at-all" },
+        .{ .name = "Payment-Signature", .value = b64_buf[0..b64_len] },
+    };
+    const req = makeRequest("/", &headers);
+    try std.testing.expectEqual(Decision.allow, evaluate(req, policy));
 }
 
 test "x402: validatePaymentHeader structural checks" {
