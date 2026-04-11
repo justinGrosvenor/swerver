@@ -257,6 +257,7 @@ pub const Server = struct {
             .payment_required_b64 = cfg.x402.payment_required_b64,
         });
         try registerDefaultRoutes(&app_router);
+        middleware.security.buildCache();
         registerDefaultPostHooks(&app_router);
         return initWithRouter(allocator, cfg, app_router);
     }
@@ -4295,19 +4296,33 @@ fn releaseBufferOpaque(ctx: *anyopaque, handle: buffer_pool.BufferHandle) void {
     io.releaseBuffer(handle);
 }
 
-/// Wire the default post-response middleware hooks into the router's
-/// chain. Pre-request hooks (security, rate-limit, health) are left
-/// to the user / ServerBuilder; post-response hooks (metrics recording,
-/// access logging) are universal and safe to install by default.
+/// Wire the default middleware hooks into the router's chain:
 ///
-/// Called from Server.init() and should be called by any custom setup
-/// that wants metrics + logging without manually constructing a Chain.
+///   Pre-request:
+///     - security.evaluate — Host validation, HSTS, CSP, CORS,
+///       X-Frame-Options, Referrer-Policy, X-Content-Type-Options.
+///       Runs on every cold-path request (hot-path pre-encoded
+///       responses bake security headers at build time via MW-2).
+///
+///   Post-response:
+///     - metrics_mw.postResponse — records request count, response
+///       status, latency, body bytes, per-stream metrics.
+///     - access_log.postResponseCombined — writes a combined-format
+///       access log line to stderr.
+///
+/// Called from Server.init() and main.zig. Should be called by any
+/// custom setup that wants the full middleware stack without manually
+/// constructing a Chain.
 pub fn registerDefaultPostHooks(app_router: *router.Router) void {
+    const pre_hooks = [_]middleware.MiddlewareFn{
+        middleware.security.evaluate,
+    };
     const post_hooks = [_]middleware.PostResponseFn{
         metrics_mw.postResponse,
         middleware.access_log.postResponseCombined,
     };
     var chain = app_router.middleware_chain;
+    chain.pre = &pre_hooks;
     chain.post = &post_hooks;
     app_router.setMiddleware(chain);
 }
