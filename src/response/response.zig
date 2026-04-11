@@ -13,7 +13,7 @@ pub const ManagedBody = struct {
 /// to the write queue without linearizing. Used for echo POST optimization.
 pub const ScatteredBody = struct {
     handles: []buffer_pool.BufferHandle,
-    count: u8,
+    count: u16,
     last_buf_len: usize,
     total_len: usize,
     buffer_size: usize,

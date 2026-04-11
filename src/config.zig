@@ -95,7 +95,7 @@ pub const Timeouts = struct {
 
 pub const Limits = struct {
     max_header_bytes: usize = 32 * 1024,
-    max_body_bytes: usize = 8 * 1024 * 1024,
+    max_body_bytes: usize = 32 * 1024 * 1024,
     max_header_count: usize = 128,
 };
 

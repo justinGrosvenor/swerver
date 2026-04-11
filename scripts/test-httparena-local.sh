@@ -74,7 +74,7 @@ done
 echo '{"name":"swerver"}' > "$STATIC_DIR/manifest.json"
 
 echo "==> Building Docker image $IMAGE ..."
-docker build -f httparena/Dockerfile -t "$IMAGE" . >/dev/null
+docker build -f httparena/Dockerfile --build-arg USE_LOCAL=1 -t "$IMAGE" . >/dev/null
 
 # ---- Start the container ----
 docker rm -f "$CONTAINER" 2>/dev/null || true

@@ -388,13 +388,8 @@ pub const Server = struct {
         const plaintext_headers = [_]response_mod.Header{
             .{ .name = "Content-Type", .value = "text/plain" },
         };
-        const json_headers = [_]response_mod.Header{
-            .{ .name = "Content-Type", .value = "application/json" },
-        };
-
         self.registerPreencodedH3("GET", "/health", 200, &[_]response_mod.Header{}, "");
         self.registerPreencodedH3("GET", "/plaintext", 200, &plaintext_headers, "Hello, World!");
-        self.registerPreencodedH3("GET", "/json", 200, &json_headers, "{\"message\":\"Hello, World!\"}");
         // HttpArena baselines: both h2/h3 share /baseline2 and h1
         // uses /baseline11. The canonical benchmark URL is always
         // ?a=1&b=1 → body "2". /pipeline returns "ok".
@@ -491,7 +486,6 @@ pub const Server = struct {
         self.registerPreencodedH1("GET", "/echo", 200, &json_headers, "{\"status\":\"ok\"}");
         self.registerPreencodedH1("GET", "/health", 200, &[_]response_mod.Header{}, "");
         self.registerPreencodedH1("GET", "/plaintext", 200, &plaintext_headers, "Hello, World!");
-        self.registerPreencodedH1("GET", "/json", 200, &json_headers, "{\"message\":\"Hello, World!\"}");
         self.registerPreencodedH1("GET", "/baseline2?a=1&b=1", 200, &plaintext_headers, "2");
         self.registerPreencodedH1("GET", "/baseline11?a=1&b=1", 200, &plaintext_headers, "2");
         self.registerPreencodedH1("GET", "/pipeline", 200, &plaintext_headers, "ok");
@@ -642,13 +636,8 @@ pub const Server = struct {
         const plaintext_headers = [_]response_mod.Header{
             .{ .name = "Content-Type", .value = "text/plain" },
         };
-        const json_headers = [_]response_mod.Header{
-            .{ .name = "Content-Type", .value = "application/json" },
-        };
-
         self.registerPreencodedH2("GET", "/health", 200, &[_]response_mod.Header{}, "");
         self.registerPreencodedH2("GET", "/plaintext", 200, &plaintext_headers, "Hello, World!");
-        self.registerPreencodedH2("GET", "/json", 200, &json_headers, "{\"message\":\"Hello, World!\"}");
         self.registerPreencodedH2("GET", "/baseline2?a=1&b=1", 200, &plaintext_headers, "2");
         self.registerPreencodedH2("GET", "/baseline11?a=1&b=1", 200, &plaintext_headers, "2");
         self.registerPreencodedH2("GET", "/pipeline", 200, &plaintext_headers, "ok");
@@ -4335,7 +4324,6 @@ pub fn registerDefaultRoutes(app_router: *router.Router) !void {
     try app_router.get("/blob", handleBenchBlob);
     // TechEmpower Framework Benchmark endpoints
     try app_router.get("/plaintext", handleTfbPlaintext);
-    try app_router.get("/json", handleTfbJson);
     // HttpArena benchmark endpoints. All three are "sum of query
     // params" / "fixed ok" endpoints used by the throughput and
     // pipelining profiles across h1, h2, and h3. PR PERF-3's
@@ -4346,10 +4334,11 @@ pub fn registerDefaultRoutes(app_router: *router.Router) !void {
     try app_router.post("/baseline11", handleHttpArenaBaseline11);
     try app_router.get("/baseline2", handleHttpArenaBaseline2);
     try app_router.post("/baseline2", handleHttpArenaBaseline2);
+    // JSON processing: load dataset, compute totals, return JSON.
+    // Falls back to TechEmpower {"message":"Hello, World!"} when no dataset.
+    try app_router.get("/json", handleHttpArenaJson);
     // Upload: return byte count of POST body
     try app_router.post("/upload", handleHttpArenaUpload);
-    // JSON processing: load dataset, compute totals, return JSON
-    try app_router.get("/json", handleHttpArenaJson);
 }
 
 // ============================================================
@@ -4425,16 +4414,6 @@ fn handleBenchEchoPost(ctx: *router.HandlerContext) response_mod.Response {
     }
 
 /// GET /json - TechEmpower JSON serialization test
-    fn handleTfbJson(_: *router.HandlerContext) response_mod.Response {
-        return .{
-            .status = 200,
-            .headers = &[_]response_mod.Header{
-                .{ .name = "Content-Type", .value = "application/json" },
-            },
-            .body = .{ .bytes = "{\"message\":\"Hello, World!\"}" },
-        };
-    }
-
 /// GET /baseline2?a=1&b=1 - HttpArena h2/h3 throughput endpoint.
 /// Returns the literal sum of query params a and b. HttpArena always
 /// sends the canonical ?a=1&b=1, so the response body is always "2".
@@ -4493,10 +4472,13 @@ fn handleHttpArenaJson(_: *router.HandlerContext) response_mod.Response {
     // For now: build the response from the pre-loaded json_dataset.
     const dataset_bytes = json_dataset_bytes;
     if (dataset_bytes.len == 0) {
+        // No dataset file — fall back to TechEmpower /json format.
         return .{
-            .status = 500,
-            .headers = &[_]response_mod.Header{},
-            .body = .{ .bytes = "dataset not loaded" },
+            .status = 200,
+            .headers = &[_]response_mod.Header{
+                .{ .name = "Content-Type", .value = "application/json" },
+            },
+            .body = .{ .bytes = "{\"message\":\"Hello, World!\"}" },
         };
     }
     return .{

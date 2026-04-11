@@ -10,14 +10,14 @@ const tls = @import("../tls/provider.zig");
 /// State for accumulating large request bodies across multiple reads.
 /// Heap-allocated on demand (only for bodies that exceed the read buffer).
 pub const BodyAccumState = struct {
-    pub const MAX_BODY_BUFFERS = 128; // 128 × 64KB = 8MB
+    pub const MAX_BODY_BUFFERS = 512; // 512 × 64KB = 32MB
 
     content_length: usize,
     is_chunked: bool,
     bytes_received: usize,
     bytes_decoded: usize,
     body_buffers: [MAX_BODY_BUFFERS]buffer_pool.BufferHandle,
-    buffer_count: u8,
+    buffer_count: u16,
     current_buf_offset: usize,
     chunk_decoder: http1.ChunkDecoder,
     header_result: http1.HeaderParseResult,

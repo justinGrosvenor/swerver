@@ -39,11 +39,19 @@ RUN set -eux; \
     ln -s /opt/zig/zig /usr/local/bin/zig; \
     zig version
 
-# Clone swerver source
+# Clone swerver source (or use local copy if USE_LOCAL=1)
 ARG SWERVER_REPO=https://github.com/justinGrosvenor/swerver.git
 ARG SWERVER_REF=main
+ARG USE_LOCAL=0
 WORKDIR /src
-RUN git clone --depth=1 --branch ${SWERVER_REF} ${SWERVER_REPO} .
+COPY . /src/_local_ctx/
+RUN if [ "${USE_LOCAL}" = "1" ]; then \
+        cp -a /src/_local_ctx/* /src/ 2>/dev/null || true; \
+    else \
+        git clone --depth=1 --branch ${SWERVER_REF} ${SWERVER_REPO} /src/_clone && \
+        cp -a /src/_clone/* /src/; \
+    fi && \
+    rm -rf /src/_local_ctx /src/_clone
 
 # Debian puts OpenSSL libs in the multiarch `/usr/lib/$arch-linux-gnu/`
 # path. Zig's built-in linker (lld) doesn't search multiarch subdirs
@@ -74,9 +82,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /src/zig-out/bin/swerver /usr/local/bin/swerver
-COPY config-h1.json /etc/swerver/config-h1.json
-COPY config-tls.json /etc/swerver/config-tls.json
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY httparena/config-h1.json /etc/swerver/config-h1.json
+COPY httparena/config-tls.json /etc/swerver/config-tls.json
+COPY httparena/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # HttpArena's harness mounts /certs/ and /data/static/ read-only
