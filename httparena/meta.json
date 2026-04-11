@@ -1,17 +1,20 @@
 {
   "display_name": "swerver",
   "language": "Zig",
-  "type": "engine",
+  "type": "production",
   "engine": "swerver",
-  "description": "Low-level Zig HTTP server with single-threaded event loops per worker, SO_REUSEPORT fork fan-out, native HTTP/1.1 + HTTP/2 + HTTP/3 support, and per-protocol pre-encoded response caches for hot static endpoints.",
-  "repo": "https://github.com/justin-gros/swerver",
+  "description": "Single-threaded event loop per worker with SO_REUSEPORT fork fan-out, native HTTP/1.1 + HTTP/2 + HTTP/3 (QUIC), kqueue/epoll/io_uring backends.",
+  "repo": "https://github.com/justinGrosvenor/swerver",
   "enabled": true,
   "tests": [
     "baseline",
     "pipelined",
     "limited-conn",
+    "static",
     "baseline-h2",
-    "baseline-h3"
+    "static-h2",
+    "baseline-h3",
+    "static-h3"
   ],
   "maintainers": []
 }

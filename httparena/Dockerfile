@@ -7,32 +7,22 @@
 # Runtime stage: debian:trixie-slim with libssl3 to match the build-
 # time OpenSSL ABI.
 #
-# Build context: the swerver repo root (not this directory). Invoke as:
-#     docker build -f httparena/Dockerfile -t httparena-swerver .
+# Build context: frameworks/swerver/ in the HttpArena repo.
+# The build clones swerver from GitHub at SWERVER_REF.
 #
-# Run (mimicking HttpArena's `scripts/run.sh` framework harness):
-#     docker run --network host \
-#       -v $PWD/httparena/certs:/certs:ro \
-#       -v $PWD/httparena/static:/data/static:ro \
-#       httparena-swerver
+# Local test:
+#   docker build -t httparena-swerver httparena/
+#   docker run --network host \
+#     -v $PWD/certs:/certs:ro -v $PWD/data/static:/data/static:ro \
+#     httparena-swerver
 
 FROM debian:trixie AS build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates \
-        curl \
-        xz-utils \
-        libssl-dev \
-        pkg-config \
-        python3 \
+        ca-certificates curl xz-utils git libssl-dev pkg-config python3 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Zig by resolving the current master tarball URL from
-# ziglang.org/download/index.json. Pinning a specific dev build
-# doesn't work long-term (ziglang.org rotates dev builds daily).
-# Architecture detection uses `dpkg --print-architecture` at RUN
-# time (not a build ARG) so the container always matches the
-# platform Docker actually builds for.
+# Install latest Zig nightly (0.16.0-dev)
 RUN set -eux; \
     DPKG_ARCH=$(dpkg --print-architecture); \
     case "${DPKG_ARCH}" in \
@@ -42,7 +32,6 @@ RUN set -eux; \
     esac; \
     ZIG_URL=$(curl -fsSL https://ziglang.org/download/index.json | \
         python3 -c "import json,sys; d=json.load(sys.stdin)['master']; print(d['${ZIG_ARCH}-linux']['tarball'])"); \
-    echo "downloading ${ZIG_URL}"; \
     curl -fsSL "${ZIG_URL}" -o /tmp/zig.tar.xz; \
     mkdir -p /opt/zig; \
     tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1; \
@@ -50,8 +39,11 @@ RUN set -eux; \
     ln -s /opt/zig/zig /usr/local/bin/zig; \
     zig version
 
+# Clone swerver source
+ARG SWERVER_REPO=https://github.com/justinGrosvenor/swerver.git
+ARG SWERVER_REF=main
 WORKDIR /src
-COPY . /src
+RUN git clone --depth=1 --branch ${SWERVER_REF} ${SWERVER_REPO} .
 
 # Debian puts OpenSSL libs in the multiarch `/usr/lib/$arch-linux-gnu/`
 # path. Zig's built-in linker (lld) doesn't search multiarch subdirs
@@ -82,9 +74,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /src/zig-out/bin/swerver /usr/local/bin/swerver
-COPY httparena/config-h1.json /etc/swerver/config-h1.json
-COPY httparena/config-tls.json /etc/swerver/config-tls.json
-COPY httparena/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY config-h1.json /etc/swerver/config-h1.json
+COPY config-tls.json /etc/swerver/config-tls.json
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # HttpArena's harness mounts /certs/ and /data/static/ read-only
