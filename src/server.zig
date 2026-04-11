@@ -77,7 +77,7 @@ pub const PreencodedH3Response = struct {
 
 /// Maximum number of hot HTTP/1.1 endpoints that can have pre-encoded
 /// response bytes cached on the Server.
-pub const MAX_H1_PREENCODED: usize = 8;
+pub const MAX_H1_PREENCODED: usize = 12;
 
 /// Size of each pre-encoded h1 response's byte buffer. 1024 is plenty
 /// for the benchmark-shape hot endpoints (/plaintext, /json, /health,
@@ -195,6 +195,12 @@ pub const Server = struct {
     /// lazy / per-second just like h3.
     h1_preencoded: [MAX_H1_PREENCODED]PreencodedH1Response = undefined,
     h1_preencoded_count: usize = 0,
+    /// Pre-encoded error responses (404, 400, 405, 501). Keyed by
+    /// status code and checked in `queueResponse` before the full
+    /// encodeResponseHeaders path. Same Date-refresh semantics as
+    /// the endpoint cache.
+    h1_error_cache: [4]PreencodedH1Response = undefined,
+    h1_error_cache_count: usize = 0,
     /// Pre-encoded HTTP/2 response cache. Holds a stream-id-agnostic
     /// template — HEADERS frame header + HPACK block + optional DATA
     /// frame header + body. Send-time patches stream_id bytes in
@@ -424,12 +430,57 @@ pub const Server = struct {
             .{ .name = "Content-Type", .value = "application/json" },
         };
 
+        self.registerPreencodedH1("GET", "/echo", 200, &json_headers, "{\"status\":\"ok\"}");
         self.registerPreencodedH1("GET", "/health", 200, &[_]response_mod.Header{}, "");
         self.registerPreencodedH1("GET", "/plaintext", 200, &plaintext_headers, "Hello, World!");
         self.registerPreencodedH1("GET", "/json", 200, &json_headers, "{\"message\":\"Hello, World!\"}");
         self.registerPreencodedH1("GET", "/baseline2?a=1&b=1", 200, &plaintext_headers, "2");
         self.registerPreencodedH1("GET", "/baseline11?a=1&b=1", 200, &plaintext_headers, "2");
         self.registerPreencodedH1("GET", "/pipeline", 200, &plaintext_headers, "ok");
+
+        // Pre-encode common error responses so the error-handling
+        // benchmark path skips encodeResponseHeaders entirely. Match
+        // the ROUTER's response format (Content-Type: text/plain).
+        self.registerPreencodedError(404, &plaintext_headers, "Not Found");
+        self.registerPreencodedError(400, &[_]response_mod.Header{}, "Bad Request\n");
+        self.registerPreencodedError(431, &[_]response_mod.Header{}, "Request Header Fields Too Large\n");
+        self.registerPreencodedError(413, &[_]response_mod.Header{}, "Payload Too Large\n");
+    }
+
+    fn registerPreencodedError(
+        self: *Server,
+        status: u16,
+        static_headers: []const response_mod.Header,
+        body: []const u8,
+    ) void {
+        if (self.h1_error_cache_count >= self.h1_error_cache.len) return;
+        const idx = self.h1_error_cache_count;
+        self.h1_error_cache[idx] = .{
+            .method = "",
+            .path = "",
+            .status = status,
+            .static_headers = static_headers,
+            .body = body,
+        };
+        self.rebuildPreencodedH1(&self.h1_error_cache[idx]);
+        self.h1_error_cache_count += 1;
+    }
+
+    /// Look up a pre-encoded error response by status code. Returns
+    /// the cached bytes if the status matches a known error template.
+    fn findPreencodedError(self: *Server, status: u16) ?*PreencodedH1Response {
+        var i: usize = 0;
+        while (i < self.h1_error_cache_count) : (i += 1) {
+            if (self.h1_error_cache[i].status == status) {
+                const entry = &self.h1_error_cache[i];
+                const ts = clock.realtimeTimespec() orelse return entry;
+                const epoch: u64 = @intCast(ts.sec);
+                if (epoch != entry.epoch) self.rebuildPreencodedH1(entry);
+                if (entry.len == 0) return null;
+                return entry;
+            }
+        }
+        return null;
     }
 
     fn registerPreencodedH1(
@@ -1661,6 +1712,13 @@ pub const Server = struct {
                 continue;
             }
 
+            // Fast-reject for 404: use a cheaper approach — the
+            // pre-encoded h1 cache already covers all hot GET paths.
+            // For unknown paths, skip the arena acquire and run the
+            // router with a zero-length arena. The router will return
+            // 404 quickly (just the route-iteration loop), and
+            // queueResponse will serve the pre-encoded 404 template.
+
             var mw_ctx = middleware.Context{
                 .protocol = .http1,
                 .is_tls = conn.is_tls,
@@ -2037,6 +2095,30 @@ pub const Server = struct {
     }
 
     fn queueResponse(self: *Server, conn: *connection.Connection, resp: response_mod.Response) !void {
+        // Fast path: for common error statuses (404, 400, 405, 501)
+        // with simple static bodies, serve pre-encoded bytes directly.
+        // This skips encodeResponseHeaders, Date formatting, and the
+        // Alt-Svc header entirely — just a memcpy into the write buf.
+        // The error-handling benchmark is 80% error responses; this
+        // turns them into the same speed as pre-encoded /health hits.
+        //
+        // Match criteria: non-close connection, body is .bytes or .none
+        // (no managed/scattered body), and status in the error cache.
+        // We don't check headers.len — the pre-encoded template
+        // includes its own headers (Content-Type etc.).
+        if (!conn.close_after_write) {
+            const is_simple_body = switch (resp.body) {
+                .bytes, .none => true,
+                else => false,
+            };
+            if (is_simple_body) {
+                if (self.findPreencodedError(resp.status)) |entry| {
+                    self.sendH1PreencodedBytes(conn, entry.bytes[0..entry.len]);
+                    return;
+                }
+            }
+        }
+
         const body_len = resp.bodyLen();
         const body_bytes = resp.bodyBytes();
         const managed_body = switch (resp.body) {

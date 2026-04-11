@@ -576,6 +576,54 @@ pub const Router = struct {
         return .{ .resp = notFound() };
     }
 
+    /// Quick O(route_count) check: does ANY registered route's path
+    /// pattern match `path` (ignoring method)? Used by the server to
+    /// fast-reject 404s before setting up middleware/arena/scratch.
+    /// Does NOT run middleware or handlers — purely structural.
+    pub fn hasAnyRouteForPath(self: *Router, path: []const u8) bool {
+        // Strip query string for matching (same as matchRoute).
+        const clean_path = if (std.mem.indexOfScalar(u8, path, '?')) |qi| path[0..qi] else path;
+        for (self.routes[0..self.route_count]) |r| {
+            if (pathMatchesPattern(r.pattern, clean_path)) return true;
+        }
+        return false;
+    }
+
+    /// Lightweight path-vs-pattern match (no param extraction).
+    fn pathMatchesPattern(pattern: []const u8, path: []const u8) bool {
+        // Exact match fast path
+        if (std.mem.eql(u8, pattern, path)) return true;
+
+        // Static prefix check — if the pattern has no `:` params, it
+        // must match exactly or with a trailing `/` difference.
+        if (std.mem.indexOfScalar(u8, pattern, ':') == null) {
+            // Check for trailing-slash tolerance
+            if (pattern.len > 0 and path.len > 0) {
+                if (pattern.len == path.len + 1 and pattern[pattern.len - 1] == '/') {
+                    return std.mem.eql(u8, pattern[0 .. pattern.len - 1], path);
+                }
+                if (path.len == pattern.len + 1 and path[path.len - 1] == '/') {
+                    return std.mem.eql(u8, path[0 .. path.len - 1], pattern);
+                }
+            }
+            return false;
+        }
+
+        // Pattern has params — do segment-by-segment comparison.
+        // `:name` segments match any non-empty segment.
+        var pat_it = std.mem.splitScalar(u8, if (pattern.len > 0 and pattern[0] == '/') pattern[1..] else pattern, '/');
+        var path_it = std.mem.splitScalar(u8, if (path.len > 0 and path[0] == '/') path[1..] else path, '/');
+
+        while (true) {
+            const pat_seg = pat_it.next();
+            const path_seg = path_it.next();
+            if (pat_seg == null and path_seg == null) return true;
+            if (pat_seg == null or path_seg == null) return false;
+            if (pat_seg.?.len > 0 and pat_seg.?[0] == ':') continue; // param matches anything
+            if (!std.mem.eql(u8, pat_seg.?, path_seg.?)) return false;
+        }
+    }
+
     fn matchRoute(self: *Router, r: *const Route, path: []const u8, ctx: *HandlerContext) bool {
         _ = self;
         ctx.param_count = 0;
