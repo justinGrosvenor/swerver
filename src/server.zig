@@ -555,6 +555,12 @@ pub const Server = struct {
     /// those aren't GET).
     fn tryDispatchPreencodedH1(self: *Server, conn: *connection.Connection, req_view: request.RequestView) bool {
         if (conn.close_after_write) return false;
+        // x402 gate: if payment is required, the pre-encoded cache must
+        // NOT bypass the payment check. Fall through to the router path
+        // which runs x402.evaluate before dispatching. Without this,
+        // cached endpoints (/echo, /health, etc.) would be accessible
+        // without paying even when require_payment = true.
+        if (self.app_router.x402_policy.require_payment) return false;
         const method_str = req_view.getMethodName();
         if (self.findAndRefreshPreencodedH1(method_str, req_view.path)) |entry| {
             self.sendH1PreencodedBytes(conn, entry.bytes[0..entry.len]);
@@ -1198,10 +1204,13 @@ pub const Server = struct {
         }
 
         // --- Fast path: pre-encoded response cache ---
+        // x402 gate: skip cache when payment required (must run x402.evaluate first)
         const method_str = req_view.getMethodName();
-        if (self.findAndRefreshPreencodedH3(method_str, req_view.path)) |entry| {
-            self.sendHttp3ResponseBytes(udp_fd, conn, req.stream_id, peer_addr, entry.bytes[0..entry.len]);
-            return;
+        if (!self.app_router.x402_policy.require_payment) {
+            if (self.findAndRefreshPreencodedH3(method_str, req_view.path)) |entry| {
+                self.sendHttp3ResponseBytes(udp_fd, conn, req.stream_id, peer_addr, entry.bytes[0..entry.len]);
+                return;
+            }
         }
 
         // --- Cold path: full router dispatch ---
@@ -1879,7 +1888,11 @@ pub const Server = struct {
                             // pre-encoded cache; otherwise dispatch
                             // normally.
                             const method_str = hdr.request.getMethodName();
-                            if (self.findAndRefreshPreencodedH2(method_str, hdr.request.path)) |entry| {
+                            // x402 gate: skip cache when payment required
+                            if (!self.app_router.x402_policy.require_payment and
+                                self.findAndRefreshPreencodedH2(method_str, hdr.request.path) != null)
+                            {
+                                const entry = self.findAndRefreshPreencodedH2(method_str, hdr.request.path).?;
                                 self.sendH2PreencodedBytes(conn, hdr.stream_id, entry);
                             } else if (self.cfg.static_root.len > 0 and std.mem.startsWith(u8, hdr.request.path, "/static/")) {
                                 // Static file serving over h2 — same

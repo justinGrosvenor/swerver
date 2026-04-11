@@ -23,6 +23,7 @@ const http3_qpack = @import("protocol/http3/qpack.zig");
 const tls_quic_session = @import("tls/quic_session.zig");
 const metrics_mw = @import("middleware/metrics_mw.zig");
 const access_log = @import("middleware/access_log.zig");
+const x402 = @import("middleware/x402.zig");
 const server = @import("server.zig");
 const master = @import("master.zig");
 
@@ -59,6 +60,7 @@ comptime {
     _ = tls_quic_session;
     _ = metrics_mw;
     _ = access_log;
+    _ = x402;
     _ = server;
     _ = master;
     // Config file parser

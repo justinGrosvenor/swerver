@@ -133,3 +133,172 @@ fn paymentRequired(payload_b64: []const u8) response.Response {
         .body = .{ .bytes = "Payment required" },
     };
 }
+
+// ============================================================
+// Tests
+// ============================================================
+
+fn makeRequest(path: []const u8, headers: []const request.Header) request.RequestView {
+    return .{
+        .method = .GET,
+        .method_raw = "",
+        .path = path,
+        .headers = headers,
+        .body = "",
+    };
+}
+
+test "x402: disabled policy allows all requests" {
+    const policy = Policy{ .require_payment = false, .payment_required_b64 = "" };
+    const req = makeRequest("/", &.{});
+    try std.testing.expectEqual(Decision.allow, evaluate(req, policy));
+}
+
+test "x402: enabled policy rejects requests without payment header" {
+    const policy = Policy{ .require_payment = true, .payment_required_b64 = "dGVzdA==" };
+    const req = makeRequest("/protected", &.{});
+    switch (evaluate(req, policy)) {
+        .allow => return error.TestUnexpectedResult,
+        .reject => |resp| {
+            try std.testing.expectEqual(@as(u16, 402), resp.status);
+        },
+    }
+}
+
+test "x402: accepts valid X-Payment header" {
+    const policy = Policy{ .require_payment = true, .payment_required_b64 = "dGVzdA==" };
+    // Build a base64-encoded JSON with "signature" and "payload" fields
+    const json = "{\"signature\":\"0xabc\",\"payload\":{\"amount\":\"100\"}}";
+    var b64_buf: [256]u8 = undefined;
+    const b64_len = std.base64.standard.Encoder.calcSize(json.len);
+    _ = std.base64.standard.Encoder.encode(b64_buf[0..b64_len], json);
+
+    const headers = [_]request.Header{
+        .{ .name = "X-Payment", .value = b64_buf[0..b64_len] },
+    };
+    const req = makeRequest("/protected", &headers);
+    try std.testing.expectEqual(Decision.allow, evaluate(req, policy));
+}
+
+test "x402: accepts Payment-Signature header (case insensitive)" {
+    const policy = Policy{ .require_payment = true, .payment_required_b64 = "dGVzdA==" };
+    const json = "{\"signature\":\"0xdef\",\"payload\":{}}";
+    var b64_buf: [256]u8 = undefined;
+    const b64_len = std.base64.standard.Encoder.calcSize(json.len);
+    _ = std.base64.standard.Encoder.encode(b64_buf[0..b64_len], json);
+
+    const headers = [_]request.Header{
+        .{ .name = "payment-signature", .value = b64_buf[0..b64_len] },
+    };
+    const req = makeRequest("/", &headers);
+    try std.testing.expectEqual(Decision.allow, evaluate(req, policy));
+}
+
+test "x402: rejects empty payment header" {
+    const policy = Policy{ .require_payment = true, .payment_required_b64 = "dGVzdA==" };
+    const headers = [_]request.Header{
+        .{ .name = "X-Payment", .value = "" },
+    };
+    const req = makeRequest("/", &headers);
+    switch (evaluate(req, policy)) {
+        .allow => return error.TestUnexpectedResult,
+        .reject => |resp| {
+            try std.testing.expectEqual(@as(u16, 402), resp.status);
+        },
+    }
+}
+
+test "x402: rejects invalid base64" {
+    const policy = Policy{ .require_payment = true, .payment_required_b64 = "dGVzdA==" };
+    const headers = [_]request.Header{
+        .{ .name = "X-Payment", .value = "not-valid-base64!!!" },
+    };
+    const req = makeRequest("/", &headers);
+    switch (evaluate(req, policy)) {
+        .allow => return error.TestUnexpectedResult,
+        .reject => {},
+    }
+}
+
+test "x402: rejects base64 JSON missing signature field" {
+    const policy = Policy{ .require_payment = true, .payment_required_b64 = "dGVzdA==" };
+    const json = "{\"payload\":{\"amount\":\"100\"}}"; // no "signature"
+    var b64_buf: [256]u8 = undefined;
+    const b64_len = std.base64.standard.Encoder.calcSize(json.len);
+    _ = std.base64.standard.Encoder.encode(b64_buf[0..b64_len], json);
+
+    const headers = [_]request.Header{
+        .{ .name = "X-Payment", .value = b64_buf[0..b64_len] },
+    };
+    const req = makeRequest("/", &headers);
+    switch (evaluate(req, policy)) {
+        .allow => return error.TestUnexpectedResult,
+        .reject => {},
+    }
+}
+
+test "x402: rejects base64 JSON missing payload field" {
+    const policy = Policy{ .require_payment = true, .payment_required_b64 = "dGVzdA==" };
+    const json = "{\"signature\":\"0xabc\"}"; // no "payload"
+    var b64_buf: [256]u8 = undefined;
+    const b64_len = std.base64.standard.Encoder.calcSize(json.len);
+    _ = std.base64.standard.Encoder.encode(b64_buf[0..b64_len], json);
+
+    const headers = [_]request.Header{
+        .{ .name = "X-Payment", .value = b64_buf[0..b64_len] },
+    };
+    const req = makeRequest("/", &headers);
+    switch (evaluate(req, policy)) {
+        .allow => return error.TestUnexpectedResult,
+        .reject => {},
+    }
+}
+
+test "x402: rejects oversized payment header (>11KB)" {
+    const policy = Policy{ .require_payment = true, .payment_required_b64 = "dGVzdA==" };
+    const big_value = "A" ** 12000;
+    const headers = [_]request.Header{
+        .{ .name = "X-Payment", .value = big_value },
+    };
+    const req = makeRequest("/", &headers);
+    switch (evaluate(req, policy)) {
+        .allow => return error.TestUnexpectedResult,
+        .reject => {},
+    }
+}
+
+test "x402: 402 response includes PAYMENT-REQUIRED header" {
+    const policy = Policy{ .require_payment = true, .payment_required_b64 = "dGVzdF9wYXlsb2Fk" };
+    const req = makeRequest("/", &.{});
+    switch (evaluate(req, policy)) {
+        .allow => return error.TestUnexpectedResult,
+        .reject => |resp| {
+            try std.testing.expectEqual(@as(u16, 402), resp.status);
+            try std.testing.expect(resp.headers.len > 0);
+            try std.testing.expectEqualStrings("PAYMENT-REQUIRED", resp.headers[0].name);
+            try std.testing.expectEqualStrings("dGVzdF9wYXlsb2Fk", resp.headers[0].value);
+        },
+    }
+}
+
+test "x402: validatePaymentHeader structural checks" {
+    // Valid: has both fields
+    try std.testing.expect(validatePaymentHeader(encodeJson("{\"signature\":\"x\",\"payload\":{}}")));
+    // Missing signature
+    try std.testing.expect(!validatePaymentHeader(encodeJson("{\"payload\":{}}")));
+    // Missing payload
+    try std.testing.expect(!validatePaymentHeader(encodeJson("{\"signature\":\"x\"}")));
+    // Empty
+    try std.testing.expect(!validatePaymentHeader(""));
+    // Not base64
+    try std.testing.expect(!validatePaymentHeader("!!!"));
+}
+
+fn encodeJson(json: []const u8) []const u8 {
+    const S = struct {
+        var buf: [1024]u8 = undefined;
+    };
+    const len = std.base64.standard.Encoder.calcSize(json.len);
+    _ = std.base64.standard.Encoder.encode(S.buf[0..len], json);
+    return S.buf[0..len];
+}
