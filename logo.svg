@@ -1,0 +1,12 @@
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg">
+  <rect width="256" height="256" fill="#000000"/>
+  <path d="M0 60 L256 20 L256 80 L0 120 Z" fill="#FFD60A"/>
+  <path d="M0 140 L256 100 L256 160 L0 200 Z" fill="#FFD60A"/>
+  <text x="18" y="186"
+        font-family="JetBrains Mono, monospace"
+        font-size="28"
+        font-weight="600"
+        fill="#000000">
+    s
+  </text>
+</svg>

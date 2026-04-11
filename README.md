@@ -1,6 +1,10 @@
-# swerver
+<p align="center">
+  <img src="logo.svg" width="128" height="128" alt="swerver">
+</p>
 
-A zero-copy, zero-allocation HTTP server written in pure Zig.
+<h1 align="center">swerver</h1>
+
+<p align="center">A zero-copy, zero-allocation HTTP server written in pure Zig.</p>
 
 ```
 HTTP/1.1 ──┐
