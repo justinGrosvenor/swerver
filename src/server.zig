@@ -899,19 +899,22 @@ pub const Server = struct {
 
         try self.io.start();
         if (self.listener_fd == null) {
-            const fd = try net.listen(self.cfg.address, self.cfg.port, 1024);
+            const fd = try net.listen(self.cfg.address, self.cfg.port, 4096);
             self.listener_fd = fd;
-            try self.io.registerListener(fd);
         }
+        try self.io.registerListener(self.listener_fd.?);
         // Initialize UDP listener for QUIC if enabled
-        if (self.quic != null and self.udp_fd == null) {
-            const quic_port = self.cfg.quic.port;
-            if (quic_port > 0) {
-                const udp_fd = net.bindUdp(self.cfg.address, quic_port) catch |err| {
-                    std.log.warn("Failed to bind UDP port {}: {}", .{ quic_port, err });
-                    return err;
-                };
-                self.udp_fd = udp_fd;
+        if (self.quic != null) {
+            if (self.udp_fd == null) {
+                const quic_port = self.cfg.quic.port;
+                if (quic_port > 0) {
+                    self.udp_fd = net.bindUdp(self.cfg.address, quic_port) catch |err| {
+                        std.log.warn("Failed to bind UDP port {}: {}", .{ quic_port, err });
+                        return err;
+                    };
+                }
+            }
+            if (self.udp_fd) |udp_fd| {
                 self.io.registerUdpSocket(udp_fd) catch |err| {
                     std.log.warn("Failed to register UDP socket: {}", .{err});
                     clock.closeFd(udp_fd);

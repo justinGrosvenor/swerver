@@ -59,9 +59,9 @@ pub const Connection = struct {
     read_buffered_bytes: usize,
     write_buffered_bytes: usize,
     write_queue: [write_queue_capacity]WriteEntry,
-    write_head: u8,
-    write_tail: u8,
-    write_count: u8,
+    write_head: u16,
+    write_tail: u16,
+    write_count: u16,
     close_after_write: bool,
     sent_continue: bool,
     protocol: Protocol,
@@ -323,7 +323,7 @@ pub const Connection = struct {
     }
 
     /// Returns number of available slots in write queue
-    pub fn writeQueueAvailable(self: *Connection) u8 {
+    pub fn writeQueueAvailable(self: *Connection) u16 {
         return write_queue_capacity - self.write_count;
     }
 
@@ -449,10 +449,11 @@ fn isValidTransition(from: State, to: State) bool {
     };
 }
 
-/// Per-connection write queue capacity. Sized for HTTP/2 multiplexing where
-/// each response can take 2 slots (HEADERS + DATA) plus control frames.
-/// 128 entries supports ~60 concurrent in-flight h2 responses.
-const write_queue_capacity: u8 = 128;
+/// Per-connection write queue capacity. Sized for HTTP/1.1 pipelining (16
+/// pipelined requests × multiple concurrent connections) and HTTP/2
+/// multiplexing (HEADERS + DATA per stream). 256 entries prevents write
+/// queue saturation under heavy pipelining loads.
+const write_queue_capacity: u16 = 256;
 pub const HeaderCapacity: usize = 128;
 
 const WriteEntry = struct {
@@ -461,6 +462,6 @@ const WriteEntry = struct {
     offset: usize,
 };
 
-fn nextIndex(index: u8) u8 {
+fn nextIndex(index: u16) u16 {
     return (index + 1) % write_queue_capacity;
 }
