@@ -4,7 +4,7 @@
     "port": 8080,
     "max_connections": 2048,
     "static_root": "/data/static",
-    "workers": 1
+    "workers": 0
   },
   "http2": {
     "max_streams": 256,

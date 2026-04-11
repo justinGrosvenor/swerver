@@ -4,7 +4,7 @@
     "port": 8443,
     "max_connections": 2048,
     "static_root": "/data/static",
-    "workers": 1
+    "workers": 0
   },
   "tls": {
     "cert_path": "/certs/server.crt",
