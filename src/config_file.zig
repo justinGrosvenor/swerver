@@ -79,6 +79,12 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
         if (t.write_ms) |v| cfg.timeouts.write_ms = v;
     }
 
+    // Buffer pool
+    if (file_cfg.buffer_pool) |bp| {
+        if (bp.buffer_size) |v| cfg.buffer_pool.buffer_size = v;
+        if (bp.buffer_count) |v| cfg.buffer_pool.buffer_count = v;
+    }
+
     // Limits
     if (file_cfg.limits) |l| {
         if (l.max_header_bytes) |v| cfg.limits.max_header_bytes = v;
@@ -239,6 +245,7 @@ const FileConfig = struct {
     server: ?ServerJson = null,
     timeouts: ?TimeoutsJson = null,
     limits: ?LimitsJson = null,
+    buffer_pool: ?BufferPoolJson = null,
     tls: ?TlsJson = null,
     http2: ?Http2Json = null,
     quic: ?QuicJson = null,
@@ -266,6 +273,11 @@ const LimitsJson = struct {
     max_header_bytes: ?usize = null,
     max_body_bytes: ?usize = null,
     max_header_count: ?usize = null,
+};
+
+const BufferPoolJson = struct {
+    buffer_size: ?usize = null,
+    buffer_count: ?usize = null,
 };
 
 const TlsJson = struct {
