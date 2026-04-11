@@ -279,11 +279,11 @@ Tested against nginx, actix (Rust/Tokio), Apache APISIX (nginx + LuaJIT gateway)
 
 | Scenario | swerver | actix | nginx | apisix |
 |----------|---------|-------|-------|--------|
-| **Throughput** (req/s) | **147,435** | 133,691 | 118,061 | 91,522 |
+| **Throughput** (req/s) | **169,815** | 133,691 | 118,061 | 91,522 |
 | **Concurrent** ramp to 1000 VUs (req/s) | **156,854** | 149,558 | 120,577 | 92,751 |
 | **Connections** new conn/req (conn/s) | **90,657** | 66,019 | 19,206 | 22,916 |
 | **Spike** 50→1000 VUs (req/s) | **147,136** | 137,189 | 114,119 | 95,129 |
-| **Rapid-fire** 200 VUs (req/s) | **143,437** | 128,155 | 125,346 | 94,279 |
+| **Rapid-fire** 200 VUs (req/s) | **152,187** | 128,155 | 125,346 | 94,279 |
 | **Error path** p99 (ms) | **2.02** | 2.65 | 34.97 | 35.48 |
 
 ### Docker k6 TLS + HTTP/2 (100 VUs, 30s, April 2026)
