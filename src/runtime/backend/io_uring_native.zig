@@ -218,11 +218,19 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
     pub fn registerConnection(self: *IoUringNativeBackend, conn_id: u32, fd: i32) !void {
         if (conn_id >= self.generations.len) return error.ConnIdOutOfRange;
         const gen = self.generations[conn_id];
-        _ = try self.buf_group.recv_multishot(
+        const sq_ready_before = self.ring.sq_ready();
+        std.log.warn("native: registerConnection conn_id={} fd={} gen={} sq_ready_before={}", .{ conn_id, fd, gen, sq_ready_before });
+        const sqe = self.buf_group.recv_multishot(
             packUserData(.recv, gen, conn_id),
             fd,
             0,
-        );
+        ) catch |err| {
+            std.log.warn("native: recv_multishot failed: {}", .{err});
+            return err;
+        };
+        _ = sqe;
+        const sq_ready_after = self.ring.sq_ready();
+        std.log.warn("native: registerConnection done sq_ready_after={}", .{sq_ready_after});
     }
 
     /// Submit a send operation for a response. The completion arrives
@@ -272,14 +280,18 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
         // drains the CQ ring — so we'd miss the initial multishot
         // accept arm on the first poll cycle.
         const wait_nr: u32 = if (timeout_ms > 0) 1 else 0;
-        _ = self.ring.submit_and_wait(wait_nr) catch |err| switch (err) {
+        const sq_before = self.ring.sq_ready();
+        std.log.warn("native: poll enter wait_nr={} sq_ready={}", .{ wait_nr, sq_before });
+        const submitted = self.ring.submit_and_wait(wait_nr) catch |err| switch (err) {
             error.SignalInterrupt => return self.events[0..0],
             else => return err,
         };
+        std.log.warn("native: poll submit_and_wait returned submitted={}", .{submitted});
         const ready = self.ring.copy_cqes(&cqe_batch, 0) catch |err| switch (err) {
             error.SignalInterrupt => return self.events[0..0],
             else => return err,
         };
+        std.log.warn("native: poll copy_cqes ready={}", .{ready});
 
         var count: usize = 0;
         var i: u32 = 0;
