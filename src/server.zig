@@ -1067,16 +1067,10 @@ pub const Server = struct {
 
     /// Called when the io_uring_native backend delivers a multishot
     /// accept CQE. The kernel has already accepted the connection and
-    /// given us the client fd — skip the accept() syscall and go
-    /// straight to the per-connection setup.
+    /// given us the client fd — already non-blocking and close-on-exec
+    /// because armMultishotAccept passed SOCK_NONBLOCK | SOCK_CLOEXEC
+    /// as the accept flags. Go straight to the per-connection setup.
     fn handlePreAccepted(self: *Server, client_fd: std.posix.fd_t) !void {
-        // The native backend doesn't set SOCK_NONBLOCK on the multishot
-        // accept SQE (yet), so make sure it's non-blocking before use.
-        const flags = std.c.fcntl(client_fd, std.posix.F.GETFL);
-        if (flags >= 0) {
-            const nonblock: c_int = @bitCast(@as(c_uint, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK"));
-            _ = std.c.fcntl(client_fd, std.posix.F.SETFL, flags | nonblock);
-        }
         try self.setupAcceptedConnection(client_fd);
     }
 

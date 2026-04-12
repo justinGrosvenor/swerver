@@ -260,12 +260,21 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
     fn armMultishotAccept(self: *IoUringNativeBackend, fd: i32) !void {
         // Use stdlib's accept_multishot helper, which calls
         // prep_multishot_accept (correct opcode + IORING_ACCEPT_MULTISHOT flag).
+        //
+        // Pass SOCK_NONBLOCK | SOCK_CLOEXEC as the accept flags so the
+        // kernel hands us back non-blocking, close-on-exec fds without
+        // forcing a follow-up fcntl() round trip per accept. That
+        // extra syscall was the single biggest overhead vs epoll's
+        // accept4(SOCK_NONBLOCK) fast path — and the reason the
+        // earlier Connection: close benchmark came in 4x slower
+        // than the epoll backend for new-connection-per-request
+        // workloads.
         _ = try self.ring.accept_multishot(
             packUserData(.accept, 0, 0),
             @intCast(fd),
             null,
             null,
-            0,
+            linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC,
         );
     }
 
