@@ -6,6 +6,12 @@ const middleware = @import("../middleware/middleware.zig");
 const buffer_pool = @import("../runtime/buffer_pool.zig");
 const clock = @import("../runtime/clock.zig");
 
+/// Per-thread scratch for merging handler-returned headers with
+/// middleware-accumulated headers (security, CORS, etc.) before the
+/// response gets serialized. Sized to hold the handler's max + the
+/// middleware chain's max in one pass. See `Router.handle`.
+threadlocal var merged_headers_tls: [MAX_RESPONSE_HEADERS + middleware.Chain.MAX_MIDDLEWARE_HEADERS]response.Header = undefined;
+
 pub const RouterError = error{
     RouteLimitExceeded,
     SegmentLimitExceeded,
@@ -656,6 +662,34 @@ pub const Router = struct {
                 else
                     notFound();
             }
+        }
+
+        // Merge middleware-accumulated response headers (e.g. security headers
+        // from middleware/security.zig .modify decisions) into the outgoing
+        // response. Preencoded fast paths bake these in at build time; the
+        // router-dispatch path has to merge them here after the handler runs.
+        // Uses a threadlocal buffer so we don't have to grow HandlerScratch
+        // at every call site. Safe because router.handle() is non-reentrant
+        // per thread and the protocol layer serializes the response bytes
+        // before the next request on the same thread.
+        const mw_headers = self.middleware_chain.getResponseHeaders();
+        if (mw_headers.len > 0) {
+            const handler_headers = result_resp.headers;
+            const merge_total = handler_headers.len + mw_headers.len;
+            const merge_cap = merged_headers_tls.len;
+            const capped = @min(merge_total, merge_cap);
+            var i: usize = 0;
+            for (handler_headers) |h| {
+                if (i >= merge_cap) break;
+                merged_headers_tls[i] = h;
+                i += 1;
+            }
+            for (mw_headers) |h| {
+                if (i >= merge_cap) break;
+                merged_headers_tls[i] = h;
+                i += 1;
+            }
+            result_resp.headers = merged_headers_tls[0..capped];
         }
 
         // Post-response hooks: access logging, metrics, etc.

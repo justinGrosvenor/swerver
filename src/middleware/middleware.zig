@@ -154,7 +154,7 @@ pub const Chain = struct {
     response_headers: [MAX_MIDDLEWARE_HEADERS]response.Header = undefined,
     response_header_count: usize = 0,
 
-    const MAX_MIDDLEWARE_HEADERS = 16;
+    pub const MAX_MIDDLEWARE_HEADERS = 16;
 
     pub fn init(pre: []const MiddlewareFn, post: []const PostResponseFn) Chain {
         return .{

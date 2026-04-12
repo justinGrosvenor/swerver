@@ -390,11 +390,6 @@ pub const Server = struct {
         };
         self.registerPreencodedH3("GET", "/health", 200, &[_]response_mod.Header{}, "");
         self.registerPreencodedH3("GET", "/plaintext", 200, &plaintext_headers, "Hello, World!");
-        // HttpArena baselines: both h2/h3 share /baseline2 and h1
-        // uses /baseline11. The canonical benchmark URL is always
-        // ?a=1&b=1 → body "2". /pipeline returns "ok".
-        self.registerPreencodedH3("GET", "/baseline2?a=1&b=1", 200, &plaintext_headers, "2");
-        self.registerPreencodedH3("GET", "/baseline11?a=1&b=1", 200, &plaintext_headers, "2");
         self.registerPreencodedH3("GET", "/pipeline", 200, &plaintext_headers, "ok");
     }
 
@@ -486,8 +481,6 @@ pub const Server = struct {
         self.registerPreencodedH1("GET", "/echo", 200, &json_headers, "{\"status\":\"ok\"}");
         self.registerPreencodedH1("GET", "/health", 200, &[_]response_mod.Header{}, "");
         self.registerPreencodedH1("GET", "/plaintext", 200, &plaintext_headers, "Hello, World!");
-        self.registerPreencodedH1("GET", "/baseline2?a=1&b=1", 200, &plaintext_headers, "2");
-        self.registerPreencodedH1("GET", "/baseline11?a=1&b=1", 200, &plaintext_headers, "2");
         self.registerPreencodedH1("GET", "/pipeline", 200, &plaintext_headers, "ok");
 
         // Pre-encode common error responses so the error-handling
@@ -647,8 +640,6 @@ pub const Server = struct {
         };
         self.registerPreencodedH2("GET", "/health", 200, &[_]response_mod.Header{}, "");
         self.registerPreencodedH2("GET", "/plaintext", 200, &plaintext_headers, "Hello, World!");
-        self.registerPreencodedH2("GET", "/baseline2?a=1&b=1", 200, &plaintext_headers, "2");
-        self.registerPreencodedH2("GET", "/baseline11?a=1&b=1", 200, &plaintext_headers, "2");
         self.registerPreencodedH2("GET", "/pipeline", 200, &plaintext_headers, "ok");
     }
 
