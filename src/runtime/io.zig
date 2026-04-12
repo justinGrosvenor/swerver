@@ -671,8 +671,16 @@ fn translateIoUringNativeEvents(
     out: []Event,
 ) usize {
     var count: usize = 0;
+    std.log.warn("native: translating {} events", .{events.len});
     for (events) |ev| {
         if (count >= out.len) break;
+        std.log.warn("native: event kind={s} conn_id={} data_len={?} buf_id={?} accepted_fd={?}", .{
+            @tagName(ev.kind),
+            ev.conn_id,
+            if (ev.data) |d| d.len else null,
+            ev.kernel_buffer_id,
+            ev.accepted_fd,
+        });
         switch (ev.kind) {
             .accept => {
                 out[count] = .{
