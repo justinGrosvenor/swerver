@@ -89,9 +89,9 @@ pub const IoUringBackend = struct {
     /// Layout: [0]=listener, [1]=UDP, [2..]=connections (indexed by conn_id + 2)
     registered_fds: []RegisteredFd,
     /// Pending SQEs queued for submission on the next poll.
-    /// Re-arm SQEs from the previous cycle are submitted together
-    /// with the wait call, saving one io_uring_enter syscall per cycle.
     pending_submits: u32 = 0,
+    /// Whether DEFER_TASKRUN is active (requires GETEVENTS on every enter).
+    defer_taskrun: bool = false,
 
     const RegisteredFd = struct {
         fd: i32 = -1,
@@ -135,6 +135,7 @@ pub const IoUringBackend = struct {
             ring_fd = io_uring_setup(entries, &params);
         }
         if (ring_fd < 0) return error.IoUringSetupFailed;
+        const has_defer_taskrun = (params.flags & IORING_SETUP_DEFER_TASKRUN) != 0;
         errdefer _ = linux.close(@intCast(ring_fd));
 
         // Map SQ ring
@@ -170,6 +171,7 @@ pub const IoUringBackend = struct {
             .cq_tail = @ptrCast(@alignCast(&cq_ring[params.cq_off.tail])),
             .events = events,
             .registered_fds = registered_fds,
+            .defer_taskrun = has_defer_taskrun,
         };
     }
 
@@ -191,9 +193,12 @@ pub const IoUringBackend = struct {
         // previous cycle AND wait for new events. This merges what was
         // previously two syscalls (submit + wait) into one.
         const min_complete: u32 = if (timeout_ms > 0) 1 else 0;
-        // GETEVENTS must always be set with DEFER_TASKRUN to process
-        // deferred completions, even for non-blocking peeks.
-        const flags: u32 = IORING_ENTER_GETEVENTS;
+        // GETEVENTS is required with DEFER_TASKRUN to process deferred
+        // completions. Without DEFER_TASKRUN, only set it when waiting.
+        const flags: u32 = if (self.defer_taskrun or min_complete > 0)
+            IORING_ENTER_GETEVENTS
+        else
+            0;
         const to_submit = self.pending_submits;
         self.pending_submits = 0;
 
