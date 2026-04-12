@@ -975,12 +975,22 @@ pub const Server = struct {
             for (events) |event| {
                 switch (event.kind) {
                     .accept => {
-                        // Use event.handle if provided (kqueue), otherwise use listener_fd (epoll)
-                        const fd = event.handle orelse self.listener_fd orelse continue;
-                        self.handleAccept(fd) catch |err| {
-                            // Log accept errors but don't crash the server
-                            std.log.warn("Accept failed: {}", .{err});
-                        };
+                        // The native io_uring backend delivers the already-
+                        // accepted client fd inline with the event (multishot
+                        // accept). Other backends deliver a readiness event
+                        // on the listener; we call accept() ourselves.
+                        if (self.io.capabilities().multishot_accept) {
+                            if (event.handle) |client_fd| {
+                                self.handlePreAccepted(client_fd) catch |err| {
+                                    std.log.warn("Pre-accepted setup failed: {}", .{err});
+                                };
+                            }
+                        } else {
+                            const fd = event.handle orelse self.listener_fd orelse continue;
+                            self.handleAccept(fd) catch |err| {
+                                std.log.warn("Accept failed: {}", .{err});
+                            };
+                        }
                     },
                     .datagram => {
                         try self.handleDatagram();
@@ -1042,11 +1052,33 @@ pub const Server = struct {
         }
     }
 
+    /// Called when the io_uring_native backend delivers a multishot
+    /// accept CQE. The kernel has already accepted the connection and
+    /// given us the client fd — skip the accept() syscall and go
+    /// straight to the per-connection setup.
+    fn handlePreAccepted(self: *Server, client_fd: std.posix.fd_t) !void {
+        // The native backend doesn't set SOCK_NONBLOCK on the multishot
+        // accept SQE (yet), so make sure it's non-blocking before use.
+        const flags = std.c.fcntl(client_fd, std.posix.F.GETFL);
+        if (flags >= 0) {
+            const nonblock: c_int = @bitCast(@as(c_uint, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK"));
+            _ = std.c.fcntl(client_fd, std.posix.F.SETFL, flags | nonblock);
+        }
+        try self.setupAcceptedConnection(client_fd);
+    }
+
     fn acceptOne(self: *Server, listener_fd: std.posix.fd_t) !void {
         const client_fd = net.accept(listener_fd) catch |err| switch (err) {
             error.WouldBlock => return error.WouldBlock,
             else => return err,
         };
+        try self.setupAcceptedConnection(client_fd);
+    }
+
+    /// Common per-connection setup after an accept: set TCP_NODELAY,
+    /// acquire a pool connection, wire up the read buffer, cache peer
+    /// address, register with the backend, start TLS if configured.
+    fn setupAcceptedConnection(self: *Server, client_fd: std.posix.fd_t) !void {
         // Disable Nagle's algorithm — without this, h2 HEADERS+DATA writes
         // can stall for 40ms (TCP delayed ACK) since they're separate sends.
         // For h1 we use writev (one syscall), so this also helps multi-frame writes.
