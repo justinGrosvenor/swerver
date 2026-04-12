@@ -200,11 +200,15 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
     }
 
     fn armMultishotAccept(self: *IoUringNativeBackend, fd: i32) !void {
-        const sqe = try self.ring.get_sqe();
-        sqe.prep_accept(fd, null, null, 0);
-        // IORING_ACCEPT_MULTISHOT: rearm automatically after each accept
-        sqe.ioprio |= 1; // IORING_ACCEPT_MULTISHOT (flag value = 1)
-        sqe.user_data = packUserData(.accept, 0, 0);
+        // Use stdlib's accept_multishot helper, which calls
+        // prep_multishot_accept (correct opcode + IORING_ACCEPT_MULTISHOT flag).
+        _ = try self.ring.accept_multishot(
+            packUserData(.accept, 0, 0),
+            @intCast(fd),
+            null,
+            null,
+            0,
+        );
     }
 
     /// Arm a multishot recv on a freshly-accepted connection. Data
