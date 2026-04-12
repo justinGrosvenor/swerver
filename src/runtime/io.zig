@@ -14,6 +14,10 @@ pub const IoRuntime = struct {
     backend_state: BackendState,
     connections: connection.ConnectionPool,
     buffers: buffer_pool.BufferPool,
+    /// Dedicated pool for large request body accumulation (uploads).
+    /// Larger buffers (1MB default), fewer slots. Keeps uploads from
+    /// exhausting the hot-path pool used by request/response buffers.
+    body_buffers: buffer_pool.BufferPool,
     events: []Event,
     timer: clock.Timer,
 
@@ -23,6 +27,11 @@ pub const IoRuntime = struct {
         errdefer connections.deinit();
         var buffers = try buffer_pool.BufferPool.init(allocator, cfg.buffer_pool);
         errdefer buffers.deinit();
+        var body_buffers = try buffer_pool.BufferPool.init(allocator, .{
+            .buffer_size = cfg.buffer_pool.body_buffer_size,
+            .buffer_count = cfg.buffer_pool.body_buffer_count,
+        });
+        errdefer body_buffers.deinit();
         const events = try allocator.alloc(Event, cfg.max_connections);
         errdefer allocator.free(events);
         var backend_state = try initBackend(allocator, backend, cfg.max_connections, cfg.workers != 1);
@@ -35,6 +44,7 @@ pub const IoRuntime = struct {
             .backend_state = backend_state,
             .connections = connections,
             .buffers = buffers,
+            .body_buffers = body_buffers,
             .events = events,
             .timer = timer,
         };
@@ -43,6 +53,7 @@ pub const IoRuntime = struct {
     pub fn deinit(self: *IoRuntime) void {
         self.connections.deinit();
         self.buffers.deinit();
+        self.body_buffers.deinit();
         deinitBackend(&self.backend_state, self.allocator);
         self.allocator.free(self.events);
     }
@@ -134,6 +145,21 @@ pub const IoRuntime = struct {
 
     pub fn releaseBuffer(self: *IoRuntime, handle: buffer_pool.BufferHandle) void {
         self.buffers.release(handle);
+    }
+
+    /// Acquire a large buffer from the body pool (for request body
+    /// accumulation). Body buffers are separate from the hot-path pool
+    /// so large uploads don't exhaust request/response buffers.
+    pub fn acquireBodyBuffer(self: *IoRuntime) ?buffer_pool.BufferHandle {
+        return self.body_buffers.acquire();
+    }
+
+    pub fn releaseBodyBuffer(self: *IoRuntime, handle: buffer_pool.BufferHandle) void {
+        self.body_buffers.release(handle);
+    }
+
+    pub fn bodyBufferSize(self: *IoRuntime) usize {
+        return self.body_buffers.buffer_size;
     }
 
     pub fn canRead(self: *IoRuntime, conn: *connection.Connection) bool {

@@ -3413,11 +3413,11 @@ pub const Server = struct {
             // Feed through chunk decoder
             while (remaining.len > 0 and !accum.chunk_decoder.isDone()) {
                 // Ensure we have a destination buffer
-                if (accum.buffer_count == 0 or accum.current_buf_offset >= self.cfg.buffer_pool.buffer_size) {
+                if (accum.buffer_count == 0 or accum.current_buf_offset >= self.io.bodyBufferSize()) {
                     if (accum.buffer_count >= connection.BodyAccumState.MAX_BODY_BUFFERS) {
                         return error.BodyTooLarge;
                     }
-                    const buf = self.io.acquireBuffer() orelse return error.OutOfMemory;
+                    const buf = self.io.acquireBodyBuffer() orelse return error.OutOfMemory;
                     accum.body_buffers[accum.buffer_count] = buf;
                     accum.buffer_count += 1;
                     accum.current_buf_offset = 0;
@@ -3443,11 +3443,11 @@ pub const Server = struct {
                 const to_consume = @min(remaining.len, left);
 
                 // Ensure we have a destination buffer
-                if (accum.buffer_count == 0 or accum.current_buf_offset >= self.cfg.buffer_pool.buffer_size) {
+                if (accum.buffer_count == 0 or accum.current_buf_offset >= self.io.bodyBufferSize()) {
                     if (accum.buffer_count >= connection.BodyAccumState.MAX_BODY_BUFFERS) {
                         return error.BodyTooLarge;
                     }
-                    const buf = self.io.acquireBuffer() orelse return error.OutOfMemory;
+                    const buf = self.io.acquireBodyBuffer() orelse return error.OutOfMemory;
                     accum.body_buffers[accum.buffer_count] = buf;
                     accum.buffer_count += 1;
                     accum.current_buf_offset = 0;
@@ -3485,7 +3485,7 @@ pub const Server = struct {
                 .handles = accum.body_buffers[0..accum.buffer_count],
                 .last_buf_len = accum.current_buf_offset,
                 .total_len = accum.bytes_decoded,
-                .buffer_size = self.cfg.buffer_pool.buffer_size,
+                .buffer_size = self.io.bodyBufferSize(),
             },
         };
 
@@ -3531,7 +3531,7 @@ pub const Server = struct {
         if (total_len > 0) {
             const buffer_count = accum.buffer_count;
             const last_buf_len = accum.current_buf_offset;
-            const buffer_size = self.cfg.buffer_pool.buffer_size;
+            const buffer_size = self.io.bodyBufferSize();
 
             const body_mem = self.allocator.alloc(u8, total_len) catch {
                 self.abortBodyAccumulation(conn, 503);
@@ -3600,34 +3600,12 @@ pub const Server = struct {
                 conn.setRateLimitPause(self.io.nowMs(), pause_ms);
             }
 
-            // Check if the handler echoed back the body (response .bytes ptr == body_mem ptr).
-            // If so, use scattered body to enqueue accum buffers directly (skip re-copy).
-            const is_echo = switch (result.resp.body) {
-                .bytes => |b| b.ptr == body_mem.ptr and b.len == total_len,
-                else => false,
-            };
-
-            if (is_echo and buffer_count > 0) {
-                // Echo detected: build a scattered response and transfer body buffers directly
-                var scattered_resp = result.resp;
-                scattered_resp.body = .{ .scattered = .{
-                    .handles = accum.body_buffers[0..buffer_count],
-                    .count = buffer_count,
-                    .last_buf_len = last_buf_len,
-                    .total_len = total_len,
-                    .buffer_size = buffer_size,
-                } };
-                // Release original read buffer (header data no longer needed)
-                if (accum.original_read_buffer) |orig_buf| {
-                    self.io.releaseBuffer(orig_buf);
-                    accum.original_read_buffer = null;
-                }
-                self.queueResponse(conn, scattered_resp) catch {};
-                // queueResponse transferred the buffer handles — zero out to prevent double-free
-                accum.buffer_count = 0;
-                conn.body_accum = null;
-                self.allocator.free(body_mem);
-            } else {
+            // Previously a zero-copy echo path transferred body buffers
+            // to the write queue as a scattered response. Disabled now
+            // that body buffers are from a separate pool with different
+            // size — the transfer would require per-handle pool tagging.
+            // The echo case still works via the normal copy path below.
+            {
                 // Non-echo response: cleanup body buffers and queue normally
                 self.cleanupBodyAccumulation(conn);
                 self.queueResponse(conn, result.resp) catch {};
@@ -3691,9 +3669,9 @@ pub const Server = struct {
     fn cleanupBodyAccumulation(self: *Server, conn: *connection.Connection) void {
         if (conn.body_accum) |*accum| {
             for (0..accum.buffer_count) |i| {
-                self.io.releaseBuffer(accum.body_buffers[i]);
+                self.io.releaseBodyBuffer(accum.body_buffers[i]);
             }
-            // Release the original read buffer that held header data
+            // The original read buffer is from the hot-path pool
             if (accum.original_read_buffer) |buf| {
                 self.io.releaseBuffer(buf);
             }

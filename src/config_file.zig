@@ -84,6 +84,8 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
     if (file_cfg.buffer_pool) |bp| {
         if (bp.buffer_size) |v| cfg.buffer_pool.buffer_size = v;
         if (bp.buffer_count) |v| cfg.buffer_pool.buffer_count = v;
+        if (bp.body_buffer_size) |v| cfg.buffer_pool.body_buffer_size = v;
+        if (bp.body_buffer_count) |v| cfg.buffer_pool.body_buffer_count = v;
     }
 
     // Limits
@@ -280,6 +282,8 @@ const LimitsJson = struct {
 const BufferPoolJson = struct {
     buffer_size: ?usize = null,
     buffer_count: ?usize = null,
+    body_buffer_size: ?usize = null,
+    body_buffer_count: ?usize = null,
 };
 
 const TlsJson = struct {

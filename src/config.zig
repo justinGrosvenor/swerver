@@ -112,6 +112,12 @@ pub const Backpressure = struct {
 pub const BufferPoolConfig = struct {
     buffer_size: usize = 64 * 1024,
     buffer_count: usize = 4096,
+    /// Separate pool for large request body accumulation (uploads).
+    /// Prevents large uploads from exhausting the hot-path pool.
+    /// Default: 32 × 1MB = 32MB per worker, enough for a few
+    /// concurrent 20MB uploads.
+    body_buffer_size: usize = 1024 * 1024,
+    body_buffer_count: usize = 32,
 };
 
 pub const X402Config = struct {
