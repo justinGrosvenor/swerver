@@ -96,6 +96,33 @@ pub const Connection = struct {
     cached_peer_ip: ?[4]u8,
     /// Cached peer IPv6 address (populated once at accept time)
     cached_peer_ip6: ?[16]u8,
+    /// Carryover ciphertext buffer for TLS connections using memory BIOs.
+    /// Populated when a TLS writev gets partial/EAGAIN mid-drain: the remaining
+    /// ciphertext (from the in-flight record plus anything still pending in wbio)
+    /// is copied here so the next handleWrite event can flush it before SSL_write
+    /// encrypts more plaintext. Null whenever there's nothing carried over.
+    tls_cipher_carry_handle: ?buffer_pool.BufferHandle = null,
+    /// Offset into `tls_cipher_carry_handle.bytes` where unsent ciphertext starts.
+    tls_cipher_carry_offset: usize = 0,
+    /// Total length of ciphertext in `tls_cipher_carry_handle.bytes` (from byte 0).
+    tls_cipher_carry_len: usize = 0,
+    /// True while an async writev SQE is in flight for this connection.
+    /// Set when `handleWrite` submits the SQE, cleared when the matching
+    /// `.write` CQE arrives. While set, `handleWrite` MUST NOT submit
+    /// another send — the queue entries referenced by the in-flight
+    /// iovec must stay stable until the kernel acks them.
+    send_in_flight: bool = false,
+    /// Stable storage for the in-flight writev's iovec array. Points into
+    /// `write_queue[write_head..]` slices, so the array must outlive the
+    /// kernel's processing of the SQE — stored on the Connection (not on
+    /// the stack) for exactly that reason.
+    async_send_iov: [async_send_iov_capacity]std.posix.iovec_const = undefined,
+    /// Number of iovec entries submitted in the current in-flight send.
+    async_send_iov_count: u16 = 0,
+    /// Total bytes submitted in the current in-flight send (sum of iov lens).
+    /// Used only for diagnostics — the CQE's `res` carries the real
+    /// bytes-written count which the server trusts for queue advancement.
+    async_send_total_bytes: usize = 0,
 
     pub fn init(index: u32) Connection {
         return .{
@@ -134,6 +161,13 @@ pub const Connection = struct {
             .pending_file_remaining = 0,
             .cached_peer_ip = null,
             .cached_peer_ip6 = null,
+            .tls_cipher_carry_handle = null,
+            .tls_cipher_carry_offset = 0,
+            .tls_cipher_carry_len = 0,
+            .send_in_flight = false,
+            .async_send_iov = undefined,
+            .async_send_iov_count = 0,
+            .async_send_total_bytes = 0,
         };
     }
 
@@ -169,6 +203,17 @@ pub const Connection = struct {
         self.cleanupPendingFile();
         self.cached_peer_ip = null;
         self.cached_peer_ip6 = null;
+        // tls_cipher_carry_handle is cleaned up by the server before reset
+        self.tls_cipher_carry_handle = null;
+        self.tls_cipher_carry_offset = 0;
+        self.tls_cipher_carry_len = 0;
+        // async send state — the server must not reuse a slot with an
+        // outstanding writev CQE; releaseConnection's generation bump
+        // keeps the old send from corrupting the new conn, but we still
+        // clear the flag here for cleanliness.
+        self.send_in_flight = false;
+        self.async_send_iov_count = 0;
+        self.async_send_total_bytes = 0;
         // active_list_pos is set by ConnectionPool.acquire
     }
 
@@ -454,6 +499,10 @@ fn isValidTransition(from: State, to: State) bool {
 /// multiplexing (HEADERS + DATA per stream). 256 entries prevents write
 /// queue saturation under heavy pipelining loads.
 const write_queue_capacity: u16 = 256;
+/// Max iovec entries per async writev SQE on the native io_uring backend.
+/// Mirrors the gather cap in the sync writev path so the two branches
+/// submit the same-sized batches.
+pub const async_send_iov_capacity: u16 = 16;
 pub const HeaderCapacity: usize = 128;
 
 const WriteEntry = struct {

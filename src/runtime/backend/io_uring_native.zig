@@ -61,6 +61,13 @@ pub const RECV_SLAB_BYTES: usize = @as(usize, RECV_BUF_SIZE) * @as(usize, RECV_B
 
 const RECV_BUF_GROUP_ID: u16 = 0;
 
+/// Reserved space for the peer sockaddr at the head of each UDP
+/// provided buffer (after the `io_uring_recvmsg_out` header). 28 bytes
+/// is enough for `sockaddr_in6` (the largest we care about); smaller
+/// is preferable because the kernel rounds the payload offset up by
+/// this amount on every datagram.
+const UDP_NAMELEN: u32 = 28;
+
 // ─── User-data encoding ──────────────────────────────────────────────
 // Every SQE carries a u64 `user_data` the kernel echoes back in its
 // CQE. We encode (op, generation, fd/conn_id) into this field so that
@@ -72,6 +79,13 @@ pub const Op = enum(u4) {
     recv = 1,
     send = 2,
     close = 3,
+    /// Multishot recvmsg on the singleton UDP socket (QUIC). The CQE
+    /// points at a provided buffer whose first bytes are a
+    /// `struct io_uring_recvmsg_out` followed by the reserved name
+    /// area (msghdr.namelen), cmsg area (msghdr.controllen, zero for
+    /// us), and the packet payload. We reuse the same buffer group
+    /// as TCP recv — a UDP flood and a TCP flood share the pool.
+    recvmsg = 4,
 };
 
 pub fn packUserData(op: Op, gen: u28, conn_id: u32) u64 {
@@ -101,18 +115,30 @@ pub fn unpackConnId(ud: u64) u32 {
 pub const IoUringNativeEvent = struct {
     kind: Kind,
     conn_id: u32,
-    // For .read events: the data already delivered by the kernel.
-    // Points into the backend's provided-buffer slab — valid until
-    // the caller releases the buffer via releaseRecvBuffer.
+    // For .read and .datagram events: the data already delivered by
+    // the kernel. Points into the backend's provided-buffer slab —
+    // valid until the caller releases the buffer via
+    // releaseRecvBuffer.
     data: ?[]const u8 = null,
-    // For .read events: the buffer ID to return to the kernel once
-    // the caller has consumed the data. Caller must eventually call
-    // IoUringNativeBackend.releaseRecvBuffer(buffer_id).
+    // For .read and .datagram events: the buffer ID to return to the
+    // kernel once the caller has consumed the data. Caller must
+    // eventually call IoUringNativeBackend.releaseRecvBuffer(buffer_id).
     kernel_buffer_id: ?u16 = null,
     // For .accept events: the new client fd.
     accepted_fd: ?i32 = null,
+    // For .write events: the actual bytes written by the kernel
+    // (cqe.res). The server advances the connection's write queue
+    // by this amount; a short write means the kernel couldn't fit
+    // the full iovec and we'll resubmit the remainder.
+    bytes_written: usize = 0,
+    // For .datagram events: the peer address the packet came from.
+    // The bytes at `datagram_peer[0..datagram_peer_len]` are the raw
+    // `struct sockaddr_in` or `sockaddr_in6` the kernel wrote into
+    // the buffer's reserved name area.
+    datagram_peer: [28]u8 = undefined,
+    datagram_peer_len: u8 = 0,
 
-    pub const Kind = enum { accept, read, write, err };
+    pub const Kind = enum { accept, read, write, err, datagram };
 };
 
 /// Non-Linux stub. Every method returns `error.Unsupported` so the
@@ -126,10 +152,16 @@ const StubBackend = struct {
     pub fn registerListener(_: *StubBackend, _: i32) !void {
         return error.Unsupported;
     }
+    pub fn registerUdpSocket(_: *StubBackend, _: i32) !void {
+        return error.Unsupported;
+    }
     pub fn registerConnection(_: *StubBackend, _: u32, _: i32) !void {
         return error.Unsupported;
     }
     pub fn submitSend(_: *StubBackend, _: u32, _: i32, _: []const u8) !void {
+        return error.Unsupported;
+    }
+    pub fn submitWritev(_: *StubBackend, _: u32, _: i32, _: []const std.posix.iovec_const) !void {
         return error.Unsupported;
     }
     pub fn bumpGeneration(_: *StubBackend, _: u32) void {}
@@ -166,6 +198,19 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
     events: []IoUringNativeEvent,
     /// Registered listener fd (for multishot accept re-arming)
     listener_fd: ?i32 = null,
+    /// Registered UDP socket fd (for multishot recvmsg re-arming,
+    /// used by QUIC). Null when QUIC isn't enabled on this process.
+    udp_fd: ?i32 = null,
+    /// Template msghdr for multishot recvmsg. Kernel reads namelen /
+    /// controllen from here to reserve space at the start of each
+    /// provided buffer. MUST remain valid for the lifetime of the
+    /// multishot op — stored here so the pointer stays stable.
+    udp_msghdr: linux.msghdr = undefined,
+    /// Dummy single iovec backing the msghdr.iov pointer. Zig's
+    /// `linux.msghdr.iov` is `[*]iovec` and cannot be null; in the
+    /// multishot path `iovlen` is 0 so the kernel never dereferences
+    /// the base pointer.
+    udp_iov: [1]std.posix.iovec = undefined,
     /// Per-connection generation counter — incremented when a conn_id
     /// is reused, so stale CQEs from the previous lifetime get ignored.
     generations: []u28,
@@ -231,6 +276,9 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
             .allocator = allocator,
             .events = events,
             .generations = generations,
+            .udp_fd = null,
+            .udp_msghdr = undefined,
+            .udp_iov = undefined,
         };
     }
 
@@ -255,6 +303,39 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
     pub fn registerListener(self: *IoUringNativeBackend, fd: i32) !void {
         self.listener_fd = fd;
         try self.armMultishotAccept(fd);
+    }
+
+    /// Register the UDP socket for QUIC and arm multishot recvmsg.
+    /// Every inbound datagram produces a CQE whose buffer starts with
+    /// a `struct io_uring_recvmsg_out` header followed by the
+    /// `UDP_NAMELEN`-byte reserved name area and then the payload.
+    pub fn registerUdpSocket(self: *IoUringNativeBackend, fd: i32) !void {
+        self.udp_fd = fd;
+        // The iov slot is never dereferenced by the kernel in the
+        // multishot path (iovlen=0) but Zig's msghdr struct declares
+        // iov as `[*]iovec` which can't be null — so we keep a
+        // dummy-but-addressable iovec to satisfy the type.
+        self.udp_iov[0] = .{ .base = undefined, .len = 0 };
+        self.udp_msghdr = .{
+            .name = null,
+            .namelen = UDP_NAMELEN,
+            .iov = @ptrCast(&self.udp_iov),
+            .iovlen = 0,
+            .control = null,
+            .controllen = 0,
+            .flags = 0,
+        };
+        try self.armMultishotRecvmsg();
+    }
+
+    fn armMultishotRecvmsg(self: *IoUringNativeBackend) !void {
+        const fd = self.udp_fd orelse return;
+        const sqe = try self.ring.get_sqe();
+        sqe.prep_recvmsg_multishot(fd, &self.udp_msghdr, 0);
+        sqe.flags |= linux.IOSQE_BUFFER_SELECT;
+        sqe.buf_index = RECV_BUF_GROUP_ID;
+        // conn_id field is unused for the singleton UDP socket.
+        sqe.user_data = packUserData(.recvmsg, 0, 0);
     }
 
     fn armMultishotAccept(self: *IoUringNativeBackend, fd: i32) !void {
@@ -305,6 +386,28 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
         const gen = self.generations[conn_id];
         const sqe = try self.ring.get_sqe();
         sqe.prep_send(fd, data, 0);
+        sqe.user_data = packUserData(.send, gen, conn_id);
+    }
+
+    /// Submit a scattered writev for a response. The iovec array MUST
+    /// remain valid until the CQE is reaped — the caller typically
+    /// parks it on the Connection struct (`conn.async_send_iov`) so
+    /// its address stays stable across the kernel's processing window.
+    ///
+    /// Completion arrives as a .send op CQE; `poll()` translates it to
+    /// a .write event whose `data.len` carries `cqe.res` (the actual
+    /// bytes written, which may be less than the total requested on a
+    /// short write / EAGAIN).
+    pub fn submitWritev(
+        self: *IoUringNativeBackend,
+        conn_id: u32,
+        fd: i32,
+        iov: []const std.posix.iovec_const,
+    ) !void {
+        if (conn_id >= self.generations.len) return error.ConnIdOutOfRange;
+        const gen = self.generations[conn_id];
+        const sqe = try self.ring.get_sqe();
+        sqe.prep_writev(fd, iov, 0);
         sqe.user_data = packUserData(.send, gen, conn_id);
     }
 
@@ -438,11 +541,89 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
                     // the next successful accept for this slot.
                 },
                 .send => {
+                    // cqe.res < 0 → socket error; cqe.res >= 0 is the
+                    // actual number of bytes the kernel wrote. The
+                    // caller uses it to advance the write queue.
+                    if (cqe.res < 0) {
+                        self.events[count] = .{
+                            .kind = .err,
+                            .conn_id = conn_id,
+                        };
+                        count += 1;
+                        continue;
+                    }
                     self.events[count] = .{
                         .kind = .write,
                         .conn_id = conn_id,
+                        .bytes_written = @intCast(cqe.res),
                     };
                     count += 1;
+                },
+                .recvmsg => {
+                    // Multishot recvmsg on the UDP socket (QUIC).
+                    // The CQE's provided buffer starts with a
+                    // `struct io_uring_recvmsg_out` header, then the
+                    // reserved name area (UDP_NAMELEN bytes), then
+                    // the packet payload.
+                    if (cqe.res < 0) {
+                        // A fatal error or a non-fatal EAGAIN — try
+                        // to re-arm once. If re-arm itself fails we
+                        // fall back to the next poll cycle picking
+                        // this up via the UDP fd eventually going
+                        // silent; there's no dedicated error event.
+                        if (cqe.flags & linux.IORING_CQE_F_BUFFER != 0) {
+                            if (cqe.buffer_id()) |bid| {
+                                self.releaseRecvBuffer(bid);
+                            } else |_| {}
+                        }
+                        if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
+                            self.armMultishotRecvmsg() catch {};
+                        }
+                        continue;
+                    }
+                    const buffer_id = cqe.buffer_id() catch {
+                        if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
+                            self.armMultishotRecvmsg() catch {};
+                        }
+                        continue;
+                    };
+                    const total: usize = @intCast(cqe.res);
+                    const slab = self.bufferSlice(buffer_id);
+                    if (total < @sizeOf(linux.io_uring_recvmsg_out)) {
+                        // Malformed CQE — release and re-arm.
+                        self.releaseRecvBuffer(buffer_id);
+                        if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
+                            self.armMultishotRecvmsg() catch {};
+                        }
+                        continue;
+                    }
+                    const out: *const linux.io_uring_recvmsg_out = @ptrCast(@alignCast(slab.ptr));
+                    const name_off: usize = @sizeOf(linux.io_uring_recvmsg_out);
+                    const cmsg_off: usize = name_off + UDP_NAMELEN;
+                    const payload_off: usize = cmsg_off + self.udp_msghdr.controllen;
+                    // Guard against truncation: o.payloadlen may
+                    // exceed what fits in the buffer if the peer
+                    // sent an oversized datagram. Clamp to what we
+                    // actually received.
+                    const max_payload = if (payload_off >= total) 0 else total - payload_off;
+                    const payload_len = @min(@as(usize, out.payloadlen), max_payload);
+                    const namelen = @min(@as(usize, out.namelen), UDP_NAMELEN);
+                    var ev: IoUringNativeEvent = .{
+                        .kind = .datagram,
+                        .conn_id = 0,
+                        .data = slab[payload_off .. payload_off + payload_len],
+                        .kernel_buffer_id = buffer_id,
+                    };
+                    @memcpy(ev.datagram_peer[0..namelen], slab[name_off .. name_off + namelen]);
+                    ev.datagram_peer_len = @intCast(namelen);
+                    self.events[count] = ev;
+                    count += 1;
+                    // Multishot recvmsg stays armed until F_MORE is
+                    // unset. Re-arm if the kernel dropped it (e.g.
+                    // ENOBUFS / EINVAL).
+                    if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
+                        self.armMultishotRecvmsg() catch {};
+                    }
                 },
                 .close => {
                     // no event — close completions are informational

@@ -158,6 +158,18 @@ pub const PreencodedH1Response = struct {
 pub const MAX_H2_PREENCODED: usize = 8;
 pub const H2_PREENCODED_BUF_SIZE: usize = 512;
 
+/// Max plaintext bytes pushed into SSL_write per `connWrite` call. Caps the
+/// ciphertext any single SSL_write can produce at roughly one TLS record,
+/// which keeps `TLS_CIPHER_SCRATCH_SIZE` (and any carryover into a pooled
+/// buffer) small and predictable.
+pub const TLS_PLAINTEXT_WRITE_CAP: usize = 16 * 1024;
+
+/// Scratch buffer size for draining wbio ciphertext to the socket. Large
+/// enough to hold the ciphertext produced by a single TLS 1.3 AES-GCM record
+/// (16384 bytes plaintext + AEAD tag + header) with comfortable slack so a
+/// healthy wbio drains in one BIO_read/writev round-trip.
+pub const TLS_CIPHER_SCRATCH_SIZE: usize = 16 * 1024 + 512;
+
 /// Pre-encoded HTTP/2 response for a hot static endpoint.
 ///
 /// Layout of `bytes[0..len]` (the wire template):
@@ -250,6 +262,13 @@ pub const Server = struct {
     /// place and enqueues the write.
     h2_preencoded: [MAX_H2_PREENCODED]PreencodedH2Response = undefined,
     h2_preencoded_count: usize = 0,
+    /// Shared ciphertext drain scratch for TLS memory-BIO writes. Sized to
+    /// hold one full TLS record's ciphertext (max_plaintext 16384 + 256 bytes
+    /// of AEAD/framing overhead). Per-SSL_write we cap plaintext at 16 KiB so
+    /// a single drain cycle never needs more than this. If the drain writev
+    /// hits EAGAIN, the unsent tail + any wbio remainder is copied into the
+    /// per-connection `tls_cipher_carry_handle`.
+    tls_cipher_scratch: [TLS_CIPHER_SCRATCH_SIZE]u8 = undefined,
 
     pub fn init(allocator: std.mem.Allocator, cfg: config.ServerConfig) !Server {
         var app_router = router.Router.init(.{
@@ -341,6 +360,7 @@ pub const Server = struct {
             .quic = quic_inst,
             .alt_svc_value = undefined,
             .alt_svc_len = 0,
+            .tls_cipher_scratch = undefined,
         };
 
         // Wire the (now stable-addressed) tls_provider into the QUIC handler
@@ -993,7 +1013,18 @@ pub const Server = struct {
                         }
                     },
                     .datagram => {
-                        try self.handleDatagram();
+                        // Native io_uring backend: the multishot recvmsg
+                        // CQE delivered the packet payload + peer addr
+                        // inline. Process this one datagram, release
+                        // the kernel buffer, and continue. Other
+                        // backends deliver a readiness event and we
+                        // drain the UDP fd via recvfrom.
+                        if (event.data) |payload| {
+                            self.handleInlineDatagram(payload, event.datagram_peer[0..event.datagram_peer_len]);
+                            if (event.kernel_buffer) |kb| kb.release();
+                        } else {
+                            try self.handleDatagram();
+                        }
                     },
                     .read, .write, .err => {
                         // Validate conn_id fits in u32 before casting
@@ -1004,6 +1035,24 @@ pub const Server = struct {
                         // be null (freed) or the connection state will be closed/accept.
                         const conn = self.io.getConnection(index) orelse continue;
                         if (conn.fd == null or conn.state == .closed or conn.state == .accept) continue;
+                        // If the backend delivered read data inline
+                        // (io_uring native multishot recv), seed it before
+                        // anything else — the handshake path also needs to
+                        // see the ciphertext bytes since TLS sessions use
+                        // memory BIOs (the kernel has already drained the
+                        // fd, so SSL_read via a socket BIO would miss it).
+                        // seedReadBuffer routes plaintext to conn.read_buffer
+                        // and ciphertext to the TLS rbio memory BIO.
+                        if (event.kind == .read) {
+                            if (event.data) |kernel_data| {
+                                self.seedReadBuffer(conn, kernel_data);
+                            }
+                            // Release the kernel buffer back to the ring
+                            // AFTER seeding but BEFORE running handlers.
+                            // The data has been copied out of kernel
+                            // memory, so we're safe to return the slot.
+                            if (event.kernel_buffer) |kb| kb.release();
+                        }
                         // TLS handshake in progress — any I/O event continues it
                         if (conn.state == .handshake) {
                             self.handleTlsHandshake(conn) catch {
@@ -1013,19 +1062,6 @@ pub const Server = struct {
                         }
                         switch (event.kind) {
                             .read => {
-                                // If the backend delivered read data inline
-                                // (io_uring native multishot recv), seed the
-                                // connection's read buffer before dispatch.
-                                // handleRead's existing pipeline loop just
-                                // picks up from there — no read() needed.
-                                if (event.data) |kernel_data| {
-                                    self.seedReadBuffer(conn, kernel_data);
-                                }
-                                // Release the kernel buffer back to the ring
-                                // AFTER seeding but BEFORE running handlers.
-                                // The data has been copied out of kernel
-                                // memory, so we're safe to return the slot.
-                                if (event.kernel_buffer) |kb| kb.release();
                                 self.handleRead(index) catch |err| {
                                     std.log.debug("handleRead conn={} failed: {}", .{ index, err });
                                 };
@@ -1036,8 +1072,18 @@ pub const Server = struct {
                                     self.handleWrite(index) catch {};
                                 }
                             },
-                            .write => self.handleWrite(index) catch |err| {
-                                std.log.debug("handleWrite conn={} failed: {}", .{ index, err });
+                            .write => {
+                                // Async writev CQE from the native backend:
+                                // `event.bytes` carries `cqe.res` (the bytes
+                                // the kernel actually sent). Advance the
+                                // write queue before entering handleWrite so
+                                // the next submission sees the post-ack state.
+                                if (conn.send_in_flight) {
+                                    self.advanceAsyncWriteQueue(conn, event.bytes);
+                                }
+                                self.handleWrite(index) catch |err| {
+                                    std.log.debug("handleWrite conn={} failed: {}", .{ index, err });
+                                };
                             },
                             .err => self.handleError(index) catch |err| {
                                 std.log.debug("handleError conn={} failed: {}", .{ index, err });
@@ -1114,7 +1160,7 @@ pub const Server = struct {
         }
         // If TLS is configured, start handshake before going active
         if (self.tcp_tls_provider) |*provider| {
-            conn.tls_session = provider.createSocketSession(client_fd) catch {
+            conn.tls_session = provider.createTcpMemSession() catch {
                 if (conn.read_buffer) |buf| self.io.releaseBuffer(buf);
                 self.io.releaseConnection(conn);
                 clock.closeFd(client_fd);
@@ -1168,9 +1214,25 @@ pub const Server = struct {
 
     fn handleTlsHandshake(self: *Server, conn: *connection.Connection) !void {
         var session = &(conn.tls_session orelse return error.NoTlsSession);
+        // Pull any ciphertext the backend hasn't seeded for us (poll/epoll
+        // path — completion backends already fed rbio from the event). Safe
+        // to call unconditionally; no-op on native.
+        _ = self.tlsPumpRead(conn);
+        // Before feeding new plaintext to SSL_do_handshake, flush any
+        // ciphertext we stashed from a prior partial writev.
+        switch (self.tlsDrainCarry(conn)) {
+            .done => {},
+            .again => return,
+            .err => return error.TlsWriteFailed,
+        }
         const accepted = session.accept() catch {
             return error.TlsHandshakeFailed;
         };
+        // session.accept may have written handshake output (ServerHello,
+        // EncryptedExtensions, Certificate, …) into wbio. Drain it now so
+        // the client can progress; the handshake is only meaningful once
+        // both sides have flushed their crypto bytes.
+        try self.tlsFlushWbio(conn);
         if (accepted) {
             // Handshake complete — check ALPN for h2 and transition to active
             conn.transition(.active, self.io.nowMs()) catch return error.InvalidTransition;
@@ -1238,8 +1300,45 @@ pub const Server = struct {
             };
             if (recv_result.bytes_read == 0) return;
 
-            self.processOneDatagram(udp_fd, quic, recv_result);
+            self.processOneDatagram(
+                udp_fd,
+                quic,
+                self.udp_recv_buf[0..recv_result.bytes_read],
+                recv_result.peer_addr,
+            );
         }
+    }
+
+    /// Handle a datagram whose payload + peer sockaddr were delivered
+    /// inline by the native io_uring backend (multishot recvmsg). The
+    /// kernel wrote the sockaddr into the provided buffer's reserved
+    /// name area; we reinterpret those bytes as SockAddrIn/SockAddrIn6
+    /// based on the family field so the QUIC stack can use it.
+    fn handleInlineDatagram(self: *Server, payload: []const u8, peer_bytes: []const u8) void {
+        const udp_fd = self.udp_fd orelse return;
+        const quic = &(self.quic orelse return);
+        // The sockaddr family lives at offset 0 (u16 on Linux; we only
+        // support Linux here since the native backend is Linux-only).
+        // IPv4 sockaddr is 16 bytes; IPv6 is 28.
+        if (peer_bytes.len < @sizeOf(u16)) return;
+        const family = std.mem.readInt(u16, peer_bytes[0..2], .little);
+        const net_peer: net.SockAddrStorage = blk: {
+            if (family == std.posix.AF.INET) {
+                if (peer_bytes.len < @sizeOf(net.SockAddrIn)) return;
+                var sa: net.SockAddrIn = undefined;
+                @memcpy(std.mem.asBytes(&sa)[0..@sizeOf(net.SockAddrIn)], peer_bytes[0..@sizeOf(net.SockAddrIn)]);
+                break :blk .{ .ip4 = sa };
+            } else if (family == std.posix.AF.INET6) {
+                if (peer_bytes.len < @sizeOf(net.SockAddrIn6)) return;
+                var sa: net.SockAddrIn6 = undefined;
+                @memcpy(std.mem.asBytes(&sa)[0..@sizeOf(net.SockAddrIn6)], peer_bytes[0..@sizeOf(net.SockAddrIn6)]);
+                break :blk .{ .ip6 = sa };
+            } else {
+                // Unsupported address family — drop the datagram.
+                return;
+            }
+        };
+        self.processOneDatagram(udp_fd, quic, payload, net_peer);
     }
 
     /// Process a single received UDP datagram through the QUIC stack,
@@ -1248,15 +1347,19 @@ pub const Server = struct {
         self: *Server,
         udp_fd: std.posix.fd_t,
         quic: *quic_handler.Handler,
-        recv_result: net.RecvFromResult,
+        payload: []const u8,
+        net_peer: net.SockAddrStorage,
     ) void {
-        // Convert peer address to our internal format (zero-init to avoid undefined bytes)
+        // Convert peer address to the QUIC stack's internal format
+        // (zero-init to avoid undefined bytes leaking into the hash).
         var peer_addr: quic_handler.connection_pool.SockAddrStorage = undefined;
         @memset(std.mem.asBytes(&peer_addr), 0);
-        @memcpy(std.mem.asBytes(&peer_addr)[0..@sizeOf(@TypeOf(recv_result.peer_addr))], std.mem.asBytes(&recv_result.peer_addr));
+        const peer_src = std.mem.asBytes(&net_peer);
+        const peer_copy_len = @min(peer_src.len, @sizeOf(quic_handler.connection_pool.SockAddrStorage));
+        @memcpy(std.mem.asBytes(&peer_addr)[0..peer_copy_len], peer_src[0..peer_copy_len]);
 
         // Process the QUIC packet
-        const result = quic.processPacket(self.udp_recv_buf[0..recv_result.bytes_read], peer_addr) catch |err| {
+        const result = quic.processPacket(payload, peer_addr) catch |err| {
             std.log.debug("QUIC packet error: {}", .{err});
             return;
         };
@@ -1264,7 +1367,7 @@ pub const Server = struct {
         // Send response if any (handshake responses)
         if (result.response) |resp| {
             if (resp.len > 0) {
-                _ = net.sendto(udp_fd, resp, recv_result.peer_addr) catch |err| {
+                _ = net.sendto(udp_fd, resp, net_peer) catch |err| {
                     std.log.debug("Failed to send QUIC response: {}", .{err});
                 };
             }
@@ -1283,7 +1386,7 @@ pub const Server = struct {
             for (result.http3_events) |event| {
                 switch (event) {
                     .request_ready => |req| {
-                        self.handleHttp3Request(udp_fd, conn, req, recv_result.peer_addr);
+                        self.handleHttp3Request(udp_fd, conn, req, net_peer);
                         conn.clearH3RequestStream(req.stream_id);
                     },
                     .settings, .goaway, .stream_error => {},
@@ -1582,7 +1685,34 @@ pub const Server = struct {
     /// delivered the data inline with the read event. After seeding,
     /// handleRead's existing pipeline loop picks up the data the same
     /// way it would after a read() syscall.
+    ///
+    /// For TLS connections the incoming bytes are ciphertext and go into
+    /// the session's rbio (memory BIO) instead of `conn.read_buffer`.
+    /// handleTlsHandshake / connRead then call SSL_do_handshake / SSL_read
+    /// which pull from rbio, run the decrypt, and deliver plaintext into
+    /// `conn.read_buffer`.
     fn seedReadBuffer(self: *Server, conn: *connection.Connection, data: []const u8) void {
+        if (data.len == 0) return;
+        if (conn.is_tls) {
+            // Feed ciphertext into rbio. BIO_write may consume less than
+            // requested on an internal failure; loop until drained or the
+            // BIO refuses progress.
+            if (conn.tls_session) |*session| {
+                var remaining = data;
+                while (remaining.len > 0) {
+                    const n = session.feedCryptoData(remaining) catch {
+                        // rbio write failed — drop the remaining bytes; the
+                        // next SSL_read will hit a TLS error and close the
+                        // connection cleanly.
+                        return;
+                    };
+                    if (n == 0) return;
+                    remaining = remaining[n..];
+                }
+                conn.markActive(self.io.nowMs());
+            }
+            return;
+        }
         const buf = conn.read_buffer orelse return;
         const end = conn.read_offset + conn.read_buffered_bytes;
         if (end + data.len > buf.bytes.len) {
@@ -1603,6 +1733,209 @@ pub const Server = struct {
         conn.markActive(self.io.nowMs());
     }
 
+    /// For TLS connections running on a non-completion backend (poll / epoll),
+    /// pull any available ciphertext from the socket with blocking reads and
+    /// feed it into the memory rbio. No-op on completion backends — the event
+    /// dispatcher already routed kernel-delivered bytes into rbio via
+    /// `seedReadBuffer`. Called before each `session.accept` / `SSL_read` so
+    /// the BIO always has the freshest bytes the kernel has handed us.
+    /// Returns true if any bytes were fed, false otherwise.
+    fn tlsPumpRead(self: *Server, conn: *connection.Connection) bool {
+        if (!conn.is_tls) return false;
+        if (self.io.capabilities().delivers_read_data) return false;
+        const fd = conn.fd orelse return false;
+        var session = &(conn.tls_session orelse return false);
+        var scratch: [16 * 1024]u8 = undefined;
+        var any: bool = false;
+        while (true) {
+            const raw = std.posix.system.read(fd, &scratch, scratch.len);
+            if (raw == 0) return any; // EOF — let the next SSL_read surface it
+            if (raw < 0) {
+                // EAGAIN / INTR — we've drained what's available.
+                return any;
+            }
+            const n: usize = @intCast(raw);
+            var remaining: []const u8 = scratch[0..n];
+            while (remaining.len > 0) {
+                const fed = session.feedCryptoData(remaining) catch return any;
+                if (fed == 0) return any;
+                remaining = remaining[fed..];
+            }
+            any = true;
+            conn.markActive(self.io.nowMs());
+        }
+    }
+
+    /// Drain any leftover ciphertext carry from a prior partial writev back to
+    /// the socket. Returns `.done` when the carry is empty (proceed to
+    /// encrypt more plaintext), `.again` when the socket is backpressured
+    /// (caller should return and wait for the next writable event), or
+    /// `.err` on a fatal socket error.
+    const CarryFlushResult = enum { done, again, err };
+    fn tlsDrainCarry(self: *Server, conn: *connection.Connection) CarryFlushResult {
+        const handle = conn.tls_cipher_carry_handle orelse return .done;
+        const fd = conn.fd orelse return .err;
+        while (conn.tls_cipher_carry_offset < conn.tls_cipher_carry_len) {
+            const slice = handle.bytes[conn.tls_cipher_carry_offset..conn.tls_cipher_carry_len];
+            const raw = std.c.write(fd, slice.ptr, slice.len);
+            if (raw < 0) {
+                return switch (std.posix.errno(raw)) {
+                    .AGAIN => .again,
+                    .INTR => continue,
+                    else => .err,
+                };
+            }
+            if (raw == 0) return .again;
+            conn.tls_cipher_carry_offset += @intCast(raw);
+            self.io.onWriteCompleted(conn, @intCast(raw));
+            conn.markActive(self.io.nowMs());
+        }
+        // Carry fully drained — release the buffer.
+        self.io.releaseBuffer(handle);
+        conn.tls_cipher_carry_handle = null;
+        conn.tls_cipher_carry_offset = 0;
+        conn.tls_cipher_carry_len = 0;
+        return .done;
+    }
+
+    /// Drain whatever ciphertext is currently pending in wbio to the socket.
+    /// If the socket is backpressured mid-drain, stashes the leftover
+    /// ciphertext into `conn.tls_cipher_carry_handle` so the next handleWrite
+    /// event can flush it. Returns normally on EAGAIN (partial + stash) or
+    /// on successful full drain; returns `error.TlsWriteFailed` on socket
+    /// errors, or `error.TlsCarryAllocFailed` if the pool is exhausted.
+    fn tlsFlushWbio(self: *Server, conn: *connection.Connection) !void {
+        var session = &(conn.tls_session orelse return);
+        const fd = conn.fd orelse return error.TlsWriteFailed;
+        while (true) {
+            const n = session.readCryptoData(&self.tls_cipher_scratch) catch {
+                return error.TlsWriteFailed;
+            };
+            if (n == 0) return;
+            var sent: usize = 0;
+            while (sent < n) {
+                const raw = std.c.write(fd, self.tls_cipher_scratch[sent..].ptr, n - sent);
+                if (raw < 0) {
+                    switch (std.posix.errno(raw)) {
+                        .AGAIN => {
+                            // Backpressured — stash the unsent tail plus
+                            // anything still queued in wbio for next time.
+                            if (!self.tlsStashCarry(conn, session, self.tls_cipher_scratch[sent..n])) {
+                                return error.TlsCarryAllocFailed;
+                            }
+                            return;
+                        },
+                        .INTR => continue,
+                        else => return error.TlsWriteFailed,
+                    }
+                }
+                if (raw == 0) {
+                    if (!self.tlsStashCarry(conn, session, self.tls_cipher_scratch[sent..n])) {
+                        return error.TlsCarryAllocFailed;
+                    }
+                    return;
+                }
+                sent += @intCast(raw);
+                conn.markActive(self.io.nowMs());
+            }
+        }
+    }
+
+    /// Build an iovec batch from the connection's write queue and
+    /// submit it as an async `IORING_OP_WRITEV` SQE on the native
+    /// io_uring backend. Returns `true` if the SQE was accepted (the
+    /// caller should `return` and wait for the CQE) or `false` if
+    /// the submission failed and the caller should fall back to a
+    /// sync writev.
+    ///
+    /// On success the iovec array is parked on `conn.async_send_iov`
+    /// so its address stays stable until the kernel has copied the
+    /// bytes out; `conn.send_in_flight` is set to lock out further
+    /// submissions until the `.write` CQE fires.
+    fn submitConnAsyncWritev(self: *Server, conn: *connection.Connection, fd: std.posix.fd_t) bool {
+        var iov_count: u16 = 0;
+        var total_bytes: usize = 0;
+        var scan_head = conn.write_head;
+        var scan_remaining = conn.write_count;
+        const cap = connection.async_send_iov_capacity;
+        while (scan_remaining > 0 and iov_count < cap) : (iov_count += 1) {
+            const e = &conn.write_queue[scan_head];
+            const s = e.handle.bytes[e.offset..e.len];
+            conn.async_send_iov[iov_count] = .{ .base = s.ptr, .len = s.len };
+            total_bytes += s.len;
+            scan_head = if (scan_head + 1 >= conn.write_queue.len) 0 else scan_head + 1;
+            scan_remaining -= 1;
+        }
+        if (iov_count == 0) return false;
+        const iov_slice = conn.async_send_iov[0..iov_count];
+        self.io.submitAsyncWritev(conn.index, fd, iov_slice) catch return false;
+        conn.send_in_flight = true;
+        conn.async_send_iov_count = iov_count;
+        conn.async_send_total_bytes = total_bytes;
+        return true;
+    }
+
+    /// Advance the connection's write queue after an async writev
+    /// CQE reports `bytes_written`. Pops any fully-sent entries,
+    /// releases their buffers, and updates `entry.offset` on a
+    /// partially-sent entry. Called from the event dispatcher when a
+    /// `.write` event arrives for a connection with `send_in_flight`.
+    fn advanceAsyncWriteQueue(self: *Server, conn: *connection.Connection, bytes_written: usize) void {
+        var remaining = bytes_written;
+        while (remaining > 0) {
+            const entry = conn.peekWrite() orelse break;
+            const left_in_entry = entry.len - entry.offset;
+            if (remaining >= left_in_entry) {
+                remaining -= left_in_entry;
+                self.io.onWriteCompleted(conn, left_in_entry);
+                self.io.releaseBuffer(entry.handle);
+                conn.popWrite();
+                if (conn.hasPendingBody()) {
+                    self.streamBodyChunks(conn, conn.pending_body);
+                }
+            } else {
+                entry.offset += remaining;
+                self.io.onWriteCompleted(conn, remaining);
+                remaining = 0;
+            }
+        }
+        conn.send_in_flight = false;
+        conn.async_send_iov_count = 0;
+        conn.async_send_total_bytes = 0;
+        conn.markActive(self.io.nowMs());
+    }
+
+    /// Stash the remaining ciphertext (scratch tail + anything still pending
+    /// in wbio) into a pool buffer so the next handleWrite call can flush it
+    /// before encrypting more plaintext. Called from the wbio drain path when
+    /// the socket returns EAGAIN or a short write.
+    fn tlsStashCarry(
+        self: *Server,
+        conn: *connection.Connection,
+        session: *tls.Session,
+        scratch_tail: []const u8,
+    ) bool {
+        // How many more ciphertext bytes are still sitting in wbio?
+        var extra_buf: [TLS_CIPHER_SCRATCH_SIZE]u8 = undefined;
+        const extra_n = session.readCryptoData(&extra_buf) catch 0;
+        const total = scratch_tail.len + extra_n;
+        if (total == 0) return true;
+        const handle = self.io.acquireBuffer() orelse return false;
+        if (handle.bytes.len < total) {
+            self.io.releaseBuffer(handle);
+            return false;
+        }
+        @memcpy(handle.bytes[0..scratch_tail.len], scratch_tail);
+        if (extra_n > 0) {
+            @memcpy(handle.bytes[scratch_tail.len..][0..extra_n], extra_buf[0..extra_n]);
+        }
+        conn.tls_cipher_carry_handle = handle;
+        conn.tls_cipher_carry_offset = 0;
+        conn.tls_cipher_carry_len = total;
+        self.io.onWriteBuffered(conn, total);
+        return true;
+    }
+
     fn handleRead(self: *Server, index: u32) !void {
         const conn = self.io.getConnection(index) orelse return;
         if (conn.fd == null) return;
@@ -1613,9 +1946,11 @@ pub const Server = struct {
         // If we're accumulating a large body, continue that instead of parsing.
         // Loop until EAGAIN to drain all available data (edge-triggered epoll).
         if (conn.isAccumulatingBody()) {
-            // Completion-model backends: the data is already in the
-            // buffer (seeded by the event dispatcher). Just consume it.
-            if (self.io.capabilities().delivers_read_data) {
+            // Completion-model backends deliver plaintext directly into the
+            // buffer, so we can consume it without another syscall. TLS on
+            // native still needs to run through connRead (SSL_read) because
+            // the bytes the kernel delivered are ciphertext living in rbio.
+            if (self.io.capabilities().delivers_read_data and !conn.is_tls) {
                 self.continueBodyAccumulation(conn) catch {
                     self.abortBodyAccumulation(conn, 400);
                     return;
@@ -1701,8 +2036,10 @@ pub const Server = struct {
         // With completion-model backends (io_uring native), the event
         // dispatcher has already seeded read_buffered_bytes from the
         // kernel's provided buffer. Skip the read() syscall in that
-        // case — the data is already there.
-        if (!self.io.capabilities().delivers_read_data) {
+        // case — the data is already there. For TLS on native, the
+        // kernel-delivered bytes are ciphertext living in rbio; we still
+        // need to call connRead (SSL_read) to pull plaintext out.
+        if (!self.io.capabilities().delivers_read_data or conn.is_tls) {
             const slice = buffer_handle.bytes[offset..];
             const count = switch (self.connRead(conn, slice)) {
                 .bytes => |n| n,
@@ -1959,10 +2296,19 @@ pub const Server = struct {
             if (conn.read_buffered_bytes == 0) break;
         }
 
-        // Read-loop draining: if buffer is fully consumed and we can still process,
-        // try one more non-blocking read to avoid an extra event loop round-trip.
-        // This helps with fast persistent-connection clients (e.g., k6 benchmarks).
-        if (conn.read_buffered_bytes == 0 and conn.canEnqueueWrite() and !conn.close_after_write) {
+        // Read-loop draining: if buffer is fully consumed and we can
+        // still process, try one more non-blocking read to avoid an
+        // extra event loop round-trip. Helps fast persistent clients
+        // (e.g. k6 benchmarks) on readiness backends. Skip on
+        // completion-model backends (native io_uring) — the kernel's
+        // multishot recv will deliver any further data as a separate
+        // CQE, so a speculative read here is always EAGAIN and wastes
+        // a syscall.
+        if (!self.io.capabilities().delivers_read_data and
+            conn.read_buffered_bytes == 0 and
+            conn.canEnqueueWrite() and
+            !conn.close_after_write)
+        {
             conn.read_offset = 0;
             const drain_buf = conn.read_buffer orelse return;
             switch (self.connRead(conn, drain_buf.bytes)) {
@@ -2181,6 +2527,18 @@ pub const Server = struct {
 
         while (true) {
             if (conn.is_tls) {
+                // Flush any ciphertext stashed from a prior partial writev
+                // before touching SSL_write — we must preserve encryption
+                // order, and SSL_write would otherwise produce a record
+                // that races ahead of the carried record on the wire.
+                switch (self.tlsDrainCarry(conn)) {
+                    .done => {},
+                    .again => return,
+                    .err => {
+                        self.closeConnection(conn);
+                        return;
+                    },
+                }
                 // TLS: write one buffer at a time through SSL_write
                 while (conn.write_count > 0) {
                     const entry = conn.peekWrite() orelse break;
@@ -2204,6 +2562,11 @@ pub const Server = struct {
                                 entry.offset += n;
                                 self.io.onWriteCompleted(conn, n);
                             }
+                            // If connWrite populated the carry (writev was
+                            // only partially absorbed), pause the loop —
+                            // we'll resume once the next writable event
+                            // drains the carry.
+                            if (conn.tls_cipher_carry_handle != null) return;
                         },
                         .again => return,
                         .err => {
@@ -2217,7 +2580,32 @@ pub const Server = struct {
                 }
                 if (conn.state == .closed) return;
             } else {
-                // Plain TCP: use writev to gather multiple entries per syscall
+                // Plain TCP path.
+                //
+                // Fast case: if the backend supports async writes
+                // (native io_uring), park an iovec batch on the
+                // connection and submit a single IORING_OP_WRITEV
+                // SQE. The completion comes back as a .write event
+                // carrying `cqe.res` in `event.bytes`; the dispatcher
+                // advances the queue there and re-runs handleWrite.
+                //
+                // Guard: skip async if a prior send is still in
+                // flight (the iovec's target slices must stay stable
+                // until the kernel acks the previous submission).
+                if (conn.send_in_flight) return;
+                if (self.io.capabilities().async_writes and conn.write_count > 0 and !conn.hasPendingFile()) {
+                    if (self.submitConnAsyncWritev(conn, socket_fd)) {
+                        // SQE accepted — the kernel will wake us via
+                        // the .write CQE. Nothing more to do this
+                        // tick; bail out of the outer while loop.
+                        return;
+                    }
+                    // SubmissionQueueFull or another submit error —
+                    // fall through to the sync writev path as a
+                    // safety valve. This should be rare in practice.
+                }
+                // Sync writev fallback: used on non-completion
+                // backends, or when the native ring's SQ is full.
                 while (conn.write_count > 0) {
                     var iov: [16]std.posix.iovec_const = undefined;
                     var iov_count: u32 = 0;
@@ -3835,6 +4223,23 @@ pub const Server = struct {
             self.io.releaseBuffer(buf);
             conn.read_buffer = null;
         }
+        // Release any stashed TLS ciphertext carry buffer.
+        if (conn.tls_cipher_carry_handle) |carry_buf| {
+            self.io.releaseBuffer(carry_buf);
+            conn.tls_cipher_carry_handle = null;
+            conn.tls_cipher_carry_offset = 0;
+            conn.tls_cipher_carry_len = 0;
+        }
+        // Clear async send state. Any still-in-flight writev CQE from
+        // this connection's previous incarnation will be dropped by
+        // the generation-counter check in the native backend's poll()
+        // (releaseConnection bumps the counter below). The fd has
+        // already been closed above, so the kernel finished copying
+        // bytes out of the connection's buffers before we reach the
+        // releaseBuffer loop.
+        conn.send_in_flight = false;
+        conn.async_send_iov_count = 0;
+        conn.async_send_total_bytes = 0;
         // Clean up pending file descriptor and body reference
         conn.cleanupPendingFile();
         conn.pending_body = &[_]u8{};
@@ -3849,8 +4254,11 @@ pub const Server = struct {
         err: void,
     };
 
-    fn connRead(_: *Server, conn: *connection.Connection, buf: []u8) ReadResult {
+    fn connRead(self: *Server, conn: *connection.Connection, buf: []u8) ReadResult {
         if (conn.is_tls) {
+            // Pull any newly-arrived ciphertext into rbio on non-completion
+            // backends (no-op on native — the event dispatcher seeded it).
+            _ = self.tlsPumpRead(conn);
             var session = &(conn.tls_session orelse return .err);
             const n = session.read(buf) catch |err| return switch (err) {
                 error.WouldBlock => .again,
@@ -3879,11 +4287,26 @@ pub const Server = struct {
         err: void,
     };
 
-    fn connWrite(_: *Server, conn: *connection.Connection, data: []const u8) WriteResult {
+    fn connWrite(self: *Server, conn: *connection.Connection, data: []const u8) WriteResult {
         if (conn.is_tls) {
+            // Cap plaintext per SSL_write so wbio never holds more ciphertext
+            // than one TLS record — that guarantees a full drain through
+            // `tls_cipher_scratch` in a single BIO_read/writev round.
+            const chunk_len = @min(data.len, TLS_PLAINTEXT_WRITE_CAP);
+            if (chunk_len == 0) return .{ .bytes = 0 };
             var session = &(conn.tls_session orelse return .err);
-            const n = session.write(data) catch |err| return switch (err) {
+            const n = session.write(data[0..chunk_len]) catch |err| return switch (err) {
                 error.WouldBlock => .again,
+                else => .err,
+            };
+            if (n == 0) return .again;
+            // Drain the fresh ciphertext straight to the socket. On
+            // backpressure the remainder is stashed into the per-conn
+            // cipher carry, and we return .bytes (the plaintext was already
+            // consumed by SSL_write). handleWrite checks the carry at the
+            // top of its loop on the next write event and flushes it there.
+            self.tlsFlushWbio(conn) catch |err| return switch (err) {
+                error.TlsCarryAllocFailed => .err,
                 else => .err,
             };
             return .{ .bytes = n };

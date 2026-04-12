@@ -78,7 +78,11 @@ pub const IoRuntime = struct {
                 .delivers_read_data = true,
                 .multishot_accept = true,
                 .zero_copy_buffers = true,
-                .async_writes = false, // phase 2b — for now writes go via sync writev
+                // Plain-TCP writes are now async via IORING_OP_WRITEV.
+                // TLS writes stay sync through `tlsFlushWbio` because
+                // the ciphertext drain re-encrypts per call and would
+                // need a deeper buffer-backed carry to go async.
+                .async_writes = true,
             },
             .windows_iocp, .unknown => .{},
         };
@@ -278,10 +282,10 @@ pub const IoRuntime = struct {
             .bsd_kqueue => |*kq| kq.registerUdpSocket(fd),
             .linux_epoll => |*ep| ep.registerUdpSocket(fd),
             .linux_io_uring_poll => |*ur| ur.registerUdpSocket(fd),
-            // Native backend: UDP (QUIC) is not wired yet — no-op. QUIC
-            // still goes through the kqueue/epoll/poll path until we
-            // add a dedicated UDP recvmsg ring to this backend.
-            .linux_io_uring_native => {},
+            // Native backend arms a multishot IORING_OP_RECVMSG SQE
+            // on the UDP socket; every packet arrives as a .datagram
+            // event with inline data and a sockaddr slice.
+            .linux_io_uring_native => |*ur| ur.registerUdpSocket(@intCast(fd)),
             else => error.UnsupportedBackend,
         };
     }
@@ -325,6 +329,22 @@ pub const IoRuntime = struct {
             else => {},
         }
     }
+
+    /// Submit an async writev for plaintext TCP responses. Only valid
+    /// when `capabilities().async_writes` is true. The iovec slice
+    /// MUST live until the CQE is reaped — callers typically park it
+    /// on the Connection struct so its address stays stable.
+    pub fn submitAsyncWritev(
+        self: *IoRuntime,
+        conn_id: u32,
+        fd: std.posix.fd_t,
+        iov: []const std.posix.iovec_const,
+    ) !void {
+        return switch (self.backend_state) {
+            .linux_io_uring_native => |*ur| ur.submitWritev(conn_id, @intCast(fd), iov),
+            else => error.UnsupportedBackend,
+        };
+    }
 };
 
 pub const Backend = enum {
@@ -364,6 +384,12 @@ pub const Event = struct {
     /// call `.release()` on this once it has copied or fully consumed
     /// the event's data (the kernel owns the memory until then).
     kernel_buffer: ?KernelBufferRef = null,
+    /// For `.datagram` events on completion-model backends: raw bytes
+    /// of the peer's sockaddr_in / sockaddr_in6 (length in
+    /// `datagram_peer_len`). The server reinterprets these into its
+    /// own `SockAddrStorage` union in `handleDatagram`.
+    datagram_peer: [28]u8 = undefined,
+    datagram_peer_len: u8 = 0,
 };
 
 pub const EventKind = enum {
@@ -396,7 +422,7 @@ pub const Capabilities = struct {
 /// Magic identifier for UDP socket events to distinguish from TCP listener (0) and connections
 pub const UDP_SOCKET_ID: u64 = std.math.maxInt(u64) - 1;
 
-fn pickBackend(cfg: config.ServerConfig) Backend {
+fn pickBackend(_: config.ServerConfig) Backend {
     // Diagnostic override: SWERVER_BACKEND=epoll|poll|native forces
     // the backend regardless of auto-detection. Intended for A/B
     // benchmarking and debugging — production should leave it unset
@@ -415,17 +441,11 @@ fn pickBackend(cfg: config.ServerConfig) Backend {
             // recv over a provided buffer ring). Requires kernel 6.1+
             // for SINGLE_ISSUER | DEFER_TASKRUN.
             //
-            // Guardrails: the native backend drains socket bytes into
-            // our own buffer slab via multishot recv. That breaks TLS
-            // (the SSL BIO reads via socket recv() and sees EAGAIN
-            // because we already consumed the bytes) and QUIC (we
-            // don't yet arm UDP recvmsg on the ring). For those
-            // configurations we fall through to the poll emulation
-            // backend or plain epoll — both still give io_uring
-            // parity for the non-TLS fast path in other processes.
-            const tls_enabled = cfg.tls.cert_path.len > 0;
-            const quic_enabled = cfg.quic.enabled;
-            if (!tls_enabled and !quic_enabled and io_uring_native_backend.probe()) {
+            // Native backend handles TCP (multishot accept + recv),
+            // TLS (memory BIOs fed from `seedReadBuffer`), and UDP
+            // (multishot recvmsg for QUIC). Pick it whenever the
+            // kernel supports SINGLE_ISSUER | DEFER_TASKRUN.
+            if (io_uring_native_backend.probe()) {
                 break :blk .linux_io_uring_native;
             }
             // Older kernels that still support io_uring fall back to
@@ -740,10 +760,14 @@ fn translateIoUringNativeEvents(
                 count += 1;
             },
             .write => {
+                // Native async writev: `bytes_written` is `cqe.res`,
+                // i.e. the actual bytes the kernel sent (may be less
+                // than the submitted iovec total on a short write).
+                // The server uses it to advance the write queue.
                 out[count] = .{
                     .kind = .write,
                     .conn_id = ev.conn_id,
-                    .bytes = 0,
+                    .bytes = ev.bytes_written,
                     .handle = null,
                 };
                 count += 1;
@@ -755,6 +779,32 @@ fn translateIoUringNativeEvents(
                     .bytes = 0,
                     .handle = null,
                 };
+                count += 1;
+            },
+            .datagram => {
+                // Kernel already filled a provided buffer with the
+                // io_uring_recvmsg_out header + peer sockaddr + QUIC
+                // packet payload. The native backend's translate step
+                // parsed the header and set `data` to the payload
+                // slice; we pass that through plus the raw sockaddr
+                // bytes so handleDatagram can feed the QUIC stack
+                // without any recvfrom call.
+                const kref: ?KernelBufferRef = if (ev.kernel_buffer_id) |bid| .{
+                    .ctx = @ptrCast(backend),
+                    .release_fn = releaseNativeRecvBuffer,
+                    .buffer_id = bid,
+                } else null;
+                var e: Event = .{
+                    .kind = .datagram,
+                    .conn_id = UDP_SOCKET_ID,
+                    .bytes = if (ev.data) |d| d.len else 0,
+                    .handle = null,
+                    .data = ev.data,
+                    .kernel_buffer = kref,
+                };
+                e.datagram_peer_len = ev.datagram_peer_len;
+                @memcpy(e.datagram_peer[0..ev.datagram_peer_len], ev.datagram_peer[0..ev.datagram_peer_len]);
+                out[count] = e;
                 count += 1;
             },
         }

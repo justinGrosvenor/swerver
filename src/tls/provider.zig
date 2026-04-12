@@ -117,6 +117,22 @@ pub const Provider = struct {
         const ssl = ffi.createSocketSession(self.ctx, fd, true) catch return error.SessionCreationFailed;
         return Session{ .ssl = ssl, .is_socket = true };
     }
+
+    /// Create a new TLS session for a TCP connection using memory BIOs
+    /// instead of a socket BIO. The caller is responsible for feeding
+    /// incoming ciphertext to rbio via `Session.feedCryptoData` and draining
+    /// outgoing ciphertext from wbio via `Session.readCryptoData`.
+    ///
+    /// This is required to run TLS over the native io_uring backend, where
+    /// multishot recv has already drained the socket's bytes into a kernel
+    /// provided buffer — a socket BIO's internal `recv(fd)` would see EAGAIN.
+    pub fn createTcpMemSession(self: *Provider) Error!Session {
+        const ssl = ffi.createSession(self.ctx, true) catch return error.SessionCreationFailed;
+        // is_socket=false — we don't want Session.deinit to call SSL_shutdown
+        // (the shutdown alert would write to wbio and we'd have to pump it).
+        // Close_notify is skipped; TCP RST on connection teardown is fine.
+        return Session{ .ssl = ssl, .is_socket = false };
+    }
 };
 
 /// Represents a TLS session for a single connection.
