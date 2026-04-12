@@ -1884,22 +1884,12 @@ pub const Server = struct {
             if (conn.read_buffered_bytes == 0) break;
         }
 
-        // Read-loop draining: if buffer is fully consumed and we can still process,
-        // try one more non-blocking read to avoid an extra event loop round-trip.
-        // This helps with fast persistent-connection clients (e.g., k6 benchmarks).
-        if (conn.read_buffered_bytes == 0 and conn.canEnqueueWrite() and !conn.close_after_write) {
-            conn.read_offset = 0;
-            const drain_buf = conn.read_buffer orelse return;
-            switch (self.connRead(conn, drain_buf.bytes)) {
-                .bytes => |drain_count| {
-                    self.io.onReadBuffered(conn, drain_count);
-                    conn.markActive(self.io.nowMs());
-                    return self.handleRead(index);
-                },
-                .eof, .again, .err => {},
-            }
-            // No more data available, continue normally
-        }
+        // Note: we do NOT do a speculative drain read here. With
+        // Pipeline:1, the client hasn't received our response yet (it's
+        // queued for write), so a read() would always return EAGAIN —
+        // wasting a syscall. Instead, after handleWrite completes and
+        // write_count drops to 0, we do a speculative read there (the
+        // client may have already sent the next request by then).
     }
 
     /// Send the HTTP/2 server connection preface (SETTINGS frame)
@@ -2237,6 +2227,32 @@ pub const Server = struct {
             if (conn.read_buffered_bytes > 0) {
                 self.handleRead(index) catch {};
                 return;
+            }
+            // Speculative read: the client may have sent the next
+            // request while we were writing the response. Try one
+            // non-blocking read before going back to poll. This
+            // saves a full poll cycle for Pipeline:1 keep-alive
+            // connections where the client sends immediately after
+            // receiving the response.
+            if (conn.canEnqueueWrite()) {
+                const read_buf = conn.read_buffer orelse {
+                    self.io.setTimeoutPhase(conn, .idle);
+                    return;
+                };
+                conn.read_offset = 0;
+                switch (self.connRead(conn, read_buf.bytes)) {
+                    .bytes => |n| {
+                        self.io.onReadBuffered(conn, n);
+                        conn.markActive(self.io.nowMs());
+                        self.handleRead(index) catch {};
+                        return;
+                    },
+                    .eof => {
+                        self.closeConnection(conn);
+                        return;
+                    },
+                    .again, .err => {},
+                }
             }
             self.io.setTimeoutPhase(conn, .idle);
         }
