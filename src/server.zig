@@ -939,6 +939,7 @@ pub const Server = struct {
             }
         }
         const deadline = if (run_for_ms) |ms| self.io.nowMs() + ms else null;
+        var last_housekeeping_ms: u64 = self.io.nowMs();
         while (true) {
             if (shutdown_requested.load(.acquire)) return;
             if (reload_requested.swap(false, .acq_rel)) {
@@ -947,23 +948,37 @@ pub const Server = struct {
             if (deadline) |limit| {
                 if (self.io.nowMs() >= limit) return;
             }
+            // Single clock call per loop iteration — reused for poll
+            // timeout, timeout enforcement, and proxy maintenance.
             const now_ms = self.io.nowMs();
-            const timeout_ms = self.io.nextPollTimeoutMs(now_ms);
+
+            // Housekeeping (timeout enforcement, QUIC cleanup, proxy
+            // maintenance) runs at most every 100ms. Under high load
+            // the event loop processes thousands of requests between
+            // housekeeping passes. This eliminates per-tick O(active)
+            // connection scans that dominated CPU at high core counts.
+            const housekeeping_interval_ms: u64 = 100;
+            const needs_housekeeping = (now_ms -% last_housekeeping_ms) >= housekeeping_interval_ms;
+            const timeout_ms: u32 = if (needs_housekeeping) 0 else 10;
             const events = try self.io.pollWithTimeout(timeout_ms);
-            // Enforce timeouts and close timed-out connections
-            const timeout_result = self.io.enforceTimeouts(self.io.nowMs());
-            for (timeout_result.to_close[0..timeout_result.count]) |conn_index| {
-                if (self.io.getConnection(conn_index)) |conn| {
-                    self.closeConnection(conn);
+
+            if (needs_housekeeping) {
+                last_housekeeping_ms = now_ms;
+                // Enforce timeouts and close timed-out connections
+                const timeout_result = self.io.enforceTimeouts(now_ms);
+                for (timeout_result.to_close[0..timeout_result.count]) |conn_index| {
+                    if (self.io.getConnection(conn_index)) |conn| {
+                        self.closeConnection(conn);
+                    }
                 }
-            }
-            // Periodic QUIC cleanup
-            if (self.quic) |*q| {
-                q.cleanup();
-            }
-            // Periodic proxy maintenance (pool eviction + health checks)
-            if (self.proxy) |proxy| {
-                proxy.runMaintenance(self.io.nowMs());
+                // Periodic QUIC cleanup
+                if (self.quic) |*q| {
+                    q.cleanup();
+                }
+                // Periodic proxy maintenance (pool eviction + health checks)
+                if (self.proxy) |proxy| {
+                    proxy.runMaintenance(now_ms);
+                }
             }
             if (events.len == 0) continue;
             for (events) |event| {

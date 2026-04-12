@@ -595,18 +595,29 @@ pub const Router = struct {
             .arena = std.heap.FixedBufferAllocator.init(scratch.arena_buf),
         };
 
-        // Capture the request start time for post-response elapsed
-        // calculation. Set it here (after pre-middleware) so elapsed
-        // reflects handler time, not middleware overhead.
-        mw_ctx.request_start = clock.Instant.now();
+        // Only capture request start time if post-response hooks exist
+        // (access logging, metrics). Skip both clock_gettime calls when
+        // middleware is disabled — saves ~40-100ns per request.
+        if (self.middleware_chain.post.len > 0) {
+            mw_ctx.request_start = clock.Instant.now();
+        }
 
         var result_resp: response.Response = undefined;
         const result_pause: ?u64 = null;
         var ran_handler = false;
 
+        // Strip query string once before the route loop — matchRoute
+        // was doing this for every route, wasting O(path.len × route_count).
+        const path_only = if (std.mem.indexOfScalar(u8, req.path, '?')) |q|
+            req.path[0..q]
+        else if (std.mem.indexOfScalar(u8, req.path, '#')) |f|
+            req.path[0..f]
+        else
+            req.path;
+
         var path_matched = false;
         for (self.routes[0..self.route_count]) |r| {
-            if (!self.matchRoute(&r, req.path, &ctx)) continue;
+            if (!self.matchRoute(&r, path_only, &ctx)) continue;
             if (r.method != req.method) {
                 path_matched = true;
                 continue;
@@ -647,17 +658,15 @@ pub const Router = struct {
             }
         }
 
-        // Post-response hooks: access logging, structured logging,
-        // metrics recording. Runs for every request that made it past
-        // the pre-request middleware chain — including 404s and 405s
-        // from the router (those are real requests that deserve logs).
-        // Does NOT run for x402 rejects, rate-limit rejects, or
-        // bloom-filter fast-rejects (those exit before this point).
-        const elapsed_ns: u64 = if (mw_ctx.request_start) |start|
-            if (clock.Instant.now()) |now_inst| now_inst.since(start) else 0
-        else
-            0;
-        self.middleware_chain.executePost(mw_ctx, req, result_resp, elapsed_ns);
+        // Post-response hooks: access logging, metrics, etc.
+        // Skip entirely when no hooks are registered (benchmark mode).
+        if (self.middleware_chain.post.len > 0) {
+            const elapsed_ns: u64 = if (mw_ctx.request_start) |start|
+                if (clock.Instant.now()) |now_inst| now_inst.since(start) else 0
+            else
+                0;
+            self.middleware_chain.executePost(mw_ctx, req, result_resp, elapsed_ns);
+        }
 
         return .{ .resp = result_resp, .pause_reads_ms = result_pause };
     }
@@ -710,22 +719,14 @@ pub const Router = struct {
         }
     }
 
+    /// Match a route pattern against a path. The path must already have
+    /// the query string stripped (caller responsibility — handle() does
+    /// this once before the route loop to avoid O(N) redundant scans).
     fn matchRoute(self: *Router, r: *const Route, path: []const u8, ctx: *HandlerContext) bool {
         _ = self;
         ctx.param_count = 0;
 
-        // Strip the query string before segment matching. RFC 3986
-        // §3.3: the path ends at the first `?` or `#`. Pre-this-fix
-        // the router did literal segment compare on the full
-        // request-target so `/baseline2?a=1&b=1` failed to match
-        // a route registered as `/baseline2`.
-        const path_only = blk: {
-            if (std.mem.indexOfScalar(u8, path, '?')) |q| break :blk path[0..q];
-            if (std.mem.indexOfScalar(u8, path, '#')) |f| break :blk path[0..f];
-            break :blk path;
-        };
-
-        var path_it = std.mem.splitScalar(u8, path_only, '/');
+        var path_it = std.mem.splitScalar(u8, path, '/');
         var seg_idx: u8 = 0;
 
         while (path_it.next()) |path_seg| {
