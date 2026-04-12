@@ -5,7 +5,7 @@ const connection = @import("connection.zig");
 const clock = @import("clock.zig");
 const kqueue_backend = @import("backend/kqueue.zig");
 const epoll_backend = @import("backend/epoll.zig");
-const io_uring_backend = @import("backend/io_uring.zig");
+const io_uring_poll_backend = @import("backend/io_uring_poll.zig");
 
 pub const IoRuntime = struct {
     allocator: std.mem.Allocator,
@@ -65,6 +65,18 @@ pub const IoRuntime = struct {
         };
     }
 
+    /// Return the capability set for this runtime's backend.
+    /// The server uses this to choose between portable readiness
+    /// paths and backend-specific fast paths.
+    pub fn capabilities(self: *const IoRuntime) Capabilities {
+        return switch (self.backend_state) {
+            .bsd_kqueue => .{},
+            .linux_epoll => .{},
+            .linux_io_uring_poll => .{},
+            .windows_iocp, .unknown => .{},
+        };
+    }
+
     pub fn poll(self: *IoRuntime) ![]const Event {
         return self.pollWithTimeout(0);
     }
@@ -81,7 +93,7 @@ pub const IoRuntime = struct {
                 const count = translateEpollEvents(epev, self.events);
                 return self.events[0..count];
             },
-            .linux_io_uring => |*ur| {
+            .linux_io_uring_poll => |*ur| {
                 const urev = try ur.poll(timeout_ms);
                 const count = translateIoUringEvents(urev, self.events);
                 return self.events[0..count];
@@ -234,7 +246,7 @@ pub const IoRuntime = struct {
         return switch (self.backend_state) {
             .bsd_kqueue => |*kq| kq.registerListener(fd),
             .linux_epoll => |*ep| ep.registerListener(fd),
-            .linux_io_uring => |*ur| ur.registerListener(fd),
+            .linux_io_uring_poll => |*ur| ur.registerListener(fd),
             else => error.UnsupportedBackend,
         };
     }
@@ -243,7 +255,7 @@ pub const IoRuntime = struct {
         return switch (self.backend_state) {
             .bsd_kqueue => |*kq| kq.registerUdpSocket(fd),
             .linux_epoll => |*ep| ep.registerUdpSocket(fd),
-            .linux_io_uring => |*ur| ur.registerUdpSocket(fd),
+            .linux_io_uring_poll => |*ur| ur.registerUdpSocket(fd),
             else => error.UnsupportedBackend,
         };
     }
@@ -256,7 +268,7 @@ pub const IoRuntime = struct {
         return switch (self.backend_state) {
             .bsd_kqueue => |*kq| kq.registerConnection(offset_id, fd),
             .linux_epoll => |*ep| ep.registerConnection(offset_id, fd),
-            .linux_io_uring => |*ur| ur.registerConnection(offset_id, fd),
+            .linux_io_uring_poll => |*ur| ur.registerConnection(offset_id, fd),
             else => error.UnsupportedBackend,
         };
     }
@@ -265,18 +277,33 @@ pub const IoRuntime = struct {
         return switch (self.backend_state) {
             .bsd_kqueue => |*kq| kq.unregister(fd),
             .linux_epoll => |*ep| ep.unregister(fd),
-            .linux_io_uring => |*ur| ur.unregister(fd),
+            .linux_io_uring_poll => |*ur| ur.unregister(fd),
             else => error.UnsupportedBackend,
         };
     }
 };
 
 pub const Backend = enum {
-    linux_io_uring,
+    linux_io_uring_poll,
     linux_epoll,
     bsd_kqueue,
     windows_iocp,
     unknown,
+};
+
+/// Optional reference to a kernel-managed buffer that must be released
+/// after the event has been fully processed. Used by completion-model
+/// backends (io_uring native with buffer groups) to deliver zero-copy
+/// reads. Readiness backends (epoll, kqueue, io_uring poll) leave this
+/// null and the server does its own read().
+pub const KernelBufferRef = struct {
+    ctx: *anyopaque,
+    release_fn: *const fn (ctx: *anyopaque, buffer_id: u16) void,
+    buffer_id: u16,
+
+    pub fn release(self: KernelBufferRef) void {
+        self.release_fn(self.ctx, self.buffer_id);
+    }
 };
 
 pub const Event = struct {
@@ -284,6 +311,14 @@ pub const Event = struct {
     conn_id: u64,
     bytes: usize,
     handle: ?std.posix.fd_t,
+    /// Optional inline data payload. Set by completion-model backends
+    /// that deliver reads via kernel-filled buffers. Readiness backends
+    /// leave this null — the server calls connRead() to fetch the data.
+    data: ?[]const u8 = null,
+    /// Optional kernel buffer token. When non-null, the server MUST
+    /// call `.release()` on this once it has copied or fully consumed
+    /// the event's data (the kernel owns the memory until then).
+    kernel_buffer: ?KernelBufferRef = null,
 };
 
 pub const EventKind = enum {
@@ -294,12 +329,31 @@ pub const EventKind = enum {
     datagram,
 };
 
+/// Capability flags describing what a backend can do. The server
+/// branches on these when choosing between specialized fast paths
+/// (e.g., native-io_uring direct-from-kernel reads) and the common
+/// portable paths (readiness + explicit read).
+pub const Capabilities = struct {
+    /// True if the backend delivers read data inline with the event.
+    /// The server should use event.data instead of calling connRead().
+    delivers_read_data: bool = false,
+    /// True if the backend keeps the accept op armed after each event
+    /// (no manual re-arm needed).
+    multishot_accept: bool = false,
+    /// True if the backend uses kernel-managed buffer groups for reads
+    /// (zero-copy path, requires event.kernel_buffer to be released).
+    zero_copy_buffers: bool = false,
+    /// True if writes are submitted asynchronously and completion is
+    /// signaled via a later .write event (vs sync writev in handleWrite).
+    async_writes: bool = false,
+};
+
 /// Magic identifier for UDP socket events to distinguish from TCP listener (0) and connections
 pub const UDP_SOCKET_ID: u64 = std.math.maxInt(u64) - 1;
 
 fn pickBackend() Backend {
     return switch (@import("builtin").os.tag) {
-        .linux => if (io_uring_backend.probeIoUring()) .linux_io_uring else .linux_epoll,
+        .linux => if (io_uring_poll_backend.probeIoUring()) .linux_io_uring_poll else .linux_epoll,
         .macos, .freebsd, .netbsd, .openbsd, .dragonfly => .bsd_kqueue,
         .windows => .windows_iocp,
         else => .unknown,
@@ -307,7 +361,7 @@ fn pickBackend() Backend {
 }
 
 pub const BackendState = union(Backend) {
-    linux_io_uring: io_uring_backend.IoUringBackend,
+    linux_io_uring_poll: io_uring_poll_backend.IoUringPollBackend,
     linux_epoll: epoll_backend.EpollBackend,
     bsd_kqueue: kqueue_backend.KqueueBackend,
     windows_iocp: void,
@@ -318,7 +372,7 @@ fn initBackend(allocator: std.mem.Allocator, backend: Backend, max_events: usize
     return switch (backend) {
         .bsd_kqueue => .{ .bsd_kqueue = try kqueue_backend.KqueueBackend.init(allocator, max_events) },
         .linux_epoll => .{ .linux_epoll = try epoll_backend.EpollBackend.init(allocator, max_events) },
-        .linux_io_uring => .{ .linux_io_uring = try io_uring_backend.IoUringBackend.init(allocator, max_events, multi_worker) },
+        .linux_io_uring_poll => .{ .linux_io_uring_poll = try io_uring_poll_backend.IoUringPollBackend.init(allocator, max_events, multi_worker) },
         .windows_iocp => .{ .windows_iocp = {} },
         .unknown => .{ .unknown = {} },
     };
@@ -328,7 +382,7 @@ fn deinitBackend(state: *BackendState, allocator: std.mem.Allocator) void {
     switch (state.*) {
         .bsd_kqueue => |*kq| kq.deinit(allocator),
         .linux_epoll => |*ep| ep.deinit(allocator),
-        .linux_io_uring => |*ur| ur.deinit(allocator),
+        .linux_io_uring_poll => |*ur| ur.deinit(allocator),
         else => {},
     }
 }
@@ -490,7 +544,7 @@ fn translateEpollEvents(events: []const epoll_backend.EpollEvent, out: []Event) 
     return count;
 }
 
-fn translateIoUringEvents(events: []const io_uring_backend.IoUringEvent, out: []Event) usize {
+fn translateIoUringEvents(events: []const io_uring_poll_backend.IoUringEvent, out: []Event) usize {
     var count: usize = 0;
     for (events) |ev| {
         if (count >= out.len) break;

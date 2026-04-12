@@ -59,7 +59,7 @@ const IoUringSqe = extern struct {
     __pad: u64,
 };
 
-pub const IoUringBackend = struct {
+pub const IoUringPollBackend = struct {
     /// io_uring file descriptor
     ring_fd: i32,
     /// SQ ring mapped memory
@@ -99,7 +99,7 @@ pub const IoUringBackend = struct {
         poll_mask: u32 = 0,
     };
 
-    pub fn init(allocator: std.mem.Allocator, max_events: usize, multi_worker: bool) !IoUringBackend {
+    pub fn init(allocator: std.mem.Allocator, max_events: usize, multi_worker: bool) !IoUringPollBackend {
         if (!is_linux) return error.Unsupported;
 
         const events = try allocator.alloc(IoUringEvent, max_events);
@@ -175,7 +175,7 @@ pub const IoUringBackend = struct {
         };
     }
 
-    pub fn deinit(self: *IoUringBackend, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *IoUringPollBackend, allocator: std.mem.Allocator) void {
         allocator.free(self.events);
         allocator.free(self.registered_fds);
         if (is_linux) {
@@ -186,7 +186,7 @@ pub const IoUringBackend = struct {
         }
     }
 
-    pub fn poll(self: *IoUringBackend, timeout_ms: u32) ![]IoUringEvent {
+    pub fn poll(self: *IoUringPollBackend, timeout_ms: u32) ![]IoUringEvent {
         if (!is_linux) return error.Unsupported;
 
         // Single io_uring_enter: submit pending re-arm SQEs from the
@@ -251,20 +251,20 @@ pub const IoUringBackend = struct {
         return self.events[0..count];
     }
 
-    pub fn registerListener(self: *IoUringBackend, fd: std.posix.fd_t) !void {
+    pub fn registerListener(self: *IoUringPollBackend, fd: std.posix.fd_t) !void {
         if (!is_linux) return error.Unsupported;
         self.registered_fds[0] = .{ .fd = fd, .conn_id = 0, .poll_mask = POLLIN };
         self.submitPollAdd(fd, 0, POLLIN);
     }
 
-    pub fn registerUdpSocket(self: *IoUringBackend, fd: std.posix.fd_t) !void {
+    pub fn registerUdpSocket(self: *IoUringPollBackend, fd: std.posix.fd_t) !void {
         if (!is_linux) return error.Unsupported;
         const udp_id = std.math.maxInt(u64) - 1;
         self.registered_fds[1] = .{ .fd = fd, .conn_id = udp_id, .poll_mask = POLLIN };
         self.submitPollAdd(fd, udp_id, POLLIN);
     }
 
-    pub fn registerConnection(self: *IoUringBackend, conn_id: u64, fd: std.posix.fd_t) !void {
+    pub fn registerConnection(self: *IoUringPollBackend, conn_id: u64, fd: std.posix.fd_t) !void {
         if (!is_linux) return error.Unsupported;
         // Offset by 2 to skip listener (slot 0) and UDP (slot 1)
         const slot = conn_id + 2;
@@ -277,7 +277,7 @@ pub const IoUringBackend = struct {
         self.submitPollAdd(fd, conn_id, POLLIN | POLLOUT);
     }
 
-    pub fn unregister(self: *IoUringBackend, fd: std.posix.fd_t) !void {
+    pub fn unregister(self: *IoUringPollBackend, fd: std.posix.fd_t) !void {
         if (!is_linux) return;
         // Find the registration and get its conn_id for POLL_REMOVE
         var conn_id_to_remove: ?u64 = null;
@@ -309,7 +309,7 @@ pub const IoUringBackend = struct {
         }
     }
 
-    fn submitPollAdd(self: *IoUringBackend, fd: std.posix.fd_t, user_data: u64, poll_mask: u32) void {
+    fn submitPollAdd(self: *IoUringPollBackend, fd: std.posix.fd_t, user_data: u64, poll_mask: u32) void {
         if (!self.sqRingHasSpace()) {
             // SQ ring full — flush pending submissions first
             _ = io_uring_enter(self.ring_fd, self.pendingSqCount(), 0, 0, null);
@@ -336,7 +336,7 @@ pub const IoUringBackend = struct {
 
     /// Queue a POLL_ADD SQE without submitting (for batched submission).
     /// Returns true if successfully queued, false if SQ ring is full.
-    fn queuePollAdd(self: *IoUringBackend, conn_id: u64) bool {
+    fn queuePollAdd(self: *IoUringPollBackend, conn_id: u64) bool {
         // Find the registered fd for this conn_id
         for (self.registered_fds) |reg| {
             if (reg.conn_id == conn_id and reg.fd >= 0) {
@@ -361,14 +361,14 @@ pub const IoUringBackend = struct {
     }
 
     /// Check if the SQ ring has space for at least one more SQE
-    fn sqRingHasSpace(self: *IoUringBackend) bool {
+    fn sqRingHasSpace(self: *IoUringPollBackend) bool {
         const head = @atomicLoad(u32, self.sq_head, .acquire);
         const tail = @atomicLoad(u32, self.sq_tail, .acquire);
         return (tail -% head) < self.sq_entries;
     }
 
     /// Count pending (unsubmitted) SQEs
-    fn pendingSqCount(self: *IoUringBackend) u32 {
+    fn pendingSqCount(self: *IoUringPollBackend) u32 {
         const head = @atomicLoad(u32, self.sq_head, .acquire);
         const tail = @atomicLoad(u32, self.sq_tail, .acquire);
         return tail -% head;

@@ -31,7 +31,7 @@ const master = @import("master.zig");
 const config_file = @import("config_file.zig");
 
 // I/O backend modules
-const io_uring = @import("runtime/backend/io_uring.zig");
+const io_uring = @import("runtime/backend/io_uring_poll.zig");
 
 // Proxy modules
 const proxy_upstream = @import("proxy/upstream.zig");
