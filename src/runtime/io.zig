@@ -155,6 +155,15 @@ pub const IoRuntime = struct {
     }
 
     pub fn releaseConnection(self: *IoRuntime, conn: *connection.Connection) void {
+        // Bump the native backend's per-slot generation counter BEFORE
+        // releasing the slot. Any in-flight multishot recv CQEs from
+        // this connection's previous incarnation will now carry a
+        // stale generation and be dropped in poll(). Without this,
+        // stale CQEs leak into the next connection to reuse the slot
+        // — which under connection churn silently hands the new
+        // connection's handler a read event for the old socket and
+        // stalls it waiting for real data that never arrives.
+        self.onConnectionReleased(conn.index);
         self.connections.release(conn);
     }
 
@@ -388,6 +397,18 @@ pub const Capabilities = struct {
 pub const UDP_SOCKET_ID: u64 = std.math.maxInt(u64) - 1;
 
 fn pickBackend(cfg: config.ServerConfig) Backend {
+    // Diagnostic override: SWERVER_BACKEND=epoll|poll|native forces
+    // the backend regardless of auto-detection. Intended for A/B
+    // benchmarking and debugging — production should leave it unset
+    // so the picker's capability-based auto-detection chooses the
+    // best available backend for the current OS + kernel + config.
+    if (std.c.getenv("SWERVER_BACKEND")) |forced_ptr| {
+        const forced = std.mem.span(forced_ptr);
+        if (std.mem.eql(u8, forced, "epoll")) return .linux_epoll;
+        if (std.mem.eql(u8, forced, "poll")) return .linux_io_uring_poll;
+        if (std.mem.eql(u8, forced, "kqueue")) return .bsd_kqueue;
+        // "native" or anything else → fall through to auto-pick.
+    }
     return switch (@import("builtin").os.tag) {
         .linux => blk: {
             // Prefer the native io_uring backend (multishot accept +
