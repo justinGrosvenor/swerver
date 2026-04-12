@@ -41,7 +41,7 @@ RUN set -eux; \
 
 # Clone swerver source (or use local copy if USE_LOCAL=1)
 ARG SWERVER_REPO=https://github.com/justinGrosvenor/swerver.git
-ARG SWERVER_REF=main
+ARG SWERVER_REF=v0.1.0-alpha.0
 ARG USE_LOCAL=0
 WORKDIR /src
 COPY . /src/_local_ctx/
