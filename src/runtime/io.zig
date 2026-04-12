@@ -25,7 +25,7 @@ pub const IoRuntime = struct {
         errdefer buffers.deinit();
         const events = try allocator.alloc(Event, cfg.max_connections);
         errdefer allocator.free(events);
-        var backend_state = try initBackend(allocator, backend, cfg.max_connections);
+        var backend_state = try initBackend(allocator, backend, cfg.max_connections, cfg.workers != 1);
         errdefer deinitBackend(&backend_state, allocator);
         const timer = try clock.Timer.start();
         return .{
@@ -288,11 +288,11 @@ pub const BackendState = union(Backend) {
     unknown: void,
 };
 
-fn initBackend(allocator: std.mem.Allocator, backend: Backend, max_events: usize) !BackendState {
+fn initBackend(allocator: std.mem.Allocator, backend: Backend, max_events: usize, multi_worker: bool) !BackendState {
     return switch (backend) {
         .bsd_kqueue => .{ .bsd_kqueue = try kqueue_backend.KqueueBackend.init(allocator, max_events) },
         .linux_epoll => .{ .linux_epoll = try epoll_backend.EpollBackend.init(allocator, max_events) },
-        .linux_io_uring => .{ .linux_io_uring = try io_uring_backend.IoUringBackend.init(allocator, max_events) },
+        .linux_io_uring => .{ .linux_io_uring = try io_uring_backend.IoUringBackend.init(allocator, max_events, multi_worker) },
         .windows_iocp => .{ .windows_iocp = {} },
         .unknown => .{ .unknown = {} },
     };

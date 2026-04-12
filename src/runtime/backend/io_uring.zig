@@ -99,7 +99,7 @@ pub const IoUringBackend = struct {
         poll_mask: u32 = 0,
     };
 
-    pub fn init(allocator: std.mem.Allocator, max_events: usize) !IoUringBackend {
+    pub fn init(allocator: std.mem.Allocator, max_events: usize, multi_worker: bool) !IoUringBackend {
         if (!is_linux) return error.Unsupported;
 
         const events = try allocator.alloc(IoUringEvent, max_events);
@@ -119,12 +119,18 @@ pub const IoUringBackend = struct {
         // storms that add ~1ms latency per request.
         const entries: u32 = @intCast(@min(max_events * 2, 4096));
         var params: IoUringParams = std.mem.zeroes(IoUringParams);
-        params.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
+        if (multi_worker) {
+            // Only enable in multi-worker (forked) mode where the
+            // flags eliminate lock contention across 64+ rings.
+            // Single-process mode doesn't benefit and some kernels
+            // (e.g., linuxkit) have issues with DEFER_TASKRUN in
+            // single-process io_uring.
+            params.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
+        }
 
         var ring_fd = io_uring_setup(entries, &params);
-        if (ring_fd < 0) {
-            // Fallback: older kernels may not support these flags.
-            // Retry without them for compatibility.
+        if (ring_fd < 0 and params.flags != 0) {
+            // Fallback: retry without flags for compatibility.
             params = std.mem.zeroes(IoUringParams);
             ring_fd = io_uring_setup(entries, &params);
         }
