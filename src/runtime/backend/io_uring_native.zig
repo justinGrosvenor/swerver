@@ -4,11 +4,12 @@ const builtin = @import("builtin");
 const is_linux = builtin.os.tag == .linux;
 const linux = if (is_linux) std.os.linux else undefined;
 const IoUring = if (is_linux) linux.IoUring else void;
-const BufferGroup = if (is_linux) linux.IoUring.BufferGroup else void;
+const page_size_min = std.heap.page_size_min;
 
 /// Native io_uring backend — completion model with multishot accept,
-/// multishot recv over a provided buffer group, and SINGLE_ISSUER +
-/// DEFER_TASKRUN for lockless single-worker-per-ring operation.
+/// multishot recv over a non-incremental provided-buffer ring, and
+/// SINGLE_ISSUER + DEFER_TASKRUN for lockless single-worker-per-ring
+/// operation.
 ///
 /// Unlike `io_uring_poll`, this backend delivers read data inline with
 /// the event: the kernel fills a buffer from the provided ring, and
@@ -16,9 +17,20 @@ const BufferGroup = if (is_linux) linux.IoUring.BufferGroup else void;
 /// caller MUST release the buffer back to the ring once the data has
 /// been consumed (or copied out).
 ///
-/// Writes are submitted as `send` SQEs and confirmed via later `.write`
-/// completion events. For simplicity on the initial implementation we
-/// fall back to a direct syscall when the ring has no SQ space.
+/// We deliberately set up the provided-buffer ring with `.inc = false`
+/// (non-incremental) rather than going through stdlib's `BufferGroup`
+/// (which hardcodes `.inc = true`). Non-incremental gives us clean
+/// one-CQE-one-buffer semantics: every recv CQE fully consumes its
+/// buffer, so `releaseRecvBuffer` can re-add it without any head/tail
+/// bookkeeping. Incremental would require tracking partial consumption
+/// across CQEs and composing awkwardly with the server's copy-out +
+/// release-immediately flow.
+///
+/// Not used with TLS or QUIC: those configurations stay on the poll
+/// emulation backend, because (a) the TLS BIO reads through plain
+/// `recv()` and would see EAGAIN forever after multishot recv drains
+/// the socket into our slab, and (b) UDP recvmsg isn't wired into the
+/// native ring yet. The picker in `io.zig` enforces this.
 
 // ─── io_uring setup flags (kernel 6.0+ / 6.1+) ──────────────────────
 // SINGLE_ISSUER: tells the kernel that only one thread submits SQEs to
@@ -84,14 +96,14 @@ pub fn unpackConnId(ud: u64) u32 {
 // We deliberately mirror the event shape used by the poll backend so
 // the io.zig translation layer can normalize across backends. The
 // `data` and `kernel_buffer_id` fields are native-specific: the data
-// was filled by the kernel and lives in our BufferGroup slab until we
-// release that buffer.
+// was filled by the kernel into one of our provided buffers and lives
+// in the slab until we release that buffer back to the ring.
 pub const IoUringNativeEvent = struct {
     kind: Kind,
     conn_id: u32,
     // For .read events: the data already delivered by the kernel.
-    // Points into the BufferGroup slab — valid until the caller
-    // releases the buffer.
+    // Points into the backend's provided-buffer slab — valid until
+    // the caller releases the buffer via releaseRecvBuffer.
     data: ?[]const u8 = null,
     // For .read events: the buffer ID to return to the kernel once
     // the caller has consumed the data. Caller must eventually call
@@ -128,8 +140,27 @@ const StubBackend = struct {
 };
 
 pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
-    ring: IoUring,
-    buf_group: BufferGroup,
+    /// Heap-allocated so its address is stable across struct copies.
+    /// This MUST be a pointer, not a value: any code that caches a
+    /// `*IoUring` (like our own recv_multishot path, which takes
+    /// `&self.ring.*` to pass the ring's address to `get_sqe`) would
+    /// otherwise see a dangling pointer the moment this struct is
+    /// copied out of `init()` into the caller's slot.
+    ring: *IoUring,
+    /// Our own provided-buffer ring (not stdlib's `BufferGroup`).
+    /// We bypass `BufferGroup` because it hardcodes
+    /// `REGISTER_PBUF_RING` with `.inc = true` (incremental buffer
+    /// consumption, kernel 6.12+). Incremental mode means the kernel
+    /// can deliver multiple CQEs that all point at the *same* buffer
+    /// (`F_BUF_MORE` set) and only the final CQE releases it — a
+    /// protocol that does not compose with our event-based release
+    /// path where the server copies data out and releases the buffer
+    /// immediately. Non-incremental gives us the clean
+    /// one-CQE-one-buffer semantics the rest of the backend assumes.
+    br: *align(page_size_min) linux.io_uring_buf_ring,
+    /// Backing slab for the buffer ring: RECV_BUF_COUNT buffers of
+    /// RECV_BUF_SIZE bytes each.
+    buffers: []u8,
     allocator: std.mem.Allocator,
     /// Output events produced by poll()
     events: []IoUringNativeEvent,
@@ -149,7 +180,9 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
         // performance — it eliminates ring-level lock contention and
         // interrupt storms that otherwise cost ~1ms per request.
         const entries: u16 = @intCast(std.math.ceilPowerOfTwoAssert(u32, @intCast(@min(max_events * 2, 4096))));
-        var ring = IoUring.init(
+        const ring = try allocator.create(IoUring);
+        errdefer allocator.destroy(ring);
+        ring.* = IoUring.init(
             entries,
             IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN,
         ) catch |err| blk: {
@@ -158,15 +191,31 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
         };
         errdefer ring.deinit();
 
-        // Set up the provided buffer group for recv_multishot.
-        var buf_group = try BufferGroup.init(
-            &ring,
-            allocator,
-            RECV_BUF_GROUP_ID,
-            RECV_BUF_SIZE,
+        // Set up a provided-buffer ring with .inc = false (non-
+        // incremental). Each CQE fully consumes the buffer it points
+        // at; the server copies the bytes out and calls
+        // releaseRecvBuffer to return the buffer id to the kernel.
+        const br = try linux.IoUring.setup_buf_ring(
+            ring.fd,
             RECV_BUF_COUNT,
+            RECV_BUF_GROUP_ID,
+            .{ .inc = false },
         );
-        errdefer buf_group.deinit(allocator);
+        errdefer linux.IoUring.free_buf_ring(ring.fd, br, RECV_BUF_COUNT, RECV_BUF_GROUP_ID);
+        linux.IoUring.buf_ring_init(br);
+
+        const buffers = try allocator.alloc(u8, @as(usize, RECV_BUF_SIZE) * @as(usize, RECV_BUF_COUNT));
+        errdefer allocator.free(buffers);
+
+        // Seed the buffer ring with all RECV_BUF_COUNT buffers.
+        const mask = linux.IoUring.buf_ring_mask(RECV_BUF_COUNT);
+        var i: u16 = 0;
+        while (i < RECV_BUF_COUNT) : (i += 1) {
+            const pos = @as(usize, RECV_BUF_SIZE) * @as(usize, i);
+            const buf = buffers[pos .. pos + RECV_BUF_SIZE];
+            linux.IoUring.buf_ring_add(br, buf, i, mask, i);
+        }
+        linux.IoUring.buf_ring_advance(br, RECV_BUF_COUNT);
 
         const events = try allocator.alloc(IoUringNativeEvent, max_events);
         errdefer allocator.free(events);
@@ -177,7 +226,8 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
 
         return .{
             .ring = ring,
-            .buf_group = buf_group,
+            .br = br,
+            .buffers = buffers,
             .allocator = allocator,
             .events = events,
             .generations = generations,
@@ -185,10 +235,18 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
     }
 
     pub fn deinit(self: *IoUringNativeBackend, allocator: std.mem.Allocator) void {
-        self.buf_group.deinit(allocator);
+        linux.IoUring.free_buf_ring(self.ring.fd, self.br, RECV_BUF_COUNT, RECV_BUF_GROUP_ID);
+        allocator.free(self.buffers);
         self.ring.deinit();
+        allocator.destroy(self.ring);
         allocator.free(self.events);
         allocator.free(self.generations);
+    }
+
+    /// Compute the slice that buffer `id` points at in our slab.
+    fn bufferSlice(self: *IoUringNativeBackend, id: u16) []u8 {
+        const pos = @as(usize, RECV_BUF_SIZE) * @as(usize, id);
+        return self.buffers[pos .. pos + RECV_BUF_SIZE];
     }
 
     /// Register the TCP listener fd and arm multishot accept. The
@@ -212,25 +270,22 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
     }
 
     /// Arm a multishot recv on a freshly-accepted connection. Data
-    /// arrives via the buffer group and is delivered inline with each
-    /// completion event. The multishot SQE stays armed until the
-    /// connection closes.
+    /// arrives via the provided buffer ring and is delivered inline
+    /// with each completion event. The multishot SQE stays armed
+    /// until the connection closes or errors.
     pub fn registerConnection(self: *IoUringNativeBackend, conn_id: u32, fd: i32) !void {
         if (conn_id >= self.generations.len) return error.ConnIdOutOfRange;
         const gen = self.generations[conn_id];
-        const sq_ready_before = self.ring.sq_ready();
-        std.log.warn("native: registerConnection conn_id={} fd={} gen={} sq_ready_before={}", .{ conn_id, fd, gen, sq_ready_before });
-        const sqe = self.buf_group.recv_multishot(
-            packUserData(.recv, gen, conn_id),
-            fd,
-            0,
-        ) catch |err| {
-            std.log.warn("native: recv_multishot failed: {}", .{err});
-            return err;
-        };
-        _ = sqe;
-        const sq_ready_after = self.ring.sq_ready();
-        std.log.warn("native: registerConnection done sq_ready_after={}", .{sq_ready_after});
+        const sqe = try self.ring.get_sqe();
+        // Equivalent of `prep_recv` + IOSQE_BUFFER_SELECT + multishot
+        // (what BufferGroup.recv_multishot does, but without the
+        // hardcoded incremental-consumption buffer group).
+        sqe.prep_rw(.RECV, fd, 0, 0, 0);
+        sqe.rw_flags = 0;
+        sqe.flags |= linux.IOSQE_BUFFER_SELECT;
+        sqe.buf_index = RECV_BUF_GROUP_ID;
+        sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
+        sqe.user_data = packUserData(.recv, gen, conn_id);
     }
 
     /// Submit a send operation for a response. The completion arrives
@@ -252,18 +307,17 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
         self.generations[conn_id] +%= 1;
     }
 
-    /// Release a recv buffer back to the kernel's buffer ring.
-    /// Called by the server after it has finished consuming the data
-    /// (copied out or fully processed) for a given .read event.
+    /// Release a recv buffer back to the kernel's provided-buffer
+    /// ring. Called by the server after it has copied the data out
+    /// of the kernel-owned slab (or fully processed it).
+    ///
+    /// Non-incremental semantics: each buffer id maps 1:1 to a CQE,
+    /// so re-adding the buffer at its original offset makes it
+    /// available for the next recv without any head/tail bookkeeping.
     pub fn releaseRecvBuffer(self: *IoUringNativeBackend, buffer_id: u16) void {
-        // The BufferGroup.put API wants a CQE (it reads the buffer_id
-        // and flags from it). We reconstruct a minimal CQE shape.
-        const fake_cqe = linux.io_uring_cqe{
-            .user_data = 0,
-            .res = 0,
-            .flags = (@as(u32, buffer_id) << linux.IORING_CQE_BUFFER_SHIFT) | linux.IORING_CQE_F_BUFFER,
-        };
-        self.buf_group.put(fake_cqe) catch {};
+        const mask = linux.IoUring.buf_ring_mask(RECV_BUF_COUNT);
+        linux.IoUring.buf_ring_add(self.br, self.bufferSlice(buffer_id), buffer_id, mask, 0);
+        linux.IoUring.buf_ring_advance(self.br, 1);
     }
 
     /// Scratch buffer for copying CQEs out of the completion ring.
@@ -280,18 +334,14 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
         // drains the CQ ring — so we'd miss the initial multishot
         // accept arm on the first poll cycle.
         const wait_nr: u32 = if (timeout_ms > 0) 1 else 0;
-        const sq_before = self.ring.sq_ready();
-        std.log.warn("native: poll enter wait_nr={} sq_ready={}", .{ wait_nr, sq_before });
-        const submitted = self.ring.submit_and_wait(wait_nr) catch |err| switch (err) {
+        _ = self.ring.submit_and_wait(wait_nr) catch |err| switch (err) {
             error.SignalInterrupt => return self.events[0..0],
             else => return err,
         };
-        std.log.warn("native: poll submit_and_wait returned submitted={}", .{submitted});
         const ready = self.ring.copy_cqes(&cqe_batch, 0) catch |err| switch (err) {
             error.SignalInterrupt => return self.events[0..0],
             else => return err,
         };
-        std.log.warn("native: poll copy_cqes ready={}", .{ready});
 
         var count: usize = 0;
         var i: u32 = 0;
@@ -305,8 +355,12 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
             // Drop stale CQEs from reused conn_id slots.
             if (op == .recv or op == .send) {
                 if (conn_id >= self.generations.len or self.generations[conn_id] != gen) {
+                    // If the stale CQE carried a buffer, release it so
+                    // the kernel doesn't leak provided-buffer slots.
                     if (cqe.flags & linux.IORING_CQE_F_BUFFER != 0) {
-                        self.buf_group.put(cqe) catch {};
+                        if (cqe.buffer_id()) |bid| {
+                            self.releaseRecvBuffer(bid);
+                        } else |_| {}
                     }
                     continue;
                 }
@@ -336,6 +390,14 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
                 },
                 .recv => {
                     if (cqe.res <= 0) {
+                        // EOF / error. A real CQE may still carry a
+                        // buffer id (e.g., a zero-length "wake up and
+                        // close" notification) — release it if so.
+                        if (cqe.flags & linux.IORING_CQE_F_BUFFER != 0) {
+                            if (cqe.buffer_id()) |bid| {
+                                self.releaseRecvBuffer(bid);
+                            } else |_| {}
+                        }
                         self.events[count] = .{
                             .kind = .err,
                             .conn_id = conn_id,
@@ -343,9 +405,8 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
                         count += 1;
                         continue;
                     }
-                    const data = self.buf_group.get(cqe) catch {
-                        // Buffer lookup failed — return error event and
-                        // don't try to reuse the (possibly-invalid) id.
+                    const buffer_id = cqe.buffer_id() catch {
+                        // CQE claimed no buffer — treat as error.
                         self.events[count] = .{
                             .kind = .err,
                             .conn_id = conn_id,
@@ -353,7 +414,8 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
                         count += 1;
                         continue;
                     };
-                    const buffer_id = cqe.buffer_id() catch 0;
+                    const used: usize = @intCast(cqe.res);
+                    const data = self.bufferSlice(buffer_id)[0..used];
                     self.events[count] = .{
                         .kind = .read,
                         .conn_id = conn_id,
@@ -361,10 +423,10 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
                         .kernel_buffer_id = buffer_id,
                     };
                     count += 1;
-                    // Multishot recv re-arms itself unless F_MORE is unset.
-                    // If it dropped out (ENOBUFS, EINVAL, etc.), the server
-                    // will observe the next .err event; we rely on the
-                    // connection-close path to re-arm via registerConnection.
+                    // Multishot recv re-arms itself unless F_MORE is
+                    // unset. If it dropped out (ENOBUFS, EINVAL, etc.),
+                    // the caller will re-arm via registerConnection on
+                    // the next successful accept for this slot.
                 },
                 .send => {
                     self.events[count] = .{

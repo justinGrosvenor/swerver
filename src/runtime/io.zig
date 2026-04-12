@@ -23,7 +23,7 @@ pub const IoRuntime = struct {
     timer: clock.Timer,
 
     pub fn init(allocator: std.mem.Allocator, cfg: config.ServerConfig) !IoRuntime {
-        const backend = pickBackend();
+        const backend = pickBackend(cfg);
         var connections = try connection.ConnectionPool.init(allocator, cfg.max_connections);
         errdefer connections.deinit();
         var buffers = try buffer_pool.BufferPool.init(allocator, cfg.buffer_pool);
@@ -387,13 +387,26 @@ pub const Capabilities = struct {
 /// Magic identifier for UDP socket events to distinguish from TCP listener (0) and connections
 pub const UDP_SOCKET_ID: u64 = std.math.maxInt(u64) - 1;
 
-fn pickBackend() Backend {
+fn pickBackend(cfg: config.ServerConfig) Backend {
     return switch (@import("builtin").os.tag) {
         .linux => blk: {
             // Prefer the native io_uring backend (multishot accept +
-            // recv over a provided buffer group). Requires kernel 6.1+
+            // recv over a provided buffer ring). Requires kernel 6.1+
             // for SINGLE_ISSUER | DEFER_TASKRUN.
-            if (io_uring_native_backend.probe()) break :blk .linux_io_uring_native;
+            //
+            // Guardrails: the native backend drains socket bytes into
+            // our own buffer slab via multishot recv. That breaks TLS
+            // (the SSL BIO reads via socket recv() and sees EAGAIN
+            // because we already consumed the bytes) and QUIC (we
+            // don't yet arm UDP recvmsg on the ring). For those
+            // configurations we fall through to the poll emulation
+            // backend or plain epoll — both still give io_uring
+            // parity for the non-TLS fast path in other processes.
+            const tls_enabled = cfg.tls.cert_path.len > 0;
+            const quic_enabled = cfg.quic.enabled;
+            if (!tls_enabled and !quic_enabled and io_uring_native_backend.probe()) {
+                break :blk .linux_io_uring_native;
+            }
             // Older kernels that still support io_uring fall back to
             // the POLL_ADD emulation backend.
             if (io_uring_poll_backend.probeIoUring()) break :blk .linux_io_uring_poll;
@@ -671,16 +684,8 @@ fn translateIoUringNativeEvents(
     out: []Event,
 ) usize {
     var count: usize = 0;
-    std.log.warn("native: translating {} events", .{events.len});
     for (events) |ev| {
         if (count >= out.len) break;
-        std.log.warn("native: event kind={s} conn_id={} data_len={?} buf_id={?} accepted_fd={?}", .{
-            @tagName(ev.kind),
-            ev.conn_id,
-            if (ev.data) |d| d.len else null,
-            ev.kernel_buffer_id,
-            ev.accepted_fd,
-        });
         switch (ev.kind) {
             .accept => {
                 out[count] = .{
