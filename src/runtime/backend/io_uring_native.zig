@@ -258,28 +258,33 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
         self.buf_group.put(fake_cqe) catch {};
     }
 
+    /// Scratch buffer for copying CQEs out of the completion ring.
+    /// Reused across poll() calls to avoid per-tick allocation.
+    var cqe_batch: [256]linux.io_uring_cqe = undefined;
+
     /// Blocks until at least one CQE is available (or returns
     /// immediately when `timeout_ms == 0`). Reaps all available CQEs
     /// and translates them into IoUringNativeEvent entries.
     pub fn poll(self: *IoUringNativeBackend, timeout_ms: u32) ![]IoUringNativeEvent {
-
-        // Submit any pending SQEs and (if waiting) block on the first
-        // completion. With DEFER_TASKRUN, GETEVENTS must be set on
-        // every enter call for deferred completions to run.
+        // submit_and_wait: flushes pending SQEs to the kernel AND
+        // (if wait_nr > 0) blocks until at least one CQE is available.
+        // copy_cqes alone would not submit pending SQEs — it only
+        // drains the CQ ring — so we'd miss the initial multishot
+        // accept arm on the first poll cycle.
         const wait_nr: u32 = if (timeout_ms > 0) 1 else 0;
         _ = self.ring.submit_and_wait(wait_nr) catch |err| switch (err) {
             error.SignalInterrupt => return self.events[0..0],
             else => return err,
         };
+        const ready = self.ring.copy_cqes(&cqe_batch, 0) catch |err| switch (err) {
+            error.SignalInterrupt => return self.events[0..0],
+            else => return err,
+        };
 
         var count: usize = 0;
-        while (count < self.events.len) {
-            const cqe = self.ring.copy_cqe() catch |err| switch (err) {
-                error.SignalInterrupt => break,
-                else => return err,
-            };
-            if (cqe.user_data == 0 and cqe.res == 0 and cqe.flags == 0) break;
-
+        var i: u32 = 0;
+        while (i < ready and count < self.events.len) : (i += 1) {
+            const cqe = cqe_batch[i];
             const ud = cqe.user_data;
             const op = unpackOp(ud);
             const gen = unpackGen(ud);
