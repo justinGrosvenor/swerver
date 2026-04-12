@@ -86,6 +86,10 @@ pub const IoUringBackend = struct {
     /// Track registered FDs for re-arming (POLL_ADD is one-shot)
     /// Layout: [0]=listener, [1]=UDP, [2..]=connections (indexed by conn_id + 2)
     registered_fds: []RegisteredFd,
+    /// Pending SQEs queued for submission on the next poll.
+    /// Re-arm SQEs from the previous cycle are submitted together
+    /// with the wait call, saving one io_uring_enter syscall per cycle.
+    pending_submits: u32 = 0,
 
     const RegisteredFd = struct {
         fd: i32 = -1,
@@ -163,74 +167,59 @@ pub const IoUringBackend = struct {
     pub fn poll(self: *IoUringBackend, timeout_ms: u32) ![]IoUringEvent {
         if (!is_linux) return error.Unsupported;
 
-        // Submit any pending SQEs and wait for at least 1 CQE
-        // Use IORING_ENTER_GETEVENTS with min_complete=1 to block up to timeout
+        // Single io_uring_enter: submit pending re-arm SQEs from the
+        // previous cycle AND wait for new events. This merges what was
+        // previously two syscalls (submit + wait) into one.
         const min_complete: u32 = if (timeout_ms > 0) 1 else 0;
         const flags: u32 = if (min_complete > 0) IORING_ENTER_GETEVENTS else 0;
+        const to_submit = self.pending_submits;
+        self.pending_submits = 0;
 
-        // For timeout support, we use a timespec on the stack.
-        // io_uring_enter with IORING_ENTER_GETEVENTS + timeout_sig is complex,
-        // so we use a simple poll-based approach: submit with GETEVENTS flag.
-        // The kernel will return when at least min_complete CQEs are available.
-        // For non-blocking (timeout_ms=0), we just check without waiting.
-        const rc = io_uring_enter(self.ring_fd, 0, min_complete, flags, null);
+        const rc = io_uring_enter(self.ring_fd, to_submit, min_complete, flags, null);
         if (rc < 0) {
-            // EINTR is expected from signal handlers — just return empty
             return self.events[0..0];
         }
 
-        // Reap CQEs — collect all events first, then batch re-arms
+        // Reap CQEs and queue re-arms for next cycle
         var count: usize = 0;
-        var rearm_count: usize = 0;
-        var rearm_ids: [256]u64 = undefined;
 
         var head = @atomicLoad(u32, self.cq_head, .acquire);
         const tail = @atomicLoad(u32, self.cq_tail, .acquire);
 
         while (head != tail and count < self.events.len) {
             const cqe = &self.cqes[head & self.cq_mask];
-
-            // Translate CQE to event
             const conn_id = cqe.user_data;
             const res = cqe.res;
 
             if (res < 0) {
-                // Error — still emit event so caller can handle/close
                 self.events[count] = .{
                     .events = POLLERR,
                     .data = .{ .u64 = conn_id },
                 };
             } else {
-                // Success — res contains the poll revents mask
                 self.events[count] = .{
                     .events = @intCast(res),
                     .data = .{ .u64 = conn_id },
                 };
             }
             count += 1;
-
-            // Collect conn_ids for batched re-arming after CQ advance
-            if (rearm_count < rearm_ids.len) {
-                rearm_ids[rearm_count] = conn_id;
-                rearm_count += 1;
-            }
-
             head +%= 1;
         }
 
-        // Advance CQ head before re-arming to free CQ slots
+        // Advance CQ head before queuing re-arms
         @atomicStore(u32, self.cq_head, head, .release);
 
-        // Batch re-arm: submit all POLL_ADD SQEs, then one io_uring_enter
+        // Queue re-arm SQEs — they'll be submitted on the NEXT poll()
+        // call, merged with the wait. This eliminates the separate
+        // io_uring_enter for re-arming that was costing 1 syscall/cycle.
         var submitted: u32 = 0;
-        for (rearm_ids[0..rearm_count]) |conn_id| {
-            if (self.queuePollAdd(conn_id)) {
+        // Re-read the events we just collected to get conn_ids for re-arm
+        for (self.events[0..count]) |ev| {
+            if (self.queuePollAdd(ev.data.u64)) {
                 submitted += 1;
             }
         }
-        if (submitted > 0) {
-            _ = io_uring_enter(self.ring_fd, submitted, 0, 0, null);
-        }
+        self.pending_submits = submitted;
 
         return self.events[0..count];
     }
