@@ -1013,6 +1013,19 @@ pub const Server = struct {
                         }
                         switch (event.kind) {
                             .read => {
+                                // If the backend delivered read data inline
+                                // (io_uring native multishot recv), seed the
+                                // connection's read buffer before dispatch.
+                                // handleRead's existing pipeline loop just
+                                // picks up from there — no read() needed.
+                                if (event.data) |kernel_data| {
+                                    self.seedReadBuffer(conn, kernel_data);
+                                }
+                                // Release the kernel buffer back to the ring
+                                // AFTER seeding but BEFORE running handlers.
+                                // The data has been copied out of kernel
+                                // memory, so we're safe to return the slot.
+                                if (event.kernel_buffer) |kb| kb.release();
                                 self.handleRead(index) catch |err| {
                                     std.log.debug("handleRead conn={} failed: {}", .{ index, err });
                                 };
@@ -1570,6 +1583,32 @@ pub const Server = struct {
         }
     }
 
+    /// Copy kernel-delivered read data into the connection's read buffer.
+    /// Called by the event dispatcher when the backend (io_uring native)
+    /// delivered the data inline with the read event. After seeding,
+    /// handleRead's existing pipeline loop picks up the data the same
+    /// way it would after a read() syscall.
+    fn seedReadBuffer(self: *Server, conn: *connection.Connection, data: []const u8) void {
+        const buf = conn.read_buffer orelse return;
+        const end = conn.read_offset + conn.read_buffered_bytes;
+        if (end + data.len > buf.bytes.len) {
+            // Data doesn't fit in the remaining buffer space. In this
+            // case we simply drop the extra bytes — they were
+            // already consumed from the kernel ring. The connection
+            // will likely hit a parse error and close, which is the
+            // correct behavior for an oversized request.
+            const available = if (end >= buf.bytes.len) 0 else buf.bytes.len - end;
+            if (available == 0) return;
+            @memcpy(buf.bytes[end..][0..available], data[0..available]);
+            self.io.onReadBuffered(conn, available);
+            conn.markActive(self.io.nowMs());
+            return;
+        }
+        @memcpy(buf.bytes[end..][0..data.len], data);
+        self.io.onReadBuffered(conn, data.len);
+        conn.markActive(self.io.nowMs());
+    }
+
     fn handleRead(self: *Server, index: u32) !void {
         const conn = self.io.getConnection(index) orelse return;
         if (conn.fd == null) return;
@@ -1580,6 +1619,15 @@ pub const Server = struct {
         // If we're accumulating a large body, continue that instead of parsing.
         // Loop until EAGAIN to drain all available data (edge-triggered epoll).
         if (conn.isAccumulatingBody()) {
+            // Completion-model backends: the data is already in the
+            // buffer (seeded by the event dispatcher). Just consume it.
+            if (self.io.capabilities().delivers_read_data) {
+                self.continueBodyAccumulation(conn) catch {
+                    self.abortBodyAccumulation(conn, 400);
+                    return;
+                };
+                return;
+            }
             while (true) {
                 const accum_buf = conn.read_buffer orelse return;
                 const acc_offset = conn.read_offset + conn.read_buffered_bytes;
@@ -1656,21 +1704,31 @@ pub const Server = struct {
             }
             return;
         }
-        const slice = buffer_handle.bytes[offset..];
-        const count = switch (self.connRead(conn, slice)) {
-            .bytes => |n| n,
-            .eof => {
-                self.closeConnection(conn);
-                return;
-            },
-            .again => return,
-            .err => {
-                self.closeConnection(conn);
-                return;
-            },
-        };
-        self.io.onReadBuffered(conn, count);
-        conn.markActive(self.io.nowMs());
+        // With completion-model backends (io_uring native), the event
+        // dispatcher has already seeded read_buffered_bytes from the
+        // kernel's provided buffer. Skip the read() syscall in that
+        // case — the data is already there.
+        if (!self.io.capabilities().delivers_read_data) {
+            const slice = buffer_handle.bytes[offset..];
+            const count = switch (self.connRead(conn, slice)) {
+                .bytes => |n| n,
+                .eof => {
+                    self.closeConnection(conn);
+                    return;
+                },
+                .again => return,
+                .err => {
+                    self.closeConnection(conn);
+                    return;
+                },
+            };
+            self.io.onReadBuffered(conn, count);
+            conn.markActive(self.io.nowMs());
+        } else if (conn.read_buffered_bytes == 0) {
+            // Completion backend but no data seeded (shouldn't happen
+            // unless the event was spurious). Nothing to do.
+            return;
+        }
 
         if (build_options.enable_http2 and conn.protocol == .http1 and conn.read_offset == 0) {
             const end = conn.read_offset + conn.read_buffered_bytes;
