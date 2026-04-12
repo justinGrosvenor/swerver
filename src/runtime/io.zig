@@ -6,6 +6,7 @@ const clock = @import("clock.zig");
 const kqueue_backend = @import("backend/kqueue.zig");
 const epoll_backend = @import("backend/epoll.zig");
 const io_uring_poll_backend = @import("backend/io_uring_poll.zig");
+const io_uring_native_backend = @import("backend/io_uring_native.zig");
 
 pub const IoRuntime = struct {
     allocator: std.mem.Allocator,
@@ -73,6 +74,12 @@ pub const IoRuntime = struct {
             .bsd_kqueue => .{},
             .linux_epoll => .{},
             .linux_io_uring_poll => .{},
+            .linux_io_uring_native => .{
+                .delivers_read_data = true,
+                .multishot_accept = true,
+                .zero_copy_buffers = true,
+                .async_writes = false, // phase 2b — for now writes go via sync writev
+            },
             .windows_iocp, .unknown => .{},
         };
     }
@@ -96,6 +103,11 @@ pub const IoRuntime = struct {
             .linux_io_uring_poll => |*ur| {
                 const urev = try ur.poll(timeout_ms);
                 const count = translateIoUringEvents(urev, self.events);
+                return self.events[0..count];
+            },
+            .linux_io_uring_native => |*ur| {
+                const nev = try ur.poll(timeout_ms);
+                const count = translateIoUringNativeEvents(ur, nev, self.events);
                 return self.events[0..count];
             },
             else => {
@@ -247,6 +259,7 @@ pub const IoRuntime = struct {
             .bsd_kqueue => |*kq| kq.registerListener(fd),
             .linux_epoll => |*ep| ep.registerListener(fd),
             .linux_io_uring_poll => |*ur| ur.registerListener(fd),
+            .linux_io_uring_native => |*ur| ur.registerListener(@intCast(fd)),
             else => error.UnsupportedBackend,
         };
     }
@@ -256,6 +269,10 @@ pub const IoRuntime = struct {
             .bsd_kqueue => |*kq| kq.registerUdpSocket(fd),
             .linux_epoll => |*ep| ep.registerUdpSocket(fd),
             .linux_io_uring_poll => |*ur| ur.registerUdpSocket(fd),
+            // Native backend: UDP (QUIC) is not wired yet — no-op. QUIC
+            // still goes through the kqueue/epoll/poll path until we
+            // add a dedicated UDP recvmsg ring to this backend.
+            .linux_io_uring_native => {},
             else => error.UnsupportedBackend,
         };
     }
@@ -269,6 +286,10 @@ pub const IoRuntime = struct {
             .bsd_kqueue => |*kq| kq.registerConnection(offset_id, fd),
             .linux_epoll => |*ep| ep.registerConnection(offset_id, fd),
             .linux_io_uring_poll => |*ur| ur.registerConnection(offset_id, fd),
+            // Native backend uses the raw conn_id (no offset) because
+            // its user_data encoding already distinguishes ops and
+            // treats conn_id == 0 as valid (accept events use op = .accept).
+            .linux_io_uring_native => |*ur| ur.registerConnection(@intCast(conn_id), @intCast(fd)),
             else => error.UnsupportedBackend,
         };
     }
@@ -278,12 +299,27 @@ pub const IoRuntime = struct {
             .bsd_kqueue => |*kq| kq.unregister(fd),
             .linux_epoll => |*ep| ep.unregister(fd),
             .linux_io_uring_poll => |*ur| ur.unregister(fd),
+            // Native backend: multishot recv will drop when the fd
+            // closes. The connection slot's generation is bumped in
+            // releaseConnection() so any in-flight CQEs are dropped.
+            .linux_io_uring_native => {},
             else => error.UnsupportedBackend,
         };
+    }
+
+    /// Called when a connection slot is being recycled. The native
+    /// backend uses this to bump the generation counter so stale CQEs
+    /// from the previous incarnation get dropped.
+    pub fn onConnectionReleased(self: *IoRuntime, conn_id: u32) void {
+        switch (self.backend_state) {
+            .linux_io_uring_native => |*ur| ur.bumpGeneration(conn_id),
+            else => {},
+        }
     }
 };
 
 pub const Backend = enum {
+    linux_io_uring_native,
     linux_io_uring_poll,
     linux_epoll,
     bsd_kqueue,
@@ -353,7 +389,16 @@ pub const UDP_SOCKET_ID: u64 = std.math.maxInt(u64) - 1;
 
 fn pickBackend() Backend {
     return switch (@import("builtin").os.tag) {
-        .linux => if (io_uring_poll_backend.probeIoUring()) .linux_io_uring_poll else .linux_epoll,
+        .linux => blk: {
+            // Prefer the native io_uring backend (multishot accept +
+            // recv over a provided buffer group). Requires kernel 6.1+
+            // for SINGLE_ISSUER | DEFER_TASKRUN.
+            if (io_uring_native_backend.probe()) break :blk .linux_io_uring_native;
+            // Older kernels that still support io_uring fall back to
+            // the POLL_ADD emulation backend.
+            if (io_uring_poll_backend.probeIoUring()) break :blk .linux_io_uring_poll;
+            break :blk .linux_epoll;
+        },
         .macos, .freebsd, .netbsd, .openbsd, .dragonfly => .bsd_kqueue,
         .windows => .windows_iocp,
         else => .unknown,
@@ -361,6 +406,7 @@ fn pickBackend() Backend {
 }
 
 pub const BackendState = union(Backend) {
+    linux_io_uring_native: io_uring_native_backend.IoUringNativeBackend,
     linux_io_uring_poll: io_uring_poll_backend.IoUringPollBackend,
     linux_epoll: epoll_backend.EpollBackend,
     bsd_kqueue: kqueue_backend.KqueueBackend,
@@ -373,6 +419,7 @@ fn initBackend(allocator: std.mem.Allocator, backend: Backend, max_events: usize
         .bsd_kqueue => .{ .bsd_kqueue = try kqueue_backend.KqueueBackend.init(allocator, max_events) },
         .linux_epoll => .{ .linux_epoll = try epoll_backend.EpollBackend.init(allocator, max_events) },
         .linux_io_uring_poll => .{ .linux_io_uring_poll = try io_uring_poll_backend.IoUringPollBackend.init(allocator, max_events, multi_worker) },
+        .linux_io_uring_native => .{ .linux_io_uring_native = try io_uring_native_backend.IoUringNativeBackend.init(allocator, max_events) },
         .windows_iocp => .{ .windows_iocp = {} },
         .unknown => .{ .unknown = {} },
     };
@@ -383,6 +430,7 @@ fn deinitBackend(state: *BackendState, allocator: std.mem.Allocator) void {
         .bsd_kqueue => |*kq| kq.deinit(allocator),
         .linux_epoll => |*ep| ep.deinit(allocator),
         .linux_io_uring_poll => |*ur| ur.deinit(allocator),
+        .linux_io_uring_native => |*ur| ur.deinit(allocator),
         else => {},
     }
 }
@@ -605,6 +653,76 @@ fn translateIoUringEvents(events: []const io_uring_poll_backend.IoUringEvent, ou
                 .handle = null,
             };
             count += 1;
+        }
+    }
+    return count;
+}
+
+/// Release callback for KernelBufferRef from the native io_uring backend.
+/// The `ctx` argument is a type-erased pointer to the IoUringNativeBackend.
+fn releaseNativeRecvBuffer(ctx: *anyopaque, buffer_id: u16) void {
+    const backend: *io_uring_native_backend.IoUringNativeBackend = @ptrCast(@alignCast(ctx));
+    backend.releaseRecvBuffer(buffer_id);
+}
+
+fn translateIoUringNativeEvents(
+    backend: *io_uring_native_backend.IoUringNativeBackend,
+    events: []const io_uring_native_backend.IoUringNativeEvent,
+    out: []Event,
+) usize {
+    var count: usize = 0;
+    for (events) |ev| {
+        if (count >= out.len) break;
+        switch (ev.kind) {
+            .accept => {
+                out[count] = .{
+                    .kind = .accept,
+                    .conn_id = 0,
+                    .bytes = 0,
+                    // The multishot accept CQE hands us the new client fd
+                    // directly — stash it in .handle so handleAccept can
+                    // skip the accept() syscall.
+                    .handle = ev.accepted_fd,
+                };
+                count += 1;
+            },
+            .read => {
+                // The kernel has already filled a buffer for us. Pass
+                // the slice inline and the buffer_id token so the
+                // server can return the buffer when it's done.
+                const kref: ?KernelBufferRef = if (ev.kernel_buffer_id) |bid| .{
+                    .ctx = @ptrCast(backend),
+                    .release_fn = releaseNativeRecvBuffer,
+                    .buffer_id = bid,
+                } else null;
+                out[count] = .{
+                    .kind = .read,
+                    .conn_id = ev.conn_id,
+                    .bytes = if (ev.data) |d| d.len else 0,
+                    .handle = null,
+                    .data = ev.data,
+                    .kernel_buffer = kref,
+                };
+                count += 1;
+            },
+            .write => {
+                out[count] = .{
+                    .kind = .write,
+                    .conn_id = ev.conn_id,
+                    .bytes = 0,
+                    .handle = null,
+                };
+                count += 1;
+            },
+            .err => {
+                out[count] = .{
+                    .kind = .err,
+                    .conn_id = ev.conn_id,
+                    .bytes = 0,
+                    .handle = null,
+                };
+                count += 1;
+            },
         }
     }
     return count;

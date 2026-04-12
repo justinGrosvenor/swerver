@@ -103,7 +103,31 @@ pub const IoUringNativeEvent = struct {
     pub const Kind = enum { accept, read, write, err };
 };
 
-pub const IoUringNativeBackend = struct {
+/// Non-Linux stub. Every method returns `error.Unsupported` so the
+/// type checks on every platform but fails cleanly at runtime if the
+/// backend picker somehow selects it on a non-Linux build.
+const StubBackend = struct {
+    pub fn init(_: std.mem.Allocator, _: usize) !StubBackend {
+        return error.Unsupported;
+    }
+    pub fn deinit(_: *StubBackend, _: std.mem.Allocator) void {}
+    pub fn registerListener(_: *StubBackend, _: i32) !void {
+        return error.Unsupported;
+    }
+    pub fn registerConnection(_: *StubBackend, _: u32, _: i32) !void {
+        return error.Unsupported;
+    }
+    pub fn submitSend(_: *StubBackend, _: u32, _: i32, _: []const u8) !void {
+        return error.Unsupported;
+    }
+    pub fn bumpGeneration(_: *StubBackend, _: u32) void {}
+    pub fn releaseRecvBuffer(_: *StubBackend, _: u16) void {}
+    pub fn poll(_: *StubBackend, _: u32) ![]IoUringNativeEvent {
+        return &[_]IoUringNativeEvent{};
+    }
+};
+
+pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
     ring: IoUring,
     buf_group: BufferGroup,
     allocator: std.mem.Allocator,
@@ -119,7 +143,6 @@ pub const IoUringNativeBackend = struct {
         allocator: std.mem.Allocator,
         max_events: usize,
     ) !IoUringNativeBackend {
-        if (!is_linux) return error.Unsupported;
 
         // Try the fast flags first; fall back to plain init if the
         // kernel is too old. The fast path is critical for multi-worker
@@ -172,7 +195,6 @@ pub const IoUringNativeBackend = struct {
     /// accept SQE stays alive for the lifetime of the listener — each
     /// incoming connection produces a CQE without any re-submission.
     pub fn registerListener(self: *IoUringNativeBackend, fd: i32) !void {
-        if (!is_linux) return error.Unsupported;
         self.listener_fd = fd;
         try self.armMultishotAccept(fd);
     }
@@ -190,7 +212,6 @@ pub const IoUringNativeBackend = struct {
     /// completion event. The multishot SQE stays armed until the
     /// connection closes.
     pub fn registerConnection(self: *IoUringNativeBackend, conn_id: u32, fd: i32) !void {
-        if (!is_linux) return error.Unsupported;
         if (conn_id >= self.generations.len) return error.ConnIdOutOfRange;
         const gen = self.generations[conn_id];
         _ = try self.buf_group.recv_multishot(
@@ -204,7 +225,6 @@ pub const IoUringNativeBackend = struct {
     /// as a .write event once the kernel has transmitted the data.
     /// `data` must remain valid until the CQE is reaped.
     pub fn submitSend(self: *IoUringNativeBackend, conn_id: u32, fd: i32, data: []const u8) !void {
-        if (!is_linux) return error.Unsupported;
         if (conn_id >= self.generations.len) return error.ConnIdOutOfRange;
         const gen = self.generations[conn_id];
         const sqe = try self.ring.get_sqe();
@@ -238,7 +258,6 @@ pub const IoUringNativeBackend = struct {
     /// immediately when `timeout_ms == 0`). Reaps all available CQEs
     /// and translates them into IoUringNativeEvent entries.
     pub fn poll(self: *IoUringNativeBackend, timeout_ms: u32) ![]IoUringNativeEvent {
-        if (!is_linux) return error.Unsupported;
 
         // Submit any pending SQEs and (if waiting) block on the first
         // completion. With DEFER_TASKRUN, GETEVENTS must be set on
