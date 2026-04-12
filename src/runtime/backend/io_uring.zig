@@ -16,6 +16,8 @@ const linux = if (is_linux) std.os.linux else undefined;
 
 // io_uring constants (from linux/io_uring.h)
 const IORING_SETUP_SQPOLL = 1 << 1;
+const IORING_SETUP_SINGLE_ISSUER = 1 << 12; // kernel 6.0+: lockless SQE submission
+const IORING_SETUP_DEFER_TASKRUN = 1 << 13; // kernel 6.1+: batch CQE delivery
 const IORING_OP_POLL_ADD: u8 = 6;
 const IORING_OP_POLL_REMOVE: u8 = 7;
 const IORING_OP_NOP: u8 = 0;
@@ -109,11 +111,23 @@ pub const IoUringBackend = struct {
         errdefer allocator.free(registered_fds);
         @memset(registered_fds, RegisteredFd{});
 
-        // Setup io_uring with desired queue depth
+        // Setup io_uring with desired queue depth.
+        // SINGLE_ISSUER: lockless SQE submission (each worker has its own ring).
+        // DEFER_TASKRUN: batch CQE delivery to io_uring_enter instead of
+        // interrupting immediately. Critical for multi-worker scalability —
+        // without these, 64 workers generate lock contention and interrupt
+        // storms that add ~1ms latency per request.
         const entries: u32 = @intCast(@min(max_events * 2, 4096));
         var params: IoUringParams = std.mem.zeroes(IoUringParams);
+        params.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
 
-        const ring_fd = io_uring_setup(entries, &params);
+        var ring_fd = io_uring_setup(entries, &params);
+        if (ring_fd < 0) {
+            // Fallback: older kernels may not support these flags.
+            // Retry without them for compatibility.
+            params = std.mem.zeroes(IoUringParams);
+            ring_fd = io_uring_setup(entries, &params);
+        }
         if (ring_fd < 0) return error.IoUringSetupFailed;
         errdefer _ = linux.close(@intCast(ring_fd));
 
@@ -171,7 +185,9 @@ pub const IoUringBackend = struct {
         // previous cycle AND wait for new events. This merges what was
         // previously two syscalls (submit + wait) into one.
         const min_complete: u32 = if (timeout_ms > 0) 1 else 0;
-        const flags: u32 = if (min_complete > 0) IORING_ENTER_GETEVENTS else 0;
+        // GETEVENTS must always be set with DEFER_TASKRUN to process
+        // deferred completions, even for non-blocking peeks.
+        const flags: u32 = IORING_ENTER_GETEVENTS;
         const to_submit = self.pending_submits;
         self.pending_submits = 0;
 
