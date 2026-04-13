@@ -1062,6 +1062,16 @@ pub const Server = struct {
                         }
                         switch (event.kind) {
                             .read => {
+                                // Snapshot conn.id so we can detect slot
+                                // reuse after handleRead runs. If the
+                                // slot gets released and re-acquired for
+                                // a new connection, the id changes and
+                                // we must NOT rearm recv — the new
+                                // connection has its own recv SQE from
+                                // registerConnection, and a stray rearm
+                                // would create a double-recv race on
+                                // the same fd.
+                                const pre_id: u64 = conn.id;
                                 self.handleRead(index) catch |err| {
                                     std.log.debug("handleRead conn={} failed: {}", .{ index, err });
                                 };
@@ -1070,6 +1080,29 @@ pub const Server = struct {
                                 const rconn = self.io.getConnection(index) orelse continue;
                                 if (rconn.write_count > 0) {
                                     self.handleWrite(index) catch {};
+                                }
+                                // Re-arm single-shot recv on the native backend
+                                // if the connection is still the same incarnation
+                                // AND is not about to close. For close-mode
+                                // requests with async writev, the close happens
+                                // when the write CQE arrives (later, in the
+                                // .write dispatcher arm), not synchronously in
+                                // handleWrite. At this point the connection is
+                                // still .active with an in-flight async write,
+                                // but `close_after_write` is set — we must NOT
+                                // arm a new recv because the kernel may reuse
+                                // the fd number for a new connection as soon
+                                // as our close lands, and the zombie recv SQE
+                                // would then race with that new connection's
+                                // own recv.
+                                const postconn = self.io.getConnection(index) orelse continue;
+                                if (postconn.id == pre_id and
+                                    postconn.state != .closed and
+                                    !postconn.close_after_write)
+                                {
+                                    if (postconn.fd) |pfd| {
+                                        self.io.rearmRecv(index, pfd);
+                                    }
                                 }
                             },
                             .write => {

@@ -78,10 +78,9 @@ pub const IoRuntime = struct {
                 .delivers_read_data = true,
                 .multishot_accept = true,
                 .zero_copy_buffers = true,
-                // Plain-TCP writes are now async via IORING_OP_WRITEV.
-                // TLS writes stay sync through `tlsFlushWbio` because
-                // the ciphertext drain re-encrypts per call and would
-                // need a deeper buffer-backed carry to go async.
+                // Plain-TCP writes go through IORING_OP_WRITEV. TLS
+                // writes stay sync through `tlsFlushWbio` since the
+                // ciphertext drain re-encrypts per call.
                 .async_writes = true,
             },
             .windows_iocp, .unknown => .{},
@@ -344,6 +343,19 @@ pub const IoRuntime = struct {
             .linux_io_uring_native => |*ur| ur.submitWritev(conn_id, @intCast(fd), iov),
             else => error.UnsupportedBackend,
         };
+    }
+
+    /// Re-arm a single-shot recv on a still-alive connection. Only
+    /// meaningful on the native io_uring backend when single-shot
+    /// mode is enabled; a no-op on all other backends. Called from
+    /// the dispatcher after a .read event has been processed and
+    /// the connection is confirmed alive, so keepalive connections
+    /// keep receiving data.
+    pub fn rearmRecv(self: *IoRuntime, conn_id: u32, fd: std.posix.fd_t) void {
+        switch (self.backend_state) {
+            .linux_io_uring_native => |*ur| ur.rearmRecv(conn_id, @intCast(fd)),
+            else => {},
+        }
     }
 };
 

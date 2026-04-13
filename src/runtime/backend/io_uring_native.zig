@@ -164,6 +164,7 @@ const StubBackend = struct {
     pub fn submitWritev(_: *StubBackend, _: u32, _: i32, _: []const std.posix.iovec_const) !void {
         return error.Unsupported;
     }
+    pub fn rearmRecv(_: *StubBackend, _: u32, _: i32) void {}
     pub fn bumpGeneration(_: *StubBackend, _: u32) void {}
     pub fn releaseRecvBuffer(_: *StubBackend, _: u16) void {}
     pub fn poll(_: *StubBackend, _: u32) ![]IoUringNativeEvent {
@@ -363,19 +364,54 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
     /// arrives via the provided buffer ring and is delivered inline
     /// with each completion event. The multishot SQE stays armed
     /// until the connection closes or errors.
+    ///
+    /// TEMP experiment: when SWERVER_SINGLESHOT_RECV=1 is set, submit
+    /// a single-shot recv instead. Close-mode requests only need one
+    /// recv per connection, so single-shot works for the connections
+    /// benchmark. Used to isolate whether multishot recv is the
+    /// bottleneck.
+    /// Arm a single-shot recv on a freshly-accepted connection. Data
+    /// arrives via the provided buffer ring and is delivered inline
+    /// with the completion event. After processing the .read event,
+    /// the server dispatcher calls `rearmRecv` to submit a new recv
+    /// SQE for keepalive connections. Close-mode connections (where
+    /// `conn.close_after_write` is set) skip the rearm so the kernel
+    /// can reclaim the fd when `closeConnection` eventually runs.
+    ///
+    /// We used to use `IORING_RECV_MULTISHOT` here, but under mixed
+    /// keepalive + connection-churn workloads the multishot lifecycle
+    /// raced with slot reuse: the terminal CQE for a dying conn
+    /// could arrive AFTER the slot had been re-acquired by a new
+    /// connection and its own multishot recv was armed. Even with
+    /// the per-slot generation counter catching the stale CQE, the
+    /// kernel had already spent cycles processing a recv on a
+    /// newly-reused fd, and occasionally the fd number would be
+    /// reused across iterations and cause real data races. Single-shot
+    /// eliminates the terminal-CQE race entirely.
     pub fn registerConnection(self: *IoUringNativeBackend, conn_id: u32, fd: i32) !void {
         if (conn_id >= self.generations.len) return error.ConnIdOutOfRange;
+        try self.armRecv(conn_id, fd);
+    }
+
+    fn armRecv(self: *IoUringNativeBackend, conn_id: u32, fd: i32) !void {
         const gen = self.generations[conn_id];
         const sqe = try self.ring.get_sqe();
-        // Equivalent of `prep_recv` + IOSQE_BUFFER_SELECT + multishot
-        // (what BufferGroup.recv_multishot does, but without the
-        // hardcoded incremental-consumption buffer group).
         sqe.prep_rw(.RECV, fd, 0, 0, 0);
         sqe.rw_flags = 0;
         sqe.flags |= linux.IOSQE_BUFFER_SELECT;
         sqe.buf_index = RECV_BUF_GROUP_ID;
-        sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
         sqe.user_data = packUserData(.recv, gen, conn_id);
+    }
+
+    /// Re-arm a single-shot recv on a still-alive connection. Called
+    /// by the server dispatcher from the `.read` arm after handleRead
+    /// returns, but only if the connection is still the same
+    /// incarnation and is not about to close (no `close_after_write`
+    /// flag set and no in-flight close). The server owns the fd, so
+    /// it passes it through to avoid any backend-side fd tracking —
+    /// which would otherwise race with slot reuse.
+    pub fn rearmRecv(self: *IoUringNativeBackend, conn_id: u32, fd: i32) void {
+        self.armRecv(conn_id, fd) catch {};
     }
 
     /// Submit a send operation for a response. The completion arrives
@@ -535,10 +571,15 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
                         .kernel_buffer_id = buffer_id,
                     };
                     count += 1;
-                    // Multishot recv re-arms itself unless F_MORE is
-                    // unset. If it dropped out (ENOBUFS, EINVAL, etc.),
-                    // the caller will re-arm via registerConnection on
-                    // the next successful accept for this slot.
+                    // Re-arm is not done inline here: in single-shot
+                    // mode the caller (server dispatcher) calls
+                    // `rearmRecv` after processing the read event if
+                    // the connection is still alive AND is not
+                    // about to close. This ordering avoids a race
+                    // where a re-armed SQE submitted inside the poll
+                    // loop fires on a fd the server has since closed
+                    // — the kernel might have reused that fd number
+                    // for a different connection.
                 },
                 .send => {
                     // cqe.res < 0 → socket error; cqe.res >= 0 is the
