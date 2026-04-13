@@ -435,33 +435,39 @@ pub const Capabilities = struct {
 pub const UDP_SOCKET_ID: u64 = std.math.maxInt(u64) - 1;
 
 fn pickBackend(_: config.ServerConfig) Backend {
-    // Diagnostic override: SWERVER_BACKEND=epoll|poll|native forces
-    // the backend regardless of auto-detection. Intended for A/B
-    // benchmarking and debugging — production should leave it unset
-    // so the picker's capability-based auto-detection chooses the
-    // best available backend for the current OS + kernel + config.
+    // Diagnostic / opt-in override: SWERVER_BACKEND=epoll|poll|native
+    // forces a specific backend. `native` is the opt-in entry for the
+    // WIP completion-model backend (multishot accept + recv via
+    // provided buffer ring + async writev + UDP recvmsg + TLS memory
+    // BIOs). It's not yet faster than `poll` on all workloads —
+    // specifically, connection-churn scenarios on Linux 6.12
+    // (Docker Desktop linuxkit kernel) show ~10x fewer accept CQEs
+    // per io_uring_enter cycle than the POLL_ADD + accept4 loop the
+    // poll backend uses, which tanks throughput on mixed
+    // keepalive/close workloads. Until native's accept path is reworked
+    // to match poll's drain-per-event pattern, it stays opt-in.
     if (std.c.getenv("SWERVER_BACKEND")) |forced_ptr| {
         const forced = std.mem.span(forced_ptr);
         if (std.mem.eql(u8, forced, "epoll")) return .linux_epoll;
         if (std.mem.eql(u8, forced, "poll")) return .linux_io_uring_poll;
         if (std.mem.eql(u8, forced, "kqueue")) return .bsd_kqueue;
-        // "native" or anything else → fall through to auto-pick.
+        if (std.mem.eql(u8, forced, "native")) {
+            // Only honor the native opt-in if the kernel actually
+            // supports it; fall through to auto-pick otherwise.
+            if (@import("builtin").os.tag == .linux and
+                io_uring_native_backend.probe())
+            {
+                return .linux_io_uring_native;
+            }
+        }
     }
     return switch (@import("builtin").os.tag) {
         .linux => blk: {
-            // Prefer the native io_uring backend (multishot accept +
-            // recv over a provided buffer ring). Requires kernel 6.1+
-            // for SINGLE_ISSUER | DEFER_TASKRUN.
-            //
-            // Native backend handles TCP (multishot accept + recv),
-            // TLS (memory BIOs fed from `seedReadBuffer`), and UDP
-            // (multishot recvmsg for QUIC). Pick it whenever the
-            // kernel supports SINGLE_ISSUER | DEFER_TASKRUN.
-            if (io_uring_native_backend.probe()) {
-                break :blk .linux_io_uring_native;
-            }
-            // Older kernels that still support io_uring fall back to
-            // the POLL_ADD emulation backend.
+            // Default: io_uring_poll (readiness-model io_uring).
+            // This is the same backend the `v0.1.0-alpha.0` tag
+            // shipped with — it holds the HttpArena top-tier scores
+            // and is the known-good path. Native is opt-in via
+            // `SWERVER_BACKEND=native`.
             if (io_uring_poll_backend.probeIoUring()) break :blk .linux_io_uring_poll;
             break :blk .linux_epoll;
         },
