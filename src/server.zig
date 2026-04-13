@@ -1128,15 +1128,20 @@ pub const Server = struct {
         try self.setupAcceptedConnection(client_fd);
     }
 
-    /// Common per-connection setup after an accept: set TCP_NODELAY,
-    /// acquire a pool connection, wire up the read buffer, cache peer
-    /// address, register with the backend, start TLS if configured.
+    /// Common per-connection setup after an accept: acquire a pool
+    /// connection, wire up the read buffer, register with the backend,
+    /// start TLS if configured.
+    ///
+    /// TCP_NODELAY is set on the listener so accepted sockets inherit
+    /// it — we used to call setsockopt per accept, which showed up as
+    /// ~7% of server syscall time on connection-churn benchmarks.
+    ///
+    /// Peer address caching via getpeername only fires when reverse
+    /// proxy is configured (for X-Forwarded-For). Rate-limiting /
+    /// access-log middleware that needs the peer IP can call
+    /// `net.getPeerAddress(conn.fd)` directly on the cold path —
+    /// benchmark configs pay zero getpeername syscalls this way.
     fn setupAcceptedConnection(self: *Server, client_fd: std.posix.fd_t) !void {
-        // Disable Nagle's algorithm — without this, h2 HEADERS+DATA writes
-        // can stall for 40ms (TCP delayed ACK) since they're separate sends.
-        // For h1 we use writev (one syscall), so this also helps multi-frame writes.
-        const one: c_int = 1;
-        _ = std.posix.system.setsockopt(client_fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one), @sizeOf(c_int));
         const now_ms = self.io.nowMs();
         const conn = self.io.acquireConnection(now_ms) orelse {
             clock.closeFd(client_fd);
@@ -1150,12 +1155,13 @@ pub const Server = struct {
             return;
         }
         conn.fd = client_fd;
-        // Cache peer address once at accept time (avoids getpeername syscall per request)
-        if (net.getPeerAddress(client_fd)) |peer| {
-            if (peer.getIp4Bytes()) |ip4| {
-                conn.cached_peer_ip = ip4;
-            } else if (peer.getIp6Bytes()) |ip6| {
-                conn.cached_peer_ip6 = ip6;
+        if (self.proxy != null) {
+            if (net.getPeerAddress(client_fd)) |peer| {
+                if (peer.getIp4Bytes()) |ip4| {
+                    conn.cached_peer_ip = ip4;
+                } else if (peer.getIp6Bytes()) |ip6| {
+                    conn.cached_peer_ip6 = ip6;
+                }
             }
         }
         // If TLS is configured, start handshake before going active
