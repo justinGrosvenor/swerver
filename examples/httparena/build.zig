@@ -2,7 +2,14 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    // Default to ReleaseFast for this benchmark-oriented example —
+    // running a Debug build against a 64-core HttpArena box gives
+    // wildly misleading numbers (Debug swerver is ~10× slower than
+    // ReleaseFast). Callers can still override with
+    // `-Doptimize=Debug` during development.
+    const optimize = b.standardOptimizeOption(.{
+        .preferred_optimize_mode = .ReleaseFast,
+    });
 
     // Pull in swerver as a library. With `b.dependency("swerver", …)`
     // this example becomes a real end-to-end test of the library

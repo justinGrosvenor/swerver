@@ -2,6 +2,8 @@
 
 ## Unreleased — targeting `v0.1.0-alpha.1`
 
+**Headline:** swerver is now consumable as a Zig package via `b.dependency` + `b.addModule`. HttpArena benchmark handlers decoupled out of the core server module into a standalone `examples/httparena/` downstream example. QUIC multi-range ACK encoding added for lossy-path throughput. 26 previously-invisible modules now analyzed by the test runner, which surfaced and fixed 8 latent bugs. Public API types have real doc comments. CI runs `test-matrix` on a native Linux runner. Release workflow publishes cross-platform binaries on tag push. No known bugs ship with the tag.
+
 ### Packaging
 - `build.zig.zon` added (name, version, pinned Zig 0.16.0-dev.2135+7c0b42ba0, paths, empty dependencies) — swerver is now consumable as a Zig package via `b.dependency("swerver").module("swerver")`.
 - `build.zig` swapped `b.createModule` → `b.addModule("swerver", …)` so downstream projects can actually import the library.
@@ -31,6 +33,15 @@
 
 ### HttpArena subscription
 - Added `json` to `httparena/meta.json` subscribed tests. The `/json` handler (already in `benchmark_routes.zig`) matches the HttpArena validator's requirements: 50 items, `count` field, `items[].total = price × quantity` rounded to 2 decimals, Content-Type `application/json`. `api-4` was originally queued alongside but scoped out — reading the HttpArena harness shows it's a composite test that requires PostgreSQL via `/async-db?min=X&max=Y`, which is new infrastructure rather than a new handler. See `known-issues-triage.md#3.3` for the written reason.
+
+### Deferred to `v0.1.0-alpha.2`
+Three items from the original alpha.1 grind list are explicitly scoped out of this tag with a written reason. None of them ship as silent omissions — each has a named target alpha and a concrete unblock condition:
+
+- **2.1 Reverse proxy benchmarked at HttpArena-level load.** Needs real Linux bench hardware (the Docker Desktop 2-vCPU linuxkit VM can't simulate the 64-core HttpArena shape, and the proxy's failure modes under high concurrency only surface under load). Landing next weekend alongside 2.4 pipelined-512 + 1.2 static-h2 4xx. The alpha.1 README marks the proxy as "functional, benchmarked informally, not yet load-tested at HttpArena scale" — not "experimental."
+- **2.11 HTTP/2 optimization pass.** Speculative hot-path rewrites without bench validation aren't worth the review time; this becomes a measure → optimize → re-measure loop once the Linux box is up. The alpha.1 tag ships with swerver at rank 5 on `baseline-h2` and acknowledges the gap directly rather than hiding it. Target for alpha.2: parity with actix / aspnet-minimal.
+- **3.7 QUIC cipher suite negotiation (TLS_AES_256_GCM_SHA384 support).** The multi-range ACK half of 3.7 landed. The cipher half needs `Aes256Gcm` code paths in `protectPayload`/`unprotectPayload`, a `Keys.init256` + SHA-384 48-byte-secret `deriveKeysFromSecret` variant, runtime cipher detection via `SSL_get_current_cipher` plumbed from `tls/quic_session.zig` down to every key-derivation call site, and removal of the `setCiphersuites(ctx, "TLS_AES_128_GCM_SHA256")` pin in `tls/ffi.zig`. All four together is multi-day work with real risk of breaking the handshake against real clients, and testing requires a SHA-384-preferring QUIC client. AES-128-GCM is the universal baseline every mainstream QUIC client supports, so this is a feature-breadth gap, not a correctness loss. Revisits post-alpha.
+
+The other Pass 3 items (1.1 upload re-bench, 1.2 static-h2 4xx, 2.4 pipelined-512) are also deferred to alpha.2 for the same reason — they need bench hardware. See `known-issues-triage.md` for the full list.
 
 ### Test surface expansion + bug catches
 - `src/tests.zig`: structural fix, not a cosmetic one. Zig uses lazy analysis — modules that aren't `_ = module` in a comptime block are *completely invisible to the compiler*, which means bugs inside them go undetected until someone actually calls the affected code. This pass added 26 modules to the comptime list (`config`, `config_file`, `server_builder`, `router`, `middleware/middleware`, `middleware/health`, `middleware/ratelimit`, `middleware/security`, `runtime/clock`, `runtime/io`, `runtime/net`, `runtime/buffer_pool`, `runtime/connection`, `runtime/json_write`, `protocol/http1`, `protocol/http2`, `protocol/http3`, `protocol/huffman`, `protocol/request`, `response/response`, `tls/provider`, `quic/connection_pool`, `quic/connection`, `quic/handler`, `benchmark_routes`, and OS-gated backends `epoll` / `io_uring_native` / `kqueue`), and surfaced 8 latent bugs that had been invisible the entire time:

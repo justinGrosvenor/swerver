@@ -13,7 +13,7 @@ Instead, please email **jgrosvenor415@gmail.com** with:
 - Potential impact
 - Suggested fix (if you have one)
 
-You should receive a response within 48 hours. Once the issue is confirmed, a fix will be developed and released as soon as possible.
+Responses are on a best-effort basis — swerver is maintained by a single person, and while I aim to acknowledge reports within a few business days, there is no SLA. Once a report is confirmed, a fix will be developed and released as quickly as the severity warrants.
 
 ## Scope
 

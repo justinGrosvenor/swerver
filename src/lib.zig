@@ -128,11 +128,13 @@ pub const proxy = struct {
     pub const handler = @import("proxy/proxy.zig");
 };
 
-/// Benchmark route handlers (HttpArena / TechEmpower).
-///
-/// Not part of the core library surface — present so benchmark-oriented
-/// consumers (like `examples/httparena/main.zig`) can register the
-/// standard set of benchmark endpoints without copy-pasting handler
-/// definitions. Application code that isn't serving benchmark endpoints
-/// should ignore this namespace.
+/// Benchmark route handlers (HttpArena / TechEmpower). **Not part of
+/// the stable API** — this namespace exists so benchmark-oriented
+/// consumers (the bundled `src/main.zig` binary, `examples/httparena/`,
+/// and any downstream project that wants the same endpoints) can
+/// register the canonical benchmark route set without copy-pasting
+/// handler definitions. The handler shapes, the `/json` dataset
+/// format, and the helper signatures here may be moved or removed
+/// before 1.0 without a major bump. Fine for benchmarks; don't build
+/// production apps against it.
 pub const benchmark = @import("benchmark_routes.zig");

@@ -108,6 +108,8 @@ docker build -t swerver -f httparena/Dockerfile --build-arg USE_LOCAL=1 .
 docker run -p 8080:8080 -p 8443:8443 -p 8443:8443/udp swerver
 ```
 
+`USE_LOCAL=1` builds from the current working tree. Without it the Dockerfile clones the swerver tag specified by `SWERVER_REF` from GitHub — useful for reproducible CI builds, unnecessary for local experimentation.
+
 The Dockerfile uses `debian:trixie` (OpenSSL 3.5) in the build stage and `debian:trixie-slim` at runtime, matching the ABI the HttpArena submission targets.
 
 ## Use as a library

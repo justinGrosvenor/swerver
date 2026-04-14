@@ -1571,30 +1571,6 @@ pub const Connection = struct {
         return self.peer_cid;
     }
 
-    /// Generate an ACK frame for a packet number space
-    pub fn generateAckFrame(self: *Connection, space: types.PacketNumberSpace) ?frame.AckFrame {
-        const pn_space = self.getPacketSpace(space);
-
-        if (!pn_space.ack_needed) return null;
-
-        const largest = pn_space.largest_received orelse return null;
-
-        pn_space.ack_needed = false;
-
-        // Calculate ACK delay in microseconds, then encode with exponent
-        // ACK delay encoding: delay_us / (2^ack_delay_exponent)
-        const delay_us = pn_space.calculateAckDelay();
-        const exponent = self.local_params.ack_delay_exponent;
-        const encoded_delay = delay_us >> @intCast(exponent);
-
-        return frame.AckFrame{
-            .largest_acked = largest,
-            .ack_delay = encoded_delay,
-            .first_ack_range = 0, // ACK only the single largest packet
-            .ranges = &[_]frame.AckRange{},
-            .ecn = null,
-        };
-    }
 };
 
 // Note: the file-local deriveKeysFromTlsSecret was a duplicate of

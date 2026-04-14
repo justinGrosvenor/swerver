@@ -744,7 +744,6 @@ pub const Handler = struct {
                     .pad_datagram_to = if (need_pad_to_1200 and !want_handshake and !want_one_rtt) 1200 else 0,
                     .datagram_bytes_so_far = offset,
                     .ack_largest = if (conn.initial_space.ack_needed) conn.initial_space.largest_received else null,
-                    .ack_first_range = conn.initial_space.firstAckRange(),
                 },
             );
             offset += built.bytes_written;
@@ -766,7 +765,6 @@ pub const Handler = struct {
                     .pad_datagram_to = if (need_pad_to_1200 and !want_one_rtt) 1200 else 0,
                     .datagram_bytes_so_far = offset,
                     .ack_largest = if (conn.handshake_space.ack_needed) conn.handshake_space.largest_received else null,
-                    .ack_first_range = conn.handshake_space.firstAckRange(),
                 },
             );
             offset += built.bytes_written;
@@ -835,6 +833,14 @@ pub const Handler = struct {
 /// caller-supplied handshake bytes, optional PADDING to satisfy the RFC 9000
 /// §14.1 1200-byte minimum on the *datagram*, then runs AEAD packet
 /// protection + header protection over the result.
+///
+/// The ACK frame is generated via `PacketNumberSpace.collectAckRanges`
+/// through the same `writeAckMultiRange` path as `buildShortPacket` —
+/// Initial and Handshake packets rarely see gaps in practice, but
+/// sharing the ACK code path keeps the builder behavior uniform across
+/// all three packet number spaces so there's no "this builder generates
+/// single-range, that builder generates multi-range" asymmetry to
+/// reason about.
 const BuildPacketOptions = struct {
     packet_type: types.PacketType,
     conn: *connection.Connection,
@@ -845,10 +851,12 @@ const BuildPacketOptions = struct {
     /// this many bytes.
     pad_datagram_to: usize,
     datagram_bytes_so_far: usize,
-    /// If non-null, emit an ACK frame acking the contiguous range
-    /// [ack_largest - ack_first_range, ack_largest] in the matching number space.
+    /// If non-null, emit an ACK frame for the matching packet number
+    /// space. The builder walks `space.collectAckRanges` internally to
+    /// derive the first range and any additional ranges — callers only
+    /// need to say "yes, I want an ACK" by setting this to the
+    /// `largest_received` value.
     ack_largest: ?u64,
-    ack_first_range: u64 = 0,
 };
 
 const BuildPacketResult = struct {
@@ -929,10 +937,24 @@ fn buildHandshakePacket(out: []u8, opts: BuildPacketOptions) Error!BuildPacketRe
     const header_len = off;
 
     // ---- Plaintext payload ----
-    // Optional ACK frame. The first ACK range is computed from the
-    // receive bitmap so we never lie about packets we haven't seen.
+    // Optional ACK frame. Walks the matching packet number space's
+    // receive bitmap via `collectAckRanges` so we never claim packets
+    // we haven't actually seen, and shares the multi-range ACK path
+    // with `buildShortPacket` — there's no asymmetry between long-
+    // header and short-header ACK generation. On lossless paths the
+    // additional-range slice is empty and the encoding is identical
+    // to the pre-multi-range single-range form.
     if (opts.ack_largest) |largest| {
-        const acked = frame.writeAckRange(out[off..], largest, opts.ack_first_range, 0) catch return Error.HandshakeFailed;
+        var range_buf: [MAX_ACK_RANGES]frame.AckRange = undefined;
+        const ranges = space.collectAckRanges(&range_buf);
+        const additional = range_buf[0..ranges.additional_count];
+        const acked = frame.writeAckMultiRange(
+            out[off..],
+            largest,
+            ranges.first_range,
+            additional,
+            0,
+        ) catch return Error.HandshakeFailed;
         off += acked;
     }
 
