@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const clock = @import("../clock.zig");
 
 const is_linux = builtin.os.tag == .linux;
 const linux = if (is_linux) std.os.linux else undefined;
@@ -68,6 +69,252 @@ const RECV_BUF_GROUP_ID: u16 = 0;
 /// this amount on every datagram.
 const UDP_NAMELEN: u32 = 28;
 
+// ─── Acceptor thread sizing ─────────────────────────────────────────
+// The acceptor runs on its own thread with its own io_uring ring,
+// drains accept CQEs from the kernel as fast as possible, and pushes
+// the new fds into a single-producer / single-consumer queue that the
+// reactor consumes at the top of each event loop iteration.
+// The key insight is that the accept path and the recv/send path don't
+// compete for the same io_uring ring,
+// so the kernel can satisfy accepts at line rate
+// without being throttled by the reactor's task-work queue under
+// DEFER_TASKRUN.
+//
+// `ACCEPT_QUEUE_CAPACITY` must be a power of two so the SPSC ring
+// can use a bitmask for index wrap. 4096 slots gives ~64 KB of state
+// per worker process and absorbs accept bursts up to that depth.
+// `ACCEPTOR_RING_ENTRIES` is the io_uring submission queue depth on
+// the acceptor's ring — accept SQEs are submitted once (multishot)
+// and never refilled, so it can be small.
+const ACCEPT_QUEUE_CAPACITY: usize = 4096;
+const ACCEPT_QUEUE_MASK: usize = ACCEPT_QUEUE_CAPACITY - 1;
+const ACCEPTOR_RING_ENTRIES: u16 = 16;
+const ACCEPTOR_CQE_BATCH: usize = 256;
+
+/// Lock-free single-producer / single-consumer ring buffer of file
+/// descriptors. The acceptor thread is the sole producer; the reactor
+/// thread is the sole consumer. No locking — ordering is enforced by
+/// release-acquire semantics on the head/tail counters.
+const SpscFdQueue = struct {
+    slots: [ACCEPT_QUEUE_CAPACITY]i32 = [_]i32{-1} ** ACCEPT_QUEUE_CAPACITY,
+    head: std.atomic.Value(usize) align(64) = std.atomic.Value(usize).init(0),
+    tail: std.atomic.Value(usize) align(64) = std.atomic.Value(usize).init(0),
+
+    fn push(self: *SpscFdQueue, fd: i32) bool {
+        const tail = self.tail.load(.monotonic);
+        const head = self.head.load(.acquire);
+        if (tail -% head >= ACCEPT_QUEUE_CAPACITY) return false;
+        self.slots[tail & ACCEPT_QUEUE_MASK] = fd;
+        self.tail.store(tail +% 1, .release);
+        return true;
+    }
+
+    fn pop(self: *SpscFdQueue) ?i32 {
+        const head = self.head.load(.monotonic);
+        const tail = self.tail.load(.acquire);
+        if (head == tail) return null;
+        const fd = self.slots[head & ACCEPT_QUEUE_MASK];
+        self.head.store(head +% 1, .release);
+        return fd;
+    }
+};
+
+/// Dedicated acceptor thread state. Heap-allocated so the spawned
+/// thread can hold a stable pointer through its entire lifetime.
+///
+/// The acceptor owns its own io_uring ring (separate from the reactor
+/// ring), arms a multishot accept on the listener fd, and pushes each
+/// accepted client fd into the SPSC queue shared with the reactor.
+/// After every push it bumps an eventfd that the reactor's main ring
+/// is poll-watching, which wakes the reactor exactly once per batch
+/// of accepts (the eventfd counter coalesces redundant signals).
+///
+/// Why this separation:
+/// With SINGLE_ISSUER + DEFER_TASKRUN set on the reactor's ring,
+/// multishot accept on that same ring gets rate-limited by the
+/// kernel's deferred-taskrun queue: new accept CQEs aren't
+/// dispatched until the next io_uring_enter, and on a busy reactor
+/// that lags behind the actual SYN backlog. Running accept on a
+/// separate ring whose only job is to sit in io_uring_enter waiting
+/// for accept CQEs lets the kernel satisfy accepts at line rate
+/// independently of how busy the reactor is.
+const Acceptor = if (!is_linux) void else struct {
+    queue: SpscFdQueue = .{},
+    /// eventfd we write to from the acceptor thread. The reactor's
+    /// main ring polls this fd; each readiness event triggers a drain
+    /// of the SPSC queue. EFD_SEMAPHORE is NOT set: a single read()
+    /// drains the entire counter, which is exactly the coalescing
+    /// behavior we want.
+    eventfd_fd: i32 = -1,
+    listener_fd: i32 = -1,
+    /// Acceptor's own io_uring ring (independent of the reactor's).
+    /// Plain init flags — DEFER_TASKRUN would defeat the whole point
+    /// of running accept on its own thread (we *want* the kernel to
+    /// dispatch accept CQEs the moment they're ready, not at the next
+    /// io_uring_enter).
+    ring: IoUring = undefined,
+    thread: ?std.Thread = null,
+    shutdown: std.atomic.Value(bool) align(64) = std.atomic.Value(bool).init(false),
+    /// Counted backpressure. Incremented when the SPSC queue is full
+    /// and the acceptor must drop the new fd (closes it cleanly so
+    /// the client gets a TCP RST). Logged at deinit for visibility.
+    overflow_drops: std.atomic.Value(u64) align(64) = std.atomic.Value(u64).init(0),
+
+    fn create(allocator: std.mem.Allocator, listener_fd: i32) !*Acceptor {
+        const self = try allocator.create(Acceptor);
+        errdefer allocator.destroy(self);
+        self.* = .{
+            .queue = .{},
+            .eventfd_fd = -1,
+            .listener_fd = listener_fd,
+            .ring = undefined,
+            .thread = null,
+            .shutdown = std.atomic.Value(bool).init(false),
+            .overflow_drops = std.atomic.Value(u64).init(0),
+        };
+
+        // eventfd via raw syscall — std.posix.eventfd was removed
+        // in newer 0.16-dev releases, and we only need the simple
+        // case (init=0, NONBLOCK + CLOEXEC). The kernel returns the
+        // new fd as a positive integer or -errno.
+        const efd_rc = linux.eventfd(0, linux.EFD.NONBLOCK | linux.EFD.CLOEXEC);
+        const efd_errno = std.posix.errno(efd_rc);
+        if (efd_errno != .SUCCESS) {
+            std.log.err("io_uring_native acceptor: eventfd failed: errno={}", .{@intFromEnum(efd_errno)});
+            return error.EventfdFailed;
+        }
+        const efd: i32 = @intCast(efd_rc);
+        errdefer clock.closeFd(efd);
+        self.eventfd_fd = efd;
+
+        self.ring = IoUring.init(ACCEPTOR_RING_ENTRIES, 0) catch |err| {
+            std.log.err("io_uring_native acceptor: IoUring.init failed: {}", .{err});
+            return err;
+        };
+        errdefer self.ring.deinit();
+
+        // Arm multishot accept on the acceptor's ring. The kernel will
+        // produce one CQE per incoming connection until F_MORE clears
+        // (kernel error / oom). user_data tag is irrelevant — this is
+        // the only op type on this ring.
+        _ = self.ring.accept_multishot(
+            1,
+            listener_fd,
+            null,
+            null,
+            std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC,
+        ) catch |err| {
+            std.log.err("io_uring_native acceptor: accept_multishot prep failed: {}", .{err});
+            return err;
+        };
+        _ = self.ring.submit() catch |err| {
+            std.log.err("io_uring_native acceptor: initial submit failed: {}", .{err});
+            return err;
+        };
+
+        return self;
+    }
+
+    fn start(self: *Acceptor) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn run(self: *Acceptor) void {
+        var rearm_pending: bool = false;
+        while (!self.shutdown.load(.acquire)) {
+            // Block until at least one accept CQE arrives. On shutdown
+            // the parent calls eventfd_write on a dummy fd to wake us;
+            // we recheck the flag at the top of the loop.
+            const submit_count: u32 = if (rearm_pending) 1 else 0;
+            _ = self.ring.submit_and_wait(1) catch |err| switch (err) {
+                error.SignalInterrupt => continue,
+                else => {
+                    std.log.warn("io_uring_native acceptor: submit_and_wait failed: {}", .{err});
+                    return;
+                },
+            };
+            _ = submit_count;
+            rearm_pending = false;
+
+            var batch: [ACCEPTOR_CQE_BATCH]linux.io_uring_cqe = undefined;
+            const n = self.ring.copy_cqes(&batch, 0) catch |err| switch (err) {
+                error.SignalInterrupt => continue,
+                else => {
+                    std.log.warn("io_uring_native acceptor: copy_cqes failed: {}", .{err});
+                    return;
+                },
+            };
+
+            var any_pushed: bool = false;
+            var i: u32 = 0;
+            while (i < n) : (i += 1) {
+                const cqe = batch[i];
+
+                // Multishot accept terminated (kernel ENOMEM, etc.).
+                // Re-arm so we don't lose the listener.
+                if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
+                    rearm_pending = true;
+                    _ = self.ring.accept_multishot(
+                        1,
+                        self.listener_fd,
+                        null,
+                        null,
+                        std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC,
+                    ) catch {};
+                }
+
+                if (cqe.res < 0) continue;
+                const fd: i32 = cqe.res;
+
+                // Hand off to the reactor via the SPSC queue. If the
+                // queue is full the reactor is too far behind us to
+                // catch up — close the fresh fd to release the SYN
+                // backlog slot and bump the drop counter.
+                if (!self.queue.push(fd)) {
+                    _ = self.overflow_drops.fetchAdd(1, .monotonic);
+                    clock.closeFd(fd);
+                    continue;
+                }
+                any_pushed = true;
+            }
+
+            if (any_pushed) {
+                // Wake the reactor exactly once per batch. We always
+                // write 1; the reactor's read() drains the eventfd
+                // counter to zero in a single call so even bursts
+                // collapse to one wakeup.
+                const one: u64 = 1;
+                _ = linux.write(self.eventfd_fd, @ptrCast(&one), @sizeOf(u64));
+            }
+        }
+    }
+
+    fn signalShutdown(self: *Acceptor) void {
+        self.shutdown.store(true, .release);
+        // Bump the eventfd to give the reactor one last poke, and
+        // wake the acceptor thread (which is blocked in
+        // submit_and_wait on its own ring) by closing the listener
+        // — the parent process tearing down will do that, and the
+        // kernel delivers a final -EBADF CQE which unblocks the wait.
+        const one: u64 = 1;
+        _ = linux.write(self.eventfd_fd, @ptrCast(&one), @sizeOf(u64));
+    }
+
+    fn destroy(self: *Acceptor, allocator: std.mem.Allocator) void {
+        const drops = self.overflow_drops.load(.monotonic);
+        if (drops > 0) {
+            std.log.warn("io_uring_native acceptor: dropped {d} accepts due to SPSC backpressure", .{drops});
+        }
+        if (self.thread) |t| {
+            self.signalShutdown();
+            t.join();
+        }
+        if (self.eventfd_fd >= 0) clock.closeFd(self.eventfd_fd);
+        self.ring.deinit();
+        allocator.destroy(self);
+    }
+};
+
 // ─── User-data encoding ──────────────────────────────────────────────
 // Every SQE carries a u64 `user_data` the kernel echoes back in its
 // CQE. We encode (op, generation, fd/conn_id) into this field so that
@@ -86,6 +333,13 @@ pub const Op = enum(u4) {
     /// us), and the packet payload. We reuse the same buffer group
     /// as TCP recv — a UDP flood and a TCP flood share the pool.
     recvmsg = 4,
+    /// POLL_ADD readiness wake for write backpressure. The CQE is
+    /// emitted when a connection's socket becomes writable again
+    /// after a sync writev hit EAGAIN. `cqe.res` carries the poll
+    /// mask, not a byte count — we emit a .write event with
+    /// `bytes_written = 0` so the server's dispatcher re-enters
+    /// handleWrite and retries the writev.
+    poll_writable = 5,
 };
 
 pub fn packUserData(op: Op, gen: u28, conn_id: u32) u64 {
@@ -164,6 +418,9 @@ const StubBackend = struct {
     pub fn submitWritev(_: *StubBackend, _: u32, _: i32, _: []const std.posix.iovec_const) !void {
         return error.Unsupported;
     }
+    pub fn armWritable(_: *StubBackend, _: u32, _: i32) !void {
+        return error.Unsupported;
+    }
     pub fn rearmRecv(_: *StubBackend, _: u32, _: i32) void {}
     pub fn bumpGeneration(_: *StubBackend, _: u32) void {}
     pub fn releaseRecvBuffer(_: *StubBackend, _: u16) void {}
@@ -215,6 +472,18 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
     /// Per-connection generation counter — incremented when a conn_id
     /// is reused, so stale CQEs from the previous lifetime get ignored.
     generations: []u28,
+    /// Per-connection "multishot recv is live" flag. Set by armRecv,
+    /// cleared when the kernel delivers a terminal CQE (F_MORE not
+    /// set on a non-stale completion). Used to skip redundant rearms
+    /// from the server's generic per-event rearm path when the
+    /// multishot is still producing CQEs.
+    recv_armed: []bool,
+
+    // ─── Acceptor thread state ──────────────────────────────────────
+    // Heap-allocated so the acceptor thread can hold a stable pointer
+    // to it for its entire lifetime, regardless of how the parent
+    // backend struct gets moved/copied during init().
+    acceptor: ?*Acceptor = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -270,6 +539,10 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
         @memset(generations, 0);
         errdefer allocator.free(generations);
 
+        const recv_armed = try allocator.alloc(bool, max_events);
+        @memset(recv_armed, false);
+        errdefer allocator.free(recv_armed);
+
         return .{
             .ring = ring,
             .br = br,
@@ -277,19 +550,30 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
             .allocator = allocator,
             .events = events,
             .generations = generations,
+            .recv_armed = recv_armed,
             .udp_fd = null,
             .udp_msghdr = undefined,
             .udp_iov = undefined,
+            .acceptor = null,
         };
     }
 
     pub fn deinit(self: *IoUringNativeBackend, allocator: std.mem.Allocator) void {
+        // Stop and free the acceptor first: it owns the listener fd
+        // and an independent io_uring ring. Doing this before the
+        // reactor ring's free_buf_ring/deinit makes sure no acceptor
+        // CQE arrives during teardown to push into a destroyed queue.
+        if (self.acceptor) |acc| {
+            acc.destroy(allocator);
+            self.acceptor = null;
+        }
         linux.IoUring.free_buf_ring(self.ring.fd, self.br, RECV_BUF_COUNT, RECV_BUF_GROUP_ID);
         allocator.free(self.buffers);
         self.ring.deinit();
         allocator.destroy(self.ring);
         allocator.free(self.events);
         allocator.free(self.generations);
+        allocator.free(self.recv_armed);
     }
 
     /// Compute the slice that buffer `id` points at in our slab.
@@ -298,12 +582,51 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
         return self.buffers[pos .. pos + RECV_BUF_SIZE];
     }
 
-    /// Register the TCP listener fd and arm multishot accept. The
-    /// accept SQE stays alive for the lifetime of the listener — each
-    /// incoming connection produces a CQE without any re-submission.
+    /// Register the TCP listener fd. Two modes:
+    /// - Default: reactor arms POLL_ADD on the listener directly and
+    ///   calls `accept4()` in a userspace loop on each readiness
+    ///   event. Same accept model as the `io_uring_poll` backend.
+    ///   Best overall on mixed workloads because the reactor's CQE
+    ///   batch window stays wide and there's no cross-thread wakeup
+    ///   latency between accept and the first recv.
+    /// - `SWERVER_THREADED_ACCEPT=1`: a dedicated acceptor thread
+    ///   runs multishot accept on its own io_uring ring and hands
+    ///   fds to the reactor through a lock-free SPSC queue + an
+    ///   eventfd. Reserved for very accept-heavy benchmarks that
+    ///   want to fully saturate a single core with accept4 syscalls.
     pub fn registerListener(self: *IoUringNativeBackend, fd: i32) !void {
         self.listener_fd = fd;
-        try self.armMultishotAccept(fd);
+        if (envThreadedAccept()) {
+            const acc = try Acceptor.create(self.allocator, fd);
+            errdefer acc.destroy(self.allocator);
+            try acc.start();
+            self.acceptor = acc;
+            try self.armAcceptorWakeup(acc.eventfd_fd);
+            return;
+        }
+        try self.armListenerPoll(fd);
+    }
+
+    fn envThreadedAccept() bool {
+        const raw = std.c.getenv("SWERVER_THREADED_ACCEPT") orelse return false;
+        const v = std.mem.span(raw);
+        return std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
+    }
+
+    fn armListenerPoll(self: *IoUringNativeBackend, fd: i32) !void {
+        _ = try self.ring.poll_add(
+            packUserData(.accept, 0, 0),
+            @intCast(fd),
+            linux.POLL.IN,
+        );
+    }
+
+    fn armAcceptorWakeup(self: *IoUringNativeBackend, eventfd: i32) !void {
+        _ = try self.ring.poll_add(
+            packUserData(.accept, 0, 0),
+            @intCast(eventfd),
+            linux.POLL.IN,
+        );
     }
 
     /// Register the UDP socket for QUIC and arm multishot recvmsg.
@@ -339,55 +662,22 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
         sqe.user_data = packUserData(.recvmsg, 0, 0);
     }
 
-    fn armMultishotAccept(self: *IoUringNativeBackend, fd: i32) !void {
-        // Use stdlib's accept_multishot helper, which calls
-        // prep_multishot_accept (correct opcode + IORING_ACCEPT_MULTISHOT flag).
-        //
-        // Pass SOCK_NONBLOCK | SOCK_CLOEXEC as the accept flags so the
-        // kernel hands us back non-blocking, close-on-exec fds without
-        // forcing a follow-up fcntl() round trip per accept. That
-        // extra syscall was the single biggest overhead vs epoll's
-        // accept4(SOCK_NONBLOCK) fast path — and the reason the
-        // earlier Connection: close benchmark came in 4x slower
-        // than the epoll backend for new-connection-per-request
-        // workloads.
-        _ = try self.ring.accept_multishot(
-            packUserData(.accept, 0, 0),
-            @intCast(fd),
-            null,
-            null,
-            linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC,
-        );
-    }
 
     /// Arm a multishot recv on a freshly-accepted connection. Data
     /// arrives via the provided buffer ring and is delivered inline
-    /// with each completion event. The multishot SQE stays armed
-    /// until the connection closes or errors.
+    /// with each completion event. The multishot SQE stays armed for
+    /// the lifetime of the connection: as long as the kernel sets
+    /// IORING_CQE_F_MORE on each CQE, we do no further submissions
+    /// and amortize the recv-setup cost across every request on the
+    /// connection. This is the core amortization that makes the
+    /// native backend win on keepalive workloads.
     ///
-    /// TEMP experiment: when SWERVER_SINGLESHOT_RECV=1 is set, submit
-    /// a single-shot recv instead. Close-mode requests only need one
-    /// recv per connection, so single-shot works for the connections
-    /// benchmark. Used to isolate whether multishot recv is the
-    /// bottleneck.
-    /// Arm a single-shot recv on a freshly-accepted connection. Data
-    /// arrives via the provided buffer ring and is delivered inline
-    /// with the completion event. After processing the .read event,
-    /// the server dispatcher calls `rearmRecv` to submit a new recv
-    /// SQE for keepalive connections. Close-mode connections (where
-    /// `conn.close_after_write` is set) skip the rearm so the kernel
-    /// can reclaim the fd when `closeConnection` eventually runs.
-    ///
-    /// We used to use `IORING_RECV_MULTISHOT` here, but under mixed
-    /// keepalive + connection-churn workloads the multishot lifecycle
-    /// raced with slot reuse: the terminal CQE for a dying conn
-    /// could arrive AFTER the slot had been re-acquired by a new
-    /// connection and its own multishot recv was armed. Even with
-    /// the per-slot generation counter catching the stale CQE, the
-    /// kernel had already spent cycles processing a recv on a
-    /// newly-reused fd, and occasionally the fd number would be
-    /// reused across iterations and cause real data races. Single-shot
-    /// eliminates the terminal-CQE race entirely.
+    /// Stale-CQE safety: when a connection slot is reused, the per-
+    /// slot generation counter gets bumped in `bumpGeneration` (called
+    /// from `IoRuntime.releaseConnection`). Any CQE still in the
+    /// kernel's completion queue from the previous incarnation carries
+    /// the old generation and gets filtered out in `poll()` below
+    /// before the provided buffer is handed back to the server.
     pub fn registerConnection(self: *IoUringNativeBackend, conn_id: u32, fd: i32) !void {
         if (conn_id >= self.generations.len) return error.ConnIdOutOfRange;
         try self.armRecv(conn_id, fd);
@@ -401,17 +691,45 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
         sqe.flags |= linux.IOSQE_BUFFER_SELECT;
         sqe.buf_index = RECV_BUF_GROUP_ID;
         sqe.user_data = packUserData(.recv, gen, conn_id);
+        self.recv_armed[conn_id] = true;
     }
 
-    /// Re-arm a single-shot recv on a still-alive connection. Called
-    /// by the server dispatcher from the `.read` arm after handleRead
-    /// returns, but only if the connection is still the same
-    /// incarnation and is not about to close (no `close_after_write`
-    /// flag set and no in-flight close). The server owns the fd, so
-    /// it passes it through to avoid any backend-side fd tracking —
-    /// which would otherwise race with slot reuse.
+    /// Re-arm a single-shot recv after a .read event has been
+    /// processed by the server. Called by the dispatcher for each
+    /// still-alive non-close-mode connection. Close-mode connections
+    /// skip the rearm so the kernel can reclaim the fd when
+    /// `closeConnection` runs.
+    ///
+    /// Multishot recv is a correctness footgun in this server because
+    /// pipelined data and EOF CQEs can arrive for a connection that
+    /// has already been written+closed by an earlier event in the
+    /// same poll() batch; single-shot sidesteps the issue by only
+    /// having one SQE in flight per connection at a time.
     pub fn rearmRecv(self: *IoUringNativeBackend, conn_id: u32, fd: i32) void {
+        if (conn_id >= self.recv_armed.len) return;
         self.armRecv(conn_id, fd) catch {};
+    }
+
+    /// Arm a POLL_ADD for POLLOUT on a connection's socket. The
+    /// server calls this when a sync `writev(2)` hits EAGAIN mid
+    /// response — the socket send buffer filled up and we need the
+    /// kernel to tell us when there's room for more. When the CQE
+    /// fires, `poll()` emits a .write event for this conn_id so
+    /// the server's dispatcher resumes `handleWrite`.
+    ///
+    /// This is the native analogue of the `io_uring_poll` backend's
+    /// POLLOUT re-arm. It's only used for large responses whose
+    /// first writev couldn't drain the whole iovec in one shot —
+    /// the hot path (small responses, keepalive fast writes) never
+    /// hits EAGAIN and so never submits this SQE.
+    pub fn armWritable(self: *IoUringNativeBackend, conn_id: u32, fd: i32) !void {
+        if (conn_id >= self.generations.len) return error.ConnIdOutOfRange;
+        const gen = self.generations[conn_id];
+        _ = try self.ring.poll_add(
+            packUserData(.poll_writable, gen, conn_id),
+            @intCast(fd),
+            linux.POLL.OUT,
+        );
     }
 
     /// Submit a send operation for a response. The completion arrives
@@ -453,6 +771,10 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
     pub fn bumpGeneration(self: *IoUringNativeBackend, conn_id: u32) void {
         if (conn_id >= self.generations.len) return;
         self.generations[conn_id] +%= 1;
+        // Slot is being recycled. Any prior multishot recv belongs to
+        // the old incarnation; mark it inactive so the next
+        // registerConnection arms a fresh one.
+        self.recv_armed[conn_id] = false;
     }
 
     /// Release a recv buffer back to the kernel's provided-buffer
@@ -476,22 +798,48 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
     /// immediately when `timeout_ms == 0`). Reaps all available CQEs
     /// and translates them into IoUringNativeEvent entries.
     pub fn poll(self: *IoUringNativeBackend, timeout_ms: u32) ![]IoUringNativeEvent {
-        // submit_and_wait: flushes pending SQEs to the kernel AND
-        // (if wait_nr > 0) blocks until at least one CQE is available.
-        // copy_cqes alone would not submit pending SQEs — it only
-        // drains the CQ ring — so we'd miss the initial multishot
-        // accept arm on the first poll cycle.
-        const wait_nr: u32 = if (timeout_ms > 0) 1 else 0;
+        var count: usize = 0;
+
+        // ── Step 1: drain the acceptor SPSC queue first ──────────────
+        // The acceptor thread is the producer; we are the only
+        // consumer. Drain unconditionally on every poll() — under
+        // load the reactor's own CQE stream keeps this loop spinning,
+        // so new fds get picked up within a single iteration. The
+        // eventfd POLL_ADD is only the cold-wake path for when the
+        // reactor is idle with nothing else in flight.
+        if (self.acceptor) |acc| {
+            // Drain the eventfd counter so the next POLL_ADD wakeup
+            // fires only on the *next* batch — not on the residue
+            // from a previous one. Single read() consumes the entire
+            // counter regardless of how many writes the acceptor did.
+            var counter: u64 = 0;
+            _ = linux.read(acc.eventfd_fd, @ptrCast(&counter), @sizeOf(u64));
+            while (count < self.events.len) {
+                const fd = acc.queue.pop() orelse break;
+                self.events[count] = .{
+                    .kind = .accept,
+                    .conn_id = 0,
+                    .accepted_fd = fd,
+                };
+                count += 1;
+            }
+        }
+
+        // ── Step 2: submit pending SQEs and reap CQEs ────────────────
+        // Only block if we don't already have accept events from the
+        // SPSC drain above. If we do, return immediately so the
+        // server can register all of them right away — the next
+        // poll() will catch up on any CQEs.
+        const wait_nr: u32 = if (count > 0 or timeout_ms == 0) 0 else 1;
         _ = self.ring.submit_and_wait(wait_nr) catch |err| switch (err) {
-            error.SignalInterrupt => return self.events[0..0],
+            error.SignalInterrupt => return self.events[0..count],
             else => return err,
         };
         const ready = self.ring.copy_cqes(&cqe_batch, 0) catch |err| switch (err) {
-            error.SignalInterrupt => return self.events[0..0],
+            error.SignalInterrupt => return self.events[0..count],
             else => return err,
         };
 
-        var count: usize = 0;
         var i: u32 = 0;
         while (i < ready and count < self.events.len) : (i += 1) {
             const cqe = cqe_batch[i];
@@ -501,7 +849,7 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
             const conn_id = unpackConnId(ud);
 
             // Drop stale CQEs from reused conn_id slots.
-            if (op == .recv or op == .send) {
+            if (op == .recv or op == .send or op == .poll_writable) {
                 if (conn_id >= self.generations.len or self.generations[conn_id] != gen) {
                     // If the stale CQE carried a buffer, release it so
                     // the kernel doesn't leak provided-buffer slots.
@@ -516,31 +864,48 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
 
             switch (op) {
                 .accept => {
-                    if (cqe.res < 0) {
-                        // accept failed; try to re-arm once
-                        if (self.listener_fd) |fd| {
-                            self.armMultishotAccept(fd) catch {};
+                    if (self.acceptor) |acc| {
+                        // Threaded-acceptor path: the eventfd
+                        // POLL_ADD fired because a batch of fds
+                        // arrived. The SPSC drain already ran at the
+                        // top of poll(); re-arm the wakeup so the
+                        // next cold-idle wait can fire and pick up
+                        // any stragglers the earlier drain missed.
+                        while (count < self.events.len) {
+                            const fd = acc.queue.pop() orelse break;
+                            self.events[count] = .{
+                                .kind = .accept,
+                                .conn_id = 0,
+                                .accepted_fd = fd,
+                            };
+                            count += 1;
                         }
-                        continue;
-                    }
-                    self.events[count] = .{
-                        .kind = .accept,
-                        .conn_id = 0,
-                        .accepted_fd = cqe.res,
-                    };
-                    count += 1;
-                    // Multishot accept re-arms itself unless F_MORE is unset.
-                    if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
-                        if (self.listener_fd) |fd| {
-                            self.armMultishotAccept(fd) catch {};
+                        self.armAcceptorWakeup(acc.eventfd_fd) catch {};
+                    } else {
+                        // Inline-accept path: POLL_ADD readiness on
+                        // the listener itself. The res is a poll
+                        // mask; re-arm regardless and emit one
+                        // .accept event so the server's handleAccept
+                        // drains accept4 in userspace until EAGAIN.
+                        if (self.listener_fd) |lfd| {
+                            self.armListenerPoll(lfd) catch {};
                         }
+                        self.events[count] = .{
+                            .kind = .accept,
+                            .conn_id = 0,
+                            .accepted_fd = null,
+                        };
+                        count += 1;
                     }
                 },
                 .recv => {
+                    // Single-shot recv: each CQE consumes its SQE.
+                    self.recv_armed[conn_id] = false;
+
                     if (cqe.res <= 0) {
                         // EOF / error. A real CQE may still carry a
-                        // buffer id (e.g., a zero-length "wake up and
-                        // close" notification) — release it if so.
+                        // buffer id (e.g., a zero-length notification)
+                        // — release it if so.
                         if (cqe.flags & linux.IORING_CQE_F_BUFFER != 0) {
                             if (cqe.buffer_id()) |bid| {
                                 self.releaseRecvBuffer(bid);
@@ -571,15 +936,6 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
                         .kernel_buffer_id = buffer_id,
                     };
                     count += 1;
-                    // Re-arm is not done inline here: in single-shot
-                    // mode the caller (server dispatcher) calls
-                    // `rearmRecv` after processing the read event if
-                    // the connection is still alive AND is not
-                    // about to close. This ordering avoids a race
-                    // where a re-armed SQE submitted inside the poll
-                    // loop fires on a fd the server has since closed
-                    // — the kernel might have reused that fd number
-                    // for a different connection.
                 },
                 .send => {
                     // cqe.res < 0 → socket error; cqe.res >= 0 is the
@@ -597,6 +953,29 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
                         .kind = .write,
                         .conn_id = conn_id,
                         .bytes_written = @intCast(cqe.res),
+                    };
+                    count += 1;
+                },
+                .poll_writable => {
+                    // POLL_ADD POLLOUT readiness wake. cqe.res is the
+                    // returned poll mask or a negative errno. Either
+                    // way we emit a zero-byte .write event so the
+                    // dispatcher re-enters handleWrite. bytes_written
+                    // is 0 because no bytes actually moved — the
+                    // socket just became writable again and the
+                    // retry happens in the server.
+                    if (cqe.res < 0) {
+                        self.events[count] = .{
+                            .kind = .err,
+                            .conn_id = conn_id,
+                        };
+                        count += 1;
+                        continue;
+                    }
+                    self.events[count] = .{
+                        .kind = .write,
+                        .conn_id = conn_id,
+                        .bytes_written = 0,
                     };
                     count += 1;
                 },

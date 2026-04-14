@@ -401,19 +401,17 @@ pub const Stack = struct {
     ///   emitted. Partial request streams must be held by the caller
     ///   (PR B wires this up via `stream.Stream.read()`/`consumeRead()`
     ///   in the handler). For single-STREAM-frame requests — which is
-    ///   every HttpArena h3 GET and most real-world h3 traffic — the
-    ///   entire request arrives in one `ingest` call with `end_stream`
-    ///   already true, and this path is the fast path.
+    ///   the overwhelming majority of real-world h3 GET traffic —
+    ///   the entire request arrives in one `ingest` call with
+    ///   `end_stream` already true, and this path is the fast path.
     /// - On FIN: parse all h3 frames in one linear pass, QPACK-decode
     ///   the HEADERS into the Stack's fixed-size owned header storage,
     ///   capture the DATA frame payload (if any) as a direct slice
     ///   into the caller's input, and emit one `RequestReadyEvent`.
     /// - Multi-DATA-frame request bodies are rejected with
-    ///   `error.ConnectionError`. The RFC allows them, but PR A
+    ///   `error.ConnectionError`. The RFC allows them, but this path
     ///   focuses on zero-copy single-frame bodies; concatenation is
-    ///   tracked as a follow-up. HttpArena's h3 profiles are all GETs
-    ///   with no body, so this limitation is invisible to the
-    ///   submission.
+    ///   tracked as a follow-up.
     /// - Zero heap allocations on the hot path: no hashmap, no
     ///   ArrayList grow past capacity after warmup, no slab acquire.
     ///   The only allocations are the `self.events.append` calls,

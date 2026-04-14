@@ -76,12 +76,21 @@ pub const IoRuntime = struct {
             .linux_io_uring_poll => .{},
             .linux_io_uring_native => .{
                 .delivers_read_data = true,
-                .multishot_accept = true,
+                // Native's default accept path is POLL_ADD on the
+                // listener + `accept4()` drain loop on readiness.
+                // The dispatcher's accept arm treats a null
+                // `event.handle` as "call handleAccept" for either
+                // the threaded or the inline model, so this flag
+                // reflects the default (inline) shape.
+                .multishot_accept = false,
                 .zero_copy_buffers = true,
-                // Plain-TCP writes go through IORING_OP_WRITEV. TLS
-                // writes stay sync through `tlsFlushWbio` since the
-                // ciphertext drain re-encrypts per call.
-                .async_writes = true,
+                // All TCP writes go through sync `writev(2)`. We
+                // benchmarked IORING_OP_WRITEV and the CQE round trip
+                // between submit and continuation cost more than the
+                // memcpy-into-kernel-buffer it was supposed to
+                // overlap. Sync is strictly faster for this server's
+                // shape.
+                .async_writes = false,
             },
             .windows_iocp, .unknown => .{},
         };
@@ -357,6 +366,21 @@ pub const IoRuntime = struct {
             else => {},
         }
     }
+
+    /// Arm a POLLOUT wake for a connection whose sync writev hit
+    /// EAGAIN. The next .write event for this conn_id signals the
+    /// socket is writable again; the dispatcher re-enters handleWrite
+    /// to retry the remaining iovec. Only implemented on the native
+    /// io_uring backend — other backends either queue POLLOUT as
+    /// part of their generic POLL_ADD re-arm (io_uring_poll, epoll)
+    /// or simply don't face the same issue because they use async
+    /// writev completions.
+    pub fn armWritable(self: *IoRuntime, conn_id: u32, fd: std.posix.fd_t) !void {
+        switch (self.backend_state) {
+            .linux_io_uring_native => |*ur| try ur.armWritable(conn_id, @intCast(fd)),
+            else => {},
+        }
+    }
 };
 
 pub const Backend = enum {
@@ -437,23 +461,13 @@ pub const UDP_SOCKET_ID: u64 = std.math.maxInt(u64) - 1;
 fn pickBackend(_: config.ServerConfig) Backend {
     // Diagnostic / opt-in override: SWERVER_BACKEND=epoll|poll|native
     // forces a specific backend. `native` is the opt-in entry for the
-    // WIP completion-model backend (multishot accept + recv via
-    // provided buffer ring + async writev + UDP recvmsg + TLS memory
-    // BIOs). It's not yet faster than `poll` on all workloads —
-    // specifically, connection-churn scenarios on Linux 6.12
-    // (Docker Desktop linuxkit kernel) show ~10x fewer accept CQEs
-    // per io_uring_enter cycle than the POLL_ADD + accept4 loop the
-    // poll backend uses, which tanks throughput on mixed
-    // keepalive/close workloads. Until native's accept path is reworked
-    // to match poll's drain-per-event pattern, it stays opt-in.
+    // Allow forcing a specific backend via env var for A/B testing.
     if (std.c.getenv("SWERVER_BACKEND")) |forced_ptr| {
         const forced = std.mem.span(forced_ptr);
         if (std.mem.eql(u8, forced, "epoll")) return .linux_epoll;
         if (std.mem.eql(u8, forced, "poll")) return .linux_io_uring_poll;
         if (std.mem.eql(u8, forced, "kqueue")) return .bsd_kqueue;
         if (std.mem.eql(u8, forced, "native")) {
-            // Only honor the native opt-in if the kernel actually
-            // supports it; fall through to auto-pick otherwise.
             if (@import("builtin").os.tag == .linux and
                 io_uring_native_backend.probe())
             {
@@ -463,11 +477,14 @@ fn pickBackend(_: config.ServerConfig) Backend {
     }
     return switch (@import("builtin").os.tag) {
         .linux => blk: {
-            // Default: io_uring_poll (readiness-model io_uring).
-            // This is the same backend the `v0.1.0-alpha.0` tag
-            // shipped with — it holds the HttpArena top-tier scores
-            // and is the known-good path. Native is opt-in via
-            // `SWERVER_BACKEND=native`.
+            // Default: native io_uring when available. The inline
+            // accept path (POLL_ADD on listener + `accept4()` drain
+            // loop) matches the poll backend on connection-churn,
+            // while completion-model recv + provided buffers beats
+            // poll on keepalive throughput. Per-connection sync/async
+            // writev keeps close-mode requests off the WRITEV CQE
+            // round trip that would otherwise dominate their latency.
+            if (io_uring_native_backend.probe()) break :blk .linux_io_uring_native;
             if (io_uring_poll_backend.probeIoUring()) break :blk .linux_io_uring_poll;
             break :blk .linux_epoll;
         },

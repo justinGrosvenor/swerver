@@ -558,9 +558,8 @@ pub const Handler = struct {
         // FIN — bypass Stream creation, recv_buffer management, and the
         // reassembly machinery entirely. Parse h3 frames directly on the
         // decrypted STREAM frame bytes and let the Stack emit a
-        // RequestReadyEvent inline. This is the path /baseline2 always
-        // takes and where HttpArena's throughput benchmark spends its
-        // time.
+        // RequestReadyEvent inline. This is the h3 throughput fast path
+        // and carries the bulk of real-world h3 GET traffic.
         //
         // Shape: new stream ID, client-initiated bidi (id % 4 == 0),
         // offset 0, FIN set.

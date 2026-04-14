@@ -356,8 +356,11 @@ fn sendGsoLinux(
     @memcpy(cmsg_buf[cmsg_off..][0..@sizeOf(u16)], std.mem.asBytes(&segment_size));
     cmsg_off += @sizeOf(u16);
 
-    // Round up to usize alignment for controllen
-    const controllen: usize = (cmsg_off + @alignOf(usize) - 1) & ~(@as(usize, @alignOf(usize)) - 1);
+    // Round up to usize alignment for controllen. Linux's msghdr.controllen
+    // is u32; macOS uses socklen_t (also u32 in practice). Cast at the
+    // boundary so the arithmetic above can stay in usize.
+    const controllen_usize: usize = (cmsg_off + @alignOf(usize) - 1) & ~(@as(usize, @alignOf(usize)) - 1);
+    const controllen: u32 = @intCast(controllen_usize);
 
     const msg = std.posix.msghdr_const{
         .name = sockaddr_ptr,

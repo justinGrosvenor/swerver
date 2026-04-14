@@ -83,9 +83,9 @@ fn handleReloadSignal(_: std.posix.SIG) callconv(.c) void {
 pub const MAX_H3_PREENCODED: usize = 8;
 
 /// Size of each pre-encoded response's byte buffer. 1024 is plenty
-/// for the HttpArena and TechEmpower-style hot endpoints (/plaintext
-/// returns 13 bytes, /json returns 27, /baseline2 returns 1). Larger
-/// static files don't belong in this cache — they use the mmap path.
+/// for tiny hot endpoints like /plaintext (13 bytes), /json (27), or
+/// /baseline2 (1). Larger static files don't belong in this cache —
+/// they use the mmap path.
 pub const H3_PREENCODED_BUF_SIZE: usize = 1024;
 
 /// Pre-encoded HTTP/3 response for a hot static endpoint.
@@ -393,14 +393,13 @@ pub const Server = struct {
         // are patched per-request.
         if (build_options.enable_http2) self.initPreencodedH2();
 
-        // Load /data/dataset.json for the HttpArena /json endpoint.
-        // No-op if the file doesn't exist (local dev without the dataset).
+        // Load /data/dataset.json for the /json endpoint. No-op if
+        // the file doesn't exist (local dev without the dataset).
         loadJsonDataset();
     }
 
     /// Populate the h3 pre-encoded response cache with a fixed set of
-    /// hot static endpoints — the ones that show up in HttpArena and
-    /// TechEmpower benchmarks. On request, if the URL matches one of
+    /// hot static endpoints. On request, if the URL matches one of
     /// these entries we skip the router + middleware + encode path
     /// entirely and feed pre-encoded h3 bytes straight to the QUIC
     /// send loop. See `PreencodedH3Response`.
@@ -995,18 +994,22 @@ pub const Server = struct {
             for (events) |event| {
                 switch (event.kind) {
                     .accept => {
-                        // The native io_uring backend delivers the already-
-                        // accepted client fd inline with the event (multishot
-                        // accept). Other backends deliver a readiness event
-                        // on the listener; we call accept() ourselves.
-                        if (self.io.capabilities().multishot_accept) {
-                            if (event.handle) |client_fd| {
-                                self.handlePreAccepted(client_fd) catch |err| {
-                                    std.log.warn("Pre-accepted setup failed: {}", .{err});
-                                };
-                            }
+                        // Two delivery models:
+                        // 1. Pre-accepted: the backend hands us a
+                        //    fresh client fd inline (native io_uring
+                        //    with its threaded multishot accept).
+                        //    Go straight to setup.
+                        // 2. Readiness: the backend woke us because
+                        //    the listener has pending connections;
+                        //    we call accept4() in a userspace loop
+                        //    until EAGAIN (epoll, poll, io_uring_poll,
+                        //    and native-with-inline-accept).
+                        if (event.handle) |client_fd| {
+                            self.handlePreAccepted(client_fd) catch |err| {
+                                std.log.warn("Pre-accepted setup failed: {}", .{err});
+                            };
                         } else {
-                            const fd = event.handle orelse self.listener_fd orelse continue;
+                            const fd = self.listener_fd orelse continue;
                             self.handleAccept(fd) catch |err| {
                                 std.log.warn("Accept failed: {}", .{err});
                             };
@@ -1028,13 +1031,27 @@ pub const Server = struct {
                     },
                     .read, .write, .err => {
                         // Validate conn_id fits in u32 before casting
-                        if (event.conn_id > std.math.maxInt(u32)) continue;
+                        if (event.conn_id > std.math.maxInt(u32)) {
+                            if (event.kernel_buffer) |kb| kb.release();
+                            continue;
+                        }
                         const index: u32 = @intCast(event.conn_id);
                         // Guard against stale events: if the connection slot was freed
                         // and reused between event generation and dispatch, the fd will
                         // be null (freed) or the connection state will be closed/accept.
-                        const conn = self.io.getConnection(index) orelse continue;
-                        if (conn.fd == null or conn.state == .closed or conn.state == .accept) continue;
+                        // We MUST still return the kernel buffer in that case — with
+                        // multishot recv the backend can deliver multiple CQEs for the
+                        // same slot in a single poll() batch, and a close triggered by
+                        // an earlier event in the batch will leave any later buffers
+                        // stranded if we don't release them here.
+                        const conn = self.io.getConnection(index) orelse {
+                            if (event.kernel_buffer) |kb| kb.release();
+                            continue;
+                        };
+                        if (conn.fd == null or conn.state == .closed or conn.state == .accept) {
+                            if (event.kernel_buffer) |kb| kb.release();
+                            continue;
+                        }
                         // If the backend delivered read data inline
                         // (io_uring native multishot recv), seed it before
                         // anything else — the handshake path also needs to
@@ -2621,30 +2638,18 @@ pub const Server = struct {
             } else {
                 // Plain TCP path.
                 //
-                // Fast case: if the backend supports async writes
-                // (native io_uring), park an iovec batch on the
-                // connection and submit a single IORING_OP_WRITEV
-                // SQE. The completion comes back as a .write event
-                // carrying `cqe.res` in `event.bytes`; the dispatcher
-                // advances the queue there and re-runs handleWrite.
-                //
-                // Guard: skip async if a prior send is still in
-                // flight (the iovec's target slices must stay stable
-                // until the kernel acks the previous submission).
+                // Sync `writev(2)` is the fast path for plain TCP on
+                // every backend. We tried routing keepalive responses
+                // through IORING_OP_WRITEV, but the CQE round trip
+                // between submit and continuation cost more than the
+                // memcpy-into-kernel-buffer it was supposed to
+                // overlap, and the resulting send-in-flight gating
+                // serialized subsequent requests on the same
+                // connection. Sync writev runs inline, lets us close
+                // the fd in the same dispatcher tick for close-mode
+                // requests, and never blocks the reactor because the
+                // socket is non-blocking.
                 if (conn.send_in_flight) return;
-                if (self.io.capabilities().async_writes and conn.write_count > 0 and !conn.hasPendingFile()) {
-                    if (self.submitConnAsyncWritev(conn, socket_fd)) {
-                        // SQE accepted — the kernel will wake us via
-                        // the .write CQE. Nothing more to do this
-                        // tick; bail out of the outer while loop.
-                        return;
-                    }
-                    // SubmissionQueueFull or another submit error —
-                    // fall through to the sync writev path as a
-                    // safety valve. This should be rare in practice.
-                }
-                // Sync writev fallback: used on non-completion
-                // backends, or when the native ring's SQ is full.
                 while (conn.write_count > 0) {
                     var iov: [16]std.posix.iovec_const = undefined;
                     var iov_count: u32 = 0;
@@ -2665,7 +2670,20 @@ pub const Server = struct {
                     const bytes_written = std.c.writev(socket_fd, &iov, @intCast(iov_count));
                     if (bytes_written < 0) {
                         switch (std.posix.errno(bytes_written)) {
-                            .AGAIN => return,
+                            .AGAIN => {
+                                // Socket send buffer is full.
+                                // On completion-model backends (native
+                                // io_uring) the reactor has no generic
+                                // POLLOUT readiness event, so we must
+                                // explicitly arm one — otherwise the
+                                // connection stalls forever waiting
+                                // for a wake that never comes. Other
+                                // backends re-arm their POLL_ADD mask
+                                // through the standard dispatcher path
+                                // so this call is a no-op for them.
+                                self.io.armWritable(conn.index, socket_fd) catch {};
+                                return;
+                            },
                             .INTR => continue,
                             else => {
                                 self.closeConnection(conn);
@@ -4900,21 +4918,21 @@ pub fn registerDefaultRoutes(app_router: *router.Router) !void {
     try app_router.get("/blob", handleBenchBlob);
     // TechEmpower Framework Benchmark endpoints
     try app_router.get("/plaintext", handleTfbPlaintext);
-    // HttpArena benchmark endpoints. All three are "sum of query
-    // params" / "fixed ok" endpoints used by the throughput and
-    // pipelining profiles across h1, h2, and h3. PR PERF-3's
-    // preencoded caches key on the full canonical URL and serve the
-    // zero-router fast path.
-    try app_router.get("/pipeline", handleHttpArenaPipeline);
-    try app_router.get("/baseline11", handleHttpArenaBaseline11);
-    try app_router.post("/baseline11", handleHttpArenaBaseline11);
-    try app_router.get("/baseline2", handleHttpArenaBaseline2);
-    try app_router.post("/baseline2", handleHttpArenaBaseline2);
+    // Throughput and pipelining benchmark endpoints. /pipeline returns
+    // a fixed "ok". /baseline11 and /baseline2 sum the ?a= and ?b=
+    // query params (plus POST body for baseline11); their canonical
+    // hot queries are served from the preencoded response cache
+    // entirely, so these handlers only run on the cold path.
+    try app_router.get("/pipeline", handleBenchPipeline);
+    try app_router.get("/baseline11", handleBenchBaseline11);
+    try app_router.post("/baseline11", handleBenchBaseline11);
+    try app_router.get("/baseline2", handleBenchBaseline2);
+    try app_router.post("/baseline2", handleBenchBaseline2);
     // JSON processing: load dataset, compute totals, return JSON.
-    // Falls back to TechEmpower {"message":"Hello, World!"} when no dataset.
-    try app_router.get("/json", handleHttpArenaJson);
+    // Falls back to {"message":"Hello, World!"} when no dataset.
+    try app_router.get("/json", handleBenchJson);
     // Upload: return byte count of POST body
-    try app_router.post("/upload", handleHttpArenaUpload);
+    try app_router.post("/upload", handleBenchUpload);
 }
 
 // ============================================================
@@ -4989,24 +5007,20 @@ fn handleBenchEchoPost(ctx: *router.HandlerContext) response_mod.Response {
         };
     }
 
-/// GET /json - TechEmpower JSON serialization test
-/// GET /baseline2?a=1&b=1 - HttpArena h2/h3 throughput endpoint.
-/// Returns the literal sum of query params a and b. HttpArena always
-/// sends the canonical ?a=1&b=1, so the response body is always "2".
-/// The pre-encoded cache catches that exact URL; this cold-path
-/// handler only runs for non-canonical queries (which HttpArena
-/// doesn't send). Same applies to /baseline11 below.
-fn handleHttpArenaBaseline2(ctx: *router.HandlerContext) response_mod.Response {
-    // Same logic as baseline11: parse a & b from query, sum them.
-    // The pre-encoded cache handles the hot case (a=1&b=1 → "2");
-    // this handler covers the anti-cheat path (random params).
-    return handleHttpArenaBaseline11(ctx);
+/// GET|POST /baseline2?a=1&b=1 - h2/h3 throughput endpoint.
+/// Returns the sum of query params `a` and `b`. The canonical
+/// ?a=1&b=1 query hits the pre-encoded response cache directly;
+/// this cold-path handler only runs for non-canonical queries.
+fn handleBenchBaseline2(ctx: *router.HandlerContext) response_mod.Response {
+    // Same arithmetic as baseline11; the pre-encoded cache handles
+    // the hot case (a=1&b=1 → "2") and this handler covers queries
+    // with arbitrary parameter values.
+    return handleBenchBaseline11(ctx);
 }
 
-/// GET /pipeline - HttpArena h1 pipelining throughput endpoint.
-/// Returns the fixed body "ok". See h2o's on_pipeline handler for
-/// the canonical reference shape.
-fn handleHttpArenaPipeline(_: *router.HandlerContext) response_mod.Response {
+/// GET /pipeline - h1 pipelining throughput endpoint.
+/// Returns the fixed body "ok".
+fn handleBenchPipeline(_: *router.HandlerContext) response_mod.Response {
     return .{
         .status = 200,
         .headers = &[_]response_mod.Header{
@@ -5016,9 +5030,9 @@ fn handleHttpArenaPipeline(_: *router.HandlerContext) response_mod.Response {
     };
 }
 
-/// POST /upload - HttpArena upload endpoint.
+/// POST /upload - upload throughput endpoint.
 /// Returns the byte count of the request body as text/plain.
-fn handleHttpArenaUpload(ctx: *router.HandlerContext) response_mod.Response {
+fn handleBenchUpload(ctx: *router.HandlerContext) response_mod.Response {
     const body_len = ctx.request.body.len;
     const body = std.fmt.bufPrint(ctx.response_buf, "{d}", .{body_len}) catch "0";
     return .{
@@ -5030,7 +5044,7 @@ fn handleHttpArenaUpload(ctx: *router.HandlerContext) response_mod.Response {
     };
 }
 
-/// GET /json - HttpArena JSON processing endpoint.
+/// GET /json - JSON dataset processing endpoint.
 /// Loads /data/dataset.json (50 items), computes total = price × quantity
 /// for each item, returns JSON with count + items array.
 ///
@@ -5038,7 +5052,7 @@ fn handleHttpArenaUpload(ctx: *router.HandlerContext) response_mod.Response {
 /// arena (which is the router scratch arena_buf). Since this is a GET
 /// handler, the lazy arena path gives us a zero-length arena, so we
 /// format directly into response_buf instead.
-fn handleHttpArenaJson(_: *router.HandlerContext) response_mod.Response {
+fn handleBenchJson(_: *router.HandlerContext) response_mod.Response {
     // The dataset is 50 items with {id,name,category,price,quantity,active,tags,rating}.
     // We need to add a "total" field = price * quantity.
     // Since we can't dynamically load a file inside a handler (no allocator,
@@ -5048,7 +5062,7 @@ fn handleHttpArenaJson(_: *router.HandlerContext) response_mod.Response {
     // For now: build the response from the pre-loaded json_dataset.
     const dataset_bytes = json_dataset_bytes;
     if (dataset_bytes.len == 0) {
-        // No dataset file — fall back to TechEmpower /json format.
+        // No dataset file — fall back to the canonical tiny /json body.
         return .{
             .status = 200,
             .headers = &[_]response_mod.Header{
@@ -5131,13 +5145,13 @@ pub fn loadJsonDataset() void {
     json_dataset_bytes = out[0..off];
 }
 
-/// GET|POST /baseline11 - HttpArena h1 throughput endpoint.
+/// GET|POST /baseline11 - h1 throughput endpoint.
 /// Sums the ?a= and ?b= query params, plus the request body for
 /// POST. For the canonical GET ?a=1&b=1 the sum is 2, cached via
-/// the pre-encoded pre-encoded h1 cache. The cold-path handler below
+/// the pre-encoded h1 response cache. The cold-path handler below
 /// is reached for POSTs and for non-canonical queries — and does
 /// the actual arithmetic.
-fn handleHttpArenaBaseline11(ctx: *router.HandlerContext) response_mod.Response {
+fn handleBenchBaseline11(ctx: *router.HandlerContext) response_mod.Response {
     var sum: i64 = 0;
     // Parse query string: find '?' in path
     if (std.mem.indexOfScalar(u8, ctx.request.path, '?')) |q_start| {

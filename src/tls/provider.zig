@@ -239,19 +239,25 @@ pub const Session = struct {
 
     /// Read decrypted data from TLS socket connection.
     pub fn read(self: *Session, buf: []u8) Error!usize {
-        return ffi.sslRead(self.ssl, buf) catch |err| switch (err) {
-            error.WouldBlock => error.WouldBlock,
-            error.ConnectionClosed => error.ConnectionClosed,
-            error.TlsError => error.TlsError,
-        };
+        if (comptime build_options.enable_tls) {
+            return ffi.sslRead(self.ssl, buf) catch |err| switch (err) {
+                error.WouldBlock => error.WouldBlock,
+                error.ConnectionClosed => error.ConnectionClosed,
+                error.TlsError => error.TlsError,
+            };
+        }
+        return error.TlsError;
     }
 
     /// Write data to TLS socket connection (encrypts automatically).
     pub fn write(self: *Session, data: []const u8) Error!usize {
-        return ffi.sslWrite(self.ssl, data) catch |err| switch (err) {
-            error.WouldBlock => error.WouldBlock,
-            error.TlsError => error.TlsError,
-        };
+        if (comptime build_options.enable_tls) {
+            return ffi.sslWrite(self.ssl, data) catch |err| switch (err) {
+                error.WouldBlock => error.WouldBlock,
+                error.TlsError => error.TlsError,
+            };
+        }
+        return error.TlsError;
     }
 
     /// Feed incoming TLS handshake data (from CRYPTO frames).
