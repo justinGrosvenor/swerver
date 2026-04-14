@@ -22,6 +22,7 @@ const benchmark_routes = @import("benchmark_routes.zig");
 const proxy_mod = @import("proxy/proxy.zig");
 const forward_mod = @import("proxy/forward.zig");
 const preencoded = @import("server/preencoded.zig");
+const server_tls = @import("server/tls.zig");
 
 /// Global shutdown flag set by signal handler (atomic for signal safety)
 var shutdown_requested = std.atomic.Value(bool).init(false);
@@ -79,17 +80,9 @@ fn handleReloadSignal(_: std.posix.SIG) callconv(.c) void {
 //       even on the fast path.
 // ============================================================
 
-/// Max plaintext bytes pushed into SSL_write per `connWrite` call. Caps the
-/// ciphertext any single SSL_write can produce at roughly one TLS record,
-/// which keeps `TLS_CIPHER_SCRATCH_SIZE` (and any carryover into a pooled
-/// buffer) small and predictable.
-pub const TLS_PLAINTEXT_WRITE_CAP: usize = 16 * 1024;
+// TLS_PLAINTEXT_WRITE_CAP and TLS_CIPHER_SCRATCH_SIZE live in
+// `server/tls.zig` alongside the handshake + ciphertext pump helpers.
 
-/// Scratch buffer size for draining wbio ciphertext to the socket. Large
-/// enough to hold the ciphertext produced by a single TLS 1.3 AES-GCM record
-/// (16384 bytes plaintext + AEAD tag + header) with comfortable slack so a
-/// healthy wbio drains in one BIO_read/writev round-trip.
-pub const TLS_CIPHER_SCRATCH_SIZE: usize = 16 * 1024 + 512;
 
 /// Single-threaded event-loop HTTP server. One `Server` instance runs
 /// per worker process in the default multi-worker fork model, or one
@@ -176,7 +169,7 @@ pub const Server = struct {
     /// a single drain cycle never needs more than this. If the drain writev
     /// hits EAGAIN, the unsent tail + any wbio remainder is copied into the
     /// per-connection `tls_cipher_carry_handle`.
-    tls_cipher_scratch: [TLS_CIPHER_SCRATCH_SIZE]u8 = undefined,
+    tls_cipher_scratch: [server_tls.TLS_CIPHER_SCRATCH_SIZE]u8 = undefined,
 
     /// Quick-start constructor for the benchmark-style server: pre-
     /// registers the HttpArena / TechEmpower routes and the default
@@ -524,7 +517,7 @@ pub const Server = struct {
                         }
                         // TLS handshake in progress — any I/O event continues it
                         if (conn.state == .handshake) {
-                            self.handleTlsHandshake(conn) catch {
+                            server_tls.handleTlsHandshake(self, conn) catch {
                                 self.closeConnection(conn);
                             };
                             continue;
@@ -691,7 +684,7 @@ pub const Server = struct {
                 return err;
             };
             // Try handshake immediately (may complete in one round-trip)
-            self.handleTlsHandshake(conn) catch {
+            server_tls.handleTlsHandshake(self, conn) catch {
                 self.closeConnection(conn);
                 return;
             };
@@ -718,70 +711,6 @@ pub const Server = struct {
                 return;
             };
         }
-    }
-
-    fn handleTlsHandshake(self: *Server, conn: *connection.Connection) !void {
-        var session = &(conn.tls_session orelse return error.NoTlsSession);
-        // Pull any ciphertext the backend hasn't seeded for us (poll/epoll
-        // path — completion backends already fed rbio from the event). Safe
-        // to call unconditionally; no-op on native.
-        _ = self.tlsPumpRead(conn);
-        // Before feeding new plaintext to SSL_do_handshake, flush any
-        // ciphertext we stashed from a prior partial writev.
-        switch (self.tlsDrainCarry(conn)) {
-            .done => {},
-            .again => return,
-            .err => return error.TlsWriteFailed,
-        }
-        const accepted = session.accept() catch {
-            return error.TlsHandshakeFailed;
-        };
-        // session.accept may have written handshake output (ServerHello,
-        // EncryptedExtensions, Certificate, …) into wbio. Drain it now so
-        // the client can progress; the handshake is only meaningful once
-        // both sides have flushed their crypto bytes.
-        try self.tlsFlushWbio(conn);
-        if (accepted) {
-            // Handshake complete — check ALPN for h2 and transition to active
-            conn.transition(.active, self.io.nowMs()) catch return error.InvalidTransition;
-            if (build_options.enable_http2) {
-                if (session.getAlpn()) |alpn| {
-                    if (std.mem.eql(u8, alpn, "h2")) {
-                        if (conn.http2_stack == null) {
-                            const stack_ptr = try self.allocator.create(http2.Stack);
-                            stack_ptr.* = http2.Stack.initWithConfig(.{
-                                .max_streams = self.cfg.http2.max_streams,
-                                .max_header_list_size = self.cfg.http2.max_header_list_size,
-                                .initial_window_size = self.cfg.http2.initial_window_size,
-                                .max_frame_size = self.cfg.http2.max_frame_size,
-                                .max_dynamic_table_size = self.cfg.http2.max_dynamic_table_size,
-                            });
-                            conn.http2_stack = stack_ptr;
-                        }
-                        conn.protocol = .http2;
-                        self.sendHttp2ServerPreface(conn) catch {
-                            return error.Http2PrefaceFailed;
-                        };
-                    }
-                }
-            }
-            // For HTTP/2 over TLS, flush the server preface (SETTINGS) before
-            // reading. The client won't send its h2 preface until it receives ours.
-            if (conn.protocol == .http2) {
-                self.handleWrite(conn.index) catch {};
-            }
-            // Try to read immediately (data may already be buffered by TLS/kernel)
-            self.handleRead(conn.index) catch {
-                self.closeConnection(conn);
-                return;
-            };
-            // Flush any response queued by handleRead (the event loop also does
-            // this after read events, but we need it here for the initial handshake)
-            if (conn.write_count > 0) {
-                self.handleWrite(conn.index) catch {};
-            }
-        }
-        // If not accepted, handshake needs more I/O — wait for next event
     }
 
     /// Maximum datagrams to drain per handleDatagram call before
@@ -1237,114 +1166,6 @@ pub const Server = struct {
         conn.markActive(self.io.nowMs());
     }
 
-    /// For TLS connections running on a non-completion backend (poll / epoll),
-    /// pull any available ciphertext from the socket with blocking reads and
-    /// feed it into the memory rbio. No-op on completion backends — the event
-    /// dispatcher already routed kernel-delivered bytes into rbio via
-    /// `seedReadBuffer`. Called before each `session.accept` / `SSL_read` so
-    /// the BIO always has the freshest bytes the kernel has handed us.
-    /// Returns true if any bytes were fed, false otherwise.
-    fn tlsPumpRead(self: *Server, conn: *connection.Connection) bool {
-        if (!conn.is_tls) return false;
-        if (self.io.capabilities().delivers_read_data) return false;
-        const fd = conn.fd orelse return false;
-        var session = &(conn.tls_session orelse return false);
-        var scratch: [16 * 1024]u8 = undefined;
-        var any: bool = false;
-        while (true) {
-            const raw = std.posix.system.read(fd, &scratch, scratch.len);
-            if (raw == 0) return any; // EOF — let the next SSL_read surface it
-            if (raw < 0) {
-                // EAGAIN / INTR — we've drained what's available.
-                return any;
-            }
-            const n: usize = @intCast(raw);
-            var remaining: []const u8 = scratch[0..n];
-            while (remaining.len > 0) {
-                const fed = session.feedCryptoData(remaining) catch return any;
-                if (fed == 0) return any;
-                remaining = remaining[fed..];
-            }
-            any = true;
-            conn.markActive(self.io.nowMs());
-        }
-    }
-
-    /// Drain any leftover ciphertext carry from a prior partial writev back to
-    /// the socket. Returns `.done` when the carry is empty (proceed to
-    /// encrypt more plaintext), `.again` when the socket is backpressured
-    /// (caller should return and wait for the next writable event), or
-    /// `.err` on a fatal socket error.
-    const CarryFlushResult = enum { done, again, err };
-    fn tlsDrainCarry(self: *Server, conn: *connection.Connection) CarryFlushResult {
-        const handle = conn.tls_cipher_carry_handle orelse return .done;
-        const fd = conn.fd orelse return .err;
-        while (conn.tls_cipher_carry_offset < conn.tls_cipher_carry_len) {
-            const slice = handle.bytes[conn.tls_cipher_carry_offset..conn.tls_cipher_carry_len];
-            const raw = std.c.write(fd, slice.ptr, slice.len);
-            if (raw < 0) {
-                return switch (std.posix.errno(raw)) {
-                    .AGAIN => .again,
-                    .INTR => continue,
-                    else => .err,
-                };
-            }
-            if (raw == 0) return .again;
-            conn.tls_cipher_carry_offset += @intCast(raw);
-            self.io.onWriteCompleted(conn, @intCast(raw));
-            conn.markActive(self.io.nowMs());
-        }
-        // Carry fully drained — release the buffer.
-        self.io.releaseBuffer(handle);
-        conn.tls_cipher_carry_handle = null;
-        conn.tls_cipher_carry_offset = 0;
-        conn.tls_cipher_carry_len = 0;
-        return .done;
-    }
-
-    /// Drain whatever ciphertext is currently pending in wbio to the socket.
-    /// If the socket is backpressured mid-drain, stashes the leftover
-    /// ciphertext into `conn.tls_cipher_carry_handle` so the next handleWrite
-    /// event can flush it. Returns normally on EAGAIN (partial + stash) or
-    /// on successful full drain; returns `error.TlsWriteFailed` on socket
-    /// errors, or `error.TlsCarryAllocFailed` if the pool is exhausted.
-    fn tlsFlushWbio(self: *Server, conn: *connection.Connection) !void {
-        var session = &(conn.tls_session orelse return);
-        const fd = conn.fd orelse return error.TlsWriteFailed;
-        while (true) {
-            const n = session.readCryptoData(&self.tls_cipher_scratch) catch {
-                return error.TlsWriteFailed;
-            };
-            if (n == 0) return;
-            var sent: usize = 0;
-            while (sent < n) {
-                const raw = std.c.write(fd, self.tls_cipher_scratch[sent..].ptr, n - sent);
-                if (raw < 0) {
-                    switch (std.posix.errno(raw)) {
-                        .AGAIN => {
-                            // Backpressured — stash the unsent tail plus
-                            // anything still queued in wbio for next time.
-                            if (!self.tlsStashCarry(conn, session, self.tls_cipher_scratch[sent..n])) {
-                                return error.TlsCarryAllocFailed;
-                            }
-                            return;
-                        },
-                        .INTR => continue,
-                        else => return error.TlsWriteFailed,
-                    }
-                }
-                if (raw == 0) {
-                    if (!self.tlsStashCarry(conn, session, self.tls_cipher_scratch[sent..n])) {
-                        return error.TlsCarryAllocFailed;
-                    }
-                    return;
-                }
-                sent += @intCast(raw);
-                conn.markActive(self.io.nowMs());
-            }
-        }
-    }
-
     /// Build an iovec batch from the connection's write queue and
     /// submit it as an async `IORING_OP_WRITEV` SQE on the native
     /// io_uring backend. Returns `true` if the SQE was accepted (the
@@ -1409,38 +1230,7 @@ pub const Server = struct {
         conn.markActive(self.io.nowMs());
     }
 
-    /// Stash the remaining ciphertext (scratch tail + anything still pending
-    /// in wbio) into a pool buffer so the next handleWrite call can flush it
-    /// before encrypting more plaintext. Called from the wbio drain path when
-    /// the socket returns EAGAIN or a short write.
-    fn tlsStashCarry(
-        self: *Server,
-        conn: *connection.Connection,
-        session: *tls.Session,
-        scratch_tail: []const u8,
-    ) bool {
-        // How many more ciphertext bytes are still sitting in wbio?
-        var extra_buf: [TLS_CIPHER_SCRATCH_SIZE]u8 = undefined;
-        const extra_n = session.readCryptoData(&extra_buf) catch 0;
-        const total = scratch_tail.len + extra_n;
-        if (total == 0) return true;
-        const handle = self.io.acquireBuffer() orelse return false;
-        if (handle.bytes.len < total) {
-            self.io.releaseBuffer(handle);
-            return false;
-        }
-        @memcpy(handle.bytes[0..scratch_tail.len], scratch_tail);
-        if (extra_n > 0) {
-            @memcpy(handle.bytes[scratch_tail.len..][0..extra_n], extra_buf[0..extra_n]);
-        }
-        conn.tls_cipher_carry_handle = handle;
-        conn.tls_cipher_carry_offset = 0;
-        conn.tls_cipher_carry_len = total;
-        self.io.onWriteBuffered(conn, total);
-        return true;
-    }
-
-    fn handleRead(self: *Server, index: u32) !void {
+    pub fn handleRead(self: *Server, index: u32) !void {
         const conn = self.io.getConnection(index) orelse return;
         if (conn.fd == null) return;
         if (!self.io.canRead(conn)) return;
@@ -1828,7 +1618,7 @@ pub const Server = struct {
     }
 
     /// Send the HTTP/2 server connection preface (SETTINGS frame)
-    fn sendHttp2ServerPreface(self: *Server, conn: *connection.Connection) !void {
+    pub fn sendHttp2ServerPreface(self: *Server, conn: *connection.Connection) !void {
         const buf = self.io.acquireBuffer() orelse return error.OutOfMemory;
         const len = http2.writeServerSettings(buf.bytes, .{
             .max_streams = self.cfg.http2.max_streams,
@@ -2025,7 +1815,7 @@ pub const Server = struct {
         }
     }
 
-    fn handleWrite(self: *Server, index: u32) !void {
+    pub fn handleWrite(self: *Server, index: u32) !void {
         const conn = self.io.getConnection(index) orelse return;
         const socket_fd = conn.fd orelse return;
 
@@ -2035,7 +1825,7 @@ pub const Server = struct {
                 // before touching SSL_write — we must preserve encryption
                 // order, and SSL_write would otherwise produce a record
                 // that races ahead of the carried record on the wire.
-                switch (self.tlsDrainCarry(conn)) {
+                switch (server_tls.tlsDrainCarry(self, conn)) {
                     .done => {},
                     .again => return,
                     .err => {
@@ -3763,7 +3553,7 @@ pub const Server = struct {
         if (conn.is_tls) {
             // Pull any newly-arrived ciphertext into rbio on non-completion
             // backends (no-op on native — the event dispatcher seeded it).
-            _ = self.tlsPumpRead(conn);
+            _ = server_tls.tlsPumpRead(self, conn);
             var session = &(conn.tls_session orelse return .err);
             const n = session.read(buf) catch |err| return switch (err) {
                 error.WouldBlock => .again,
@@ -3797,7 +3587,7 @@ pub const Server = struct {
             // Cap plaintext per SSL_write so wbio never holds more ciphertext
             // than one TLS record — that guarantees a full drain through
             // `tls_cipher_scratch` in a single BIO_read/writev round.
-            const chunk_len = @min(data.len, TLS_PLAINTEXT_WRITE_CAP);
+            const chunk_len = @min(data.len, server_tls.TLS_PLAINTEXT_WRITE_CAP);
             if (chunk_len == 0) return .{ .bytes = 0 };
             var session = &(conn.tls_session orelse return .err);
             const n = session.write(data[0..chunk_len]) catch |err| return switch (err) {
@@ -3810,7 +3600,7 @@ pub const Server = struct {
             // cipher carry, and we return .bytes (the plaintext was already
             // consumed by SSL_write). handleWrite checks the carry at the
             // top of its loop on the next write event and flushes it there.
-            self.tlsFlushWbio(conn) catch |err| return switch (err) {
+            server_tls.tlsFlushWbio(self, conn) catch |err| return switch (err) {
                 error.TlsCarryAllocFailed => .err,
                 else => .err,
             };
