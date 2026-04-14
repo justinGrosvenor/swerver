@@ -94,6 +94,7 @@ comptime {
     _ = server_builder;
     _ = master;
     _ = benchmark_routes;
+    _ = @import("server/preencoded.zig");
 
     // Runtime
     _ = buffer_pool;
