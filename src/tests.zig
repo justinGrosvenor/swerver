@@ -1,13 +1,44 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+// Top-level modules
 const config = @import("config.zig");
+const config_file = @import("config_file.zig");
+const server = @import("server.zig");
+const server_builder = @import("server_builder.zig");
+const master = @import("master.zig");
+const benchmark_routes = @import("benchmark_routes.zig");
+
+// Runtime
 const buffer_pool = @import("runtime/buffer_pool.zig");
 const connection = @import("runtime/connection.zig");
+const clock = @import("runtime/clock.zig");
+const io = @import("runtime/io.zig");
+const net = @import("runtime/net.zig");
+const json_write = @import("runtime/json_write.zig");
+
+// I/O backend modules (OS-gated at the comptime block below)
+const io_uring = @import("runtime/backend/io_uring_poll.zig");
+
+// Protocol layer
 const http1 = @import("protocol/http1.zig");
 const http2 = @import("protocol/http2.zig");
+const http3 = @import("protocol/http3.zig");
+const huffman = @import("protocol/huffman.zig");
 const request = @import("protocol/request.zig");
+const http3_frame = @import("protocol/http3/frame.zig");
+const http3_qpack = @import("protocol/http3/qpack.zig");
 const response = @import("response/response.zig");
 
-// QUIC and HTTP/3 modules (excluding those that depend on TLS FFI)
+// Router
+const router = @import("router/router.zig");
+
+// QUIC / HTTP/3 stack
+//
+// Note: quic_connection, quic_handler, and http3 transitively import
+// tls/ffi.zig (OpenSSL). The test build links -lssl -lcrypto, so they
+// compile; verify this still holds if the test build configuration
+// changes.
 const quic_types = @import("quic/types.zig");
 const quic_varint = @import("quic/varint.zig");
 const quic_packet = @import("quic/packet.zig");
@@ -18,22 +49,25 @@ const quic_recovery = @import("quic/recovery.zig");
 const quic_sent_ring = @import("quic/sent_ring.zig");
 const quic_congestion = @import("quic/congestion.zig");
 const quic_metrics = @import("quic/metrics.zig");
-const http3_frame = @import("protocol/http3/frame.zig");
-const http3_qpack = @import("protocol/http3/qpack.zig");
+const quic_connection_pool = @import("quic/connection_pool.zig");
+const quic_connection = @import("quic/connection.zig");
+const quic_handler = @import("quic/handler.zig");
+
+// TLS
 const tls_quic_session = @import("tls/quic_session.zig");
+const tls_provider = @import("tls/provider.zig");
+
+// Middleware
+const middleware = @import("middleware/middleware.zig");
 const metrics_mw = @import("middleware/metrics_mw.zig");
 const access_log = @import("middleware/access_log.zig");
+const observability = @import("middleware/observability.zig");
 const x402 = @import("middleware/x402.zig");
-const server = @import("server.zig");
-const master = @import("master.zig");
+const health = @import("middleware/health.zig");
+const ratelimit = @import("middleware/ratelimit.zig");
+const security = @import("middleware/security.zig");
 
-// Config file parser
-const config_file = @import("config_file.zig");
-
-// I/O backend modules
-const io_uring = @import("runtime/backend/io_uring_poll.zig");
-
-// Proxy modules
+// Proxy
 const proxy_upstream = @import("proxy/upstream.zig");
 const proxy_pool = @import("proxy/pool.zig");
 const proxy_balancer = @import("proxy/balancer.zig");
@@ -41,10 +75,48 @@ const proxy_forward = @import("proxy/forward.zig");
 const proxy_health = @import("proxy/health.zig");
 const proxy_handler = @import("proxy/proxy.zig");
 
-// Force tests in these modules to be included
-// Note: quic_connection, quic_handler, and http3 are excluded as they
-// transitively import TLS FFI which requires OpenSSL linking
+// Force tests in these modules to be included. Lazy analysis means
+// `_ = module` is the only way to pull test blocks into the test
+// binary.
+//
+// Exclusions (intentional):
+//   - src/main.zig             — executable entry point
+//   - src/lib.zig              — re-export module, tests run via `--dep swerver`
+//   - src/tls/ffi.zig          — raw OpenSSL C bindings, no tests
+//   - src/quic/test_utils.zig  — test-only helper
+//   - src/fuzz/http1_parser.zig — fuzz harness, not a test target
+//   - OS-specific backends are gated at the bottom of this block
 comptime {
+    // Top-level
+    _ = config;
+    _ = config_file;
+    _ = server;
+    _ = server_builder;
+    _ = master;
+    _ = benchmark_routes;
+
+    // Runtime
+    _ = buffer_pool;
+    _ = connection;
+    _ = clock;
+    _ = io;
+    _ = net;
+    _ = json_write;
+
+    // Protocol
+    _ = http1;
+    _ = http2;
+    _ = http3;
+    _ = huffman;
+    _ = request;
+    _ = http3_frame;
+    _ = http3_qpack;
+    _ = response;
+
+    // Router
+    _ = router;
+
+    // QUIC
     _ = quic_types;
     _ = quic_varint;
     _ = quic_packet;
@@ -55,25 +127,45 @@ comptime {
     _ = quic_sent_ring;
     _ = quic_congestion;
     _ = quic_metrics;
-    _ = http3_frame;
-    _ = http3_qpack;
+    _ = quic_connection_pool;
+    _ = quic_connection;
+    _ = quic_handler;
+
+    // TLS
     _ = tls_quic_session;
+    _ = tls_provider;
+
+    // Middleware
+    _ = middleware;
     _ = metrics_mw;
     _ = access_log;
+    _ = observability;
     _ = x402;
-    _ = server;
-    _ = master;
-    // Config file parser
-    _ = config_file;
-    // I/O backend modules
-    _ = io_uring;
-    // Proxy modules
+    _ = health;
+    _ = ratelimit;
+    _ = security;
+
+    // Proxy
     _ = proxy_upstream;
     _ = proxy_pool;
     _ = proxy_balancer;
     _ = proxy_forward;
     _ = proxy_health;
     _ = proxy_handler;
+
+    // I/O backend — `io_uring_poll` is the portable one
+    _ = io_uring;
+
+    // OS-specific backends: only pull them in on their target platform
+    // so the macOS test build doesn't try to analyze io_uring_native
+    // (Linux-only) and vice versa.
+    if (builtin.os.tag == .linux) {
+        _ = @import("runtime/backend/epoll.zig");
+        _ = @import("runtime/backend/io_uring_native.zig");
+    }
+    if (builtin.os.tag.isDarwin()) {
+        _ = @import("runtime/backend/kqueue.zig");
+    }
 }
 
 const Parsed = struct {

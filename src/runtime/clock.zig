@@ -59,6 +59,14 @@ pub fn realtimeTimespec() ?posix.timespec {
     return ts;
 }
 
+/// Get the current wall-clock time as nanoseconds since the Unix epoch.
+/// Replacement for the removed std.time.nanoTimestamp(). Returns null if
+/// the underlying clock_gettime call fails.
+pub fn realtimeNanos() ?i128 {
+    const ts = realtimeTimespec() orelse return null;
+    return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+}
+
 /// Get the current monotonic time as a posix timespec.
 /// Replacement for the removed std.posix.clock_gettime(.MONOTONIC).
 pub fn monotonicTimespec() ?posix.timespec {

@@ -2,6 +2,7 @@ const std = @import("std");
 const request = @import("../protocol/request.zig");
 const response = @import("../response/response.zig");
 const middleware = @import("middleware.zig");
+const clock = @import("../runtime/clock.zig");
 
 /// Rate Limiting Middleware
 ///
@@ -27,7 +28,7 @@ pub const TokenBucket = struct {
             .tokens = max_tokens,
             .max_tokens = max_tokens,
             .refill_rate = refill_rate,
-            .last_refill_ns = std.time.nanoTimestamp(),
+            .last_refill_ns = clock.realtimeNanos() orelse 0,
         };
     }
 
@@ -44,7 +45,7 @@ pub const TokenBucket = struct {
 
     /// Refill tokens based on elapsed time
     fn refill(self: *TokenBucket) void {
-        const now = std.time.nanoTimestamp();
+        const now = clock.realtimeNanos() orelse return;
         const elapsed_ns = now - self.last_refill_ns;
 
         if (elapsed_ns <= 0) return;
@@ -131,6 +132,11 @@ pub const RateLimiter = struct {
     };
 
     pub fn init(config: Config) RateLimiter {
+        // 4096 entries × a loop body with memory writes exceeds the default
+        // comptime backward-branch quota when this runs during module-level
+        // initialization of `var limiter`. Bump the quota so the comptime
+        // eval of a no-op "mark every entry inactive" loop succeeds.
+        @setEvalBranchQuota(MAX_TRACKED_IPS * 8);
         var rl = RateLimiter{
             .entries = undefined,
             .count = 0,
@@ -165,7 +171,7 @@ pub const RateLimiter = struct {
     }
 
     fn getOrCreateBucket(self: *RateLimiter, ip: IpKey) *BucketEntry {
-        const now = std.time.nanoTimestamp();
+        const now = clock.realtimeNanos() orelse 0;
 
         // Look for existing entry
         for (&self.entries) |*entry| {
@@ -244,6 +250,8 @@ pub fn init(config: RateLimiter.Config) void {
 /// Pre-computed Retry-After header values for common retry durations (0-60 seconds).
 /// Avoids threadlocal buffer lifetime hazards — all values are comptime string literals.
 const retry_after_strings = blk: {
+    // 61 × comptimePrint bursts well past the default backward-branch budget.
+    @setEvalBranchQuota(20_000);
     var strs: [61][]const u8 = undefined;
     for (0..61) |i| {
         strs[i] = std.fmt.comptimePrint("{d}", .{i});
@@ -284,11 +292,9 @@ pub fn evaluate(ctx: *middleware.Context, req: request.RequestView) middleware.D
     if (!limiter.config.enabled) return .allow;
 
     // Check excluded paths
-    if (req.path) |path| {
-        for (limiter.config.exclude_paths) |excluded| {
-            if (std.mem.eql(u8, path, excluded)) {
-                return .allow;
-            }
+    for (limiter.config.exclude_paths) |excluded| {
+        if (std.mem.eql(u8, req.path, excluded)) {
+            return .allow;
         }
     }
 
@@ -317,11 +323,9 @@ pub fn evaluateSimple(ctx: *middleware.Context, req: request.RequestView) middle
     if (!limiter.config.enabled) return .allow;
 
     // Check excluded paths
-    if (req.path) |path| {
-        for (limiter.config.exclude_paths) |excluded| {
-            if (std.mem.eql(u8, path, excluded)) {
-                return .allow;
-            }
+    for (limiter.config.exclude_paths) |excluded| {
+        if (std.mem.eql(u8, req.path, excluded)) {
+            return .allow;
         }
     }
 
@@ -394,6 +398,7 @@ test "excluded paths bypass rate limit" {
         .method = .GET,
         .path = "/.healthz",
         .headers = &.{},
+        .body = "",
     };
 
     // Health check always allowed
