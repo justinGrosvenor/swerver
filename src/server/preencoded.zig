@@ -31,6 +31,7 @@ const server_mod = @import("../server.zig");
 const Server = server_mod.Server;
 
 const response_mod = @import("../response/response.zig");
+const http1 = @import("http1.zig");
 const http2 = @import("../protocol/http2.zig");
 const middleware = @import("../middleware/middleware.zig");
 const clock = @import("../runtime/clock.zig");
@@ -383,7 +384,7 @@ fn rebuildPreencodedH1(server: *Server, entry: *PreencodedH1Response) void {
     else
         null;
     const date_str = server.getCachedDate();
-    entry.len = Server.encodeResponse(&entry.bytes, resp, alt_svc, false, date_str) catch 0;
+    entry.len = http1.encodeResponse(&entry.bytes, resp, alt_svc, false, date_str) catch 0;
     const ts = clock.realtimeTimespec() orelse return;
     entry.epoch = @intCast(ts.sec);
 }
