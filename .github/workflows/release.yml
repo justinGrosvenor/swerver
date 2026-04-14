@@ -1,0 +1,125 @@
+name: Release
+
+# Builds cross-platform release binaries on tag push (or manual dispatch)
+# and publishes them to the corresponding GitHub Release. Intentionally
+# runs only on tags so that feature development on main doesn't churn
+# release artifacts.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (for manual runs — e.g. v0.1.0-alpha.1)"
+        required: true
+        type: string
+
+env:
+  ZIG_VERSION: "0.16.0-dev.2135+7c0b42ba0"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            target: x86_64-linux-musl
+            runner: ubuntu-latest
+          - name: linux-aarch64
+            target: aarch64-linux-musl
+            runner: ubuntu-latest
+          - name: macos-x86_64
+            target: x86_64-macos
+            runner: macos-latest
+          - name: macos-aarch64
+            target: aarch64-macos
+            runner: macos-latest
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build ReleaseFast for ${{ matrix.target }}
+        run: |
+          # The main build enables TLS by default on native targets only
+          # because OpenSSL linking requires the host toolchain. Release
+          # binaries cross-compile without TLS — users who need TLS can
+          # build from source or use the Docker image. The README's
+          # Install section discloses this.
+          zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast --summary all
+
+      - name: Smoke test (native targets only)
+        # Cross-compiled binaries can't run on the build host (e.g. a
+        # linux-aarch64 binary built on an Ubuntu x86_64 runner won't
+        # execute), so we only run the smoke check when the build host
+        # matches the build target. Catches obvious failures like libc
+        # version mismatches or linker drift that would otherwise ship
+        # unnoticed to the Release page.
+        if: |
+          (runner.os == 'Linux' && matrix.target == 'x86_64-linux-musl') ||
+          (runner.os == 'macOS' && matrix.name == 'macos-aarch64' && runner.arch == 'ARM64') ||
+          (runner.os == 'macOS' && matrix.name == 'macos-x86_64' && runner.arch == 'X64')
+        run: |
+          ./zig-out/bin/swerver --run-for-ms 50 || \
+          (echo "Smoke test failed for ${{ matrix.name }}" >&2 && exit 1)
+
+      - name: Stage artifact
+        run: |
+          mkdir -p dist
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          NAME="swerver-${TAG}-${{ matrix.name }}"
+          cp zig-out/bin/swerver "dist/${NAME}"
+          # Produce a tarball so the Release page has one file per target.
+          tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
+          rm "dist/${NAME}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: swerver-${{ matrix.name }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Only publish on real tag pushes — workflow_dispatch runs build the
+    # artifacts but don't touch the Release page.
+    if: github.event_name == 'push'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Flatten artifact directory
+        run: |
+          mkdir -p release
+          find dist -name '*.tar.gz' -exec cp {} release/ \;
+          ls -la release/
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*.tar.gz
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') }}
+          generate_release_notes: true
