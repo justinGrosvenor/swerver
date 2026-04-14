@@ -702,7 +702,7 @@ pub const Server = struct {
                 self.io.releaseBuffer(entry.handle);
                 conn.popWrite();
                 if (conn.hasPendingBody()) {
-                    self.streamBodyChunks(conn, conn.pending_body);
+                    http1_mod.streamBodyChunks(self, conn, conn.pending_body);
                 }
             } else {
                 entry.offset += remaining;
@@ -731,8 +731,8 @@ pub const Server = struct {
             // native still needs to run through connRead (SSL_read) because
             // the bytes the kernel delivered are ciphertext living in rbio.
             if (self.io.capabilities().delivers_read_data and !conn.is_tls) {
-                self.continueBodyAccumulation(conn) catch {
-                    self.abortBodyAccumulation(conn, 400);
+                http1_mod.continueBodyAccumulation(self, conn) catch {
+                    http1_mod.abortBodyAccumulation(self, conn, 400);
                     return;
                 };
                 return;
@@ -748,20 +748,20 @@ pub const Server = struct {
                 const count = switch (self.connRead(conn, slice)) {
                     .bytes => |n| n,
                     .eof => {
-                        self.abortBodyAccumulation(conn, 400);
+                        http1_mod.abortBodyAccumulation(self, conn, 400);
                         return;
                     },
                     .again => return,
                     .err => {
-                        self.cleanupBodyAccumulation(conn);
+                        http1_mod.cleanupBodyAccumulation(self, conn);
                         self.closeConnection(conn);
                         return;
                     },
                 };
                 self.io.onReadBuffered(conn, count);
                 conn.markActive(self.io.nowMs());
-                self.continueBodyAccumulation(conn) catch {
-                    self.abortBodyAccumulation(conn, 400);
+                http1_mod.continueBodyAccumulation(self, conn) catch {
+                    http1_mod.abortBodyAccumulation(self, conn, 400);
                     return;
                 };
                 // Body complete — dispatch already happened
@@ -784,15 +784,15 @@ pub const Server = struct {
                 if (hparse.state == .err) {
                     conn.close_after_write = true;
                     self.io.onReadConsumed(conn, conn.read_buffered_bytes);
-                    try self.queueResponse(conn, errorResponseFor(hparse.error_code));
+                    try http1_mod.queueResponse(self, conn, http1_mod.errorResponseFor(hparse.error_code));
                 } else if (hparse.state == .complete) {
                     // Headers valid, body too big for buffer → init body accumulation
                     const needs_body = hparse.is_chunked or hparse.content_length > 0;
                     if (needs_body) {
-                        self.initBodyAccumulation(conn, hparse, buffer_handle) catch {
+                        http1_mod.initBodyAccumulation(self, conn, hparse, buffer_handle) catch {
                             conn.close_after_write = true;
                             self.io.onReadConsumed(conn, conn.read_buffered_bytes);
-                            try self.queueResponse(conn, errorResponseFor(.body_too_large));
+                            try http1_mod.queueResponse(self, conn, http1_mod.errorResponseFor(.body_too_large));
                             return;
                         };
                         // Body accumulation started — re-enter handleRead to drain socket
@@ -802,13 +802,13 @@ pub const Server = struct {
                         // No body but buffer full → shouldn't happen (parse() would've completed)
                         conn.close_after_write = true;
                         self.io.onReadConsumed(conn, conn.read_buffered_bytes);
-                        try self.queueResponse(conn, errorResponseFor(.body_too_large));
+                        try http1_mod.queueResponse(self, conn, http1_mod.errorResponseFor(.body_too_large));
                     }
                 } else {
                     // .partial — headers not even complete yet → 431 (header too large)
                     conn.close_after_write = true;
                     self.io.onReadConsumed(conn, conn.read_buffered_bytes);
-                    try self.queueResponse(conn, errorResponseFor(.header_too_large));
+                    try http1_mod.queueResponse(self, conn, http1_mod.errorResponseFor(.header_too_large));
                 }
             }
             return;
@@ -910,7 +910,7 @@ pub const Server = struct {
             if (parse.state == .partial) {
                 if (parse.expect_continue and !conn.sent_continue) {
                     conn.sent_continue = true;
-                    try self.queueResponse(conn, continueResponse());
+                    try http1_mod.queueResponse(self, conn, http1_mod.continueResponse());
                 }
                 // If buffer is full with a partial request, attempt body accumulation now.
                 // With edge-triggered epoll, we may not get another read event to trigger
@@ -924,10 +924,10 @@ pub const Server = struct {
                         .headers_storage = conn.headers[0..],
                     });
                     if (hparse.state == .complete and (hparse.is_chunked or hparse.content_length > 0)) {
-                        self.initBodyAccumulation(conn, hparse, buffer_handle) catch {
+                        http1_mod.initBodyAccumulation(self, conn, hparse, buffer_handle) catch {
                             conn.close_after_write = true;
                             self.io.onReadConsumed(conn, conn.read_buffered_bytes);
-                            try self.queueResponse(conn, errorResponseFor(.body_too_large));
+                            try http1_mod.queueResponse(self, conn, http1_mod.errorResponseFor(.body_too_large));
                             return;
                         };
                         // Re-enter to drain remaining socket data
@@ -936,7 +936,7 @@ pub const Server = struct {
                         // Headers not complete → 431
                         conn.close_after_write = true;
                         self.io.onReadConsumed(conn, conn.read_buffered_bytes);
-                        try self.queueResponse(conn, errorResponseFor(.header_too_large));
+                        try http1_mod.queueResponse(self, conn, http1_mod.errorResponseFor(.header_too_large));
                     }
                     // else: hparse.state == .err handled by returning (let next event handle it)
                 }
@@ -945,7 +945,7 @@ pub const Server = struct {
             if (parse.state == .err) {
                 conn.close_after_write = true;
                 self.io.onReadConsumed(conn, conn.read_buffered_bytes);
-                try self.queueResponse(conn, errorResponseFor(parse.error_code));
+                try http1_mod.queueResponse(self, conn, http1_mod.errorResponseFor(parse.error_code));
                 return;
             }
             conn.header_count = parse.view.headers.len;
@@ -957,7 +957,7 @@ pub const Server = struct {
 
             if (!self.isAllowedHost(parse.view)) {
                 conn.close_after_write = true;
-                try self.queueResponse(conn, badRequestResponse());
+                try http1_mod.queueResponse(self, conn, badRequestResponse());
                 return;
             }
 
@@ -965,7 +965,7 @@ pub const Server = struct {
             if (self.cfg.static_root.len > 0 and std.mem.startsWith(u8, parse.view.path, "/static/")) {
                 const file_path = parse.view.path[8..]; // Skip "/static/"
                 const content_type = guessContentType(file_path);
-                try self.queueFileResponse(conn, self.cfg.static_root, file_path, content_type);
+                try http1_mod.queueFileResponse(self, conn, self.cfg.static_root, file_path, content_type);
                 if (conn.read_buffered_bytes == 0) break;
                 continue;
             }
@@ -997,10 +997,10 @@ pub const Server = struct {
                     );
                     defer proxy_result.release();
 
-                    try self.queueResponse(conn, proxy_result.resp);
+                    try http1_mod.queueResponse(self, conn, proxy_result.resp);
                     // Materialize pending_body before proxy_result.release() frees the upstream buffer
                     if (conn.pending_body.len > 0) {
-                        self.materializePendingBody(conn);
+                        http1_mod.materializePendingBody(self, conn);
                     }
                     if (conn.read_buffered_bytes == 0) break;
                     continue;
@@ -1072,7 +1072,7 @@ pub const Server = struct {
             if (result.pause_reads_ms) |pause_ms| {
                 conn.setRateLimitPause(self.io.nowMs(), pause_ms);
             }
-            try self.queueResponse(conn, result.resp);
+            try http1_mod.queueResponse(self, conn, result.resp);
             if (conn.read_buffered_bytes == 0) break;
         }
 
@@ -1138,7 +1138,7 @@ pub const Server = struct {
                                 self.io.releaseBuffer(entry.handle);
                                 conn.popWrite();
                                 if (conn.hasPendingBody()) {
-                                    self.streamBodyChunks(conn, conn.pending_body);
+                                    http1_mod.streamBodyChunks(self, conn, conn.pending_body);
                                 }
                             } else {
                                 entry.offset += n;
@@ -1157,7 +1157,7 @@ pub const Server = struct {
                         },
                     }
                 }
-                if (conn.write_count == 0 and conn.hasPendingFile() and self.bufferPendingFileWrites(conn)) {
+                if (conn.write_count == 0 and conn.hasPendingFile() and http1_mod.bufferPendingFileWrites(self, conn)) {
                     continue;
                 }
                 if (conn.state == .closed) return;
@@ -1230,7 +1230,7 @@ pub const Server = struct {
                             self.io.releaseBuffer(entry.handle);
                             conn.popWrite();
                             if (conn.hasPendingBody()) {
-                                self.streamBodyChunks(conn, conn.pending_body);
+                                http1_mod.streamBodyChunks(self, conn, conn.pending_body);
                             }
                         } else {
                             entry.offset += written;
@@ -1291,367 +1291,6 @@ pub const Server = struct {
     fn handleError(self: *Server, index: u32) !void {
         const conn = self.io.getConnection(index) orelse return;
         self.closeConnection(conn);
-    }
-
-    fn queueResponse(self: *Server, conn: *connection.Connection, resp: response_mod.Response) !void {
-        // Fast path: for common error statuses (404, 400, 405, 501)
-        // with simple static bodies, serve pre-encoded bytes directly.
-        // This skips encodeResponseHeaders, Date formatting, and the
-        // Alt-Svc header entirely — just a memcpy into the write buf.
-        // The error-handling benchmark is 80% error responses; this
-        // turns them into the same speed as pre-encoded /health hits.
-        //
-        // Match criteria: non-close connection, body is .bytes or .none
-        // (no managed/scattered body), and status in the error cache.
-        // We don't check headers.len — the pre-encoded template
-        // includes its own headers (Content-Type etc.).
-        if (!conn.close_after_write) {
-            const is_simple_body = switch (resp.body) {
-                .bytes, .none => true,
-                else => false,
-            };
-            if (is_simple_body) {
-                if (preencoded.findPreencodedError(self, resp.status)) |entry| {
-                    if (preencoded.sendH1PreencodedBytes(self, conn, entry.bytes[0..entry.len])) return;
-                    // Pool exhausted — fall through to the normal encode path
-                    // which also acquires a buffer. If that also fails, the
-                    // connection is closed there (existing behavior).
-                }
-            }
-        }
-
-        const body_len = resp.bodyLen();
-        const body_bytes = resp.bodyBytes();
-        const managed_body = switch (resp.body) {
-            .managed => |managed| managed,
-            else => null,
-        };
-        const scattered_body = switch (resp.body) {
-            .scattered => |sc| sc,
-            else => null,
-        };
-        const date_str = self.getCachedDate();
-        // RFC 9110 §9.3.2: HEAD response MUST NOT contain a message body
-        const suppress_body = conn.is_head_request;
-        const buf = self.io.acquireBuffer() orelse {
-            // Cannot acquire buffer to send response - close connection
-            if (managed_body) |managed| self.io.releaseBuffer(managed.handle);
-            if (scattered_body) |sc| {
-                for (sc.handles[0..sc.count]) |h| self.io.releaseBuffer(h);
-            }
-            self.closeConnection(conn);
-            return;
-        };
-        // Include Alt-Svc header to advertise HTTP/3 when QUIC is enabled
-        const alt_svc: ?[]const u8 = if (self.alt_svc_len > 0)
-            self.alt_svc_value[0..self.alt_svc_len]
-        else
-            null;
-
-        if (managed_body) |managed| {
-            if (body_len > managed.handle.bytes.len) {
-                self.io.releaseBuffer(managed.handle);
-                self.io.releaseBuffer(buf);
-                self.closeConnection(conn);
-                return;
-            }
-            const managed_bytes = managed.handle.bytes[0..body_len];
-
-            // Try to fit headers + body in a single buffer for one write() syscall
-            const header_space = 512;
-            if (!suppress_body and body_len > 0 and body_len <= buf.bytes.len - header_space) {
-                const header_len = http1_mod.encodeResponseHeaders(buf.bytes, resp, alt_svc, conn.close_after_write, date_str) catch {
-                    self.io.releaseBuffer(managed.handle);
-                    self.io.releaseBuffer(buf);
-                    self.closeConnection(conn);
-                    return;
-                };
-                if (header_len + body_len <= buf.bytes.len) {
-                    // Copy body into header buffer — single write
-                    @memcpy(buf.bytes[header_len .. header_len + body_len], managed_bytes);
-                    self.io.releaseBuffer(managed.handle);
-                    if (!conn.enqueueWrite(buf, header_len + body_len)) {
-                        self.io.releaseBuffer(buf);
-                        self.closeConnection(conn);
-                        return;
-                    }
-                    self.io.onWriteBuffered(conn, header_len + body_len);
-                    self.io.setTimeoutPhase(conn, .write);
-                    return;
-                }
-            }
-
-            // Fallback: headers and body as separate writes
-            const header_len = http1_mod.encodeResponseHeaders(buf.bytes, resp, alt_svc, conn.close_after_write, date_str) catch {
-                self.io.releaseBuffer(managed.handle);
-                self.io.releaseBuffer(buf);
-                self.closeConnection(conn);
-                return;
-            };
-            if (!conn.enqueueWrite(buf, header_len)) {
-                self.io.releaseBuffer(managed.handle);
-                self.io.releaseBuffer(buf);
-                self.closeConnection(conn);
-                return;
-            }
-            self.io.onWriteBuffered(conn, header_len);
-
-            if (body_len == 0 or suppress_body) {
-                self.io.releaseBuffer(managed.handle);
-                self.io.setTimeoutPhase(conn, .write);
-                return;
-            }
-            if (!conn.enqueueWrite(managed.handle, body_len)) {
-                self.io.releaseBuffer(managed.handle);
-                self.closeConnection(conn);
-                return;
-            }
-            self.io.onWriteBuffered(conn, body_len);
-            self.io.setTimeoutPhase(conn, .write);
-            return;
-        }
-
-        // Scattered body: enqueue pre-allocated pool buffers directly (zero-copy echo)
-        if (scattered_body) |sc| {
-            const header_len = http1_mod.encodeResponseHeaders(buf.bytes, resp, alt_svc, conn.close_after_write, date_str) catch {
-                for (sc.handles[0..sc.count]) |h| self.io.releaseBuffer(h);
-                self.io.releaseBuffer(buf);
-                self.closeConnection(conn);
-                return;
-            };
-            if (!conn.enqueueWrite(buf, header_len)) {
-                for (sc.handles[0..sc.count]) |h| self.io.releaseBuffer(h);
-                self.io.releaseBuffer(buf);
-                self.closeConnection(conn);
-                return;
-            }
-            self.io.onWriteBuffered(conn, header_len);
-
-            if (suppress_body or sc.count == 0) {
-                for (sc.handles[0..sc.count]) |h| self.io.releaseBuffer(h);
-                self.io.setTimeoutPhase(conn, .write);
-                return;
-            }
-
-            // Enqueue each body buffer directly — no copy needed
-            for (0..sc.count) |i| {
-                const buf_len = if (i == sc.count - 1) sc.last_buf_len else sc.buffer_size;
-                if (!conn.enqueueWrite(sc.handles[i], buf_len)) {
-                    // Can't enqueue — release remaining buffers and close
-                    for (i..sc.count) |j| self.io.releaseBuffer(sc.handles[j]);
-                    self.closeConnection(conn);
-                    return;
-                }
-                self.io.onWriteBuffered(conn, buf_len);
-            }
-            self.io.setTimeoutPhase(conn, .write);
-            return;
-        }
-
-        if (suppress_body) {
-            // HEAD: send headers with Content-Length but no body
-            const header_len = http1_mod.encodeResponseHeaders(buf.bytes, resp, alt_svc, conn.close_after_write, date_str) catch {
-                self.io.releaseBuffer(buf);
-                self.closeConnection(conn);
-                return;
-            };
-            if (!conn.enqueueWrite(buf, header_len)) {
-                self.io.releaseBuffer(buf);
-                self.closeConnection(conn);
-                return;
-            }
-            self.io.onWriteBuffered(conn, header_len);
-            self.io.setTimeoutPhase(conn, .write);
-            return;
-        }
-
-        // For large bodies that don't fit in a single buffer, write headers first then chunk body
-        const header_space = 512; // Reserve space for headers
-        if (body_len > buf.bytes.len - header_space) {
-            // Write headers only first
-            const header_len = http1_mod.encodeResponseHeaders(buf.bytes, resp, alt_svc, conn.close_after_write, date_str) catch {
-                self.io.releaseBuffer(buf);
-                self.closeConnection(conn);
-                return;
-            };
-            if (!conn.enqueueWrite(buf, header_len)) {
-                self.io.releaseBuffer(buf);
-                self.closeConnection(conn);
-                return;
-            }
-            self.io.onWriteBuffered(conn, header_len);
-
-            // Stream body in chunks - only enqueue what fits, store rest for later
-            self.streamBodyChunks(conn, body_bytes);
-            self.io.setTimeoutPhase(conn, .write);
-            return;
-        }
-
-        // Small response - write everything in one buffer
-        const written = http1_mod.encodeResponse(buf.bytes, resp, alt_svc, conn.close_after_write, date_str) catch {
-            // Cannot encode response - close connection
-            self.io.releaseBuffer(buf);
-            self.closeConnection(conn);
-            return;
-        };
-        if (!conn.enqueueWrite(buf, written)) {
-            self.io.releaseBuffer(buf);
-            self.closeConnection(conn);
-            return;
-        }
-        self.io.onWriteBuffered(conn, written);
-        self.io.setTimeoutPhase(conn, .write);
-    }
-
-    /// Stream body data in chunks, enqueueing up to available queue slots.
-    /// Remaining data is stored in conn.pending_body for later streaming.
-    ///
-    /// LIFETIME CONTRACT: `body` (and thus `conn.pending_body`) must point to
-    /// memory that outlives the connection — typically compile-time string literals
-    /// from handler responses (e.g., `body = .{ .bytes = "Hello" }`). The slice is
-    /// never freed by the server; it is only read and copied into write buffers.
-    /// Managed bodies (.managed) are written inline in queueResponse and never
-    /// stored in pending_body.
-    fn streamBodyChunks(self: *Server, conn: *connection.Connection, body: []const u8) void {
-        var remaining = body;
-
-        // Enqueue chunks while we have queue space (leave 1 slot for new requests)
-        while (remaining.len > 0 and conn.writeQueueAvailable() > 1) {
-            const body_buf = self.io.acquireBuffer() orelse {
-                // No buffers available - store remaining and wait
-                conn.pending_body = remaining;
-                return;
-            };
-            const chunk_len = @min(remaining.len, body_buf.bytes.len);
-            @memcpy(body_buf.bytes[0..chunk_len], remaining[0..chunk_len]);
-            if (!conn.enqueueWrite(body_buf, chunk_len)) {
-                self.io.releaseBuffer(body_buf);
-                conn.pending_body = remaining;
-                return;
-            }
-            self.io.onWriteBuffered(conn, chunk_len);
-            remaining = remaining[chunk_len..];
-        }
-
-        // Store any remaining data for continuation in handleWrite
-        conn.pending_body = remaining;
-    }
-
-    /// Queue a file response using sendfile for zero-copy transfer.
-    /// Sends HTTP headers first, then sets up the connection for sendfile.
-    fn queueFileResponse(self: *Server, conn: *connection.Connection, static_root: []const u8, file_path: []const u8, content_type: []const u8) !void {
-        _ = static_root; // No longer used at request time — we use the cached dirfd.
-
-        // Reject paths containing percent-encoded sequences to prevent URL-encoded
-        // path traversal (e.g., %2e%2e bypassing the ".." check below)
-        if (std.mem.indexOfScalar(u8, file_path, '%') != null) {
-            try self.queueResponse(conn, notFoundResponse());
-            return;
-        }
-        // Prevent path traversal attacks — reject ".." components
-        if (std.mem.indexOf(u8, file_path, "..") != null) {
-            try self.queueResponse(conn, notFoundResponse());
-            return;
-        }
-        // Reject paths with null bytes
-        if (std.mem.indexOfScalar(u8, file_path, 0) != null) {
-            try self.queueResponse(conn, notFoundResponse());
-            return;
-        }
-        // Reject absolute paths — the root is the cached dirfd, not "/"
-        if (file_path.len > 0 and file_path[0] == '/') {
-            try self.queueResponse(conn, notFoundResponse());
-            return;
-        }
-
-        // Resolve against the cached static_root dirfd. This avoids realpath
-        // on the hot path and pins the root directory against post-startup
-        // renames. If static_root is unset or failed to open at init, serve 404.
-        const root_fd = self.static_root_fd orelse {
-            try self.queueResponse(conn, notFoundResponse());
-            return;
-        };
-
-        // Build null-terminated relative path.
-        var path_buf: [4096]u8 = undefined;
-        if (file_path.len >= path_buf.len) {
-            try self.queueResponse(conn, notFoundResponse());
-            return;
-        }
-        @memcpy(path_buf[0..file_path.len], file_path);
-        path_buf[file_path.len] = 0;
-        const path_z: [*:0]const u8 = @ptrCast(&path_buf);
-
-        // Open with NOFOLLOW on the leaf. Intermediate-component symlinks
-        // under static_root can still escape — operators should not place
-        // arbitrary symlinks inside the static tree. Linux-only full
-        // containment via openat2(RESOLVE_BENEATH) is a future enhancement.
-        var o_flags: std.posix.O = .{};
-        if (@hasField(std.posix.O, "NOFOLLOW")) o_flags.NOFOLLOW = true;
-        const file_fd = std.posix.openatZ(root_fd, path_z, o_flags, 0) catch {
-            try self.queueResponse(conn, notFoundResponse());
-            return;
-        };
-
-        // Get file size using lseek. Also rejects directories (can't seek on them).
-        const end_pos = std.c.lseek(file_fd, 0, std.posix.SEEK.END);
-        if (end_pos < 0) {
-            clock.closeFd(file_fd);
-            try self.queueResponse(conn, notFoundResponse());
-            return;
-        }
-        // Seek back to start for reading
-        _ = std.c.lseek(file_fd, 0, std.posix.SEEK.SET);
-        const file_size: u64 = @intCast(end_pos);
-
-        // Build and send headers
-        const buf = self.io.acquireBuffer() orelse {
-            clock.closeFd(file_fd);
-            self.closeConnection(conn);
-            return;
-        };
-
-        var size_buf: [20]u8 = undefined;
-        const size_str = std.fmt.bufPrint(&size_buf, "{d}", .{file_size}) catch {
-            self.io.releaseBuffer(buf);
-            clock.closeFd(file_fd);
-            self.closeConnection(conn);
-            return;
-        };
-
-        const headers = [_]response_mod.Header{
-            .{ .name = "Content-Type", .value = content_type },
-            .{ .name = "Content-Length", .value = size_str },
-        };
-
-        const header_len = http1_mod.encodeFileHeaders(buf.bytes, 200, &headers, self.getCachedDate()) catch {
-            self.io.releaseBuffer(buf);
-            clock.closeFd(file_fd);
-            self.closeConnection(conn);
-            return;
-        };
-
-        if (!conn.enqueueWrite(buf, header_len)) {
-            self.io.releaseBuffer(buf);
-            clock.closeFd(file_fd);
-            self.closeConnection(conn);
-            return;
-        }
-        self.io.onWriteBuffered(conn, header_len);
-
-        // RFC 9110 §9.3.2: HEAD response sends headers with Content-Length but no body
-        if (conn.is_head_request) {
-            clock.closeFd(file_fd);
-            self.io.setTimeoutPhase(conn, .write);
-            return;
-        }
-
-        // Set up sendfile - file body will be sent after headers
-        conn.pending_file_fd = file_fd;
-        conn.pending_file_offset = 0;
-        conn.pending_file_remaining = file_size;
-
-        self.io.setTimeoutPhase(conn, .write);
     }
 
     /// Format current time as IMF-fixdate (RFC 9110 §5.6.7)
@@ -1722,14 +1361,6 @@ pub const Server = struct {
         return self.cached_date[0..29];
     }
 
-    fn continueResponse() response_mod.Response {
-        return .{
-            .status = 100,
-            .headers = &[_]response_mod.Header{},
-            .body = .none,
-        };
-    }
-
     pub fn notFoundResponse() response_mod.Response {
         return .{
             .status = 404,
@@ -1797,31 +1428,6 @@ pub const Server = struct {
         } else {
             return "application/octet-stream";
         }
-    }
-
-    fn errorResponseFor(code: http1.ErrorCode) response_mod.Response {
-        return switch (code) {
-            .body_too_large => .{
-                .status = 413,
-                .headers = &[_]response_mod.Header{},
-                .body = .{ .bytes = "Payload Too Large\n" },
-            },
-            .header_too_large => .{
-                .status = 431,
-                .headers = &[_]response_mod.Header{},
-                .body = .{ .bytes = "Request Header Fields Too Large\n" },
-            },
-            .expectation_failed => .{
-                .status = 417,
-                .headers = &[_]response_mod.Header{},
-                .body = .{ .bytes = "Expectation Failed\n" },
-            },
-            else => .{
-                .status = 400,
-                .headers = &[_]response_mod.Header{},
-                .body = .{ .bytes = "Bad Request\n" },
-            },
-        };
     }
 
     pub fn buildHttp3RequestView(req: http3.RequestReadyEvent, headers_out: []request.Header) ?request.RequestView {
@@ -1898,456 +1504,6 @@ pub const Server = struct {
         return trimmed;
     }
 
-    fn bufferPendingFileWrites(self: *Server, conn: *connection.Connection) bool {
-        var queued_any = false;
-
-        while (conn.hasPendingFile() and conn.writeQueueAvailable() > 0) {
-            const body_buf = self.io.acquireBuffer() orelse {
-                if (!queued_any) {
-                    conn.cleanupPendingFile();
-                    self.closeConnection(conn);
-                }
-                return queued_any;
-            };
-
-            const max_read: usize = @intCast(@min(conn.pending_file_remaining, @as(u64, body_buf.bytes.len)));
-            const read_result = std.c.pread(conn.pending_file_fd.?, body_buf.bytes.ptr, max_read, @intCast(conn.pending_file_offset));
-            if (read_result < 0) {
-                self.io.releaseBuffer(body_buf);
-                switch (std.posix.errno(read_result)) {
-                    .INTR => continue,
-                    else => {
-                        conn.cleanupPendingFile();
-                        self.closeConnection(conn);
-                        return queued_any;
-                    },
-                }
-            }
-            const bytes_read: usize = @intCast(read_result);
-            if (bytes_read == 0) {
-                self.io.releaseBuffer(body_buf);
-                conn.cleanupPendingFile();
-                break;
-            }
-            if (!conn.enqueueWrite(body_buf, bytes_read)) {
-                self.io.releaseBuffer(body_buf);
-                return queued_any;
-            }
-
-            self.io.onWriteBuffered(conn, bytes_read);
-            conn.pending_file_offset += bytes_read;
-            conn.pending_file_remaining -= bytes_read;
-            queued_any = true;
-
-            if (conn.pending_file_remaining == 0) {
-                conn.cleanupPendingFile();
-                break;
-            }
-        }
-
-        return queued_any;
-    }
-
-    /// Initialize body accumulation for a request whose body exceeds the read buffer.
-    /// Allocates BodyAccumState, seeds it with any body bytes already in the read buffer,
-    /// and transitions the connection to body-accumulation mode.
-    fn initBodyAccumulation(
-        self: *Server,
-        conn: *connection.Connection,
-        hparse: http1.HeaderParseResult,
-        buffer_handle: buffer_pool.BufferHandle,
-    ) !void {
-        conn.body_accum = .{
-            .content_length = hparse.content_length,
-            .is_chunked = hparse.is_chunked,
-            .bytes_received = 0,
-            .bytes_decoded = 0,
-            .body_buffers = undefined,
-            .buffer_count = 0,
-            .current_buf_offset = 0,
-            .chunk_decoder = http1.ChunkDecoder.init(self.cfg.limits.max_body_bytes),
-            .header_result = hparse,
-            .original_read_buffer = null,
-        };
-        conn.header_count = hparse.view.headers.len;
-        conn.is_head_request = (hparse.view.method == .HEAD);
-        if (!hparse.keep_alive) conn.close_after_write = true;
-
-        // Send 100-continue if client expects it
-        if (hparse.expect_continue and !conn.sent_continue) {
-            conn.sent_continue = true;
-            try self.queueResponse(conn, continueResponse());
-        }
-
-        self.io.setTimeoutPhase(conn, .body);
-
-        // Seed with any body bytes already in the read buffer after headers
-        const start = conn.read_offset;
-        const end = start + conn.read_buffered_bytes;
-        const body_start = start + hparse.headers_consumed;
-        if (body_start < end) {
-            const body_bytes = buffer_handle.bytes[body_start..end];
-            try self.appendBodyData(conn, body_bytes);
-        }
-
-        // Retain original read buffer (header slices point into it) and acquire a fresh one.
-        // This prevents subsequent body reads from overwriting the header data.
-        const accum = &(conn.body_accum orelse unreachable);
-        accum.original_read_buffer = conn.read_buffer;
-        conn.read_buffer = self.io.acquireBuffer() orelse {
-            // No buffers available — abort body accumulation
-            conn.read_buffer = accum.original_read_buffer;
-            accum.original_read_buffer = null;
-            return error.OutOfMemory;
-        };
-        conn.read_offset = 0;
-        conn.read_buffered_bytes = 0;
-
-        // Check if body is already complete
-        if (self.bodyComplete(conn)) {
-            try self.dispatchWithAccumulatedBody(conn);
-        }
-    }
-
-    /// Continue accumulating body data from the read buffer into body buffers.
-    fn continueBodyAccumulation(self: *Server, conn: *connection.Connection) !void {
-        const buffer_handle = conn.read_buffer orelse return;
-        const start = conn.read_offset;
-        const end = start + conn.read_buffered_bytes;
-        if (end <= start) return;
-
-        const data = buffer_handle.bytes[start..end];
-        try self.appendBodyData(conn, data);
-        self.io.onReadConsumed(conn, data.len);
-
-        if (self.bodyComplete(conn)) {
-            try self.dispatchWithAccumulatedBody(conn);
-        }
-    }
-
-    /// Append raw body data into body accumulator buffers.
-    fn appendBodyData(self: *Server, conn: *connection.Connection, data: []u8) !void {
-        const accum = &(conn.body_accum orelse return);
-        var remaining = data;
-
-        if (accum.is_chunked) {
-            // Feed through chunk decoder
-            while (remaining.len > 0 and !accum.chunk_decoder.isDone()) {
-                // Ensure we have a destination buffer
-                if (accum.buffer_count == 0 or accum.current_buf_offset >= self.io.bodyBufferSize()) {
-                    if (accum.buffer_count >= connection.BodyAccumState.MAX_BODY_BUFFERS) {
-                        return error.BodyTooLarge;
-                    }
-                    const buf = self.io.acquireBodyBuffer() orelse return error.OutOfMemory;
-                    accum.body_buffers[accum.buffer_count] = buf;
-                    accum.buffer_count += 1;
-                    accum.current_buf_offset = 0;
-                }
-                const cur_buf = accum.body_buffers[accum.buffer_count - 1];
-                const dst = cur_buf.bytes[accum.current_buf_offset..];
-                const result = accum.chunk_decoder.feed(remaining, dst) catch |err| {
-                    return switch (err) {
-                        error.BodyTooLarge => error.BodyTooLarge,
-                        error.InvalidChunk => error.InvalidRequest,
-                    };
-                };
-                accum.current_buf_offset += result.decoded;
-                accum.bytes_decoded += result.decoded;
-                remaining = remaining[result.consumed..];
-                accum.bytes_received += result.consumed;
-            }
-        } else {
-            // Content-Length: raw copy
-            while (remaining.len > 0) {
-                const left = accum.content_length - accum.bytes_received;
-                if (left == 0) break;
-                const to_consume = @min(remaining.len, left);
-
-                // Ensure we have a destination buffer
-                if (accum.buffer_count == 0 or accum.current_buf_offset >= self.io.bodyBufferSize()) {
-                    if (accum.buffer_count >= connection.BodyAccumState.MAX_BODY_BUFFERS) {
-                        return error.BodyTooLarge;
-                    }
-                    const buf = self.io.acquireBodyBuffer() orelse return error.OutOfMemory;
-                    accum.body_buffers[accum.buffer_count] = buf;
-                    accum.buffer_count += 1;
-                    accum.current_buf_offset = 0;
-                }
-                const cur_buf = accum.body_buffers[accum.buffer_count - 1];
-                const dst = cur_buf.bytes[accum.current_buf_offset..];
-                const copy_len = @min(to_consume, dst.len);
-                @memcpy(dst[0..copy_len], remaining[0..copy_len]);
-                accum.current_buf_offset += copy_len;
-                accum.bytes_received += copy_len;
-                accum.bytes_decoded += copy_len;
-                remaining = remaining[copy_len..];
-            }
-        }
-    }
-
-    /// Check if body accumulation is complete.
-    fn bodyComplete(_: *Server, conn: *connection.Connection) bool {
-        const accum = conn.body_accum orelse return false;
-        if (accum.is_chunked) {
-            return accum.chunk_decoder.isDone();
-        }
-        return accum.bytes_received >= accum.content_length;
-    }
-
-    /// Dispatch a request with accumulated body data to handler/proxy.
-    fn dispatchWithAccumulatedBody(self: *Server, conn: *connection.Connection) !void {
-        const accum = &(conn.body_accum orelse return);
-        const hparse = accum.header_result;
-        const fd = conn.fd orelse return;
-
-        // Build BodyView from accumulated buffers
-        const body_view = forward_mod.BodyView{
-            .buffers = .{
-                .handles = accum.body_buffers[0..accum.buffer_count],
-                .last_buf_len = accum.current_buf_offset,
-                .total_len = accum.bytes_decoded,
-                .buffer_size = self.io.bodyBufferSize(),
-            },
-        };
-
-        // Check proxy routes first
-        if (self.proxy) |proxy| {
-            if (proxy.matchRoute(&hparse.view) != null) {
-                var mw_ctx = middleware.Context{
-                    .protocol = .http1,
-                    .buffer_ops = .{
-                        .ctx = &self.io,
-                        .acquire = acquireBufferOpaque,
-                        .release = releaseBufferOpaque,
-                    },
-                };
-                var ip_buf: [64]u8 = undefined;
-                var client_ip_str: ?[]const u8 = null;
-                if (conn.cached_peer_ip) |ip4| {
-                    const ip_len = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ ip4[0], ip4[1], ip4[2], ip4[3] }) catch "";
-                    if (ip_len.len > 0) client_ip_str = ip_buf[0..ip_len.len];
-                }
-                var proxy_result = proxy.handleWithBody(
-                    hparse.view,
-                    body_view,
-                    &mw_ctx,
-                    client_ip_str,
-                    false,
-                    self.io.nowMs(),
-                );
-                defer proxy_result.release();
-
-                self.cleanupBodyAccumulation(conn);
-                try self.queueResponse(conn, proxy_result.resp);
-                // Materialize pending_body before proxy_result.release() frees the upstream buffer
-                if (conn.pending_body.len > 0) {
-                    self.materializePendingBody(conn);
-                }
-                return;
-            }
-        }
-
-        // Handler path: linearize body into contiguous allocation
-        const total_len = accum.bytes_decoded;
-        if (total_len > 0) {
-            const buffer_count = accum.buffer_count;
-            const last_buf_len = accum.current_buf_offset;
-            const buffer_size = self.io.bodyBufferSize();
-
-            const body_mem = self.allocator.alloc(u8, total_len) catch {
-                self.abortBodyAccumulation(conn, 503);
-                return;
-            };
-
-            // Copy from body buffers into contiguous memory
-            var copied: usize = 0;
-            for (0..buffer_count) |i| {
-                const handle = accum.body_buffers[i];
-                const buf_len = if (i == buffer_count - 1)
-                    last_buf_len
-                else
-                    buffer_size;
-                @memcpy(body_mem[copied .. copied + buf_len], handle.bytes[0..buf_len]);
-                copied += buf_len;
-            }
-
-            // Build RequestView with body
-            const req_view = request.RequestView{
-                .method = hparse.view.method,
-                .method_raw = hparse.view.method_raw,
-                .path = hparse.view.path,
-                .headers = hparse.view.headers,
-                .body = body_mem[0..total_len],
-            };
-
-            if (!self.isAllowedHost(req_view)) {
-                conn.close_after_write = true;
-                self.cleanupBodyAccumulation(conn);
-                self.queueResponse(conn, badRequestResponse()) catch {};
-                self.allocator.free(body_mem);
-                return;
-            }
-
-            // Dispatch to router, but check result before queueing to detect echo responses
-            // that can use scattered body buffers instead of re-copying.
-            var mw_ctx = middleware.Context{
-                .protocol = .http1,
-                .buffer_ops = .{
-                    .ctx = &self.io,
-                    .acquire = acquireBufferOpaque,
-                    .release = releaseBufferOpaque,
-                },
-            };
-            if (conn.cached_peer_ip) |ip4| {
-                mw_ctx.client_ip = ip4;
-            } else if (conn.cached_peer_ip6) |ip6| {
-                mw_ctx.client_ip6 = ip6;
-            }
-            var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
-            var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
-            const arena_handle = self.io.acquireBuffer();
-            var empty_arena: [0]u8 = undefined;
-            const arena_buf = if (arena_handle) |handle| handle.bytes else empty_arena[0..];
-            var scratch = router.HandlerScratch{
-                .response_buf = response_buf[0..],
-                .response_headers = response_headers[0..],
-                .arena_buf = arena_buf,
-                .arena_handle = arena_handle,
-                .buffer_ops = mw_ctx.buffer_ops,
-            };
-            const result = self.app_router.handle(req_view, &mw_ctx, &scratch);
-            if (scratch.arena_handle) |handle| self.io.releaseBuffer(handle);
-            if (result.pause_reads_ms) |pause_ms| {
-                conn.setRateLimitPause(self.io.nowMs(), pause_ms);
-            }
-
-            // Previously a zero-copy echo path transferred body buffers
-            // to the write queue as a scattered response. Disabled now
-            // that body buffers are from a separate pool with different
-            // size — the transfer would require per-handle pool tagging.
-            // The echo case still works via the normal copy path below.
-            {
-                // Non-echo response: cleanup body buffers and queue normally
-                self.cleanupBodyAccumulation(conn);
-                self.queueResponse(conn, result.resp) catch {};
-                if (conn.pending_body.len > 0) {
-                    self.materializePendingBody(conn);
-                }
-                self.allocator.free(body_mem);
-            }
-        } else {
-            self.cleanupBodyAccumulation(conn);
-            self.dispatchToRouter(conn, hparse.view, fd);
-        }
-    }
-
-    /// Dispatch a fully-formed request to the router (extracted for reuse).
-    fn dispatchToRouter(self: *Server, conn: *connection.Connection, req_view: request.RequestView, _: std.posix.fd_t) void {
-        if (!self.isAllowedHost(req_view)) {
-            conn.close_after_write = true;
-            self.queueResponse(conn, badRequestResponse()) catch {};
-            return;
-        }
-
-        // Fast path: pre-encoded h1 response cache.
-        if (preencoded.tryDispatchPreencodedH1(self, conn, req_view) == .dispatched) return;
-
-        var mw_ctx = middleware.Context{
-            .protocol = .http1,
-            .buffer_ops = .{
-                .ctx = &self.io,
-                .acquire = acquireBufferOpaque,
-                .release = releaseBufferOpaque,
-            },
-        };
-        // Use cached client IP for rate limiting and logging
-        if (conn.cached_peer_ip) |ip4| {
-            mw_ctx.client_ip = ip4;
-        } else if (conn.cached_peer_ip6) |ip6| {
-            mw_ctx.client_ip6 = ip6;
-        }
-        var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
-        var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
-        const arena_handle = self.io.acquireBuffer();
-        var empty_arena: [0]u8 = undefined;
-        const arena_buf = if (arena_handle) |handle| handle.bytes else empty_arena[0..];
-        var scratch = router.HandlerScratch{
-            .response_buf = response_buf[0..],
-            .response_headers = response_headers[0..],
-            .arena_buf = arena_buf,
-            .arena_handle = arena_handle,
-            .buffer_ops = mw_ctx.buffer_ops,
-        };
-        const result = self.app_router.handle(req_view, &mw_ctx, &scratch);
-        if (scratch.arena_handle) |handle| self.io.releaseBuffer(handle);
-        if (result.pause_reads_ms) |pause_ms| {
-            conn.setRateLimitPause(self.io.nowMs(), pause_ms);
-        }
-        self.queueResponse(conn, result.resp) catch {};
-    }
-
-    /// Release all acquired body buffers and free BodyAccumState.
-    fn cleanupBodyAccumulation(self: *Server, conn: *connection.Connection) void {
-        if (conn.body_accum) |*accum| {
-            for (0..accum.buffer_count) |i| {
-                self.io.releaseBodyBuffer(accum.body_buffers[i]);
-            }
-            // The original read buffer is from the hot-path pool
-            if (accum.original_read_buffer) |buf| {
-                self.io.releaseBuffer(buf);
-            }
-            conn.body_accum = null;
-        }
-    }
-
-    /// Copy pending_body into pool buffers so the original allocation can be freed.
-    /// Called when a handler response references temporary body memory (e.g., echo with
-    /// accumulated body). Enqueues as many chunks as the write queue allows; any overflow
-    /// is stored back in pending_body pointing to the new pool buffer (safe lifetime).
-    fn materializePendingBody(self: *Server, conn: *connection.Connection) void {
-        // Use streamBodyChunks which already copies into pool buffers and enqueues.
-        // After this call, pending_body either points to a pool buffer or is empty.
-        // The key insight: streamBodyChunks copies bytes into acquired pool buffers,
-        // and if the write queue is full, stores 'remaining' as pending_body.
-        // That 'remaining' is a subslice of the source — still pointing to body_mem.
-        // We need to fully materialize everything NOW.
-        var remaining = conn.pending_body;
-        conn.pending_body = &[_]u8{};
-
-        while (remaining.len > 0) {
-            const body_buf = self.io.acquireBuffer() orelse {
-                // Out of buffers — drop remaining data, close after current writes
-                conn.close_after_write = true;
-                return;
-            };
-            const chunk_len = @min(remaining.len, body_buf.bytes.len);
-            @memcpy(body_buf.bytes[0..chunk_len], remaining[0..chunk_len]);
-            if (!conn.enqueueWrite(body_buf, chunk_len)) {
-                // Write queue full — this chunk is in a pool buffer but can't be enqueued.
-                // Store the pool buffer slice as pending_body (safe lifetime — pool buffer).
-                // The remaining un-copied source data is lost, but the chunk we just copied
-                // will be streamed via handleWrite → streamBodyChunks later.
-                self.io.releaseBuffer(body_buf);
-                conn.close_after_write = true;
-                return;
-            }
-            self.io.onWriteBuffered(conn, chunk_len);
-            remaining = remaining[chunk_len..];
-        }
-    }
-
-    /// Abort body accumulation with an error response, then close.
-    fn abortBodyAccumulation(self: *Server, conn: *connection.Connection, status: u16) void {
-        self.cleanupBodyAccumulation(conn);
-        conn.close_after_write = true;
-        const resp: response_mod.Response = .{
-            .status = status,
-            .headers = &[_]response_mod.Header{},
-            .body = .{ .bytes = if (status == 413) "Payload Too Large\n" else "Bad Request\n" },
-        };
-        self.queueResponse(conn, resp) catch {};
-    }
-
     pub fn closeConnection(self: *Server, conn: *connection.Connection) void {
         // Clean up TLS session before closing the socket
         conn.cleanupTls();
@@ -2361,7 +1517,7 @@ pub const Server = struct {
             conn.http2_stack = null;
         }
         // Clean up body accumulation state
-        self.cleanupBodyAccumulation(conn);
+        http1_mod.cleanupBodyAccumulation(self, conn);
         // Drain write queue before releasing read buffer to avoid double-free
         // if a buffer handle appears in both places
         while (conn.peekWrite()) |entry| {
@@ -2536,7 +1692,7 @@ test "metrics middleware response queued for http1" {
     const conn = server.io.acquireConnection(server.io.nowMs()) orelse return error.OutOfMemory;
     defer if (conn.state != .closed) server.io.releaseConnection(conn);
 
-    try server.queueResponse(conn, result.resp);
+    try http1_mod.queueResponse(&server, conn, result.resp);
     // Managed body fits alongside headers — combined into single write
     try std.testing.expectEqual(@as(u8, 1), conn.write_count);
 
@@ -2713,7 +1869,7 @@ test "metrics middleware end-to-end http1" {
     const conn = server.io.acquireConnection(server.io.nowMs()) orelse return error.OutOfMemory;
     defer if (conn.state != .closed) server.io.releaseConnection(conn);
 
-    try server.queueResponse(conn, result.resp);
+    try http1_mod.queueResponse(&server, conn, result.resp);
     // Managed body fits alongside headers — combined into single write
     try std.testing.expectEqual(@as(u8, 1), conn.write_count);
 
@@ -2884,7 +2040,7 @@ test "http1 response bytes from write queue" {
         .body = .{ .bytes = "hi" },
     };
 
-    try server.queueResponse(conn, resp);
+    try http1_mod.queueResponse(&server, conn, resp);
     const bytes = try drainWriteQueue(&server.io, conn, allocator);
     defer allocator.free(bytes);
 
@@ -2931,7 +2087,7 @@ test "http1 managed response bytes from write queue" {
     const conn = server.io.acquireConnection(server.io.nowMs()) orelse return error.OutOfMemory;
     defer if (conn.state != .closed) server.io.releaseConnection(conn);
 
-    try server.queueResponse(conn, resp);
+    try http1_mod.queueResponse(&server, conn, resp);
     const bytes = try drainWriteQueue(&server.io, conn, allocator);
     defer allocator.free(bytes);
 
