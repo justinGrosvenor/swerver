@@ -96,6 +96,7 @@ comptime {
     _ = benchmark_routes;
     _ = @import("server/preencoded.zig");
     _ = @import("server/tls.zig");
+    _ = @import("server/accept.zig");
 
     // Runtime
     _ = buffer_pool;

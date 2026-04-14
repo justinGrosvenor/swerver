@@ -23,6 +23,7 @@ const proxy_mod = @import("proxy/proxy.zig");
 const forward_mod = @import("proxy/forward.zig");
 const preencoded = @import("server/preencoded.zig");
 const server_tls = @import("server/tls.zig");
+const accept_mod = @import("server/accept.zig");
 
 /// Global shutdown flag set by signal handler (atomic for signal safety)
 var shutdown_requested = std.atomic.Value(bool).init(false);
@@ -450,12 +451,12 @@ pub const Server = struct {
                         //    until EAGAIN (epoll, poll, io_uring_poll,
                         //    and native-with-inline-accept).
                         if (event.handle) |client_fd| {
-                            self.handlePreAccepted(client_fd) catch |err| {
+                            accept_mod.handlePreAccepted(self, client_fd) catch |err| {
                                 std.log.warn("Pre-accepted setup failed: {}", .{err});
                             };
                         } else {
                             const fd = self.listener_fd orelse continue;
-                            self.handleAccept(fd) catch |err| {
+                            accept_mod.handleAccept(self, fd) catch |err| {
                                 std.log.warn("Accept failed: {}", .{err});
                             };
                         }
@@ -593,124 +594,6 @@ pub const Server = struct {
 
     pub fn runFor(self: *Server, run_for_ms: u64) !void {
         try self.run(run_for_ms);
-    }
-
-    fn handleAccept(self: *Server, listener_fd: std.posix.fd_t) !void {
-        // Edge-triggered epoll: must drain the accept queue in a loop or
-        // pending connections will be stranded until the next "transition".
-        while (true) {
-            self.acceptOne(listener_fd) catch |err| switch (err) {
-                error.WouldBlock => return,
-                else => return err,
-            };
-        }
-    }
-
-    /// Called when the io_uring_native backend delivers a multishot
-    /// accept CQE. The kernel has already accepted the connection and
-    /// given us the client fd — already non-blocking and close-on-exec
-    /// because armMultishotAccept passed SOCK_NONBLOCK | SOCK_CLOEXEC
-    /// as the accept flags. Go straight to the per-connection setup.
-    fn handlePreAccepted(self: *Server, client_fd: std.posix.fd_t) !void {
-        try self.setupAcceptedConnection(client_fd);
-    }
-
-    fn acceptOne(self: *Server, listener_fd: std.posix.fd_t) !void {
-        const client_fd = net.accept(listener_fd) catch |err| switch (err) {
-            error.WouldBlock => return error.WouldBlock,
-            else => return err,
-        };
-        try self.setupAcceptedConnection(client_fd);
-    }
-
-    /// Common per-connection setup after an accept: acquire a pool
-    /// connection, wire up the read buffer, register with the backend,
-    /// start TLS if configured.
-    ///
-    /// TCP_NODELAY is set on the listener so accepted sockets inherit
-    /// it — we used to call setsockopt per accept, which showed up as
-    /// ~7% of server syscall time on connection-churn benchmarks.
-    ///
-    /// Peer address caching via getpeername only fires when reverse
-    /// proxy is configured (for X-Forwarded-For). Rate-limiting /
-    /// access-log middleware that needs the peer IP can call
-    /// `net.getPeerAddress(conn.fd)` directly on the cold path —
-    /// benchmark configs pay zero getpeername syscalls this way.
-    fn setupAcceptedConnection(self: *Server, client_fd: std.posix.fd_t) !void {
-        const now_ms = self.io.nowMs();
-        const conn = self.io.acquireConnection(now_ms) orelse {
-            clock.closeFd(client_fd);
-            return;
-        };
-        if (self.io.acquireBuffer()) |buf| {
-            conn.read_buffer = buf;
-        } else {
-            self.io.releaseConnection(conn);
-            clock.closeFd(client_fd);
-            return;
-        }
-        conn.fd = client_fd;
-        if (self.proxy != null) {
-            if (net.getPeerAddress(client_fd)) |peer| {
-                if (peer.getIp4Bytes()) |ip4| {
-                    conn.cached_peer_ip = ip4;
-                } else if (peer.getIp6Bytes()) |ip6| {
-                    conn.cached_peer_ip6 = ip6;
-                }
-            }
-        }
-        // If TLS is configured, start handshake before going active
-        if (self.tcp_tls_provider) |*provider| {
-            conn.tls_session = provider.createTcpMemSession() catch {
-                if (conn.read_buffer) |buf| self.io.releaseBuffer(buf);
-                self.io.releaseConnection(conn);
-                clock.closeFd(client_fd);
-                return;
-            };
-            conn.is_tls = true;
-            conn.transition(.handshake, now_ms) catch {
-                conn.cleanupTls();
-                if (conn.read_buffer) |buf| self.io.releaseBuffer(buf);
-                self.io.releaseConnection(conn);
-                clock.closeFd(client_fd);
-                return;
-            };
-            self.io.setTimeoutPhase(conn, .header);
-            self.io.registerConnection(conn.index, client_fd) catch |err| {
-                conn.cleanupTls();
-                if (conn.read_buffer) |buf| self.io.releaseBuffer(buf);
-                self.io.releaseConnection(conn);
-                clock.closeFd(client_fd);
-                return err;
-            };
-            // Try handshake immediately (may complete in one round-trip)
-            server_tls.handleTlsHandshake(self, conn) catch {
-                self.closeConnection(conn);
-                return;
-            };
-        } else {
-            conn.transition(.active, now_ms) catch {
-                // Invalid state transition - close connection
-                if (conn.read_buffer) |buf| self.io.releaseBuffer(buf);
-                self.io.releaseConnection(conn);
-                clock.closeFd(client_fd);
-                return;
-            };
-            self.io.setTimeoutPhase(conn, .header);
-            self.io.registerConnection(conn.index, client_fd) catch |err| {
-                if (conn.read_buffer) |buf| self.io.releaseBuffer(buf);
-                self.io.releaseConnection(conn);
-                clock.closeFd(client_fd);
-                return err;
-            };
-            // With edge-triggered epoll, we must try to read immediately after accept
-            // because data may have arrived before we registered the socket.
-            // If we don't do this, we'll miss the EPOLLIN notification.
-            self.handleRead(conn.index) catch {
-                self.closeConnection(conn);
-                return;
-            };
-        }
     }
 
     /// Maximum datagrams to drain per handleDatagram call before
