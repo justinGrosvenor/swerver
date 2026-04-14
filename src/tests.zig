@@ -100,6 +100,7 @@ comptime {
     _ = @import("server/http3.zig");
     _ = @import("server/http2.zig");
     _ = @import("server/http1.zig");
+    _ = @import("server/dispatch.zig");
 
     // Runtime
     _ = buffer_pool;
