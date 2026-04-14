@@ -14,6 +14,12 @@ const build_options = @import("build_options");
 const test_utils = @import("test_utils.zig");
 const tls = @import("../tls/provider.zig");
 
+/// Maximum additional ACK ranges (beyond the first range) a single ACK
+/// frame may emit. Sized to comfortably cover the 64-bit receive
+/// bitmap's worst case (32 interleaved ack/gap pairs) without
+/// over-allocating on the stack for the common single-range case.
+const MAX_ACK_RANGES: usize = 32;
+
 /// QUIC packet handler
 ///
 /// Processes incoming QUIC datagrams and produces responses.
@@ -778,7 +784,6 @@ pub const Handler = struct {
                     .conn = conn,
                     .keys = &application_keys_opt.?,
                     .ack_largest = if (conn.application_space.ack_needed) conn.application_space.largest_received else null,
-                    .ack_first_range = conn.application_space.firstAckRange(),
                     .send_handshake_done = !conn.handshake_done_sent,
                 },
             );
@@ -997,10 +1002,13 @@ fn buildHandshakePacket(out: []u8, opts: BuildPacketOptions) Error!BuildPacketRe
 pub const BuildShortPacketOptions = struct {
     conn: *connection.Connection,
     keys: *const crypto.Keys,
-    /// If non-null, emit an ACK frame acking the contiguous range
-    /// [ack_largest - ack_first_range, ack_largest] in the app space.
+    /// If non-null, emit an ACK frame for the application packet
+    /// number space covering every received packet in the current
+    /// 64-bit bitmap window. The builder walks
+    /// `conn.application_space.collectAckRanges` internally — callers
+    /// only need to say "yes, I want an ACK" by setting this to the
+    /// `largest_received` value.
     ack_largest: ?u64 = null,
-    ack_first_range: u64 = 0,
     /// Should this packet include a HANDSHAKE_DONE frame?
     send_handshake_done: bool = false,
     /// Optional STREAM frame payload to include. When set the builder
@@ -1060,10 +1068,23 @@ pub fn buildShortPacket(out: []u8, opts: BuildShortPacketOptions) Error!BuildPac
 
     // ---- Plaintext payload ----
 
-    // ACK frame (per-application-space). First ACK range from the
-    // receive bitmap so we never claim packets we haven't actually seen.
+    // ACK frame (per-application-space). Walk the receive bitmap to
+    // collect multi-range acknowledgements so lossy paths don't force
+    // the peer to retransmit everything below the first gap.
+    // `opts.ack_first_range` is ignored here — we compute it fresh
+    // from the connection's packet number space, which is the same
+    // data the caller looked at (no risk of skew).
     if (opts.ack_largest) |largest| {
-        const acked = frame.writeAckRange(out[off..], largest, opts.ack_first_range, 0) catch return Error.HandshakeFailed;
+        var range_buf: [MAX_ACK_RANGES]frame.AckRange = undefined;
+        const ranges = conn_ref.application_space.collectAckRanges(&range_buf);
+        const additional = range_buf[0..ranges.additional_count];
+        const acked = frame.writeAckMultiRange(
+            out[off..],
+            largest,
+            ranges.first_range,
+            additional,
+            0,
+        ) catch return Error.HandshakeFailed;
         off += acked;
     }
 

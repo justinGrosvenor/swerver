@@ -8,10 +8,12 @@
 
 ```
 HTTP/1.1 ──┐
-HTTP/2   ──┼──► swerver ──► kqueue/epoll ──► your code
+HTTP/2   ──┼──► swerver ──► kqueue/epoll/io_uring ──► your code
 HTTP/3   ──┘      │
                   └── QUIC (RFC 9000-9002)
 ```
+
+> **Alpha release.** The public library API in `src/lib.zig` will change between alpha versions as it's iterated on. Breaking changes are announced in release notes. See [Known limitations](#known-limitations) for what's in and out of scope for the current release.
 
 ## Why
 
@@ -70,6 +72,111 @@ zig build bench
 ```
 
 The server listens on `0.0.0.0:8080` by default.
+
+## Install
+
+### Build from source
+
+The canonical install path, and currently the only way to get a binary with TLS / HTTP/2 / HTTP/3 enabled. Requires Zig `0.16.0-dev.2135+7c0b42ba0` and OpenSSL 3.5+.
+
+```bash
+git clone https://github.com/justinGrosvenor/swerver.git
+cd swerver
+zig build -Doptimize=ReleaseFast -Denable-tls=true -Denable-http2=true -Denable-http3=true
+./zig-out/bin/swerver --config config.json
+```
+
+### Pre-built binaries (GitHub Releases)
+
+Tagged alpha releases publish cross-compiled binaries for linux-{x86_64, aarch64} and macos-{x86_64, aarch64} on the [Releases page](https://github.com/justinGrosvenor/swerver/releases). Download, extract, and run:
+
+```bash
+curl -LO https://github.com/justinGrosvenor/swerver/releases/download/v0.1.0-alpha.1/swerver-v0.1.0-alpha.1-linux-x86_64.tar.gz
+tar -xzf swerver-v0.1.0-alpha.1-linux-x86_64.tar.gz
+./swerver-v0.1.0-alpha.1-linux-x86_64 --config config.json
+```
+
+> **Release binaries are built without TLS, HTTP/2, or HTTP/3.** OpenSSL linking requires the host toolchain, so the cross-compiled binaries ship as HTTP/1.1-only. If you need HTTPS / HTTP/2 / HTTP/3 support, build from source (above) or use the Docker image (below). A future release may split the matrix into TLS and no-TLS variants.
+
+### Docker
+
+For a full-featured (TLS / HTTP/2 / HTTP/3) runtime image:
+
+```bash
+# Build from the repo root
+docker build -t swerver -f httparena/Dockerfile --build-arg USE_LOCAL=1 .
+docker run -p 8080:8080 -p 8443:8443 -p 8443:8443/udp swerver
+```
+
+The Dockerfile uses `debian:trixie` (OpenSSL 3.5) in the build stage and `debian:trixie-slim` at runtime, matching the ABI the HttpArena submission targets.
+
+## Use as a library
+
+Swerver ships as a Zig package — you can depend on it from another Zig project and embed the server into your own binary.
+
+In your downstream project's `build.zig.zon`:
+
+```zig
+.{
+    .name = .my_app,
+    .version = "0.1.0",
+    .dependencies = .{
+        .swerver = .{
+            .url = "https://github.com/justinGrosvenor/swerver/archive/refs/tags/v0.1.0-alpha.1.tar.gz",
+            // .hash will be filled in by `zig fetch --save`
+        },
+    },
+    .paths = .{""},
+}
+```
+
+In your `build.zig`:
+
+```zig
+const swerver_dep = b.dependency("swerver", .{
+    .target = target,
+    .optimize = optimize,
+});
+exe.root_module.addImport("swerver", swerver_dep.module("swerver"));
+```
+
+In your application code:
+
+```zig
+const std = @import("std");
+const swerver = @import("swerver");
+
+fn handleHello(ctx: *swerver.router.HandlerContext) swerver.response.Response {
+    _ = ctx;
+    return .{
+        .status = 200,
+        .headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
+        .body = .{ .bytes = "Hello, World!\n" },
+    };
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var app_router = swerver.router.Router.init(.{
+        .require_payment = false,
+        .payment_required_b64 = "",
+    });
+    try app_router.get("/hello", handleHello);
+
+    var builder = swerver.ServerBuilder.configDefault().router(app_router);
+    const srv = try builder.build(allocator);
+    defer {
+        srv.deinit();
+        allocator.destroy(srv);
+    }
+    try srv.run(null);
+}
+```
+
+See `examples/embedded/` for a complete, compiling example.
 
 ## Architecture
 
@@ -132,6 +239,8 @@ const cfg = BufferPoolConfig{
 ## Configuration
 
 ### JSON config file
+
+The config file schema is at version `1.0` (see `SCHEMA_VERSION` in `src/config_file.zig`). Core fields — `server`, `timeouts`, `limits`, `buffer_pool`, `tls`, `quic`, `upstreams`, `routes` — are stable for the `v0.1.0-alpha.N` series. Newer sub-schemas (`access_log`, `metrics`, `rate_limit`, `x402`) may move before 1.0; config files that set only the core fields will survive alpha version bumps.
 
 ```bash
 zig build run -- --config config.json
@@ -246,15 +355,6 @@ pub const Decision = union(enum) {
 | `-Denable-io-uring=true` | Enable io_uring backend (Linux) |
 | `-Doptimize=ReleaseFast` | Maximum performance |
 
-### CI note
-
-Some environments restrict access to Zig's global cache. If tests fail with `PermissionDenied`, set:
-
-```bash
-export ZIG_GLOBAL_CACHE_DIR="$(pwd)/.zig-cache-global"
-export ZIG_LOCAL_CACHE_DIR="$(pwd)/.zig-cache"
-```
-
 ## Requirements
 
 - Zig 0.16.0-dev or later
@@ -263,7 +363,9 @@ export ZIG_LOCAL_CACHE_DIR="$(pwd)/.zig-cache"
 
 ## Performance
 
-### Native (wrk, single process, macOS Apple Silicon)
+### Local sanity check (wrk, single process, macOS Apple Silicon)
+
+These are reproducible laptop numbers for people checking the repo out. They're not the authoritative competitive benchmark — see the HttpArena submission for that.
 
 | Endpoint | Connections | Requests/sec | Avg Latency | Transfer/sec |
 |----------|------------|-------------|-------------|--------------|
@@ -273,28 +375,11 @@ export ZIG_LOCAL_CACHE_DIR="$(pwd)/.zig-cache"
 | GET /json | 100 | **267,543** | 335us | 34.5 MB/s |
 | GET /blob (1MB) | 50 | **6,811** | 7.35ms | 6.65 GB/s |
 
-### Docker k6 (100 VUs, 30s, 2 CPU / 512MB per container, April 2026)
+### HttpArena leaderboard
 
-Tested against nginx, actix (Rust/Tokio), Apache APISIX (nginx + LuaJIT gateway), and http-zig (Zig stdlib).
+<!-- CRITICAL: backfill with v0.1.0-alpha.1 Linux benchmark numbers before tagging alpha.1. -->
 
-| Scenario | swerver | actix | nginx | apisix |
-|----------|---------|-------|-------|--------|
-| **Throughput** (req/s) | **169,815** | 133,691 | 118,061 | 91,522 |
-| **Concurrent** ramp to 1000 VUs (req/s) | **156,854** | 149,558 | 120,577 | 92,751 |
-| **Connections** new conn/req (conn/s) | **90,657** | 66,019 | 19,206 | 22,916 |
-| **Spike** 50→1000 VUs (req/s) | **147,136** | 137,189 | 114,119 | 95,129 |
-| **Rapid-fire** 200 VUs (req/s) | **152,187** | 128,155 | 125,346 | 94,279 |
-| **Error path** p99 (ms) | **2.02** | 2.65 | 34.97 | 35.48 |
-
-### Docker k6 TLS + HTTP/2 (100 VUs, 30s, April 2026)
-
-HTTPS and HTTP/2-over-TLS workloads. See [benchmarks repo](https://github.com/justinGrosvenor/swerver-benchmarks/tree/main/scenarios/tls-http2).
-
-| Scenario | swerver | actix | nginx | apisix |
-|----------|---------|-------|-------|--------|
-| **TLS throughput** (req/s) | 161,781 | **171,726** | 107,741 | 71,851 |
-| **H2 throughput** (req/s) | 111,698 | **129,428** | 95,878 | 68,731 |
-| **TLS handshake** (req/s, 0% err) | **1,829** | 2,765 | 1,578 (34% err) | 1,552 (32% err) |
+Swerver is submitted to [HttpArena's](https://www.http-arena.com/) engine-tier cohort, which runs every framework in the same Docker-compose environment on the same 64-core hardware with the same wrk/gcannon/oha harness. Numbers for the `v0.1.0-alpha.1` submission will land here once the Linux benchmark run is complete — see the HttpArena leaderboard directly for the current state.
 
 ### Microbenchmarks
 
@@ -303,6 +388,20 @@ zig build bench
 buffer_pool acquire/release: 21 ns/op
 connection_pool acquire/release: 30 ns/op
 ```
+
+## Known limitations
+
+Forward-looking notes about API stability and feature scope. **These are not known bugs** — they're promises about what is and isn't in the current release.
+
+- **API surface is not frozen.** Public types in `src/lib.zig` may change between alpha versions while the library surface is iterated on. Breaking changes are announced in release notes. The API will be frozen at the 1.0 release.
+- **HTTP/3 is a young stack.** The RFC 9000-9002 + 9114 implementation is complete and handles real workloads (GET and POST/PUT both work end-to-end, verified by `scripts/test-h3-interop.sh`), but it hasn't seen the hardening that the HTTP/1.1 and HTTP/2 paths have. Treat it as production-capable but new.
+- **Platform support is Linux and macOS only.** Windows is cross-compile-only — no IOCP backend, no sendfile. On the long-term roadmap but not part of the alpha.
+- **WebSocket server support is not implemented.** On the 1.0 roadmap.
+- **Full QUIC 0-RTT / early data is not implemented.** The handshake works and post-handshake throughput is competitive; 0-RTT adds replay protection and per-session token storage that are deferred to a later release.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow, build options, test matrix, and repo-specific style conventions. Security issues go through [SECURITY.md](SECURITY.md) — please don't open public issues for vulnerabilities.
 
 ## License
 

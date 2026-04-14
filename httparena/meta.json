@@ -11,6 +11,7 @@
     "pipelined",
     "limited-conn",
     "noisy",
+    "json",
     "baseline-h2",
     "baseline-h3"
   ],

@@ -4,6 +4,7 @@ const request = @import("../protocol/request.zig");
 const response = @import("../response/response.zig");
 const middleware = @import("middleware.zig");
 const clock = @import("../runtime/clock.zig");
+const json_write = @import("../runtime/json_write.zig");
 
 const is_linux = builtin.os.tag == .linux;
 const linux = if (is_linux) std.os.linux else undefined;
@@ -46,137 +47,171 @@ pub const LogEntry = struct {
     message: ?[]const u8 = null,
     error_msg: ?[]const u8 = null,
 
-    /// Format as JSON (no heap allocation)
-    pub fn formatJson(self: *const LogEntry, buf: []u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const writer = fbs.writer();
-
-        try writer.writeAll("{");
-
-        // Timestamp
-        try writer.print("\"ts\":{d}", .{self.timestamp_ns});
-
-        // Level
-        try writer.print(",\"level\":\"{s}\"", .{self.level.toString()});
-
-        // Request ID
-        if (self.request_id) |rid| {
-            try writer.print(",\"request_id\":\"{s}\"", .{rid});
-        }
-
-        // Protocol
-        try writer.print(",\"protocol\":\"{s}\"", .{self.protocol.toString()});
-
-        // Stream ID (for HTTP/2 and HTTP/3)
-        if (self.stream_id != 0) {
-            try writer.print(",\"stream_id\":{d}", .{self.stream_id});
-        }
-
-        // Method
-        if (self.method) |m| {
-            try writer.print(",\"method\":\"{s}\"", .{@tagName(m)});
-        }
-
-        // Path (escaped for JSON safety)
-        if (self.path) |p| {
-            try writer.writeAll(",\"path\":\"");
-            try writeJsonEscaped(writer, p);
-            try writer.writeAll("\"");
-        }
-
-        // Status
-        if (self.status != 0) {
-            try writer.print(",\"status\":{d}", .{self.status});
-        }
-
-        // Latency
-        if (self.latency_us != 0) {
-            try writer.print(",\"latency_us\":{d}", .{self.latency_us});
-        }
-
-        // Client IP
-        if (self.client_ip) |ip| {
-            try writer.print(",\"client_ip\":\"{d}.{d}.{d}.{d}\"", .{ ip[0], ip[1], ip[2], ip[3] });
-        }
-
-        // Route (escaped for JSON safety)
-        if (self.route) |r| {
-            try writer.writeAll(",\"route\":\"");
-            try writeJsonEscaped(writer, r);
-            try writer.writeAll("\"");
-        }
-
-        // Message (escaped for JSON safety)
-        if (self.message) |msg| {
-            try writer.writeAll(",\"msg\":\"");
-            try writeJsonEscaped(writer, msg);
-            try writer.writeAll("\"");
-        }
-
-        // Error (escaped for JSON safety)
-        if (self.error_msg) |err_msg| {
-            try writer.writeAll(",\"error\":\"");
-            try writeJsonEscaped(writer, err_msg);
-            try writer.writeAll("\"");
-        }
-
-        try writer.writeAll("}\n");
-
-        return fbs.getWritten();
+    /// Write a JSON `,"key":"escaped_value"` field into `out`, returning
+    /// the total bytes written. `prefix` is the literal `,"key":"` segment
+    /// — **the leading comma is not optional**. Closes the value with `"`.
+    ///
+    /// REQUIRES: at least one field must have already been written to the
+    /// buffer before this is called, otherwise the resulting JSON will
+    /// start with a stray `,`. In `formatJson`, the `ts` and `level` pair
+    /// is always emitted first and unconditionally, which satisfies this
+    /// invariant. If you add an earlier optional field, thread a
+    /// `first: bool` through the helper instead — don't quietly rely on
+    /// ordering.
+    fn writeEscapedField(out: []u8, prefix: []const u8, value: []const u8) !usize {
+        if (prefix.len > out.len) return error.NoSpaceLeft;
+        @memcpy(out[0..prefix.len], prefix);
+        var off: usize = prefix.len;
+        const escaped = try json_write.writeEscaped(out[off..], value);
+        off += escaped.len;
+        if (off + 1 > out.len) return error.NoSpaceLeft;
+        out[off] = '"';
+        off += 1;
+        return off;
     }
 
-    /// Format as logfmt (key=value pairs)
-    pub fn formatLogfmt(self: *const LogEntry, buf: []u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const writer = fbs.writer();
+    /// Format as JSON (no heap allocation). Control characters in
+    /// path/route/message/error fields are emitted as `\u00XX` per RFC 8259
+    /// via `json_write.writeEscaped`. Returns `error.NoSpaceLeft` if `buf`
+    /// is too small to hold the serialized entry.
+    pub fn formatJson(self: *const LogEntry, buf: []u8) ![]const u8 {
+        var off: usize = 0;
 
-        try writer.print("ts={d} level={s}", .{ self.timestamp_ns, self.level.toString() });
+        const header = try std.fmt.bufPrint(
+            buf[off..],
+            "{{\"ts\":{d},\"level\":\"{s}\"",
+            .{ self.timestamp_ns, self.level.toString() },
+        );
+        off += header.len;
 
         if (self.request_id) |rid| {
-            try writer.print(" request_id={s}", .{rid});
+            const piece = try std.fmt.bufPrint(buf[off..], ",\"request_id\":\"{s}\"", .{rid});
+            off += piece.len;
         }
 
-        try writer.print(" protocol={s}", .{self.protocol.toString()});
+        const protocol = try std.fmt.bufPrint(buf[off..], ",\"protocol\":\"{s}\"", .{self.protocol.toString()});
+        off += protocol.len;
 
         if (self.stream_id != 0) {
-            try writer.print(" stream_id={d}", .{self.stream_id});
+            const piece = try std.fmt.bufPrint(buf[off..], ",\"stream_id\":{d}", .{self.stream_id});
+            off += piece.len;
         }
 
         if (self.method) |m| {
-            try writer.print(" method={s}", .{@tagName(m)});
+            const piece = try std.fmt.bufPrint(buf[off..], ",\"method\":\"{s}\"", .{@tagName(m)});
+            off += piece.len;
         }
 
         if (self.path) |p| {
-            try writer.print(" path=\"{s}\"", .{p});
+            off += try writeEscapedField(buf[off..], ",\"path\":\"", p);
         }
 
         if (self.status != 0) {
-            try writer.print(" status={d}", .{self.status});
+            const piece = try std.fmt.bufPrint(buf[off..], ",\"status\":{d}", .{self.status});
+            off += piece.len;
         }
 
         if (self.latency_us != 0) {
-            try writer.print(" latency_us={d}", .{self.latency_us});
+            const piece = try std.fmt.bufPrint(buf[off..], ",\"latency_us\":{d}", .{self.latency_us});
+            off += piece.len;
         }
 
         if (self.client_ip) |ip| {
-            try writer.print(" client_ip={d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] });
+            const piece = try std.fmt.bufPrint(buf[off..], ",\"client_ip\":\"{d}.{d}.{d}.{d}\"", .{ ip[0], ip[1], ip[2], ip[3] });
+            off += piece.len;
         }
 
         if (self.route) |r| {
-            try writer.print(" route=\"{s}\"", .{r});
+            off += try writeEscapedField(buf[off..], ",\"route\":\"", r);
         }
 
         if (self.message) |msg| {
-            try writer.print(" msg=\"{s}\"", .{msg});
+            off += try writeEscapedField(buf[off..], ",\"msg\":\"", msg);
+        }
+
+        if (self.error_msg) |err_msg| {
+            off += try writeEscapedField(buf[off..], ",\"error\":\"", err_msg);
+        }
+
+        if (off + 2 > buf.len) return error.NoSpaceLeft;
+        buf[off] = '}';
+        buf[off + 1] = '\n';
+        off += 2;
+
+        return buf[0..off];
+    }
+
+    /// Format as logfmt (key=value pairs). No JSON escaping — logfmt uses
+    /// simple quoting for values with spaces, and ingesters tolerate raw
+    /// control chars in quoted values.
+    pub fn formatLogfmt(self: *const LogEntry, buf: []u8) ![]const u8 {
+        var off: usize = 0;
+
+        const header = try std.fmt.bufPrint(
+            buf[off..],
+            "ts={d} level={s}",
+            .{ self.timestamp_ns, self.level.toString() },
+        );
+        off += header.len;
+
+        if (self.request_id) |rid| {
+            const piece = try std.fmt.bufPrint(buf[off..], " request_id={s}", .{rid});
+            off += piece.len;
+        }
+
+        const protocol = try std.fmt.bufPrint(buf[off..], " protocol={s}", .{self.protocol.toString()});
+        off += protocol.len;
+
+        if (self.stream_id != 0) {
+            const piece = try std.fmt.bufPrint(buf[off..], " stream_id={d}", .{self.stream_id});
+            off += piece.len;
+        }
+
+        if (self.method) |m| {
+            const piece = try std.fmt.bufPrint(buf[off..], " method={s}", .{@tagName(m)});
+            off += piece.len;
+        }
+
+        if (self.path) |p| {
+            const piece = try std.fmt.bufPrint(buf[off..], " path=\"{s}\"", .{p});
+            off += piece.len;
+        }
+
+        if (self.status != 0) {
+            const piece = try std.fmt.bufPrint(buf[off..], " status={d}", .{self.status});
+            off += piece.len;
+        }
+
+        if (self.latency_us != 0) {
+            const piece = try std.fmt.bufPrint(buf[off..], " latency_us={d}", .{self.latency_us});
+            off += piece.len;
+        }
+
+        if (self.client_ip) |ip| {
+            const piece = try std.fmt.bufPrint(buf[off..], " client_ip={d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] });
+            off += piece.len;
+        }
+
+        if (self.route) |r| {
+            const piece = try std.fmt.bufPrint(buf[off..], " route=\"{s}\"", .{r});
+            off += piece.len;
+        }
+
+        if (self.message) |msg| {
+            const piece = try std.fmt.bufPrint(buf[off..], " msg=\"{s}\"", .{msg});
+            off += piece.len;
         }
 
         if (self.error_msg) |err| {
-            try writer.print(" error=\"{s}\"", .{err});
+            const piece = try std.fmt.bufPrint(buf[off..], " error=\"{s}\"", .{err});
+            off += piece.len;
         }
 
-        try writer.writeAll("\n");
+        if (off + 1 > buf.len) return error.NoSpaceLeft;
+        buf[off] = '\n';
+        off += 1;
 
-        return fbs.getWritten();
+        return buf[0..off];
     }
 };
 
@@ -470,7 +505,7 @@ pub fn log(entry: LogEntry) void {
     };
 
     if (config.log_stderr) {
-        std.io.getStdErr().writeAll(output) catch {};
+        _ = std.posix.system.write(2, output.ptr, output.len);
     }
 }
 
@@ -486,8 +521,9 @@ pub const RequestIdStorage = struct {
     }
 
     pub fn generate(self: *RequestIdStorage) void {
-        // Generate simple request ID from timestamp + random
-        const ts: u64 = @intCast(@mod(std.time.nanoTimestamp(), std.math.maxInt(u64)));
+        // Generate simple request ID from timestamp-derived seed.
+        const realtime_ns = clock.realtimeNanos() orelse 0;
+        const ts: u64 = @intCast(@mod(realtime_ns, std.math.maxInt(u64)));
         const hash = std.hash.Wyhash.hash(ts, &[_]u8{ 0, 1, 2, 3, 4, 5, 6, 7 });
 
         const result = std.fmt.bufPrint(&self.buf, "{x:0>16}", .{hash}) catch {
@@ -502,26 +538,6 @@ pub const RequestIdStorage = struct {
         return self.buf[0..self.len];
     }
 };
-
-/// Escape a string for safe JSON embedding (handles \, ", and control chars)
-fn writeJsonEscaped(writer: anytype, input: []const u8) !void {
-    for (input) |ch| {
-        switch (ch) {
-            '"' => try writer.writeAll("\\\""),
-            '\\' => try writer.writeAll("\\\\"),
-            '\n' => try writer.writeAll("\\n"),
-            '\r' => try writer.writeAll("\\r"),
-            '\t' => try writer.writeAll("\\t"),
-            else => {
-                if (ch < 0x20) {
-                    try writer.print("\\u{x:0>4}", .{ch});
-                } else {
-                    try writer.writeByte(ch);
-                }
-            },
-        }
-    }
-}
 
 /// Extract or generate request ID
 pub fn getOrGenerateRequestId(req: request.RequestView, storage: *RequestIdStorage) []const u8 {
@@ -591,7 +607,7 @@ pub fn postResponse(ctx: *middleware.Context, req: request.RequestView, resp: re
 
     const entry = LogEntry{
         .level = level,
-        .timestamp_ns = std.time.nanoTimestamp(),
+        .timestamp_ns = clock.realtimeNanos() orelse 0,
         .request_id = ctx.request_id,
         .protocol = ctx.protocol,
         .stream_id = ctx.stream_id,
@@ -636,7 +652,7 @@ pub fn postResponse(ctx: *middleware.Context, req: request.RequestView, resp: re
 pub fn logMessage(level: Level, ctx: *const middleware.Context, message: []const u8) void {
     const entry = LogEntry{
         .level = level,
-        .timestamp_ns = std.time.nanoTimestamp(),
+        .timestamp_ns = clock.realtimeNanos() orelse 0,
         .request_id = ctx.request_id,
         .protocol = ctx.protocol,
         .stream_id = ctx.stream_id,

@@ -2,15 +2,26 @@ const std = @import("std");
 const request = @import("../protocol/request.zig");
 const buffer_pool = @import("../runtime/buffer_pool.zig");
 
+/// Alias for `request.Header` — same `{name, value}` slice pair used for
+/// both request and response headers. Both `name` and `value` are borrowed
+/// slices: for responses, they typically point at string literals in the
+/// handler or into the response scratch buffer.
 pub const Header = request.Header;
 
+/// Response body backed by a pooled buffer that the server will release
+/// back to the pool after the response is serialized. Used when a handler
+/// needs to build a body larger than the per-request `response_buf`
+/// scratch — call `ctx.respond()` to acquire one.
 pub const ManagedBody = struct {
     handle: buffer_pool.BufferHandle,
     len: usize,
 };
 
-/// Pre-scattered body: multiple pool buffers that can be enqueued directly
-/// to the write queue without linearizing. Used for echo POST optimization.
+/// Response body split across multiple pooled buffers that get
+/// enqueued to the write queue directly without linearizing. Used
+/// for the zero-copy echo POST path where the request body already
+/// lives in a buffer pool slab and can be handed straight to the
+/// response write side without copying.
 pub const ScatteredBody = struct {
     handles: []buffer_pool.BufferHandle,
     count: u16,
@@ -19,6 +30,15 @@ pub const ScatteredBody = struct {
     buffer_size: usize,
 };
 
+/// Union of the four ways a handler can supply a response body.
+///   - `.none` — no body (`204 No Content`, `304 Not Modified`, empty `200`)
+///   - `.bytes` — borrowed slice: string literal, static const, or a
+///     slice into one of the per-request scratch buffers. The server
+///     copies the bytes into the write queue synchronously before the
+///     next recv, so the slice only needs to outlive the handler call.
+///   - `.managed` — pooled buffer; server releases back to the pool
+///     after the response is on the wire.
+///   - `.scattered` — multiple pooled buffers (echo POST fast path).
 pub const Body = union(enum) {
     none,
     bytes: []const u8,
@@ -26,7 +46,13 @@ pub const Body = union(enum) {
     scattered: ScatteredBody,
 };
 
-/// Response body type
+/// Response body framing discipline for HTTP/1.1.
+///   - `.fixed` — emit `Content-Length` and write exactly `bodyLen()`
+///     bytes. The default; what every normal handler wants.
+///   - `.chunked` — emit `Transfer-Encoding: chunked` (currently not
+///     wired through the write path; reserved for future streaming).
+///   - `.none` — no body headers at all. Used for 204 / 304 where the
+///     protocol forbids a body even if the response struct has one.
 pub const BodyType = enum {
     /// Fixed-length body with known content
     fixed,
@@ -36,7 +62,28 @@ pub const BodyType = enum {
     none,
 };
 
-/// Response represents an HTTP response that can be either fixed or streaming.
+/// An HTTP response.
+///
+/// Constructed by a handler, then handed to the server which serializes
+/// it for HTTP/1.1 (status line + headers + body), HTTP/2 (HEADERS +
+/// DATA frames), or HTTP/3 (HEADERS frame + optional DATA frame) as
+/// appropriate for the connection.
+///
+/// Headers are a borrowed `[]const Header` — the handler typically
+/// returns them from a stack-allocated array literal:
+///
+///     return .{
+///         .status = 200,
+///         .headers = &.{
+///             .{ .name = "Content-Type", .value = "application/json" },
+///             .{ .name = "Cache-Control", .value = "no-cache" },
+///         },
+///         .body = .{ .bytes = "{\"ok\":true}" },
+///     };
+///
+/// The middleware chain may augment this with additional headers
+/// (security headers, CORS, etc.) via `Decision.modify` — see
+/// `middleware.Chain` for how those get merged in.
 pub const Response = struct {
     status: u16,
     headers: []const Header,

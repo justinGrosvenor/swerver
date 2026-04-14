@@ -4,6 +4,27 @@ const upstream_mod = @import("proxy/upstream.zig");
 const balancer_mod = @import("proxy/balancer.zig");
 const clock = @import("runtime/clock.zig");
 
+/// Config file schema version. Bump the minor component when fields are
+/// added (backward-compatible), the major component when a field is
+/// renamed or removed (breaking).
+///
+/// Stable at alpha for the alpha.N series:
+///   - server.{address, port, workers, max_connections, static_root,
+///     disable_middleware, allowed_hosts}
+///   - timeouts.{idle_ms, header_ms, body_ms, write_ms}
+///   - limits.{max_header_bytes, max_body_bytes}
+///   - buffer_pool.{buffer_size, buffer_count, body_buffer_size, body_buffer_count}
+///   - tls.{cert_path, key_path}
+///   - quic.{enabled, port, cert_path, key_path}
+///   - upstreams[].{name, servers, load_balancer, health_check}
+///   - routes[].{path_prefix, upstream, strip_prefix}
+///
+/// Unstable / may move before 1.0:
+///   - access_log and metrics sub-schemas (feature in flux)
+///   - rate_limit sub-schema (new in alpha)
+///   - x402 sub-schema (niche feature, schema still driven by spec updates)
+pub const SCHEMA_VERSION = "1.0";
+
 /// Loaded configuration from a JSON file.
 /// Owns all parsed string data via an arena allocator.
 pub const LoadedConfig = struct {

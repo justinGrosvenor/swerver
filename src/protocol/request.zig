@@ -1,12 +1,24 @@
 const std = @import("std");
 
+/// A single HTTP header. Both `name` and `value` are borrowed slices.
+///
+/// On the request side, these are slices into the receive buffer —
+/// valid for the duration of the handler call and reclaimed before
+/// the next request on the same worker. On the response side, they're
+/// typically string literals from the handler's return statement.
+///
+/// The same struct is used for both requests and responses. Field
+/// interpretation is per RFC 9110: header names are case-insensitive
+/// (use `RequestView.getHeader` for lookups), header values are
+/// opaque ASCII-ish bytes per field-specific rules.
 pub const Header = struct {
     name: []const u8,
     value: []const u8,
 };
 
-/// HTTP methods (RFC 7231 + common extensions)
-/// Includes OTHER for extension methods like PROPFIND, REPORT, etc.
+/// HTTP methods (RFC 9110 §9). Includes `.OTHER` for extension methods
+/// like `PROPFIND`, `REPORT`, `MKCOL` — when `.OTHER` is returned,
+/// `RequestView.method_raw` holds the actual method bytes.
 pub const Method = enum {
     GET,
     HEAD,
@@ -69,6 +81,28 @@ pub const Method = enum {
     }
 };
 
+/// A parsed HTTP request, with all field slices borrowed from the
+/// connection's receive buffer.
+///
+/// This type is uniform across HTTP/1.1, HTTP/2, and HTTP/3:
+///   - **HTTP/1.1**: the parser slices headers and body out of the
+///     raw request bytes in place.
+///   - **HTTP/2**: HPACK decodes into a per-worker scratch buffer;
+///     the decoded slices then live there for the duration of the
+///     handler call.
+///   - **HTTP/3**: QPACK decodes into a per-Stack scratch buffer;
+///     single-DATA-frame bodies are a direct slice into the
+///     decrypted packet payload (zero-copy).
+///
+/// All fields are stable across the handler's synchronous execution
+/// — protocol layer guarantees the underlying buffers aren't reused
+/// until the handler returns. Stashing `path` / `headers` / `body`
+/// slices beyond the handler call is a use-after-reuse bug.
+///
+/// `body` is `[]const u8` — always non-null; an empty body is
+/// represented as an empty slice, not `null`. `method_raw` is
+/// non-empty only when `method == .OTHER` (extension methods like
+/// `PROPFIND`).
 pub const RequestView = struct {
     method: Method,
     /// Raw method string (useful when method == .OTHER for extension methods)

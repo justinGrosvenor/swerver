@@ -12,6 +12,15 @@ const clock = @import("../runtime/clock.zig");
 /// middleware chain's max in one pass. See `Router.handle`.
 threadlocal var merged_headers_tls: [MAX_RESPONSE_HEADERS + middleware.Chain.MAX_MIDDLEWARE_HEADERS]response.Header = undefined;
 
+/// Errors surfaced by `Router` registration and routing.
+///
+/// All are programmer errors (the route table is finite and fixed-size), not
+/// runtime conditions a user can recover from at request time. Registration
+/// fails at startup if you try to add more routes than `RouterLimits` allows,
+/// or if a pattern exceeds the compiled-in segment/param/length limits.
+/// `NoBufferOps` / `NoBuffers` surface from the per-request `ctx.respond()`
+/// path when the buffer pool is exhausted — see `HandlerContext` for the
+/// recommended fallback pattern.
 pub const RouterError = error{
     RouteLimitExceeded,
     SegmentLimitExceeded,
@@ -21,7 +30,15 @@ pub const RouterError = error{
     NoBuffers,
 };
 
-/// Result of routing a request
+/// Outcome of `Router.handle` for a single request.
+///
+/// `resp` is always set — even on 404, 405, and 500, the router produces a
+/// valid `Response` (via the configured `not_found_handler` / `error_handler`
+/// or a built-in default). `pause_reads_ms` is only set when a middleware in
+/// the chain returns `.rate_limit_backpressure` — the server uses it to
+/// suspend reads on the connection for the requested duration before
+/// dispatching the next request. Downstream code that doesn't implement
+/// backpressure can ignore `pause_reads_ms` safely.
 pub const RouteResult = struct {
     /// Response to send
     resp: response.Response,
@@ -29,10 +46,49 @@ pub const RouteResult = struct {
     pause_reads_ms: ?u64 = null,
 };
 
-/// Handler function type
+/// Signature of every route handler swerver dispatches. Handlers are
+/// synchronous: they run to completion between `recv()` calls on the
+/// connection, which is why `ctx.request.body` and `ctx.request.headers`
+/// can be `[]const u8` slices into the receive buffer without any copy.
+///
+/// Return a `Response` directly — no allocator, no error union. If you
+/// need to build a response body that lives beyond the caller-provided
+/// `response_buf` scratch (e.g. to fit a JSON blob larger than the
+/// default 8 KB), call `ctx.respond()` to acquire a managed buffer
+/// handle from the pool and use `ResponseBuilder.text` / `.json` /
+/// `.html`. The pool handle is released automatically after the
+/// response is serialized.
 pub const HandlerFn = *const fn (ctx: *HandlerContext) response.Response;
 
-/// Context passed to route handlers
+/// Per-request context passed into every route handler.
+///
+/// Field lifetimes:
+///   - `request.headers` / `request.body` — slices into the connection's
+///     receive buffer. Valid for the duration of the handler call. Don't
+///     stash them across async points (Zig has none, so in practice:
+///     don't store them in module-level state).
+///   - `response_buf` — caller-owned scratch for small dynamic response
+///     bodies (`std.fmt.bufPrint(ctx.response_buf, …)`). Default size is
+///     `RESPONSE_BUF_SIZE` (8 KB). Gets reused for the next request on
+///     the same worker.
+///   - `response_headers` — scratch for building a small header list
+///     inline without allocating. Default capacity is
+///     `MAX_RESPONSE_HEADERS` (4). If you need more, return headers from
+///     a `const` array literal in your handler instead.
+///   - `arena` — `FixedBufferAllocator` lazy-acquired from the buffer
+///     pool the first time you call `ctx.allocator()`. Useful for
+///     one-request-lifetime structured data. Released after response
+///     serialization.
+///   - `params` — path parameters matched from the route pattern
+///     (`/users/:id` → `params[0] = { .name = "id", .value = "123" }`).
+///     `param_count` is the number actually populated.
+///   - `app_state` / `app_services` — opaque pointers installed on the
+///     `Router` via `setState` / `setServices` before the event loop
+///     starts. Use `ctx.state(T)` / `ctx.get(T)` to downcast with type
+///     safety.
+///
+/// The handler must not free any of the above — the Router reclaims
+/// them before the next request on this worker.
 pub const HandlerContext = struct {
     request: request.RequestView,
     middleware_ctx: *middleware.Context,
@@ -216,6 +272,17 @@ pub const HandlerContext = struct {
     }
 };
 
+/// Fluent builder for registering a single route with a per-route
+/// middleware chain. Constructed via `Router.routeBuilder(method,
+/// pattern, handler)`, chained with `.withMiddleware(&chain)`, and
+/// finalized with `.register()`.
+///
+/// Use this when one specific route needs a different middleware
+/// set from the Router's default chain — e.g. an admin endpoint
+/// that wants stricter auth, or a public endpoint that should skip
+/// rate limiting. For the common case where every route uses the
+/// same chain, call `Router.setMiddleware` once at startup and use
+/// the plain `.get` / `.post` / etc. methods.
 pub const RouteBuilder = struct {
     router: *Router,
     method: request.Method,
@@ -233,6 +300,19 @@ pub const RouteBuilder = struct {
     }
 };
 
+/// Fluent builder for registering multiple routes under a common
+/// path prefix (e.g. `/api/v1`). Constructed via `Router.group(prefix)`
+/// and then used like a miniature Router:
+///
+///     var api = router.group("/api/v1");
+///     try api.get("/users", listUsers);
+///     try api.post("/users", createUser);
+///     try api.delete("/users/:id", deleteUser);
+///
+/// Each registered route's pattern is prepended with the group prefix,
+/// so the handler sees the full path (`/api/v1/users/:id`). Optionally
+/// chain `.withMiddleware(&chain)` to apply a shared middleware chain
+/// to every route registered through this group.
 pub const GroupBuilder = struct {
     router: *Router,
     prefix: []const u8,
@@ -369,6 +449,36 @@ pub const ARENA_BUF_SIZE = 16 * 1024;
 pub const ServiceGetter = *const fn (*anyopaque, []const u8) ?*anyopaque;
 
 /// Router with route registration and matching
+/// The request router. Holds a fixed-size route table, a pre-request
+/// middleware chain, optional x402 payment policy, and opaque pointers
+/// to per-app state / services.
+///
+/// Typical setup:
+///
+///     var app_router = swerver.router.Router.init(.{
+///         .require_payment = false,
+///         .payment_required_b64 = "",
+///     });
+///     try app_router.get("/users", listUsers);
+///     try app_router.post("/users", createUser);
+///     try app_router.get("/users/:id", showUser);
+///     app_router.setState(&my_app_state);
+///
+///     var builder = swerver.ServerBuilder
+///         .configDefault()
+///         .router(app_router);
+///     const srv = try builder.build(allocator);
+///
+/// Route matching is O(N) over the fixed-size `routes` array, gated by
+/// a 64-bit bloom filter over first-path-segment hashes (`first_segment_bloom`).
+/// Requests whose first segment's hash bit is clear short-circuit to a
+/// 404 without touching the route list — this cuts no-match cost roughly
+/// in half at 10 routes. Pattern compilation happens once at registration
+/// time (`Route.compile`); the hot path just walks segments.
+///
+/// Routers are cheap to construct (a few KB of fixed-size arrays) and
+/// are designed to be built entirely at startup. There's no support for
+/// dynamically adding routes after `srv.run()` has started.
 pub const Router = struct {
     routes: [MAX_ROUTES]Route = undefined,
     route_count: usize = 0,

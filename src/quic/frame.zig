@@ -762,10 +762,40 @@ pub fn writeAck(buf: []u8, largest_acked: u64, ack_delay: u64) WriteError!usize 
 /// packets [largest_acked - N, largest_acked] (N+1 packets total) are
 /// acknowledged.
 ///
-/// This single-range form is sufficient when we received every packet
-/// from 0 to largest_acked without gaps. For lossy paths we'd need
-/// ack_ranges support — a follow-up.
+/// This is the single-range form — a thin wrapper around
+/// `writeAckMultiRange` with an empty additional-range slice. Use this
+/// when the caller has already verified every packet from
+/// `largest_acked - first_ack_range` to `largest_acked` is set in the
+/// bitmap (or on lossless paths like localhost / initial handshake
+/// where gaps are rare).
 pub fn writeAckRange(buf: []u8, largest_acked: u64, first_ack_range: u64, ack_delay: u64) WriteError!usize {
+    return writeAckMultiRange(buf, largest_acked, first_ack_range, &.{}, ack_delay);
+}
+
+/// Write an ACK frame with an optional list of additional
+/// (gap, length) ranges beyond the first range (RFC 9000 §19.3.1).
+/// Used on lossy paths to acknowledge multiple disjoint runs of
+/// received packets in a single frame, so the peer retransmits
+/// only what's actually missing instead of everything older than
+/// the first gap.
+///
+/// Encoding (all fields varint):
+///   Type (0x02) || Largest Acknowledged || ACK Delay
+///   || ACK Range Count || First ACK Range
+///   || [ Gap_i || ACK Range Length_i ]* (count times)
+///
+/// The `additional` slice must be in *descending* packet-number
+/// order — the packet number space walks downward from the largest
+/// acknowledged through the first range, skips a gap, hits the next
+/// range, etc. See `PacketNumberSpace.collectAckRanges` for the
+/// natural producer of this slice.
+pub fn writeAckMultiRange(
+    buf: []u8,
+    largest_acked: u64,
+    first_ack_range: u64,
+    additional: []const AckRange,
+    ack_delay: u64,
+) WriteError!usize {
     var off: usize = 0;
 
     // Frame type 0x02 (simple ACK without ECN)
@@ -777,11 +807,17 @@ pub fn writeAckRange(buf: []u8, largest_acked: u64, first_ack_range: u64, ack_de
     // ACK Delay
     off += try varint.encode(buf[off..], ack_delay);
 
-    // ACK Range Count (0 — only the first range, no additional ranges)
-    off += try varint.encode(buf[off..], 0);
+    // ACK Range Count
+    off += try varint.encode(buf[off..], additional.len);
 
     // First ACK Range
     off += try varint.encode(buf[off..], first_ack_range);
+
+    // Additional ranges in descending packet-number order
+    for (additional) |r| {
+        off += try varint.encode(buf[off..], r.gap);
+        off += try varint.encode(buf[off..], r.length);
+    }
 
     return off;
 }

@@ -22,7 +22,7 @@ pub fn build(b: *std.Build) void {
     options.addOption(bool, "enable_proxy", enable_proxy);
     options.addOption(bool, "enable_io_uring", enable_io_uring);
 
-    const swerver_module = b.createModule(.{
+    const swerver_module = b.addModule("swerver", .{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,

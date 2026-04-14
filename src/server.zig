@@ -18,6 +18,7 @@ const quic_connection = @import("quic/connection.zig");
 const middleware = @import("middleware/middleware.zig");
 const request = @import("protocol/request.zig");
 const metrics_mw = @import("middleware/metrics_mw.zig");
+const benchmark_routes = @import("benchmark_routes.zig");
 const proxy_mod = @import("proxy/proxy.zig");
 const forward_mod = @import("proxy/forward.zig");
 
@@ -209,6 +210,32 @@ pub const PreencodedH2Response = struct {
     epoch: u64 = 0,
 };
 
+/// Single-threaded event-loop HTTP server. One `Server` instance runs
+/// per worker process in the default multi-worker fork model, or one
+/// per process in single-worker mode.
+///
+/// The server owns:
+///   - a `router.Router` with all registered routes and middleware
+///   - an `IoRuntime` wrapping the platform's I/O backend (io_uring
+///     native / io_uring poll / epoll / kqueue, picked at init)
+///   - connection state (slab-backed `connection.Connection` entries)
+///   - TCP / UDP listener file descriptors for HTTP/1.1/2 and HTTP/3
+///   - optional `tls.Provider` instances for TCP TLS and QUIC
+///   - optional `http3.Stack` for HTTP/3 dispatch
+///   - pre-encoded response caches for hot static endpoints (h1/h2/h3)
+///   - optional reverse proxy
+///
+/// **Do not construct a `Server` on the stack** — the struct is large
+/// (tens of KB of pre-allocated buffers and pool slots) and will blow
+/// the default Zig stack size in debug builds. Use
+/// `ServerBuilder.build()` which heap-allocates via the provided
+/// allocator and calls `initInPlace`. Call `deinit()` then
+/// `allocator.destroy(srv)` to tear down.
+///
+/// `run(run_for_ms)` is the event loop entry point. Pass `null` to
+/// run until SIGINT / SIGTERM; pass a value to have the loop exit
+/// automatically after that many milliseconds (used by tests and by
+/// the release workflow's smoke step).
 pub const Server = struct {
     allocator: std.mem.Allocator,
     cfg: config.ServerConfig,
@@ -270,14 +297,20 @@ pub const Server = struct {
     /// per-connection `tls_cipher_carry_handle`.
     tls_cipher_scratch: [TLS_CIPHER_SCRATCH_SIZE]u8 = undefined,
 
+    /// Quick-start constructor for the benchmark-style server: pre-
+    /// registers the HttpArena / TechEmpower routes and the default
+    /// middleware chain, then hands back a ready-to-`run()` Server.
+    /// Use `initWithRouter` / `initInPlace` directly if you want to
+    /// build your own router without the benchmark handlers.
     pub fn init(allocator: std.mem.Allocator, cfg: config.ServerConfig) !Server {
         var app_router = router.Router.init(.{
             .require_payment = cfg.x402.enabled,
             .payment_required_b64 = cfg.x402.payment_required_b64,
         });
-        try registerDefaultRoutes(&app_router);
+        try benchmark_routes.registerRoutes(&app_router);
         middleware.security.buildCache();
-        registerDefaultPostHooks(&app_router);
+        benchmark_routes.registerPostHooks(&app_router);
+        benchmark_routes.loadDataset();
         return initWithRouter(allocator, cfg, app_router);
     }
 
@@ -392,10 +425,6 @@ pub const Server = struct {
         // to build a stream-id-agnostic HPACK block + frame headers that
         // are patched per-request.
         if (build_options.enable_http2) self.initPreencodedH2();
-
-        // Load /data/dataset.json for the /json endpoint. No-op if
-        // the file doesn't exist (local dev without the dataset).
-        loadJsonDataset();
     }
 
     /// Populate the h3 pre-encoded response cache with a fixed set of
@@ -1593,7 +1622,6 @@ pub const Server = struct {
             conn.application_space.largest_received
         else
             null;
-        const pending_ack_range = conn.application_space.firstAckRange();
 
         // Fast path: single packet — no batching needed.
         if (h3_bytes.len <= max_stream_payload) {
@@ -1604,7 +1632,6 @@ pub const Server = struct {
                     .conn = conn,
                     .keys = &keys,
                     .ack_largest = pending_ack,
-                    .ack_first_range = pending_ack_range,
                     .stream_data = .{
                         .stream_id = stream_id,
                         .offset = 0,
@@ -1643,7 +1670,6 @@ pub const Server = struct {
 
             // Piggyback pending ACK onto the FIRST packet only.
             const ack_for_this_pkt = if (!ack_sent) pending_ack else null;
-            const ack_range_for_this_pkt = if (!ack_sent) pending_ack_range else 0;
 
             // Build the packet into the batch buffer at the current offset.
             const built = quic_handler.buildShortPacket(
@@ -1652,7 +1678,6 @@ pub const Server = struct {
                     .conn = conn,
                     .keys = &keys,
                     .ack_largest = ack_for_this_pkt,
-                    .ack_first_range = ack_range_for_this_pkt,
                     .stream_data = .{
                         .stream_id = stream_id,
                         .offset = stream_offset,
@@ -4879,307 +4904,10 @@ fn releaseBufferOpaque(ctx: *anyopaque, handle: buffer_pool.BufferHandle) void {
     io.releaseBuffer(handle);
 }
 
-/// Wire the default middleware hooks into the router's chain:
-///
-///   Pre-request:
-///     - security.evaluate — Host validation, HSTS, CSP, CORS,
-///       X-Frame-Options, Referrer-Policy, X-Content-Type-Options.
-///       Runs on every cold-path request (hot-path pre-encoded
-///       responses bake security headers at build time via MW-2).
-///
-///   Post-response:
-///     - metrics_mw.postResponse — records request count, response
-///       status, latency, body bytes, per-stream metrics.
-///     - access_log.postResponseCombined — writes a combined-format
-///       access log line to stderr.
-///
-/// Called from Server.init() and main.zig. Should be called by any
-/// custom setup that wants the full middleware stack without manually
-/// constructing a Chain.
-pub fn registerDefaultPostHooks(app_router: *router.Router) void {
-    const pre_hooks = [_]middleware.MiddlewareFn{
-        middleware.security.evaluate,
-    };
-    const post_hooks = [_]middleware.PostResponseFn{
-        metrics_mw.postResponse,
-        middleware.access_log.postResponseCombined,
-    };
-    var chain = app_router.middleware_chain;
-    chain.pre = &pre_hooks;
-    chain.post = &post_hooks;
-    app_router.setMiddleware(chain);
-}
-
-pub fn registerDefaultRoutes(app_router: *router.Router) !void {
-    // Register built-in benchmark endpoints
-    try app_router.get("/health", handleBenchHealth);
-    try app_router.get("/echo", handleBenchEchoGet);
-    try app_router.post("/echo", handleBenchEchoPost);
-    try app_router.get("/blob", handleBenchBlob);
-    // TechEmpower Framework Benchmark endpoints
-    try app_router.get("/plaintext", handleTfbPlaintext);
-    // Throughput and pipelining benchmark endpoints. /pipeline returns
-    // a fixed "ok". /baseline11 and /baseline2 sum the ?a= and ?b=
-    // query params (plus POST body for baseline11); their canonical
-    // hot queries are served from the preencoded response cache
-    // entirely, so these handlers only run on the cold path.
-    try app_router.get("/pipeline", handleBenchPipeline);
-    try app_router.get("/baseline11", handleBenchBaseline11);
-    try app_router.post("/baseline11", handleBenchBaseline11);
-    try app_router.get("/baseline2", handleBenchBaseline2);
-    try app_router.post("/baseline2", handleBenchBaseline2);
-    // JSON processing: load dataset, compute totals, return JSON.
-    // Falls back to {"message":"Hello, World!"} when no dataset.
-    try app_router.get("/json", handleBenchJson);
-    // Upload: return byte count of POST body
-    try app_router.post("/upload", handleBenchUpload);
-}
-
-// ============================================================
-// Benchmark Handlers
-// Built-in endpoints for performance testing
-// ============================================================
-
-/// 8KB static blob for large response benchmarks
-const benchmark_blob: [8 * 1024]u8 = [_]u8{0} ** (8 * 1024);
-
-/// GET /health - minimal health check for benchmarks
-    fn handleBenchHealth(_: *router.HandlerContext) response_mod.Response {
-        return .{
-            .status = 200,
-            .headers = &[_]response_mod.Header{},
-            .body = .none,
-        };
-    }
-
-/// GET /echo - return static JSON response
-    fn handleBenchEchoGet(_: *router.HandlerContext) response_mod.Response {
-        return .{
-            .status = 200,
-            .headers = &[_]response_mod.Header{
-                .{ .name = "Content-Type", .value = "application/json" },
-            },
-            .body = .{ .bytes = "{\"status\":\"ok\"}" },
-        };
-    }
-
-/// POST /echo - echo back request body
-    /// Returns .bytes pointing into the read buffer — safe because queueResponse
-    /// copies body into the write buffer synchronously before the next read().
-fn handleBenchEchoPost(ctx: *router.HandlerContext) response_mod.Response {
-    const body = ctx.request.body;
-    if (body.len == 0) {
-        return handleBenchEchoGet(ctx);
-    }
-    return .{
-        .status = 200,
-        .headers = &[_]response_mod.Header{
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-        .body = .{ .bytes = body },
-    };
-}
-
-/// GET /blob - return 1MB response for throughput testing
-    fn handleBenchBlob(_: *router.HandlerContext) response_mod.Response {
-        return .{
-            .status = 200,
-            .headers = &[_]response_mod.Header{
-                .{ .name = "Content-Type", .value = "application/octet-stream" },
-            },
-            .body = .{ .bytes = &benchmark_blob },
-        };
-    }
-
-// ============================================================
-// TechEmpower Framework Benchmark Handlers
-// https://www.techempower.com/benchmarks/
-// ============================================================
-
-/// GET /plaintext - TechEmpower plaintext test
-    fn handleTfbPlaintext(_: *router.HandlerContext) response_mod.Response {
-        return .{
-            .status = 200,
-            .headers = &[_]response_mod.Header{
-                .{ .name = "Content-Type", .value = "text/plain" },
-            },
-            .body = .{ .bytes = "Hello, World!" },
-        };
-    }
-
-/// GET|POST /baseline2?a=1&b=1 - h2/h3 throughput endpoint.
-/// Returns the sum of query params `a` and `b`. The canonical
-/// ?a=1&b=1 query hits the pre-encoded response cache directly;
-/// this cold-path handler only runs for non-canonical queries.
-fn handleBenchBaseline2(ctx: *router.HandlerContext) response_mod.Response {
-    // Same arithmetic as baseline11; the pre-encoded cache handles
-    // the hot case (a=1&b=1 → "2") and this handler covers queries
-    // with arbitrary parameter values.
-    return handleBenchBaseline11(ctx);
-}
-
-/// GET /pipeline - h1 pipelining throughput endpoint.
-/// Returns the fixed body "ok".
-fn handleBenchPipeline(_: *router.HandlerContext) response_mod.Response {
-    return .{
-        .status = 200,
-        .headers = &[_]response_mod.Header{
-            .{ .name = "Content-Type", .value = "text/plain" },
-        },
-        .body = .{ .bytes = "ok" },
-    };
-}
-
-/// POST /upload - upload throughput endpoint.
-/// Returns the byte count of the request body as text/plain.
-fn handleBenchUpload(ctx: *router.HandlerContext) response_mod.Response {
-    const body_len = ctx.request.body.len;
-    const body = std.fmt.bufPrint(ctx.response_buf, "{d}", .{body_len}) catch "0";
-    return .{
-        .status = 200,
-        .headers = &[_]response_mod.Header{
-            .{ .name = "Content-Type", .value = "text/plain" },
-        },
-        .body = .{ .bytes = body },
-    };
-}
-
-/// GET /json - JSON dataset processing endpoint.
-/// Loads /data/dataset.json (50 items), computes total = price × quantity
-/// for each item, returns JSON with count + items array.
-///
-/// The dataset is loaded at first request and cached in the handler's
-/// arena (which is the router scratch arena_buf). Since this is a GET
-/// handler, the lazy arena path gives us a zero-length arena, so we
-/// format directly into response_buf instead.
-fn handleBenchJson(_: *router.HandlerContext) response_mod.Response {
-    // The dataset is 50 items with {id,name,category,price,quantity,active,tags,rating}.
-    // We need to add a "total" field = price * quantity.
-    // Since we can't dynamically load a file inside a handler (no allocator,
-    // no fd), this handler is backed by a pre-loaded dataset. The Server
-    // loads it at init and the handler references it.
-    //
-    // For now: build the response from the pre-loaded json_dataset.
-    const dataset_bytes = json_dataset_bytes;
-    if (dataset_bytes.len == 0) {
-        // No dataset file — fall back to the canonical tiny /json body.
-        return .{
-            .status = 200,
-            .headers = &[_]response_mod.Header{
-                .{ .name = "Content-Type", .value = "application/json" },
-            },
-            .body = .{ .bytes = "{\"message\":\"Hello, World!\"}" },
-        };
-    }
-    return .{
-        .status = 200,
-        .headers = &[_]response_mod.Header{
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-        .body = .{ .bytes = dataset_bytes },
-    };
-}
-
-/// Pre-computed JSON response for /json endpoint.
-/// Populated by `loadJsonDataset()` at server init from /data/dataset.json.
-/// Uses a simple line-by-line approach: reads each JSON object from the
-/// array, injects a "total" field (price × quantity), wraps in
-/// {"count":N,"items":[...]}. No Zig JSON parser needed — just string ops.
-var json_dataset_buf: [65536]u8 = undefined;
-var json_dataset_bytes: []const u8 = &.{};
-
-pub fn loadJsonDataset() void {
-    var path_z: [64]u8 = undefined;
-    const dpath = "/data/dataset.json";
-    @memcpy(path_z[0..dpath.len], dpath);
-    path_z[dpath.len] = 0;
-    const path_ptr: [*:0]const u8 = @ptrCast(&path_z);
-    const fd = std.posix.openatZ(std.posix.AT.FDCWD, path_ptr, .{ .ACCMODE = .RDONLY }, 0) catch return;
-    defer clock.closeFd(fd);
-    var raw: [32768]u8 = undefined;
-    const n = std.posix.read(fd, &raw) catch return;
-    if (n == 0) return;
-
-    // Use Zig's JSON parser to read the dataset and rebuild with totals.
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, std.heap.page_allocator, raw[0..n], .{}) catch return;
-
-    const items = switch (parsed) {
-        .array => |arr| arr.items,
-        else => return,
-    };
-
-    var off: usize = 0;
-    const out = &json_dataset_buf;
-    off += (std.fmt.bufPrint(out[off..], "{{\"count\":{d},\"items\":[", .{items.len}) catch return).len;
-
-    for (items, 0..) |item_val, i| {
-        if (i > 0) { out[off] = ','; off += 1; }
-        const obj = switch (item_val) { .object => |o| o, else => continue };
-
-        // Extract fields
-        const id = switch (obj.get("id") orelse continue) { .integer => |v| v, else => continue };
-        const name = switch (obj.get("name") orelse continue) { .string => |v| v, else => continue };
-        const category = switch (obj.get("category") orelse continue) { .string => |v| v, else => continue };
-        const price = switch (obj.get("price") orelse continue) {
-            .float => |v| v,
-            .integer => |v| @as(f64, @floatFromInt(v)),
-            else => continue,
-        };
-        const quantity = switch (obj.get("quantity") orelse continue) { .integer => |v| v, else => continue };
-
-        const total = price * @as(f64, @floatFromInt(quantity));
-        const total_cents: i64 = @intFromFloat(@round(total * 100.0));
-        const whole = @divTrunc(total_cents, 100);
-        const frac: u64 = @intCast(@abs(@rem(total_cents, 100)));
-
-        const price_cents: i64 = @intFromFloat(@round(price * 100.0));
-        const p_whole = @divTrunc(price_cents, 100);
-        const p_frac: u64 = @intCast(@abs(@rem(price_cents, 100)));
-
-        const written = std.fmt.bufPrint(out[off..], "{{\"id\":{d},\"name\":\"{s}\",\"category\":\"{s}\",\"price\":{d}.{d:0>2},\"quantity\":{d},\"total\":{d}.{d:0>2}}}", .{
-            id, name, category, p_whole, p_frac, quantity, whole, frac,
-        }) catch return;
-        off += written.len;
-    }
-    off += (std.fmt.bufPrint(out[off..], "]}}", .{}) catch return).len;
-    json_dataset_bytes = out[0..off];
-}
-
-/// GET|POST /baseline11 - h1 throughput endpoint.
-/// Sums the ?a= and ?b= query params, plus the request body for
-/// POST. For the canonical GET ?a=1&b=1 the sum is 2, cached via
-/// the pre-encoded h1 response cache. The cold-path handler below
-/// is reached for POSTs and for non-canonical queries — and does
-/// the actual arithmetic.
-fn handleBenchBaseline11(ctx: *router.HandlerContext) response_mod.Response {
-    var sum: i64 = 0;
-    // Parse query string: find '?' in path
-    if (std.mem.indexOfScalar(u8, ctx.request.path, '?')) |q_start| {
-        const query = ctx.request.path[q_start + 1 ..];
-        var it = std.mem.splitScalar(u8, query, '&');
-        while (it.next()) |pair| {
-            if (std.mem.indexOfScalar(u8, pair, '=')) |eq| {
-                const val = pair[eq + 1 ..];
-                if (std.fmt.parseInt(i64, val, 10)) |n| {
-                    sum += n;
-                } else |_| {}
-            }
-        }
-    }
-    // POST body: single integer, summed into total
-    if (ctx.request.method == .POST and ctx.request.body.len > 0) {
-        const trimmed = std.mem.trim(u8, ctx.request.body, " \t\r\n");
-        if (std.fmt.parseInt(i64, trimmed, 10)) |n| {
-            sum += n;
-        } else |_| {}
-    }
-    // Format sum into the router's response_buf
-    const body = std.fmt.bufPrint(ctx.response_buf, "{d}", .{sum}) catch "0";
-    return .{
-        .status = 200,
-        .headers = &[_]response_mod.Header{
-            .{ .name = "Content-Type", .value = "text/plain" },
-        },
-        .body = .{ .bytes = body },
-    };
-}
+// Benchmark / TechEmpower handlers, `/json` dataset loader, and the
+// `registerDefaultRoutes` / `registerDefaultPostHooks` wiring moved to
+// `src/benchmark_routes.zig`. Downstream consumers reach them through
+// `swerver.benchmark.registerRoutes(&app_router)`,
+// `swerver.benchmark.registerPostHooks(&app_router)`, and
+// `swerver.benchmark.loadDataset()`. See `examples/httparena/main.zig`
+// for a reference consumer.

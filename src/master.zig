@@ -23,6 +23,35 @@ fn handleMasterChild(_: std.posix.SIG) callconv(.c) void {
     master_child_exited.store(true, .release);
 }
 
+/// Multi-process worker manager. Forks N worker processes (one per
+/// CPU by default; `cfg.workers` overrides), each running its own
+/// `Server` instance with its own listener socket bound via
+/// `SO_REUSEPORT` so the kernel distributes connections across
+/// workers without userspace coordination.
+///
+/// Typical usage from `main.zig`:
+///
+///     if (cfg.workers != 1) {
+///         var master = try swerver.Master.init(
+///             allocator, cfg, app_router, proxy_ptr);
+///         defer master.deinit();
+///         try master.run(args.run_for_ms);
+///     } else {
+///         // single-process path via ServerBuilder
+///     }
+///
+/// Each worker crashes are respawned with exponential backoff
+/// (tracked per slot in `last_crash_ms` / `crash_count`) so a
+/// pathological bug in the request path doesn't turn the whole
+/// server off. The master process itself does nothing during
+/// steady state — it sleeps in `waitpid`/`sigsuspend` and only
+/// wakes up to collect exited children or forward `SIGHUP` /
+/// `SIGTERM` to the worker pool.
+///
+/// Single-process mode (cfg.workers == 1) bypasses this entirely;
+/// see `ServerBuilder.build()` for that path. The multi-process
+/// fork model is the production shape — every HttpArena benchmark
+/// run uses it.
 pub const Master = struct {
     allocator: std.mem.Allocator,
     cfg: config.ServerConfig,

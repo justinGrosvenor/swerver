@@ -1,0 +1,15 @@
+.{
+    .name = .swerver,
+    .version = "0.1.0-alpha.1",
+    .fingerprint = 0x30d2238b8f91049d,
+    .minimum_zig_version = "0.16.0-dev.2135+7c0b42ba0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "examples",
+        "LICENSE",
+        "README.md",
+    },
+    .dependencies = .{},
+}

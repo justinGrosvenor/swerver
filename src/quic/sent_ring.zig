@@ -70,9 +70,18 @@ pub const SentRing = struct {
         self.tail = (self.tail + 1) % RING_SIZE;
     }
 
+    /// Result of `markAckedRange`: the sent-time of the largest-numbered
+    /// packet removed (for RTT estimation) and the sum of the sizes of
+    /// every in-flight packet removed (for congestion window growth).
+    pub const AckResult = struct {
+        largest_sent_time: ?u64,
+        total_bytes: u64,
+    };
+
     /// Mark all packets in [smallest, largest] for the given space as
-    /// acknowledged and remove them from the ring. Returns the sent
-    /// time of `largest` if found (for RTT calculation), or null.
+    /// acknowledged and remove them from the ring. Returns the sent time
+    /// of `largest` (for RTT calculation) alongside the total bytes of
+    /// in-flight packets removed (for the congestion controller).
     ///
     /// O(popcount of occupied bitmap) — skips empty 64-bit words.
     pub fn markAckedRange(
@@ -80,8 +89,8 @@ pub const SentRing = struct {
         space: types.PacketNumberSpace,
         smallest: u64,
         largest: u64,
-    ) ?u64 {
-        var largest_sent_time: ?u64 = null;
+    ) AckResult {
+        var result: AckResult = .{ .largest_sent_time = null, .total_bytes = 0 };
         for (&self.occupied, 0..) |*word, word_idx| {
             var bits = word.*;
             if (bits == 0) continue;
@@ -94,9 +103,12 @@ pub const SentRing = struct {
                     pkt.packet_number <= largest)
                 {
                     if (pkt.packet_number == largest) {
-                        largest_sent_time = pkt.time_sent;
+                        result.largest_sent_time = pkt.time_sent;
                     }
-                    if (pkt.in_flight) self.bytes_in_flight -|= pkt.size;
+                    if (pkt.in_flight) {
+                        self.bytes_in_flight -|= pkt.size;
+                        result.total_bytes += pkt.size;
+                    }
                     self.count -|= 1;
                     word.* &= ~(@as(u64, 1) << bit_idx);
                     // Update bits for this iteration too
@@ -106,7 +118,7 @@ pub const SentRing = struct {
                 bits &= bits - 1;
             }
         }
-        return largest_sent_time;
+        return result;
     }
 
     /// Detect lost packets using RFC 9002 time-threshold and packet-
@@ -240,8 +252,9 @@ test "SentRing: markAckedRange removes packets" {
     try std.testing.expectEqual(@as(usize, 1000), ring.bytes_in_flight);
 
     // ACK [3, 7]
-    const sent_time = ring.markAckedRange(.application, 3, 7);
-    try std.testing.expectEqual(@as(?u64, 1700), sent_time); // pn=7 sent at 1700
+    const result = ring.markAckedRange(.application, 3, 7);
+    try std.testing.expectEqual(@as(?u64, 1700), result.largest_sent_time); // pn=7 sent at 1700
+    try std.testing.expectEqual(@as(u64, 500), result.total_bytes); // 5 pkts × 100
     try std.testing.expectEqual(@as(usize, 5), ring.count); // 0,1,2,8,9 remain
     try std.testing.expectEqual(@as(usize, 500), ring.bytes_in_flight);
 }

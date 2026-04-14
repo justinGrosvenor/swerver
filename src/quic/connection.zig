@@ -151,26 +151,111 @@ pub const PacketNumberSpace = struct {
     /// Compute the First ACK Range field for an outgoing ACK frame:
     /// the number of contiguous packets immediately preceding
     /// largest_received that are also marked received in the bitmap.
-    /// We send only a single ACK range (no additional ranges) for now,
-    /// so curl will retransmit any earlier packets that aren't part of
-    /// this contiguous run, and we'll ACK those when they arrive.
+    /// Single-range form — use `collectAckRanges` to also fill in
+    /// additional ranges for multi-range ACK frames on lossy paths.
     pub fn firstAckRange(self: *const PacketNumberSpace) u64 {
-        const largest = self.largest_received orelse return 0;
-        if (largest < self.bitmap_base) return 0;
-        const largest_offset = largest - self.bitmap_base;
-        if (largest_offset >= 64) return 0;
-        // Walk backwards from the largest_received bit, counting set bits
-        // until we hit a clear bit (a gap) or run out of window.
-        var range: u64 = 0;
-        var i: i32 = @intCast(largest_offset);
-        // Skip the largest bit itself; start counting from i-1.
+        const result = self.collectAckRanges(&[_]frame.AckRange{});
+        return result.first_range;
+    }
+
+    /// Result of `collectAckRanges`: the First ACK Range value plus
+    /// the number of (gap, length) pairs written into the caller-
+    /// provided buffer.
+    pub const AckRangesResult = struct {
+        first_range: u64,
+        additional_count: usize,
+    };
+
+    /// Walk the receive bitmap backward from `largest_received` and
+    /// collect ACK range metadata suitable for a multi-range ACK
+    /// frame (RFC 9000 §19.3.1). Returns the First ACK Range value
+    /// and writes up to `out.len` additional (gap, length) pairs in
+    /// descending packet-number order.
+    ///
+    /// Each additional entry in `out` encodes the next acknowledged
+    /// run of packets after a gap:
+    ///   - `gap` = number of contiguous unacknowledged packets
+    ///     preceding the packet one lower than the smallest in the
+    ///     preceding range, encoded as length-1.
+    ///   - `length` = (count of packets in this range) - 1.
+    ///
+    /// Runs out gracefully on empty bitmap, out-of-window
+    /// `largest_received`, or an `out` buffer of length zero (in
+    /// which case it just computes and returns `first_range`, which
+    /// is what `firstAckRange` does internally).
+    pub fn collectAckRanges(self: *const PacketNumberSpace, out: []frame.AckRange) AckRangesResult {
+        const empty = AckRangesResult{ .first_range = 0, .additional_count = 0 };
+
+        const largest = self.largest_received orelse return empty;
+        if (largest < self.bitmap_base) return empty;
+        const largest_offset_u = largest - self.bitmap_base;
+        if (largest_offset_u >= 64) return empty;
+
+        var i: i32 = @intCast(largest_offset_u);
+
+        // First range: count contiguous set bits immediately preceding
+        // the largest_received bit (same semantics as the old
+        // firstAckRange — length-1 encoding, i.e. "number of packets
+        // before largest that are also acked").
         i -= 1;
+        var first_range: u64 = 0;
         while (i >= 0) : (i -= 1) {
             const bit = self.bitmap & (@as(u64, 1) << @intCast(i));
             if (bit == 0) break;
-            range += 1;
+            first_range += 1;
         }
-        return range;
+
+        // Early exit if the caller doesn't want additional ranges.
+        if (out.len == 0) return .{ .first_range = first_range, .additional_count = 0 };
+
+        // Smallest packet in the first range (absolute).
+        // largest - first_range is the smallest packet included.
+        var prev_smallest_abs: u64 = largest - first_range;
+
+        var additional_count: usize = 0;
+        while (i >= 0 and additional_count < out.len) {
+            // Skip the gap (contiguous clear bits) until we either hit
+            // a set bit (start of next range) or run out of window.
+            while (i >= 0) : (i -= 1) {
+                const bit = self.bitmap & (@as(u64, 1) << @intCast(i));
+                if (bit != 0) break;
+            }
+            if (i < 0) break;
+
+            // `i` now points at the largest set bit of the next range.
+            const next_largest_offset: u64 = @intCast(i);
+            const next_largest_abs: u64 = self.bitmap_base + next_largest_offset;
+
+            // Count the remaining set bits in this range. Skip the
+            // largest bit itself (already accounted for) and count
+            // backward — length-1 encoding, matching first_range.
+            var next_length: u64 = 0;
+            i -= 1;
+            while (i >= 0) : (i -= 1) {
+                const bit = self.bitmap & (@as(u64, 1) << @intCast(i));
+                if (bit == 0) break;
+                next_length += 1;
+            }
+
+            // Gap = (prev range smallest) - (this range largest) - 2.
+            // By construction there's at least one unacknowledged packet
+            // between the two ranges (we just walked over at least one
+            // clear bit), so prev.smallest >= next.largest + 2 and the
+            // subtraction can't underflow.
+            const gap = prev_smallest_abs - next_largest_abs - 2;
+
+            out[additional_count] = .{
+                .gap = gap,
+                .length = next_length,
+            };
+            additional_count += 1;
+
+            // Smallest packet in this range becomes the "prev" for the
+            // next iteration.
+            prev_smallest_abs = next_largest_abs - next_length;
+        }
+
+        return .{ .first_range = first_range, .additional_count = additional_count };
     }
 
     /// Record that an ACK was received
@@ -1187,9 +1272,11 @@ pub const Connection = struct {
     fn markPacketsAcked(self: *Connection, space: types.PacketNumberSpace, smallest: u64, largest: u64) void {
         const now_ns: u64 = if (clock.Instant.now()) |inst| inst.ns else 0;
 
-        // Mark the range as ACKed in the ring buffer. Returns the
-        // sent-time of `largest` if found (for RTT estimation).
-        if (self.sent_ring.markAckedRange(space, smallest, largest)) |sent_time| {
+        // Mark the range as ACKed in the ring buffer. Returns the sent
+        // time of `largest` (for RTT) and the total bytes of in-flight
+        // packets removed (for congestion window growth).
+        const ack_result = self.sent_ring.markAckedRange(space, smallest, largest);
+        if (ack_result.largest_sent_time) |sent_time| {
             // Update RTT estimator (RFC 9002 §5)
             if (now_ns > sent_time) {
                 const ack_delay_ns = self.application_space.calculateAckDelay() * 1000;
@@ -1225,18 +1312,12 @@ pub const Connection = struct {
             self.congestion.onPacketLost(lost_pkt.size, lost_pkt.packet_number);
         }
 
-        // Feed ACK into congestion window growth. Use the ring's
-        // bytes_in_flight tracking for accuracy.
-        const acked_count = largest - smallest + 1;
-        // Estimate acked bytes: average ~1200B per packet if we can't
-        // look them up (they were already removed from the ring by
-        // markAckedRange). This is a simplification; the correct
-        // approach is to sum the actual sizes before removing them.
-        // TODO: have markAckedRange return the total acked bytes.
-        const est_acked_bytes = acked_count * 1200;
-        self.congestion.onPacketAcked(est_acked_bytes, largest);
+        // Feed ACK into congestion window growth using the exact byte
+        // count from the ring rather than a `count * 1200` estimate.
+        self.congestion.onPacketAcked(ack_result.total_bytes, largest);
 
         // Update metrics
+        const acked_count = largest - smallest + 1;
         self.conn_metrics.packets_acked += acked_count;
         self.conn_metrics.rtt_us = self.recovery.rtt.smoothed_rtt / 1000;
 
@@ -1682,6 +1763,92 @@ test "PacketNumberSpace: firstAckRange skips gaps" {
     // Fill the gap: 0..5 all received → range from 5 is 5 (acks 0..5)
     space.onPacketReceived(4);
     try std.testing.expectEqual(@as(u64, 5), space.firstAckRange());
+}
+
+test "PacketNumberSpace: collectAckRanges with single range" {
+    var space = PacketNumberSpace{};
+    space.onPacketReceived(0);
+    space.onPacketReceived(1);
+    space.onPacketReceived(2);
+    space.onPacketReceived(3);
+
+    var buf: [8]frame.AckRange = undefined;
+    const result = space.collectAckRanges(&buf);
+    try std.testing.expectEqual(@as(u64, 3), result.first_range);
+    try std.testing.expectEqual(@as(usize, 0), result.additional_count);
+}
+
+test "PacketNumberSpace: collectAckRanges with one gap" {
+    var space = PacketNumberSpace{};
+    // Received: 0,1,2,_,_,5,6,7  (gap at 3,4)
+    space.onPacketReceived(0);
+    space.onPacketReceived(1);
+    space.onPacketReceived(2);
+    space.onPacketReceived(5);
+    space.onPacketReceived(6);
+    space.onPacketReceived(7);
+
+    var buf: [8]frame.AckRange = undefined;
+    const result = space.collectAckRanges(&buf);
+    // First range: {5, 6, 7} → largest=7, smallest=5, first_range = 7-5 = 2
+    try std.testing.expectEqual(@as(u64, 2), result.first_range);
+    try std.testing.expectEqual(@as(usize, 1), result.additional_count);
+    // Next range: {0, 1, 2}. largest=2, length encoding = 2 (3 packets - 1).
+    // Gap = prev.smallest (5) - next.largest (2) - 2 = 1.
+    try std.testing.expectEqual(@as(u64, 1), buf[0].gap);
+    try std.testing.expectEqual(@as(u64, 2), buf[0].length);
+}
+
+test "PacketNumberSpace: collectAckRanges with two gaps" {
+    var space = PacketNumberSpace{};
+    // Received: 0,_,2,_,4,_,_,7  (gaps at 1,3,5,6)
+    space.onPacketReceived(0);
+    space.onPacketReceived(2);
+    space.onPacketReceived(4);
+    space.onPacketReceived(7);
+
+    var buf: [8]frame.AckRange = undefined;
+    const result = space.collectAckRanges(&buf);
+    // First range: {7} — just the largest. first_range = 0.
+    try std.testing.expectEqual(@as(u64, 0), result.first_range);
+    try std.testing.expectEqual(@as(usize, 3), result.additional_count);
+    // Range 1: {4}. Gap = 7-4-2 = 1. Length = 0.
+    try std.testing.expectEqual(@as(u64, 1), buf[0].gap);
+    try std.testing.expectEqual(@as(u64, 0), buf[0].length);
+    // Range 2: {2}. Gap = 4-2-2 = 0. Length = 0.
+    try std.testing.expectEqual(@as(u64, 0), buf[1].gap);
+    try std.testing.expectEqual(@as(u64, 0), buf[1].length);
+    // Range 3: {0}. Gap = 2-0-2 = 0. Length = 0.
+    try std.testing.expectEqual(@as(u64, 0), buf[2].gap);
+    try std.testing.expectEqual(@as(u64, 0), buf[2].length);
+}
+
+test "PacketNumberSpace: collectAckRanges respects output buffer limit" {
+    var space = PacketNumberSpace{};
+    // Four disjoint ranges: {8}, {6}, {4}, {2}
+    space.onPacketReceived(2);
+    space.onPacketReceived(4);
+    space.onPacketReceived(6);
+    space.onPacketReceived(8);
+
+    // Give the walker only 2 slots — it should fill them and stop.
+    var buf: [2]frame.AckRange = undefined;
+    const result = space.collectAckRanges(&buf);
+    try std.testing.expectEqual(@as(u64, 0), result.first_range);
+    try std.testing.expectEqual(@as(usize, 2), result.additional_count);
+}
+
+test "PacketNumberSpace: collectAckRanges with empty out delegates to firstAckRange" {
+    var space = PacketNumberSpace{};
+    space.onPacketReceived(0);
+    space.onPacketReceived(1);
+    space.onPacketReceived(2);
+
+    const result = space.collectAckRanges(&[_]frame.AckRange{});
+    try std.testing.expectEqual(@as(u64, 2), result.first_range);
+    try std.testing.expectEqual(@as(usize, 0), result.additional_count);
+    // firstAckRange should return the same value.
+    try std.testing.expectEqual(result.first_range, space.firstAckRange());
 }
 
 test "PacketNumberSpace: bitmap window slides forward" {

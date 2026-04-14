@@ -1,0 +1,26 @@
+.{
+    .name = .swerver_httparena_example,
+    .version = "0.1.0-alpha.1",
+    .fingerprint = 0xcda6d30f3c99da0d,
+    .minimum_zig_version = "0.16.0-dev.2135+7c0b42ba0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "main.zig",
+    },
+    .dependencies = .{
+        // Depend on the parent swerver package via a relative path. A
+        // real downstream consumer would use a URL + hash pair here:
+        //
+        //     .swerver = .{
+        //         .url = "https://github.com/justinGrosvenor/swerver/archive/refs/tags/v0.1.0-alpha.1.tar.gz",
+        //         .hash = "…",
+        //     },
+        //
+        // The relative path is used here because this example lives in
+        // the swerver repo and tracks whatever is on disk.
+        .swerver = .{
+            .path = "../..",
+        },
+    },
+}

@@ -6,6 +6,51 @@ const router_mod = @import("router/router.zig");
 const server = @import("server.zig");
 const proxy_mod = @import("proxy/proxy.zig");
 
+/// Fluent builder for constructing a `Server`. The primary
+/// user-facing entry point for applications that embed swerver as a
+/// library.
+///
+/// Usage pattern — all chain methods return a new `ServerBuilder` by
+/// value, so typical code reads as a pipeline:
+///
+///     const srv = try swerver.ServerBuilder
+///         .configDefault()
+///         .router(my_router)
+///         .withState(&app_state)
+///         .withServices(&service_registry)
+///         .withProxy(&reverse_proxy)
+///         .build(allocator);
+///     defer {
+///         srv.deinit();
+///         allocator.destroy(srv);
+///     }
+///     try srv.run(null);
+///
+/// Fields are applied in `build()`:
+///   - `config` / `configDefault` — the `ServerConfig` to validate
+///     and install. `configDefault` uses `ServerConfig.default()`;
+///     `config(cfg)` takes a pre-built one, typically from
+///     `config_file.loadConfigFile`.
+///   - `router` — the `Router` with your registered routes. If
+///     omitted, `build()` constructs an empty router with the config's
+///     x402 policy pre-applied.
+///   - `middleware` — overrides the router's middleware chain with
+///     this one. Rarely needed — prefer calling `Router.setMiddleware`
+///     directly on the router before handing it in.
+///   - `withState(T*)` — opaque pointer to app state, later retrieved
+///     in handlers via `ctx.state(T)`. The pointer must remain valid
+///     for the lifetime of the server.
+///   - `withServices(T*)` — opaque pointer to a services struct,
+///     retrieved by field type via `ctx.get(T)`. Expands to a
+///     reflection-driven dispatch at comptime.
+///   - `withProxy(*Proxy)` — attaches a reverse-proxy instance that
+///     intercepts matching requests before the router. Typically
+///     constructed from `config_file.loadConfigFile`'s proxy routes.
+///
+/// `build()` validates the config, finalizes the router with any
+/// state/services/middleware overrides, heap-allocates a `Server`,
+/// initializes it in place, and returns the pointer. The caller is
+/// responsible for `defer srv.deinit()` + `allocator.destroy(srv)`.
 pub const ServerBuilder = struct {
     cfg: config_mod.ServerConfig,
     router_opt: ?router_mod.Router = null,

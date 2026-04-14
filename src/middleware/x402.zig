@@ -72,22 +72,42 @@ pub fn evaluate(req: request.RequestView, policy: Policy) Decision {
 }
 
 /// Validate payment header structure: must be valid base64 containing JSON
-/// with "signature" and "payload" fields.
+/// with "signature" and "payload" fields. This is a structural check only —
+/// the real gate is cryptographic signature verification, which runs after
+/// this returns true. Keeps the header contract honest: a blob that claims
+/// to be an x402 payment payload has to at least parse as one.
 fn validatePaymentHeader(header_value: []const u8) bool {
     if (header_value.len == 0 or header_value.len > 11000) return false;
 
-    // Decode base64
+    // Decode base64 into a fixed stack buffer.
     const max_decoded = std.base64.standard.Decoder.calcSizeUpperBound(header_value.len) catch return false;
     if (max_decoded > 8192) return false;
     var decode_buf: [8192]u8 = undefined;
-    // calcSizeForSlice gives exact decoded length (vs upper bound)
     const actual_len = std.base64.standard.Decoder.calcSizeForSlice(header_value) catch return false;
     std.base64.standard.Decoder.decode(decode_buf[0..max_decoded], header_value) catch return false;
     const decoded = decode_buf[0..actual_len];
 
-    // Structural validation: must contain "signature" and "payload" fields
-    if (std.mem.indexOf(u8, decoded, "\"signature\"") == null) return false;
-    if (std.mem.indexOf(u8, decoded, "\"payload\"") == null) return false;
+    // Parse into a minimal typed shape. `ignore_unknown_fields = true` lets
+    // the payload carry scheme/network/chainId/etc. without us having to
+    // mirror every x402 field here — we only care that the two mandatory
+    // fields are present and syntactically well-formed JSON.
+    const MinimalPayment = struct {
+        signature: []const u8,
+        payload: std.json.Value,
+    };
+
+    // Stack-backed fixed buffer allocator. No `ArenaAllocator` wrapper
+    // because the FBA already owns all the memory and `parseFromSliceLeaky`
+    // is fine leaking into it — the whole buffer goes out of scope on return.
+    var arena_buf: [16 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&arena_buf);
+
+    _ = std.json.parseFromSliceLeaky(
+        MinimalPayment,
+        fba.allocator(),
+        decoded,
+        .{ .ignore_unknown_fields = true },
+    ) catch return false;
 
     return true;
 }
@@ -247,6 +267,31 @@ test "x402: rejects base64 JSON missing signature field" {
 test "x402: rejects base64 JSON missing payload field" {
     const policy = Policy{ .require_payment = true, .payment_required_b64 = "dGVzdA==" };
     const json = "{\"signature\":\"0xabc\"}"; // no "payload"
+    var b64_buf: [256]u8 = undefined;
+    const b64_len = std.base64.standard.Encoder.calcSize(json.len);
+    _ = std.base64.standard.Encoder.encode(b64_buf[0..b64_len], json);
+
+    const headers = [_]request.Header{
+        .{ .name = "X-Payment", .value = b64_buf[0..b64_len] },
+    };
+    const req = makeRequest("/", &headers);
+    switch (evaluate(req, policy)) {
+        .allow => return error.TestUnexpectedResult,
+        .reject => {},
+    }
+}
+
+// Regression test for the substring-defeat attack the old validator
+// was vulnerable to. The previous implementation did
+//     std.mem.indexOf(u8, decoded, "\"signature\"")
+// to check for presence of the key, which false-positived on payloads
+// that happened to contain the literal bytes inside a string value.
+// The typed parser rejects it because the top-level object has neither
+// a `signature` nor a `payload` field — they're just characters inside
+// an unrelated `msg` string.
+test "x402: rejects JSON containing magic substrings inside string body" {
+    const policy = Policy{ .require_payment = true, .payment_required_b64 = "dGVzdA==" };
+    const json = "{\"msg\":\"need \\\"signature\\\" and \\\"payload\\\" fields\"}";
     var b64_buf: [256]u8 = undefined;
     const b64_len = std.base64.standard.Encoder.calcSize(json.len);
     _ = std.base64.standard.Encoder.encode(b64_buf[0..b64_len], json);

@@ -1,16 +1,49 @@
+//! Middleware framework.
+//!
+//! Middleware in swerver is a chain of pre-request function pointers
+//! that run before the router handler, plus a chain of post-response
+//! function pointers that run after the handler returns. Both chains
+//! are zero-allocation hot-path code — the call happens through a
+//! static `Chain` struct that holds two `[]const …Fn` slices, and every
+//! evaluation is a linear walk over them.
+//!
+//! Pre-request middleware returns a `Decision` that controls what the
+//! router does next: continue the chain, short-circuit with a response,
+//! inject response headers, or apply rate-limit backpressure. Post-
+//! response middleware runs for side effects only (access logs,
+//! metrics, tracing) and has no return value.
+//!
+//! The whole system works identically across HTTP/1.1, HTTP/2, and
+//! HTTP/3 — the protocol layer sets `Context.protocol` and, for h2/h3,
+//! `Context.stream_id` before dispatching, so middleware can observe
+//! per-stream detail without knowing which version it's running under.
+
 const std = @import("std");
 const request = @import("../protocol/request.zig");
 const response = @import("../response/response.zig");
 const buffer_pool = @import("../runtime/buffer_pool.zig");
 const clock = @import("../runtime/clock.zig");
 
-/// Middleware Framework
+/// The outcome of a pre-request middleware evaluation.
 ///
-/// Provides a unified interface for request/response middleware that works
-/// across HTTP/1.1, HTTP/2, and HTTP/3. Designed for zero heap allocations
-/// in the hot path.
-
-/// Decision returned by middleware evaluation
+/// Each middleware in the chain returns one of these. The Chain's
+/// evaluation loop honors the first non-`.allow` decision from the
+/// front of the chain and acts on it:
+///   - `.allow` — advance to the next middleware (or the handler).
+///   - `.modify` — accumulate headers into the Chain's threadlocal
+///     header buffer; the router merges them with the handler's
+///     response before serialization. `continue_chain = true` advances
+///     to the next middleware; `false` short-circuits to the handler.
+///   - `.reject` — stop dispatching, return this response immediately.
+///     The router still runs post-response middleware on it.
+///   - `.skip` — skip remaining pre-request middleware and go straight
+///     to the handler. Used by pre-hooks that want to bypass other
+///     pre-hooks for their specific case (e.g. health probes).
+///   - `.rate_limit_backpressure` — send the included 429 response and
+///     ask the server to pause reads on the connection for the given
+///     duration before the next request. Server integration is
+///     optional; middleware that doesn't need backpressure just uses
+///     `.reject` instead.
 pub const Decision = union(enum) {
     /// Allow request to continue to next middleware/handler
     allow,
@@ -42,7 +75,15 @@ pub const Modification = struct {
     continue_chain: bool = true,
 };
 
-/// Context passed to middleware, providing connection and request info
+/// Per-request, per-connection context passed into every middleware
+/// and handler. Populated by the protocol layer (h1/h2/h3) when a
+/// request comes in and reset between requests on the same connection.
+///
+/// Not all fields are populated in all cases — some are protocol-
+/// specific (`stream_id` is 0 for HTTP/1.1 and set for h2/h3) and
+/// some depend on whether the server has access to the data (e.g.
+/// `client_ip` is only set when the connection was accepted through
+/// a codepath that filled it in).
 pub const Context = struct {
     /// Client IP address (if available)
     client_ip: ?[4]u8 = null,
@@ -76,9 +117,13 @@ pub const Context = struct {
         self.request_id = self.request_id_buf[0..self.request_id_len];
     }
 
-    /// Generate a request ID
+    /// Generate a request ID derived from a realtime-nanosecond seed.
+    /// The 16-hex-char format is compact enough to fit in a log line
+    /// without truncation and random enough that collisions across a
+    /// reasonable time window are negligible.
     pub fn generateRequestId(self: *Context) void {
-        const ts: u64 = @intCast(@mod(std.time.nanoTimestamp(), std.math.maxInt(i64)));
+        const realtime_ns = clock.realtimeNanos() orelse 0;
+        const ts: u64 = @intCast(@mod(realtime_ns, std.math.maxInt(u64)));
         const hash = std.hash.Wyhash.hash(ts, &[_]u8{ 0, 1, 2, 3, 4, 5, 6, 7 });
         const result = std.fmt.bufPrint(&self.request_id_buf, "{x:0>16}", .{hash}) catch {
             self.request_id_len = 0;
@@ -127,14 +172,23 @@ pub fn respondManaged(ctx: *Context, status: u16, content_type: []const u8, body
     };
 }
 
-/// Middleware function signature
-/// Returns a Decision indicating how to proceed
+/// Pre-request middleware function. Called with the per-connection
+/// `Context` and the parsed `RequestView` (headers + body as borrowed
+/// slices). Returns a `Decision` that steers the Chain. Must be pure
+/// or use its own per-thread state — the hot path gives it no allocator.
 pub const MiddlewareFn = *const fn (ctx: *Context, req: request.RequestView) Decision;
 
-/// Post-response hook signature (for logging, metrics)
+/// Post-response hook function. Called after the handler returns and
+/// the response has been serialized, with the finalized response and
+/// the elapsed nanoseconds since the request started. Runs for side
+/// effects only — access logs, metrics, tracing spans. The return
+/// type is `void`: a post-hook can't affect what goes out on the wire,
+/// it can only observe.
 pub const PostResponseFn = *const fn (ctx: *Context, req: request.RequestView, resp: response.Response, elapsed_ns: u64) void;
 
-/// Result from executing pre-request middleware chain
+/// Aggregated outcome of a full pre-request chain evaluation. The
+/// router uses this to decide whether to dispatch the handler, serve
+/// an immediate response, or apply backpressure.
 pub const PreResult = union(enum) {
     /// Request should continue to handler
     allow,
@@ -144,7 +198,28 @@ pub const PreResult = union(enum) {
     backpressure: BackpressureInfo,
 };
 
-/// Middleware chain that executes multiple middleware in order
+/// A pair of middleware slices — one pre-request, one post-response —
+/// plus scratch space for headers that pre-hooks inject via `.modify`.
+///
+/// Constructed once at startup, usually by the benchmark-app helper or
+/// an application's own setup code, and shared across every request on
+/// a single router. The slice fields are borrowed — typical usage is:
+///
+///     const pre_hooks = [_]MiddlewareFn{ security.evaluate, auth.check };
+///     const post_hooks = [_]PostResponseFn{ access_log.postResponse };
+///     var chain = Chain.init(&pre_hooks, &post_hooks);
+///     app_router.setMiddleware(chain);
+///
+/// `response_headers` is an instance-local buffer that accumulates
+/// header additions from `.modify` decisions between `executePre` and
+/// the router's header merge. `executePre` resets the count at the
+/// start of every call, so a previous request's headers can't leak
+/// into the next one.
+///
+/// The buffer is sized to `MAX_MIDDLEWARE_HEADERS` (16) entries —
+/// enough for HSTS, CSP, X-Frame-Options, Referrer-Policy, CORS, and
+/// a few app-specific additions. Overflows are silently dropped, so
+/// keep the per-middleware `response_headers` slice small.
 pub const Chain = struct {
     /// Pre-request middleware (run before handler)
     pre: []const MiddlewareFn,
