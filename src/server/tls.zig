@@ -33,6 +33,7 @@ const Server = server_mod.Server;
 const connection = @import("../runtime/connection.zig");
 const tls = @import("../tls/provider.zig");
 const http2 = @import("../protocol/http2.zig");
+const http2_mod = @import("http2.zig");
 
 /// Max plaintext bytes pushed into SSL_write per `connWrite` call. Caps the
 /// ciphertext any single SSL_write can produce at roughly one TLS record,
@@ -91,7 +92,7 @@ pub fn handleTlsHandshake(server: *Server, conn: *connection.Connection) !void {
                         conn.http2_stack = stack_ptr;
                     }
                     conn.protocol = .http2;
-                    server.sendHttp2ServerPreface(conn) catch {
+                    http2_mod.sendHttp2ServerPreface(server, conn) catch {
                         return error.Http2PrefaceFailed;
                     };
                 }
