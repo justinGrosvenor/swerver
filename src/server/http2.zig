@@ -38,6 +38,7 @@ const middleware = @import("../middleware/middleware.zig");
 const router = @import("../router/router.zig");
 const clock = @import("../runtime/clock.zig");
 const preencoded = @import("preencoded.zig");
+const write_queue = @import("write_queue.zig");
 
 pub fn matchesHttp2Preface(candidate: []const u8) bool {
     const n = if (candidate.len < http2.Preface.len) candidate.len else http2.Preface.len;
@@ -394,8 +395,8 @@ fn dispatchHttp2Request(
         .stream_id = stream_id,
         .buffer_ops = .{
             .ctx = &server.io,
-            .acquire = server_mod.acquireBufferOpaque,
-            .release = server_mod.releaseBufferOpaque,
+            .acquire = write_queue.acquireBufferOpaque,
+            .release = write_queue.releaseBufferOpaque,
         },
     };
     if (conn.cached_peer_ip) |ip4| {

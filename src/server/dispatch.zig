@@ -40,6 +40,7 @@ const http2_mod = @import("http2.zig");
 const http3_mod = @import("http3.zig");
 const preencoded = @import("preencoded.zig");
 const server_tls = @import("tls.zig");
+const write_queue = @import("write_queue.zig");
 
 /// Global shutdown flag set by signal handler (atomic for signal safety)
 var shutdown_requested = std.atomic.Value(bool).init(false);
@@ -290,7 +291,7 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
                             // write queue before entering handleWrite so
                             // the next submission sees the post-ack state.
                             if (conn.send_in_flight) {
-                                advanceAsyncWriteQueue(server, conn, event.bytes);
+                                write_queue.advanceAsyncWriteQueue(server, conn, event.bytes);
                             }
                             handleWrite(server, index) catch |err| {
                                 std.log.debug("handleWrite conn={} failed: {}", .{ index, err });
@@ -357,70 +358,6 @@ pub fn seedReadBuffer(server: *Server, conn: *connection.Connection, data: []con
     }
     @memcpy(buf.bytes[end..][0..data.len], data);
     server.io.onReadBuffered(conn, data.len);
-    conn.markActive(server.io.nowMs());
-}
-
-/// Build an iovec batch from the connection's write queue and
-/// submit it as an async `IORING_OP_WRITEV` SQE on the native
-/// io_uring backend. Returns `true` if the SQE was accepted (the
-/// caller should `return` and wait for the CQE) or `false` if
-/// the submission failed and the caller should fall back to a
-/// sync writev.
-///
-/// On success the iovec array is parked on `conn.async_send_iov`
-/// so its address stays stable until the kernel has copied the
-/// bytes out; `conn.send_in_flight` is set to lock out further
-/// submissions until the `.write` CQE fires.
-pub fn submitConnAsyncWritev(server: *Server, conn: *connection.Connection, fd: std.posix.fd_t) bool {
-    var iov_count: u16 = 0;
-    var total_bytes: usize = 0;
-    var scan_head = conn.write_head;
-    var scan_remaining = conn.write_count;
-    const cap = connection.async_send_iov_capacity;
-    while (scan_remaining > 0 and iov_count < cap) : (iov_count += 1) {
-        const e = &conn.write_queue[scan_head];
-        const s = e.handle.bytes[e.offset..e.len];
-        conn.async_send_iov[iov_count] = .{ .base = s.ptr, .len = s.len };
-        total_bytes += s.len;
-        scan_head = if (scan_head + 1 >= conn.write_queue.len) 0 else scan_head + 1;
-        scan_remaining -= 1;
-    }
-    if (iov_count == 0) return false;
-    const iov_slice = conn.async_send_iov[0..iov_count];
-    server.io.submitAsyncWritev(conn.index, fd, iov_slice) catch return false;
-    conn.send_in_flight = true;
-    conn.async_send_iov_count = iov_count;
-    conn.async_send_total_bytes = total_bytes;
-    return true;
-}
-
-/// Advance the connection's write queue after an async writev
-/// CQE reports `bytes_written`. Pops any fully-sent entries,
-/// releases their buffers, and updates `entry.offset` on a
-/// partially-sent entry. Called from the event dispatcher when a
-/// `.write` event arrives for a connection with `send_in_flight`.
-pub fn advanceAsyncWriteQueue(server: *Server, conn: *connection.Connection, bytes_written: usize) void {
-    var remaining = bytes_written;
-    while (remaining > 0) {
-        const entry = conn.peekWrite() orelse break;
-        const left_in_entry = entry.len - entry.offset;
-        if (remaining >= left_in_entry) {
-            remaining -= left_in_entry;
-            server.io.onWriteCompleted(conn, left_in_entry);
-            server.io.releaseBuffer(entry.handle);
-            conn.popWrite();
-            if (conn.hasPendingBody()) {
-                http1_mod.streamBodyChunks(server, conn, conn.pending_body);
-            }
-        } else {
-            entry.offset += remaining;
-            server.io.onWriteCompleted(conn, remaining);
-            remaining = 0;
-        }
-    }
-    conn.send_in_flight = false;
-    conn.async_send_iov_count = 0;
-    conn.async_send_total_bytes = 0;
     conn.markActive(server.io.nowMs());
 }
 
@@ -685,8 +622,8 @@ pub fn handleRead(server: *Server, index: u32) !void {
                     .protocol = .http1,
                     .buffer_ops = .{
                         .ctx = &server.io,
-                        .acquire = server_mod.acquireBufferOpaque,
-                        .release = server_mod.releaseBufferOpaque,
+                        .acquire = write_queue.acquireBufferOpaque,
+                        .release = write_queue.releaseBufferOpaque,
                     },
                 };
                 // Use cached client IP for proxy headers
@@ -741,8 +678,8 @@ pub fn handleRead(server: *Server, index: u32) !void {
             .is_tls = conn.is_tls,
             .buffer_ops = .{
                 .ctx = &server.io,
-                .acquire = server_mod.acquireBufferOpaque,
-                .release = server_mod.releaseBufferOpaque,
+                .acquire = write_queue.acquireBufferOpaque,
+                .release = write_queue.releaseBufferOpaque,
             },
         };
         // Use cached client IP for rate limiting and logging

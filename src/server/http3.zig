@@ -39,6 +39,7 @@ const middleware = @import("../middleware/middleware.zig");
 const quic_handler = @import("../quic/handler.zig");
 const quic_connection = @import("../quic/connection.zig");
 const preencoded = @import("preencoded.zig");
+const write_queue = @import("write_queue.zig");
 
 /// Maximum datagrams to drain per handleDatagram call before
 /// yielding back to the event loop. Prevents starvation of TCP
@@ -220,8 +221,8 @@ fn handleHttp3Request(
         .protocol = .http3,
         .buffer_ops = .{
             .ctx = &server.io,
-            .acquire = server_mod.acquireBufferOpaque,
-            .release = server_mod.releaseBufferOpaque,
+            .acquire = write_queue.acquireBufferOpaque,
+            .release = write_queue.releaseBufferOpaque,
         },
     };
     var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;

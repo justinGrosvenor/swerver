@@ -43,6 +43,7 @@ const middleware = @import("../middleware/middleware.zig");
 const forward_mod = @import("../proxy/forward.zig");
 const clock = @import("../runtime/clock.zig");
 const preencoded = @import("preencoded.zig");
+const write_queue = @import("write_queue.zig");
 
 pub const connection_close_hdr = "Connection: close\r\n";
 pub const date_prefix = "Date: ";
@@ -912,8 +913,8 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
                 .protocol = .http1,
                 .buffer_ops = .{
                     .ctx = &server.io,
-                    .acquire = server_mod.acquireBufferOpaque,
-                    .release = server_mod.releaseBufferOpaque,
+                    .acquire = write_queue.acquireBufferOpaque,
+                    .release = write_queue.releaseBufferOpaque,
                 },
             };
             var ip_buf: [64]u8 = undefined;
@@ -989,8 +990,8 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
             .protocol = .http1,
             .buffer_ops = .{
                 .ctx = &server.io,
-                .acquire = server_mod.acquireBufferOpaque,
-                .release = server_mod.releaseBufferOpaque,
+                .acquire = write_queue.acquireBufferOpaque,
+                .release = write_queue.releaseBufferOpaque,
             },
         };
         if (conn.cached_peer_ip) |ip4| {
@@ -1051,8 +1052,8 @@ pub fn dispatchToRouter(server: *Server, conn: *connection.Connection, req_view:
         .protocol = .http1,
         .buffer_ops = .{
             .ctx = &server.io,
-            .acquire = server_mod.acquireBufferOpaque,
-            .release = server_mod.releaseBufferOpaque,
+            .acquire = write_queue.acquireBufferOpaque,
+            .release = write_queue.releaseBufferOpaque,
         },
     };
     // Use cached client IP for rate limiting and logging

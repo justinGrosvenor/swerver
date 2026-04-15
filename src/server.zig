@@ -28,6 +28,7 @@ const http3_mod = @import("server/http3.zig");
 const http2_mod = @import("server/http2.zig");
 const http1_mod = @import("server/http1.zig");
 const dispatch = @import("server/dispatch.zig");
+const write_queue = @import("server/write_queue.zig");
 
 // ============================================================
 // Pre-encoded response cache (PR PERF-3)
@@ -655,8 +656,8 @@ test "metrics middleware response queued for http1" {
         .protocol = .http1,
         .buffer_ops = .{
             .ctx = &server.io,
-            .acquire = acquireBufferOpaque,
-            .release = releaseBufferOpaque,
+            .acquire = write_queue.acquireBufferOpaque,
+            .release = write_queue.releaseBufferOpaque,
         },
     };
     var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
@@ -733,8 +734,8 @@ test "metrics middleware response queued for http2" {
         .protocol = .http2,
         .buffer_ops = .{
             .ctx = &server.io,
-            .acquire = acquireBufferOpaque,
-            .release = releaseBufferOpaque,
+            .acquire = write_queue.acquireBufferOpaque,
+            .release = write_queue.releaseBufferOpaque,
         },
     };
     var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
@@ -832,8 +833,8 @@ test "metrics middleware end-to-end http1" {
         .protocol = .http1,
         .buffer_ops = .{
             .ctx = &server.io,
-            .acquire = acquireBufferOpaque,
-            .release = releaseBufferOpaque,
+            .acquire = write_queue.acquireBufferOpaque,
+            .release = write_queue.releaseBufferOpaque,
         },
     };
     var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
@@ -930,8 +931,8 @@ test "metrics middleware end-to-end http2" {
         .stream_id = 1,
         .buffer_ops = .{
             .ctx = &server.io,
-            .acquire = acquireBufferOpaque,
-            .release = releaseBufferOpaque,
+            .acquire = write_queue.acquireBufferOpaque,
+            .release = write_queue.releaseBufferOpaque,
         },
     };
     var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
@@ -1031,7 +1032,7 @@ test "http1 response bytes from write queue" {
     };
 
     try http1_mod.queueResponse(&server, conn, resp);
-    const bytes = try drainWriteQueue(&server.io, conn, allocator);
+    const bytes = try write_queue.drainWriteQueue(&server.io, conn, allocator);
     defer allocator.free(bytes);
 
     // Verify structural correctness (Date header is dynamic so check components)
@@ -1078,7 +1079,7 @@ test "http1 managed response bytes from write queue" {
     defer if (conn.state != .closed) server.io.releaseConnection(conn);
 
     try http1_mod.queueResponse(&server, conn, resp);
-    const bytes = try drainWriteQueue(&server.io, conn, allocator);
+    const bytes = try write_queue.drainWriteQueue(&server.io, conn, allocator);
     defer allocator.free(bytes);
 
     // Verify structural correctness (Date header is dynamic so check components)
@@ -1087,30 +1088,6 @@ test "http1 managed response bytes from write queue" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "Date: ") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "Content-Length: 5\r\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, bytes, "\r\n\r\nhello"));
-}
-
-fn drainWriteQueue(io: *runtime.IoRuntime, conn: *connection.Connection, allocator: std.mem.Allocator) ![]u8 {
-    var list = std.ArrayList(u8).empty;
-    defer list.deinit(allocator);
-
-    while (conn.peekWrite()) |entry_ptr| {
-        const entry = entry_ptr.*;
-        try list.appendSlice(allocator, entry.handle.bytes[entry.offset..entry.len]);
-        io.releaseBuffer(entry.handle);
-        conn.popWrite();
-    }
-
-    return list.toOwnedSlice(allocator);
-}
-
-pub fn acquireBufferOpaque(ctx: *anyopaque) ?buffer_pool.BufferHandle {
-    const io: *runtime.IoRuntime = @ptrCast(@alignCast(ctx));
-    return io.acquireBuffer();
-}
-
-pub fn releaseBufferOpaque(ctx: *anyopaque, handle: buffer_pool.BufferHandle) void {
-    const io: *runtime.IoRuntime = @ptrCast(@alignCast(ctx));
-    io.releaseBuffer(handle);
 }
 
 // Benchmark / TechEmpower handlers, `/json` dataset loader, and the

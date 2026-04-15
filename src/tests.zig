@@ -101,6 +101,7 @@ comptime {
     _ = @import("server/http2.zig");
     _ = @import("server/http1.zig");
     _ = @import("server/dispatch.zig");
+    _ = @import("server/write_queue.zig");
 
     // Runtime
     _ = buffer_pool;
