@@ -781,8 +781,11 @@ pub const Router = struct {
         for (self.routes[0..self.route_count]) |r| {
             if (!self.matchRoute(&r, path_only, &ctx)) continue;
             if (r.method != req.method) {
-                path_matched = true;
-                continue;
+                // RFC 9110 §9.3.2: HEAD must be supported wherever GET is
+                if (!(req.method == .HEAD and r.method == .GET)) {
+                    path_matched = true;
+                    continue;
+                }
             }
             mw_ctx.route = r.pattern;
             const effective_policy = if (r.x402_policy.require_payment)

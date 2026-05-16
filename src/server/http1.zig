@@ -1048,6 +1048,25 @@ pub fn dispatchToRouter(server: *Server, conn: *connection.Connection, req_view:
         queueResponse(server, conn, Server.badRequestResponse()) catch {};
         return;
     }
+    // RFC 9110 §9.3.7: OPTIONS * is valid, respond with 200
+    if (req_view.method == .OPTIONS and std.mem.eql(u8, req_view.path, "*")) {
+        queueResponse(server, conn, .{
+            .status = 200,
+            .headers = &[_]response_mod.Header{},
+            .body = .none,
+        }) catch {};
+        return;
+    }
+    // RFC 9110 §9.3.6: CONNECT is for tunneling — reject without a proxy
+    if (req_view.method == .CONNECT) {
+        conn.close_after_write = true;
+        queueResponse(server, conn, .{
+            .status = 501,
+            .headers = &[_]response_mod.Header{},
+            .body = .{ .bytes = "Not Implemented" },
+        }) catch {};
+        return;
+    }
 
     // Fast path: pre-encoded h1 response cache.
     if (preencoded.tryDispatchPreencodedH1(server, conn, req_view) == .dispatched) return;

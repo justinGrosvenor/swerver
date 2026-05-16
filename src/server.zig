@@ -283,15 +283,10 @@ pub const Server = struct {
             preencoded.initPreencodedH3(self);
         }
 
-        // Pre-encode the h1 response bytes for the same hot static
-        // endpoints. No external dependency — uses encodeResponse +
-        // the already-initialized cached date + Alt-Svc config.
-        preencoded.initPreencodedH1(self);
-
-        // Pre-encode the h2 response templates. Uses http2.encodeResponseHeaders
-        // to build a stream-id-agnostic HPACK block + frame headers that
-        // are patched per-request.
-        if (build_options.enable_http2) preencoded.initPreencodedH2(self);
+        if (!self.cfg.disable_preencoded) {
+            preencoded.initPreencodedH1(self);
+            if (build_options.enable_http2) preencoded.initPreencodedH2(self);
+        }
     }
 
     pub fn deinit(self: *Server) void {

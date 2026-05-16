@@ -130,10 +130,24 @@ fn parseHeadersInternal(_bytes: []u8, _limits: Limits) HeaderParseResult {
         };
     };
     const method_str = line[0..first_space];
+    if (method_str.len > 16) {
+        return .{
+            .state = .err,
+            .view = emptyView(),
+            .error_code = .invalid_method,
+            .content_length = 0,
+            .is_chunked = false,
+            .keep_alive = true,
+            .expect_continue = false,
+            .headers_consumed = 0,
+        };
+    }
     const request_target = line[first_space + 1 .. second_space];
-    // Reject paths containing NUL or control characters (0x00-0x1F, 0x7F)
-    for (request_target) |c| {
-        if (c <= 0x1f or c == 0x7f) {
+    // Reject paths containing control characters, non-ASCII, or
+    // percent-encoded NUL (%00). RFC 9112 §3.2.1: request-target
+    // must consist of visible ASCII (0x21-0x7E) plus SP in queries.
+    for (request_target, 0..) |c, i| {
+        if (c <= 0x1f or c == 0x7f or c >= 0x80) {
             return .{
                 .state = .err,
                 .view = emptyView(),
@@ -144,6 +158,20 @@ fn parseHeadersInternal(_bytes: []u8, _limits: Limits) HeaderParseResult {
                 .expect_continue = false,
                 .headers_consumed = 0,
             };
+        }
+        if (c == '%' and i + 2 < request_target.len) {
+            if (request_target[i + 1] == '0' and request_target[i + 2] == '0') {
+                return .{
+                    .state = .err,
+                    .view = emptyView(),
+                    .error_code = .invalid_path,
+                    .content_length = 0,
+                    .is_chunked = false,
+                    .keep_alive = true,
+                    .expect_continue = false,
+                    .headers_consumed = 0,
+                };
+            }
         }
     }
     const version = line[second_space + 1 ..];
@@ -368,6 +396,18 @@ fn parseHeadersInternal(_bytes: []u8, _limits: Limits) HeaderParseResult {
                     .headers_consumed = 0,
                 };
             }
+            if (value.len == 0 or hasInvalidHostChar(value)) {
+                return .{
+                    .state = .err,
+                    .view = emptyView(),
+                    .error_code = .invalid_header_value,
+                    .content_length = 0,
+                    .is_chunked = false,
+                    .keep_alive = true,
+                    .expect_continue = false,
+                    .headers_consumed = 0,
+                };
+            }
         }
         if (std.ascii.eqlIgnoreCase(name, "content-length")) {
             if (value.len == 0) {
@@ -412,7 +452,7 @@ fn parseHeadersInternal(_bytes: []u8, _limits: Limits) HeaderParseResult {
                 return .{
                     .state = .err,
                     .view = emptyView(),
-                    .error_code = .body_too_large,
+                    .error_code = .invalid_content_length,
                     .content_length = 0,
                     .is_chunked = false,
                     .keep_alive = true,
@@ -460,7 +500,7 @@ fn parseHeadersInternal(_bytes: []u8, _limits: Limits) HeaderParseResult {
             has_content_length = true;
         }
         if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
-            if (containsToken(value, "chunked")) {
+            if (lastToken(value, "chunked")) {
                 is_chunked = true;
             } else {
                 return .{
@@ -607,7 +647,14 @@ pub const ChunkDecoder = struct {
                             const line = self.size_buf[0..line_len];
                             const semi = std.mem.indexOfScalar(u8, line, ';') orelse line.len;
                             if (semi == 0) return error.InvalidChunk;
-                            const chunk_size = std.fmt.parseInt(usize, line[0..semi], 16) catch return error.InvalidChunk;
+                            const size_str = line[0..semi];
+                            for (size_str) |sc| {
+                                if (!std.ascii.isHex(sc)) return error.InvalidChunk;
+                            }
+                            if (semi < line.len) {
+                                validateChunkExtensions(line[semi..]) catch return error.InvalidChunk;
+                            }
+                            const chunk_size = std.fmt.parseInt(usize, size_str, 16) catch return error.InvalidChunk;
                             self.size_buf_len = 0;
                             if (chunk_size == 0) {
                                 self.state = .trailer;
@@ -757,7 +804,41 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
         };
     };
     const method_str = line[0..first_space];
+    if (method_str.len > 16) {
+        return .{
+            .state = .err,
+            .view = emptyView(),
+            .error_code = .invalid_method,
+            .consumed_bytes = 0,
+            .keep_alive = true,
+            .expect_continue = false,
+        };
+    }
     const request_target = line[first_space + 1 .. second_space];
+    for (request_target, 0..) |c, i| {
+        if (c <= 0x1f or c == 0x7f or c >= 0x80) {
+            return .{
+                .state = .err,
+                .view = emptyView(),
+                .error_code = .invalid_path,
+                .consumed_bytes = 0,
+                .keep_alive = true,
+                .expect_continue = false,
+            };
+        }
+        if (c == '%' and i + 2 < request_target.len) {
+            if (request_target[i + 1] == '0' and request_target[i + 2] == '0') {
+                return .{
+                    .state = .err,
+                    .view = emptyView(),
+                    .error_code = .invalid_path,
+                    .consumed_bytes = 0,
+                    .keep_alive = true,
+                    .expect_continue = false,
+                };
+            }
+        }
+    }
     const version = line[second_space + 1 ..];
     // Use extended parsing to accept any valid token method (RFC 7230 compliance)
     const method = request.Method.fromStringExtended(method_str) orelse {
@@ -957,6 +1038,16 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
                     .expect_continue = false,
                 };
             }
+            if (value.len == 0 or hasInvalidHostChar(value)) {
+                return .{
+                    .state = .err,
+                    .view = emptyView(),
+                    .error_code = .invalid_header_value,
+                    .consumed_bytes = 0,
+                    .keep_alive = true,
+                    .expect_continue = false,
+                };
+            }
         }
         if (std.ascii.eqlIgnoreCase(name, "content-length")) {
             // Reject values with leading zeros, signs, or whitespace to prevent smuggling
@@ -998,7 +1089,7 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
                 return .{
                     .state = .err,
                     .view = emptyView(),
-                    .error_code = .body_too_large,
+                    .error_code = .invalid_content_length,
                     .consumed_bytes = 0,
                     .keep_alive = true,
                     .expect_continue = false,
@@ -1038,8 +1129,8 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
             has_content_length = true;
         }
         if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
-            // RFC 9112 §6.1: TE value is a comma-separated list of tokens
-            if (containsToken(value, "chunked")) {
+            // RFC 9112 §6.1: chunked must be the final transfer coding
+            if (lastToken(value, "chunked")) {
                 is_chunked = true;
             } else {
                 return .{
@@ -1229,10 +1320,21 @@ fn isTchar(ch: u8) bool {
 /// Allowed: HTAB, SP, VCHAR (0x21-0x7E), obs-text (0x80-0xFF)
 fn isValidFieldValue(value: []const u8) bool {
     for (value) |ch| {
-        if (ch == 0) return false; // NUL
-        if (ch == '\r' or ch == '\n') return false; // bare CR/LF (already split on CRLF)
+        // RFC 9110 §5.5: field-value = *field-content
+        // field-content = field-vchar [ 1*(SP / HTAB / field-vchar) field-vchar ]
+        // field-vchar = VCHAR / obs-text
+        // Reject control chars (0x00-0x08, 0x0A-0x1F, 0x7F) — allow HTAB (0x09)
+        if (ch < 0x20 and ch != '\t') return false;
+        if (ch == 0x7f) return false;
     }
     return true;
+}
+
+fn hasInvalidHostChar(value: []const u8) bool {
+    for (value) |ch| {
+        if (ch == '@' or ch == '/' or ch == ',') return true;
+    }
+    return false;
 }
 
 const ChunkedResult = struct {
@@ -1268,11 +1370,16 @@ fn decodeChunkedInPlace(buf: []u8, body_start: usize) !ChunkedResult {
                 };
             }
             // Trailers present or incomplete
-            const trailer_end = std.mem.indexOfPos(u8, buf, src, "\r\n\r\n") orelse return ChunkedResult{
-                .complete = false,
-                .body_start = body_start,
-                .body_len = total,
-                .consumed_bytes = 0,
+            const trailer_end = std.mem.indexOfPos(u8, buf, src, "\r\n\r\n") orelse {
+                if (std.mem.indexOfPos(u8, buf, src, "\n")) |nl| {
+                    if (nl == src or buf[nl - 1] != '\r') return error.InvalidChunk;
+                }
+                return ChunkedResult{
+                    .complete = false,
+                    .body_start = body_start,
+                    .body_len = total,
+                    .consumed_bytes = 0,
+                };
             };
             try validateTrailerHeaders(buf, src, trailer_end);
             return .{
@@ -1321,7 +1428,14 @@ fn scanChunked(buf: []const u8, body_start: usize, max_body_bytes: usize) !?Chun
                 };
             }
             // Trailers present or incomplete — search for terminal \r\n\r\n
-            const trailer_end = std.mem.indexOfPos(u8, buf, src, "\r\n\r\n") orelse return null;
+            const trailer_end = std.mem.indexOfPos(u8, buf, src, "\r\n\r\n") orelse {
+                // If we see bare LF (not preceded by CR), reject immediately
+                // instead of waiting forever for \r\n\r\n that won't come.
+                if (std.mem.indexOfPos(u8, buf, src, "\n")) |nl| {
+                    if (nl == src or buf[nl - 1] != '\r') return error.InvalidChunk;
+                }
+                return null;
+            };
             try validateTrailerHeaders(buf, src, trailer_end);
             return .{
                 .complete = true,
@@ -1343,7 +1457,57 @@ fn parseChunkSize(line: []const u8) !usize {
     const semi = std.mem.indexOfScalar(u8, line, ';') orelse line.len;
     const size_str = line[0..semi];
     if (size_str.len == 0) return error.InvalidChunk;
+    // RFC 9112 §7.1: chunk-size is 1*HEXDIG — reject non-hex chars
+    for (size_str) |ch| {
+        if (!std.ascii.isHex(ch)) return error.InvalidChunk;
+    }
+    // Validate chunk extensions if present
+    if (semi < line.len) {
+        try validateChunkExtensions(line[semi..]);
+    }
     return std.fmt.parseInt(usize, size_str, 16) catch return error.InvalidChunk;
+}
+
+fn validateChunkExtensions(ext: []const u8) !void {
+    // RFC 9112 §7.1.1: chunk-ext = *( BWS ";" BWS chunk-ext-name [ "=" chunk-ext-val ] )
+    // chunk-ext-name = token
+    // chunk-ext-val = token / quoted-string
+    // Reject control chars, bare CR/LF, or oversized extensions
+    if (ext.len > 4096) return error.InvalidChunk;
+    for (ext) |ch| {
+        if (ch < 0x20 and ch != '\t') return error.InvalidChunk;
+        if (ch == 0x7f) return error.InvalidChunk;
+    }
+    // After the semicolons, extension names must be valid tokens
+    var pos: usize = 0;
+    while (pos < ext.len) {
+        if (ext[pos] != ';') return error.InvalidChunk;
+        pos += 1;
+        // Skip BWS
+        while (pos < ext.len and (ext[pos] == ' ' or ext[pos] == '\t')) pos += 1;
+        if (pos >= ext.len) return error.InvalidChunk;
+        // ext-name must be a non-empty token
+        const name_start = pos;
+        while (pos < ext.len and isTchar(ext[pos])) pos += 1;
+        if (pos == name_start) return error.InvalidChunk;
+        // Optional = value
+        if (pos < ext.len and ext[pos] == '=') {
+            pos += 1;
+            // Skip token or quoted-string value
+            if (pos < ext.len and ext[pos] == '"') {
+                pos += 1;
+                while (pos < ext.len and ext[pos] != '"') {
+                    if (ext[pos] == '\\' and pos + 1 < ext.len) pos += 1;
+                    pos += 1;
+                }
+                if (pos < ext.len) pos += 1; // skip closing quote
+            } else {
+                while (pos < ext.len and isTchar(ext[pos])) pos += 1;
+            }
+        }
+        // Skip BWS before next semicolon
+        while (pos < ext.len and (ext[pos] == ' ' or ext[pos] == '\t')) pos += 1;
+    }
 }
 
 fn validateTrailerHeaders(buf: []const u8, start: usize, end: usize) !void {
@@ -1374,6 +1538,17 @@ fn containsToken(header_value: []const u8, token: []const u8) bool {
         }
     }
     return false;
+}
+
+/// RFC 9112 §6.1: "chunked" must be the LAST transfer coding.
+fn lastToken(header_value: []const u8, token: []const u8) bool {
+    var last: []const u8 = "";
+    var it = std.mem.splitScalar(u8, header_value, ',');
+    while (it.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t");
+        if (trimmed.len > 0) last = trimmed;
+    }
+    return std.ascii.eqlIgnoreCase(last, token);
 }
 
 test "scanChunked: no trailers" {

@@ -22,6 +22,10 @@ pub const ServerConfig = struct {
     /// Disable security headers, metrics, and access logging middleware.
     /// Use for pure benchmark mode where middleware overhead matters.
     disable_middleware: bool = false,
+    /// Disable preencoded response cache (benchmark fast-paths for /echo,
+    /// /health, /plaintext, /pipeline). Set true when user routes need
+    /// those paths.
+    disable_preencoded: bool = false,
 
     pub fn default() ServerConfig {
         return .{

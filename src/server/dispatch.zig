@@ -609,6 +609,32 @@ pub fn handleRead(server: *Server, index: u32) !void {
             return;
         }
 
+        // RFC 9110 §9.3.6: OPTIONS with asterisk-form request-target
+        if (parse.view.method == .OPTIONS and std.mem.eql(u8, parse.view.path, "*")) {
+            try http1_mod.queueResponse(server, conn, .{
+                .status = 200,
+                .headers = &[_]response_mod.Header{
+                    .{ .name = "Content-Length", .value = "0" },
+                },
+                .body = .{ .bytes = "" },
+            });
+            if (conn.read_buffered_bytes == 0) break;
+            continue;
+        }
+
+        // RFC 9110 §9.3.6: CONNECT uses authority-form — not supported
+        if (parse.view.method == .CONNECT) {
+            try http1_mod.queueResponse(server, conn, .{
+                .status = 501,
+                .headers = &[_]response_mod.Header{
+                    .{ .name = "Content-Length", .value = "0" },
+                },
+                .body = .{ .bytes = "" },
+            });
+            if (conn.read_buffered_bytes == 0) break;
+            continue;
+        }
+
         // Check for static file requests - use sendfile for zero-copy
         if (server.cfg.static_root.len > 0 and std.mem.startsWith(u8, parse.view.path, "/static/")) {
             const file_path = parse.view.path[8..]; // Skip "/static/"
