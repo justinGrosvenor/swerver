@@ -48,6 +48,72 @@ pub const Protocol = enum {
 
 pub const TransitionError = error{InvalidTransition};
 
+pub const PendingH2Body = struct {
+    stream_id: u32 = 0,
+    method: request.Method = .GET,
+    path_len: u16 = 0,
+    path_buf: [512]u8 = undefined,
+    header_count: u16 = 0,
+    header_storage_len: u16 = 0,
+    header_storage: [2048]u8 = undefined,
+    header_entries: [32]request.Header = undefined,
+    body_handle: ?buffer_pool.BufferHandle = null,
+    body_len: usize = 0,
+    active: bool = false,
+
+    pub fn stash(self: *PendingH2Body, stream_id: u32, req: request.RequestView) bool {
+        if (req.path.len > self.path_buf.len) return false;
+        self.stream_id = stream_id;
+        self.method = req.method;
+        self.path_len = @intCast(req.path.len);
+        @memcpy(self.path_buf[0..req.path.len], req.path);
+        var off: u16 = 0;
+        var count: u16 = 0;
+        for (req.headers) |h| {
+            const needed = h.name.len + h.value.len;
+            if (off + needed > self.header_storage.len or count >= self.header_entries.len) break;
+            @memcpy(self.header_storage[off .. off + h.name.len], h.name);
+            const name_start = off;
+            off += @intCast(h.name.len);
+            @memcpy(self.header_storage[off .. off + h.value.len], h.value);
+            const val_start = off;
+            off += @intCast(h.value.len);
+            self.header_entries[count] = .{
+                .name = self.header_storage[name_start .. name_start + h.name.len],
+                .value = self.header_storage[val_start .. val_start + h.value.len],
+            };
+            count += 1;
+        }
+        self.header_count = count;
+        self.header_storage_len = off;
+        self.body_handle = null;
+        self.body_len = 0;
+        self.active = true;
+        return true;
+    }
+
+    pub fn path(self: *const PendingH2Body) []const u8 {
+        return self.path_buf[0..self.path_len];
+    }
+
+    pub fn toRequestView(self: *const PendingH2Body, body: []const u8) request.RequestView {
+        return .{
+            .method = self.method,
+            .path = self.path(),
+            .headers = self.header_entries[0..self.header_count],
+            .body = body,
+        };
+    }
+
+    pub fn clear(self: *PendingH2Body) void {
+        self.active = false;
+        self.body_handle = null;
+        self.body_len = 0;
+    }
+};
+
+pub const MAX_PENDING_H2_BODIES = 32;
+
 pub const Connection = struct {
     index: u32,
     id: u64,
@@ -84,6 +150,8 @@ pub const Connection = struct {
     is_head_request: bool,
     /// Body accumulation state for large request bodies (inline, no heap alloc)
     body_accum: ?BodyAccumState = null,
+    /// Pending H2 body-bearing requests (HEADERS received, waiting for DATA)
+    h2_pending: [MAX_PENDING_H2_BODIES]PendingH2Body = [_]PendingH2Body{.{}} ** MAX_PENDING_H2_BODIES,
     /// Pending response body for streaming large responses
     pending_body: []const u8,
     /// File descriptor for sendfile-based response (null = no file pending)
@@ -199,6 +267,7 @@ pub const Connection = struct {
         self.is_head_request = false;
         // body_accum is cleaned up by the server before reset
         self.body_accum = null;
+        for (&self.h2_pending) |*p| p.clear();
         self.pending_body = &[_]u8{};
         self.cleanupPendingFile();
         self.cached_peer_ip = null;

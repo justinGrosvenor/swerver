@@ -46,10 +46,8 @@ const write_queue = @import("write_queue.zig");
 /// connections when the UDP socket has a burst of queued packets.
 const MAX_DATAGRAMS_PER_DRAIN = 64;
 
-/// GSO segment size — the maximum UDP payload we pad each QUIC
-/// packet to when batching via `sendGso`. 1280 is the QUIC minimum
-/// MTU; every segment except the last is padded to this size so the
-/// kernel can split the buffer evenly.
+/// QUIC minimum MTU — used as the congestion control packet-size
+/// estimate and the maximum UDP datagram target size.
 const GSO_SEGMENT_SIZE: u16 = 1280;
 
 pub fn handleDatagram(server: *Server) !void {
@@ -161,8 +159,18 @@ fn processOneDatagram(
                     handleHttp3Request(server, udp_fd, conn, req, net_peer);
                     conn.clearH3RequestStream(req.stream_id);
                 },
-                .settings, .goaway, .stream_error => {},
+                .settings => {},
+                .goaway, .stream_error => {},
             }
+        }
+    }
+
+    // Drain any pending response data that was buffered because
+    // the congestion window was full. ACK frames in the packet we
+    // just processed may have freed window capacity.
+    if (result.conn) |conn| {
+        if (conn.pending_send != null) {
+            drainPendingSend(udp_fd, conn, net_peer);
         }
     }
 
@@ -209,7 +217,7 @@ fn handleHttp3Request(
     // --- Fast path: pre-encoded response cache ---
     // x402 gate: skip cache when payment required (must run x402.evaluate first)
     const method_str = req_view.getMethodName();
-    if (!server.app_router.x402_policy.require_payment) {
+    if (!server.app_router.has_any_paid_routes) {
         if (preencoded.findAndRefreshPreencodedH3(server, method_str, req_view.path)) |entry| {
             sendHttp3ResponseBytes(server, udp_fd, conn, req.stream_id, peer_addr, entry.bytes[0..entry.len]);
             return;
@@ -252,6 +260,11 @@ fn handleHttp3Request(
 /// wire. Used by the cold-path (router-dispatched) h3 flow.
 /// The hot path uses `sendHttp3ResponseBytes` directly with
 /// pre-encoded bytes.
+///
+/// Responses up to ~16 KB are encoded into a stack buffer (zero
+/// allocation). Larger bodies use a pool buffer to avoid blowing
+/// the stack frame while still supporting the echo-POST benchmark
+/// path (which echoes bodies up to 256 KB).
 fn sendHttp3ResponseFromResponse(
     server: *Server,
     udp_fd: std.posix.fd_t,
@@ -262,14 +275,31 @@ fn sendHttp3ResponseFromResponse(
 ) void {
     const body_bytes = resp.bodyBytes();
     const body_len = resp.bodyLen();
-    var encoded_response_buf: [16384]u8 = undefined;
-    const resp_len = conn.encodeHttp3Response(
-        &encoded_response_buf,
-        resp.status,
-        @ptrCast(resp.headers),
-        if (body_len > 0) body_bytes else null,
-    ) catch return;
-    sendHttp3ResponseBytes(server, udp_fd, conn, stream_id, peer_addr, encoded_response_buf[0..resp_len]);
+
+    const SMALL_BUF_SIZE = 16384;
+    const HEADER_OVERHEAD = 512;
+
+    if (body_len + HEADER_OVERHEAD <= SMALL_BUF_SIZE) {
+        var encoded_response_buf: [SMALL_BUF_SIZE]u8 = undefined;
+        const resp_len = conn.encodeHttp3Response(
+            &encoded_response_buf,
+            resp.status,
+            @ptrCast(resp.headers),
+            if (body_len > 0) body_bytes else null,
+        ) catch return;
+        sendHttp3ResponseBytes(server, udp_fd, conn, stream_id, peer_addr, encoded_response_buf[0..resp_len]);
+    } else {
+        const needed = body_len + HEADER_OVERHEAD;
+        const heap_buf = server.allocator.alloc(u8, needed) catch return;
+        defer server.allocator.free(heap_buf);
+        const resp_len = conn.encodeHttp3Response(
+            heap_buf,
+            resp.status,
+            @ptrCast(resp.headers),
+            if (body_len > 0) body_bytes else null,
+        ) catch return;
+        sendHttp3ResponseBytes(server, udp_fd, conn, stream_id, peer_addr, heap_buf[0..resp_len]);
+    }
 }
 
 /// Send already-encoded h3 response bytes over the wire for a
@@ -293,71 +323,58 @@ pub fn sendHttp3ResponseBytes(
 ) void {
     _ = server;
     const keys = conn.crypto_ctx.application.server orelse return;
-    const max_stream_payload = 1200;
 
-    // Piggyback any pending ACK onto the FIRST response packet.
-    // This coalesces ACK + STREAM data into one UDP datagram
-    // instead of two (processPacket deferred the ACK when h3
-    // events were present — see the comment in handler.zig).
     const pending_ack = if (conn.application_space.ack_needed)
         conn.application_space.largest_received
     else
         null;
 
-    // Fast path: single packet — no batching needed.
-    if (h3_bytes.len <= max_stream_payload) {
+    sendStreamData(conn, udp_fd, &keys, stream_id, peer_addr, h3_bytes, 0, pending_ack);
+}
+
+/// Send STREAM data for a single stream, one packet per sendto.
+/// When the congestion window is full, buffers the remaining bytes
+/// on the Connection for later draining.
+fn sendStreamData(
+    conn: *quic_connection.Connection,
+    udp_fd: std.posix.fd_t,
+    keys: *const @import("../quic/crypto.zig").Keys,
+    stream_id: u64,
+    peer_addr: net.SockAddrStorage,
+    h3_bytes: []const u8,
+    initial_offset: u64,
+    pending_ack: ?u64,
+) void {
+    const max_stream_payload = 1200;
+    var stream_offset: u64 = initial_offset;
+    var remaining = h3_bytes;
+    var ack_sent = false;
+
+    while (remaining.len > 0) {
+        if (!conn.canSendPacket(GSO_SEGMENT_SIZE)) {
+            // Congestion window full — buffer for later.
+            const copy = conn.allocator.alloc(u8, remaining.len) catch return;
+            @memcpy(copy, remaining);
+            if (conn.pending_send) |*old| old.deinit();
+            conn.pending_send = .{
+                .stream_id = stream_id,
+                .data = copy,
+                .stream_offset = stream_offset,
+                .alloc = conn.allocator,
+            };
+            break;
+        }
+
+        const chunk_len = @min(remaining.len, max_stream_payload);
+        const is_last = (chunk_len == remaining.len);
+        const ack_for_this_pkt = if (!ack_sent) pending_ack else null;
+
         var packet_buf: [2048]u8 = undefined;
         const built = quic_handler.buildShortPacket(
             &packet_buf,
             .{
                 .conn = conn,
-                .keys = &keys,
-                .ack_largest = pending_ack,
-                .stream_data = .{
-                    .stream_id = stream_id,
-                    .offset = 0,
-                    .data = h3_bytes,
-                    .fin = true,
-                },
-            },
-        ) catch return;
-        conn.application_space.ack_needed = false;
-        _ = net.sendto(udp_fd, packet_buf[0..built.bytes_written], peer_addr) catch return;
-        return;
-    }
-
-    // Multi-packet path: build all packets into a contiguous batch
-    // buffer. On Linux, send via GSO in one syscall. On other
-    // platforms, send each packet individually.
-    //
-    // Max batch: 65536 / 1280 = 51 segments. More than enough for
-    // even large responses. If the response exceeds the batch
-    // buffer, flush mid-way and start a new batch.
-    var batch_buf: [65536]u8 = undefined;
-    var batch_offset: usize = 0;
-    var stream_offset: u64 = 0;
-    var remaining = h3_bytes;
-    var pkt_count: usize = 0;
-    var ack_sent = false;
-
-    while (remaining.len > 0) {
-        // Congestion control gate (RFC 9002 §7): don't send if the
-        // congestion window is full. Data-bearing packets count
-        // against the window; ACK-only packets are exempt.
-        if (!conn.canSendPacket(GSO_SEGMENT_SIZE)) break;
-
-        const chunk_len = @min(remaining.len, max_stream_payload);
-        const is_last = (chunk_len == remaining.len);
-
-        // Piggyback pending ACK onto the FIRST packet only.
-        const ack_for_this_pkt = if (!ack_sent) pending_ack else null;
-
-        // Build the packet into the batch buffer at the current offset.
-        const built = quic_handler.buildShortPacket(
-            batch_buf[batch_offset..],
-            .{
-                .conn = conn,
-                .keys = &keys,
+                .keys = keys,
                 .ack_largest = ack_for_this_pkt,
                 .stream_data = .{
                     .stream_id = stream_id,
@@ -372,72 +389,37 @@ pub fn sendHttp3ResponseBytes(
             ack_sent = true;
         }
 
-        // Pad non-final packets to the GSO segment size so the
-        // kernel splits evenly. Final packet can be shorter.
-        if (!is_last and built.bytes_written < GSO_SEGMENT_SIZE) {
-            const pad = GSO_SEGMENT_SIZE - built.bytes_written;
-            if (batch_offset + GSO_SEGMENT_SIZE <= batch_buf.len) {
-                @memset(batch_buf[batch_offset + built.bytes_written .. batch_offset + built.bytes_written + pad], 0);
-            }
-            batch_offset += GSO_SEGMENT_SIZE;
-        } else {
-            batch_offset += built.bytes_written;
-        }
-        pkt_count += 1;
+        _ = net.sendto(udp_fd, packet_buf[0..built.bytes_written], peer_addr) catch return;
+
         remaining = remaining[chunk_len..];
         stream_offset += chunk_len;
-
-        // If the batch buffer is nearly full, flush now and start
-        // a new batch. (Safety margin: leave room for one more
-        // max-sized packet.)
-        if (!is_last and batch_offset + GSO_SEGMENT_SIZE > batch_buf.len) {
-            flushGsoBatch(udp_fd, batch_buf[0..batch_offset], peer_addr, pkt_count);
-            batch_offset = 0;
-            pkt_count = 0;
-        }
-    }
-
-    // Flush whatever remains in the batch buffer.
-    if (batch_offset > 0) {
-        flushGsoBatch(udp_fd, batch_buf[0..batch_offset], peer_addr, pkt_count);
     }
 }
 
-/// Flush a batch of contiguously-built QUIC packets. Tries GSO
-/// first (one `sendmsg` syscall for all packets on Linux). Falls
-/// back to one `sendto` per GSO_SEGMENT_SIZE chunk on macOS or
-/// if GSO fails.
-fn flushGsoBatch(
+/// Drain any buffered response data on a connection after ACK
+/// processing may have opened the congestion window.
+pub fn drainPendingSend(
     udp_fd: std.posix.fd_t,
-    buf: []const u8,
-    peer: net.SockAddrStorage,
-    pkt_count: usize,
+    conn: *quic_connection.Connection,
+    peer_addr: net.SockAddrStorage,
 ) void {
-    if (buf.len == 0) return;
+    const ps = conn.pending_send orelse return;
+    const keys = conn.crypto_ctx.application.server orelse return;
 
-    // Single packet — sendto is sufficient.
-    if (pkt_count <= 1) {
-        _ = net.sendto(udp_fd, buf, peer) catch return;
-        return;
-    }
+    const pending_ack = if (conn.application_space.ack_needed)
+        conn.application_space.largest_received
+    else
+        null;
 
-    // Try GSO. On macOS this compiles to a plain sendto (no GSO
-    // support), which will likely fail for oversized buffers, so
-    // we fall through to the per-packet loop. On Linux, sendGso
-    // uses sendmsg + UDP_SEGMENT to send the whole batch in one
-    // syscall.
-    if (net.sendGso(udp_fd, buf, peer, GSO_SEGMENT_SIZE)) |_| {
-        return; // GSO succeeded — all packets sent in one call.
-    } else |_| {
-        // GSO failed — fall through to per-packet loop.
-    }
+    const data = ps.data;
+    const stream_id = ps.stream_id;
+    const stream_offset = ps.stream_offset;
+    const alloc = ps.alloc;
 
-    // Per-packet fallback: split the batch buffer into segments
-    // and send each one individually.
-    var offset: usize = 0;
-    while (offset < buf.len) {
-        const end = @min(offset + GSO_SEGMENT_SIZE, buf.len);
-        _ = net.sendto(udp_fd, buf[offset..end], peer) catch return;
-        offset = end;
-    }
+    conn.pending_send = null;
+    sendStreamData(conn, udp_fd, &keys, stream_id, peer_addr, data, stream_offset, pending_ack);
+    // If sendStreamData buffered a new pending_send (partial drain),
+    // the old allocation can be freed — the new buffer is a fresh copy.
+    alloc.free(data);
 }
+

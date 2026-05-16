@@ -173,8 +173,19 @@ pub const LogEntry = struct {
         }
 
         if (self.path) |p| {
-            const piece = try std.fmt.bufPrint(buf[off..], " path=\"{s}\"", .{p});
-            off += piece.len;
+            const prefix = " path=\"";
+            if (off + prefix.len >= buf.len) return error.NoSpaceLeft;
+            @memcpy(buf[off .. off + prefix.len], prefix);
+            off += prefix.len;
+            for (p) |c| {
+                if (off >= buf.len) break;
+                buf[off] = if (c <= 0x1f or c == 0x7f) '_' else c;
+                off += 1;
+            }
+            if (off < buf.len) {
+                buf[off] = '"';
+                off += 1;
+            }
         }
 
         if (self.status != 0) {

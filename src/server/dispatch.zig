@@ -34,6 +34,7 @@ const response_mod = @import("../response/response.zig");
 const router = @import("../router/router.zig");
 const middleware = @import("../middleware/middleware.zig");
 
+const x402_mod = @import("../middleware/x402.zig");
 const accept_mod = @import("accept.zig");
 const http1_mod = @import("http1.zig");
 const http2_mod = @import("http2.zig");
@@ -62,7 +63,9 @@ pub fn requestShutdown() void {
 }
 
 pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
-    // Install signal handlers for graceful shutdown
+    shutdown_requested.store(false, .release);
+    reload_requested.store(false, .release);
+
     const sa = std.posix.Sigaction{
         .handler = .{ .handler = handleShutdownSignal },
         .mask = std.posix.sigemptyset(),
@@ -617,7 +620,22 @@ pub fn handleRead(server: *Server, index: u32) !void {
 
         // Check proxy routes before router dispatch
         if (server.proxy) |proxy| {
-            if (proxy.matchRoute(&parse.view) != null) {
+            if (proxy.matchRoute(&parse.view)) |matched_route| {
+                const route_idx = proxy.routeIndex(matched_route);
+                const x402_policy = proxy.route_x402_policies[route_idx];
+                const x402_result = x402_mod.evaluateWithFacilitator(
+                    parse.view,
+                    x402_policy,
+                    server.app_router.facilitator,
+                );
+                switch (x402_result) {
+                    .allow => {},
+                    .reject => |info| {
+                        try http1_mod.queueResponse(server, conn, info.resp);
+                        if (conn.read_buffered_bytes == 0) break;
+                        continue;
+                    },
+                }
                 var mw_ctx = middleware.Context{
                     .protocol = .http1,
                     .buffer_ops = .{
@@ -643,6 +661,19 @@ pub fn handleRead(server: *Server, index: u32) !void {
                 defer proxy_result.release();
 
                 try http1_mod.queueResponse(server, conn, proxy_result.resp);
+                if (proxy_result.resp.status >= 200 and proxy_result.resp.status < 300) {
+                    if (x402_result == .allow and x402_result.allow.needs_settlement) {
+                        if (server.app_router.facilitator) |fac| {
+                            const charge = for (proxy_result.resp.headers) |hdr| {
+                                if (std.ascii.eqlIgnoreCase(hdr.name, "x-charge-amount")) break hdr.value;
+                            } else "";
+                            const settle = x402_mod.facilitatorSettle(fac, x402_result.allow.payment_header, &x402_policy, charge);
+                            if (!settle.success) {
+                                std.log.warn("x402 proxy settlement failed: {s}", .{settle.error_reason});
+                            }
+                        }
+                    }
+                }
                 // Materialize pending_body before proxy_result.release() frees the upstream buffer
                 if (conn.pending_body.len > 0) {
                     http1_mod.materializePendingBody(server, conn);

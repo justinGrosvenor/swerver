@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const types = @import("types.zig");
 const crypto = @import("crypto.zig");
 const packet = @import("packet.zig");
@@ -12,6 +13,19 @@ const sent_ring = @import("sent_ring.zig");
 const congestion_mod = @import("congestion.zig");
 const http3 = @import("../protocol/http3.zig");
 const clock = @import("../runtime/clock.zig");
+
+fn fillRandom(buf: []u8) void {
+    switch (builtin.os.tag) {
+        .macos, .ios, .tvos, .watchos, .freebsd, .netbsd, .openbsd => {
+            std.c.arc4random_buf(buf.ptr, buf.len);
+        },
+        .linux => {
+            _ = std.posix.system.getrandom(buf.ptr, buf.len, 0);
+        },
+        else => @compileError("unsupported OS for fillRandom"),
+    }
+}
+
 
 /// QUIC Connection State Machine per RFC 9000.
 ///
@@ -76,6 +90,9 @@ pub const PacketNumberSpace = struct {
     largest_received_time: ?u64 = null,
     /// ACK ranges to send (simple: just track largest for now)
     ack_needed: bool = false,
+    /// Cumulative offset of CRYPTO bytes sent on this space (for the
+    /// CRYPTO frame offset field in outgoing packets).
+    crypto_send_offset: u64 = 0,
     /// Crypto keys for this space
     keys: ?crypto.Keys = null,
 
@@ -678,6 +695,22 @@ pub const Connection = struct {
     /// Draining duration (3 × PTO, in microseconds)
     draining_duration_us: u64 = 3 * 1000 * 1000, // Default 3 seconds
 
+    /// Buffered response data that couldn't be sent because the
+    /// congestion window was full. Drained by the event loop after
+    /// ACK processing opens the window.
+    pending_send: ?PendingSend = null,
+
+    pub const PendingSend = struct {
+        stream_id: u64,
+        data: []u8,
+        stream_offset: u64,
+        alloc: std.mem.Allocator,
+
+        pub fn deinit(self: *PendingSend) void {
+            self.alloc.free(self.data);
+        }
+    };
+
     pub fn init(allocator: std.mem.Allocator, is_server: bool, dcid: types.ConnectionId) Connection {
         var conn = Connection{
             .allocator = allocator,
@@ -691,11 +724,7 @@ pub const Connection = struct {
             .recovery = recovery_mod.Recovery.init(allocator),
         };
 
-        // Generate our connection ID (8 bytes) using random seeded from clock + DCID
-        const now = clock.Instant.now();
-        const seed_ns: u64 = if (now) |i| i.ns else 0;
-        var rng = std.Random.DefaultPrng.init(seed_ns ^ std.hash.Wyhash.hash(0, dcid.slice()));
-        rng.random().bytes(conn.our_cid.bytes[0..8]);
+        fillRandom(conn.our_cid.bytes[0..8]);
         conn.our_cid.len = 8;
 
         // Derive initial keys from DCID
@@ -705,6 +734,7 @@ pub const Connection = struct {
     }
 
     pub fn deinit(self: *Connection) void {
+        if (self.pending_send) |*ps| ps.deinit();
         self.recovery.deinit();
         self.crypto_buffer.deinit(self.allocator);
         if (self.tls_session) |*session| {
@@ -1360,8 +1390,8 @@ pub const Connection = struct {
             return 0;
         }
 
-        // Increase our receive limit by the current max (double it)
-        const new_max = self.flow_control.max_data_recv * 2;
+        const MAX_FLOW_CONTROL_WINDOW: u64 = 256 * 1024 * 1024; // 256 MB
+        const new_max = @min(self.flow_control.max_data_recv * 2, MAX_FLOW_CONTROL_WINDOW);
         self.flow_control.updateMaxRecv(new_max);
 
         return frame.writeMaxData(buf, new_max);
@@ -1435,7 +1465,7 @@ pub const Connection = struct {
             .size = @intCast(@min(size, std.math.maxInt(u16))),
             .space = space,
             .ack_eliciting = ack_eliciting,
-            .in_flight = ack_eliciting or size > 0,
+            .in_flight = ack_eliciting,
         });
     }
 
@@ -1500,12 +1530,8 @@ pub const Connection = struct {
 
     /// Start a path validation by sending PATH_CHALLENGE
     pub fn startPathValidation(self: *Connection) [8]u8 {
-        // Generate 8 random bytes for challenge
         var data: [8]u8 = undefined;
-        const now = clock.Instant.now();
-        const seed: u64 = if (now) |i| i.ns else 42;
-        var prng = std.Random.DefaultPrng.init(seed);
-        prng.random().bytes(&data);
+        fillRandom(&data);
         self.pending_path_challenge = data;
         return data;
     }

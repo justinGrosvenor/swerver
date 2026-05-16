@@ -200,21 +200,20 @@ pub const Handler = struct {
                 // Collect HTTP/3 events after processing
                 result.http3_events = getHttp3Events(conn);
 
-                // If h3 request events are pending, DEFER the ACK to the
-                // response packet (handleH3Request will send it immediately
-                // after). This coalesces ACK + STREAM data into one UDP
-                // datagram instead of two, halving the sendto count for the
-                // common GET request-response cycle.
-                //
-                // If there are NO events (e.g., ACK-only reply, control
-                // stream data, or uni-stream setup), send the flight now.
-                if (result.http3_events.len == 0) {
+                // Only defer the ACK when a request_ready event will
+                // trigger an immediate response (piggybacks the ACK onto
+                // the response STREAM packet). For non-request events
+                // like SETTINGS, no response is sent, so the ACK must
+                // go out now via buildResponseFlight.
+                const has_request_ready = blk: {
+                    for (result.http3_events) |ev| {
+                        if (ev == .request_ready) break :blk true;
+                    }
+                    break :blk false;
+                };
+                if (!has_request_ready) {
                     result.response = try self.buildResponseFlight(conn);
                 }
-                // When events ARE present, ack_needed stays set and the
-                // response path in sendHttp3ResponseBytes will piggyback
-                // the ACK onto the first response packet via
-                // BuildShortPacketOptions.ack_largest.
             },
         }
 
@@ -456,11 +455,9 @@ pub const Handler = struct {
             &decrypt_buf,
             data.len,
         ) catch {
-            // Decryption failed — could be a key_phase mismatch (peer
-            // rotated keys). With only one key set, we can't recover.
-            // Drop silently; the peer will retransmit or time out.
-            // Full key rotation support (RFC 9001 §6) would try
-            // next_keys here before giving up.
+            std.log.err("h3 decrypt FAILED: data_len={} pn_offset={} largest_pn={}", .{
+                data.len, pn_offset, largest_pn,
+            });
             return;
         };
 
@@ -676,10 +673,7 @@ pub const Handler = struct {
         if (contiguous.len == 0 and !stream_frame.fin) return;
 
         const fin_now = s.recv_fin_offset != null and s.recv_offset >= s.recv_fin_offset.?;
-        _ = conn.processHttp3Stream(stream_frame.stream_id, contiguous, fin_now) catch |err| {
-            std.log.debug("HTTP/3 stream processing failed: stream={} err={}", .{ stream_frame.stream_id, err });
-            return;
-        };
+        _ = conn.processHttp3Stream(stream_frame.stream_id, contiguous, fin_now) catch return;
     }
 
     /// Get pending HTTP/3 events from the connection
@@ -871,13 +865,14 @@ fn buildHandshakePacket(out: []u8, opts: BuildPacketOptions) Error!BuildPacketRe
     var off: usize = 0;
 
     // First byte: long header (0x80) | fixed (0x40) | type (00=Initial, 10=Handshake)
-    // | reserved 00 | PN length 00 (1 byte)
+    // | reserved 00 | PN length (2 low bits, filled after PN is computed)
     const type_bits: u8 = switch (opts.packet_type) {
         .initial => 0x00,
         .handshake => 0x20,
         else => return Error.InvalidPacket,
     };
     if (off >= out.len) return Error.HandshakeFailed;
+    const first_byte_offset = off;
     out[off] = 0xc0 | type_bits;
     off += 1;
 
@@ -920,9 +915,8 @@ fn buildHandshakePacket(out: []u8, opts: BuildPacketOptions) Error!BuildPacketRe
     const length_offset = off;
     off += 2;
 
-    // Packet number — 1 byte for now (sufficient for low PN values during handshake)
+    // Packet number — dynamically sized per RFC 9000 §17.1
     const pn_offset = off;
-    const pn_len: u8 = 1;
     const space_kind: types.PacketNumberSpace = switch (opts.packet_type) {
         .initial => .initial,
         .handshake => .handshake,
@@ -930,9 +924,12 @@ fn buildHandshakePacket(out: []u8, opts: BuildPacketOptions) Error!BuildPacketRe
     };
     const space = conn_ref.getPacketSpace(space_kind);
     const pn = space.allocatePacketNumber();
-    if (off >= out.len) return Error.HandshakeFailed;
-    out[off] = @truncate(pn);
-    off += 1;
+    const pn_encoded = crypto.encodePacketNumber(pn, space.largest_acked orelse 0);
+    const pn_len = pn_encoded.len;
+    if (off + pn_len > out.len) return Error.HandshakeFailed;
+    @memcpy(out[off .. off + pn_len], pn_encoded.bytes[0..pn_len]);
+    off += pn_len;
+    out[first_byte_offset] |= @as(u8, pn_len - 1);
 
     const header_len = off;
 
@@ -958,15 +955,12 @@ fn buildHandshakePacket(out: []u8, opts: BuildPacketOptions) Error!BuildPacketRe
         off += acked;
     }
 
-    // CRYPTO frame carrying the TLS handshake bytes (if any)
+    // CRYPTO frame carrying the TLS handshake bytes (if any).
+    // Uses the per-space crypto_send_offset for correct multi-packet flights.
     if (opts.crypto_data.len > 0) {
-        // CRYPTO offset is per-encryption-level, monotonically increasing.
-        // For now we always emit at offset 0 because we drain the entire
-        // queue in one go and only ever build one packet per level per
-        // server flight. (Multi-packet handshake flights would need an
-        // out-of-line offset cursor.)
-        const written = frame.writeCrypto(out[off..], 0, opts.crypto_data) catch return Error.HandshakeFailed;
+        const written = frame.writeCrypto(out[off..], space.crypto_send_offset, opts.crypto_data) catch return Error.HandshakeFailed;
         off += written;
+        space.crypto_send_offset += opts.crypto_data.len;
     }
 
     // PADDING to satisfy the datagram minimum (RFC 9000 §14.1)
@@ -1065,8 +1059,9 @@ pub fn buildShortPacket(out: []u8, opts: BuildShortPacketOptions) Error!BuildPac
     // High bit (form) = 0 = short header.
     if (off >= out.len) return Error.HandshakeFailed;
     // Short header first byte: form=0, fixed=1, spin=0, reserved=00,
-    // key_phase from connection state, PN length=00 (1 byte).
+    // key_phase from connection state, PN length (2 low bits, filled below).
     const kp_bit: u8 = if (conn_ref.current_key_phase) 0x04 else 0x00;
+    const first_byte_offset = off;
     out[off] = 0x40 | kp_bit;
     off += 1;
 
@@ -1078,13 +1073,15 @@ pub fn buildShortPacket(out: []u8, opts: BuildShortPacketOptions) Error!BuildPac
         off += conn_ref.peer_cid.len;
     }
 
-    // Packet number — 1 byte for now, like the long-header builder.
+    // Packet number — dynamically sized per RFC 9000 §17.1
     const pn_offset = off;
-    const pn_len: u8 = 1;
     const pn = conn_ref.application_space.allocatePacketNumber();
-    if (off >= out.len) return Error.HandshakeFailed;
-    out[off] = @truncate(pn);
-    off += 1;
+    const pn_encoded = crypto.encodePacketNumber(pn, conn_ref.application_space.largest_acked orelse 0);
+    const pn_len = pn_encoded.len;
+    if (off + pn_len > out.len) return Error.HandshakeFailed;
+    @memcpy(out[off .. off + pn_len], pn_encoded.bytes[0..pn_len]);
+    off += pn_len;
+    out[first_byte_offset] |= @as(u8, pn_len - 1);
 
     const header_len = off;
 

@@ -213,8 +213,7 @@ pub fn recvfrom(fd: std.posix.fd_t, buf: []u8) UdpError!RecvFromResult {
         }
     }
 
-    // Determine if it's IPv4 or IPv6 based on family
-    if (addr_len == @sizeOf(SockAddrIn)) {
+    if (sockaddr_ptr.family == std.posix.AF.INET) {
         const ip4_ptr: *SockAddrIn = @ptrCast(&peer_storage.ip6);
         peer_storage = .{ .ip4 = ip4_ptr.* };
     }
@@ -500,7 +499,7 @@ pub fn getPeerAddress(fd: std.posix.fd_t) ?PeerAddress {
     const sockaddr_ptr: *std.posix.sockaddr = @ptrCast(&storage);
     const rc = std.posix.system.getpeername(fd, sockaddr_ptr, &addr_len);
     if (rc != 0) return null;
-    if (addr_len == @sizeOf(SockAddrIn)) {
+    if (sockaddr_ptr.family == std.posix.AF.INET) {
         const ip4_ptr: *SockAddrIn = @ptrCast(&storage);
         return .{ .storage = .{ .ip4 = ip4_ptr.* } };
     }
@@ -656,7 +655,7 @@ fn sendfileBsd(socket_fd: std.posix.fd_t, file_fd: std.posix.fd_t, offset: *u64,
         // Success - len contains bytes sent
         const sent: usize = @intCast(len);
         offset.* += sent;
-        return .{ .bytes_sent = sent, .done = sent < count };
+        return .{ .bytes_sent = sent, .done = sent == count };
     }
 
     const errno = std.posix.errno(rc);

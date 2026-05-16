@@ -348,10 +348,14 @@ pub fn queueResponse(server: *Server, conn: *connection.Connection, resp: respon
         };
         if (is_simple_body) {
             if (preencoded.findPreencodedError(server, resp.status)) |entry| {
-                if (preencoded.sendH1PreencodedBytes(server, conn, entry.bytes[0..entry.len])) return;
-                // Pool exhausted — fall through to the normal encode path
-                // which also acquires a buffer. If that also fails, the
-                // connection is closed there (existing behavior).
+                const body_matches = switch (resp.body) {
+                    .bytes => |b| std.mem.eql(u8, b, entry.body),
+                    .none => entry.body.len == 0,
+                    else => false,
+                };
+                if (body_matches) {
+                    if (preencoded.sendH1PreencodedBytes(server, conn, entry.bytes[0..entry.len])) return;
+                }
             }
         }
     }

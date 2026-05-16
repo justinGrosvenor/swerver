@@ -214,13 +214,32 @@ pub const RateLimiter = struct {
         return target;
     }
 
+    pub const RateLimitInfo = struct {
+        retry_after_s: u64,
+        resume_ms: u64,
+    };
+
+    pub fn checkAndGetInfo(self: *RateLimiter, ip: IpKey) ?RateLimitInfo {
+        if (!self.config.enabled) return null;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const entry = self.getOrCreateBucket(ip);
+        if (entry.bucket.tryConsume(1)) return null;
+        const ms = entry.bucket.timeUntilToken();
+        return .{
+            .retry_after_s = (ms + 999) / 1000,
+            .resume_ms = ms,
+        };
+    }
+
     /// Get retry-after header value in seconds
     pub fn getRetryAfter(self: *RateLimiter, ip: IpKey) u64 {
         self.mutex.lock();
         defer self.mutex.unlock();
         for (&self.entries) |*entry| {
             if (entry.active and entry.key.eql(ip)) {
-                return (entry.bucket.timeUntilToken() + 999) / 1000; // Round up to seconds
+                return (entry.bucket.timeUntilToken() + 999) / 1000;
             }
         }
         return 1;
@@ -235,7 +254,7 @@ pub const RateLimiter = struct {
                 return entry.bucket.timeUntilToken();
             }
         }
-        return 1000; // Default 1 second
+        return 1000;
     }
 };
 
@@ -307,15 +326,8 @@ pub fn evaluate(ctx: *middleware.Context, req: request.RequestView) middleware.D
         // No IP available, allow
         return .allow;
 
-    // Check rate limit
-    if (limiter.check(ip)) {
-        return .allow;
-    }
-
-    // Rate limited - return backpressure decision to pause reads
-    const retry_after_s = limiter.getRetryAfter(ip);
-    const resume_ms = limiter.getTimeUntilToken(ip);
-    return .{ .rate_limit_backpressure = backpressure(retry_after_s, resume_ms) };
+    const info = limiter.checkAndGetInfo(ip) orelse return .allow;
+    return .{ .rate_limit_backpressure = backpressure(info.retry_after_s, info.resume_ms) };
 }
 
 /// Evaluate without backpressure (for simple rejection scenarios)

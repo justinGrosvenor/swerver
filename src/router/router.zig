@@ -10,7 +10,9 @@ const clock = @import("../runtime/clock.zig");
 /// middleware-accumulated headers (security, CORS, etc.) before the
 /// response gets serialized. Sized to hold the handler's max + the
 /// middleware chain's max in one pass. See `Router.handle`.
-threadlocal var merged_headers_tls: [MAX_RESPONSE_HEADERS + middleware.Chain.MAX_MIDDLEWARE_HEADERS]response.Header = undefined;
+threadlocal var merged_headers_tls: [MAX_RESPONSE_HEADERS + middleware.Chain.MAX_MIDDLEWARE_HEADERS + 1]response.Header = undefined;
+threadlocal var x402_receipt_tls: response.Header = undefined;
+threadlocal var x402_has_receipt: bool = false;
 
 /// Errors surfaced by `Router` registration and routing.
 ///
@@ -106,6 +108,8 @@ pub const HandlerContext = struct {
     response_header_count: usize = 0,
     /// Request-scoped arena allocator
     arena: std.heap.FixedBufferAllocator,
+    /// Actual charge amount for x402 `upto` scheme (set by handler)
+    charge_amount: []const u8 = "",
 
     pub const Param = struct {
         name: []const u8,
@@ -226,6 +230,13 @@ pub const HandlerContext = struct {
         return self.arena.allocator();
     }
 
+    /// Set the actual charge amount for x402 `upto` scheme.
+    /// Call this in your handler to specify how much to settle.
+    /// For `exact` scheme, this is ignored — the configured price is used.
+    pub fn setChargeAmount(self: *HandlerContext, amount: []const u8) void {
+        self.charge_amount = amount;
+    }
+
     /// Get path parameter by name
     pub fn getParam(self: *const HandlerContext, name: []const u8) ?[]const u8 {
         for (self.params[0..self.param_count]) |p| {
@@ -289,14 +300,20 @@ pub const RouteBuilder = struct {
     pattern: []const u8,
     handler: HandlerFn,
     middleware_chain: ?*middleware.Chain = null,
+    payment: x402.RoutePaymentConfig = .{},
 
     pub fn withMiddleware(self: *RouteBuilder, chain: *middleware.Chain) *RouteBuilder {
         self.middleware_chain = chain;
         return self;
     }
 
+    pub fn withPayment(self: *RouteBuilder, config: x402.RoutePaymentConfig) *RouteBuilder {
+        self.payment = config;
+        return self;
+    }
+
     pub fn register(self: *RouteBuilder) RouterError!void {
-        return self.router.routeWithChain(self.method, self.pattern, self.handler, self.middleware_chain);
+        return self.router.routeWithOptions(self.method, self.pattern, self.handler, self.middleware_chain, self.payment);
     }
 };
 
@@ -317,30 +334,36 @@ pub const GroupBuilder = struct {
     router: *Router,
     prefix: []const u8,
     middleware_chain: ?*middleware.Chain = null,
+    payment: x402.RoutePaymentConfig = .{},
 
     pub fn withMiddleware(self: *GroupBuilder, chain: *middleware.Chain) *GroupBuilder {
         self.middleware_chain = chain;
         return self;
     }
 
+    pub fn withPayment(self: *GroupBuilder, config: x402.RoutePaymentConfig) *GroupBuilder {
+        self.payment = config;
+        return self;
+    }
+
     pub fn get(self: *GroupBuilder, pattern: []const u8, handler: HandlerFn) RouterError!void {
-        return self.router.routeWithPrefix(.GET, self.prefix, pattern, handler, self.middleware_chain);
+        return self.router.routeWithPrefixAndPayment(.GET, self.prefix, pattern, handler, self.middleware_chain, self.payment);
     }
 
     pub fn post(self: *GroupBuilder, pattern: []const u8, handler: HandlerFn) RouterError!void {
-        return self.router.routeWithPrefix(.POST, self.prefix, pattern, handler, self.middleware_chain);
+        return self.router.routeWithPrefixAndPayment(.POST, self.prefix, pattern, handler, self.middleware_chain, self.payment);
     }
 
     pub fn put(self: *GroupBuilder, pattern: []const u8, handler: HandlerFn) RouterError!void {
-        return self.router.routeWithPrefix(.PUT, self.prefix, pattern, handler, self.middleware_chain);
+        return self.router.routeWithPrefixAndPayment(.PUT, self.prefix, pattern, handler, self.middleware_chain, self.payment);
     }
 
     pub fn delete(self: *GroupBuilder, pattern: []const u8, handler: HandlerFn) RouterError!void {
-        return self.router.routeWithPrefix(.DELETE, self.prefix, pattern, handler, self.middleware_chain);
+        return self.router.routeWithPrefixAndPayment(.DELETE, self.prefix, pattern, handler, self.middleware_chain, self.payment);
     }
 
     pub fn patch(self: *GroupBuilder, pattern: []const u8, handler: HandlerFn) RouterError!void {
-        return self.router.routeWithPrefix(.PATCH, self.prefix, pattern, handler, self.middleware_chain);
+        return self.router.routeWithPrefixAndPayment(.PATCH, self.prefix, pattern, handler, self.middleware_chain, self.payment);
     }
 };
 
@@ -364,6 +387,7 @@ pub const Route = struct {
     pattern: []const u8,
     handler: HandlerFn,
     middleware_chain: ?*middleware.Chain = null,
+    x402_policy: x402.RoutePaymentConfig = .{},
     pattern_buf: [MAX_PATTERN_LEN]u8 = undefined,
     pattern_len: usize = 0,
     param_count: u8 = 0,
@@ -502,11 +526,14 @@ pub const Router = struct {
     /// the normal route scan. 64 bits → ~50% false-positive rate at
     /// 10 routes, which still cuts the no-match path in half.
     first_segment_bloom: u64 = 0,
+    has_any_paid_routes: bool = false,
+    facilitator: ?x402.FacilitatorConfig = null,
 
     pub fn init(policy: x402.Policy) Router {
         return .{
             .x402_policy = policy,
             .middleware_chain = middleware.Chain.init(&.{}, &.{}),
+            .has_any_paid_routes = policy.require_payment,
         };
     }
 
@@ -518,6 +545,7 @@ pub const Router = struct {
             .x402_policy = policy,
             .middleware_chain = middleware.Chain.init(&.{}, &.{}),
             .limits = limits,
+            .has_any_paid_routes = policy.require_payment,
         };
     }
 
@@ -588,6 +616,15 @@ pub const Router = struct {
 
     /// Register a route with a custom middleware chain.
     pub fn routeWithChain(self: *Router, method: request.Method, pattern: []const u8, handler: HandlerFn, chain: ?*middleware.Chain) RouterError!void {
+        return self.routeWithOptions(method, pattern, handler, chain, .{});
+    }
+
+    /// Register a route with per-route x402 payment config.
+    pub fn routeWithPayment(self: *Router, method: request.Method, pattern: []const u8, handler: HandlerFn, payment: x402.RoutePaymentConfig) RouterError!void {
+        return self.routeWithOptions(method, pattern, handler, null, payment);
+    }
+
+    fn routeWithOptions(self: *Router, method: request.Method, pattern: []const u8, handler: HandlerFn, chain: ?*middleware.Chain, payment: x402.RoutePaymentConfig) RouterError!void {
         if (self.route_count >= self.limits.max_routes) return error.RouteLimitExceeded;
 
         var r = try Route.compile(pattern, self.limits);
@@ -595,12 +632,18 @@ pub const Router = struct {
         r.method = method;
         r.handler = handler;
         r.middleware_chain = chain;
+        r.x402_policy = payment;
         self.routes[self.route_count] = r;
         self.route_count += 1;
         self.updateBloomFilter(pattern);
+        if (payment.require_payment) self.has_any_paid_routes = true;
     }
 
     pub fn routeWithPrefix(self: *Router, method: request.Method, prefix: []const u8, pattern: []const u8, handler: HandlerFn, chain: ?*middleware.Chain) RouterError!void {
+        return self.routeWithPrefixAndPayment(method, prefix, pattern, handler, chain, .{});
+    }
+
+    pub fn routeWithPrefixAndPayment(self: *Router, method: request.Method, prefix: []const u8, pattern: []const u8, handler: HandlerFn, chain: ?*middleware.Chain, payment: x402.RoutePaymentConfig) RouterError!void {
         if (self.route_count >= self.limits.max_routes) return error.RouteLimitExceeded;
 
         var r = try Route.compileWithPrefix(prefix, pattern, self.limits);
@@ -608,22 +651,29 @@ pub const Router = struct {
         r.method = method;
         r.handler = handler;
         r.middleware_chain = chain;
+        r.x402_policy = payment;
         self.routes[self.route_count] = r;
         self.route_count += 1;
-        // For prefixed routes, hash the combined first segment
         if (prefix.len > 0) {
             self.updateBloomFilter(prefix);
         } else {
             self.updateBloomFilter(pattern);
         }
+        if (payment.require_payment) self.has_any_paid_routes = true;
     }
 
     /// Add the first path segment's hash to the bloom filter.
+    /// Parameterized segments (`:foo`) saturate the bloom to avoid
+    /// false 404s — they match any request segment.
     fn updateBloomFilter(self: *Router, pattern: []const u8) void {
         const seg = firstPathSegment(pattern);
         if (seg.len > 0) {
-            const hash = std.hash.Wyhash.hash(0, seg);
-            self.first_segment_bloom |= @as(u64, 1) << @intCast(hash % 64);
+            if (seg[0] == ':') {
+                self.first_segment_bloom = ~@as(u64, 0);
+            } else {
+                const hash = std.hash.Wyhash.hash(0, seg);
+                self.first_segment_bloom |= @as(u64, 1) << @intCast(hash % 64);
+            }
         }
     }
 
@@ -659,6 +709,8 @@ pub const Router = struct {
     /// Handle an incoming request
     /// Returns RouteResult with response and optional backpressure signal
     pub fn handle(self: *Router, req: request.RequestView, mw_ctx: *middleware.Context, scratch: *HandlerScratch) RouteResult {
+        x402_has_receipt = false;
+
         // Bloom filter fast-reject: if the request's first path
         // segment doesn't have its hash bit set in the filter, no
         // registered route can match. Return 404 immediately without
@@ -677,12 +729,6 @@ pub const Router = struct {
                     return .{ .resp = notFound() };
                 }
             }
-        }
-
-        // Run x402 check first
-        switch (x402.evaluate(req, self.x402_policy)) {
-            .allow => {},
-            .reject => |resp| return .{ .resp = resp },
         }
 
         // Run middleware chain
@@ -739,6 +785,18 @@ pub const Router = struct {
                 continue;
             }
             mw_ctx.route = r.pattern;
+            const effective_policy = if (r.x402_policy.require_payment)
+                r.x402_policy
+            else
+                self.x402_policy;
+            const x402_result = x402.evaluateWithFacilitator(req, effective_policy, self.facilitator);
+            switch (x402_result) {
+                .allow => {},
+                .reject => |info| {
+                    result_resp = info.resp;
+                    return .{ .resp = result_resp };
+                },
+            }
             if (r.middleware_chain) |chain| {
                 switch (chain.executePre(mw_ctx, req)) {
                     .allow => {},
@@ -756,6 +814,19 @@ pub const Router = struct {
             }
             result_resp = r.handler(&ctx);
             ran_handler = true;
+            if (result_resp.status >= 200 and result_resp.status < 300) {
+                if (x402_result == .allow and x402_result.allow.needs_settlement) {
+                    if (self.facilitator) |fac| {
+                        const settle = x402.facilitatorSettle(fac, x402_result.allow.payment_header, &effective_policy, ctx.charge_amount);
+                        if (settle.success and settle.receipt_b64.len > 0) {
+                            x402_receipt_tls = .{ .name = "PAYMENT-RESPONSE", .value = settle.receipt_b64 };
+                            x402_has_receipt = true;
+                        } else if (!settle.success) {
+                            std.log.warn("x402 settlement failed: {s}", .{settle.error_reason});
+                        }
+                    }
+                }
+            }
             break;
         }
 
@@ -783,11 +854,9 @@ pub const Router = struct {
         // per thread and the protocol layer serializes the response bytes
         // before the next request on the same thread.
         const mw_headers = self.middleware_chain.getResponseHeaders();
-        if (mw_headers.len > 0) {
+        if (mw_headers.len > 0 or x402_has_receipt) {
             const handler_headers = result_resp.headers;
-            const merge_total = handler_headers.len + mw_headers.len;
             const merge_cap = merged_headers_tls.len;
-            const capped = @min(merge_total, merge_cap);
             var i: usize = 0;
             for (handler_headers) |h| {
                 if (i >= merge_cap) break;
@@ -799,7 +868,11 @@ pub const Router = struct {
                 merged_headers_tls[i] = h;
                 i += 1;
             }
-            result_resp.headers = merged_headers_tls[0..capped];
+            if (x402_has_receipt and i < merge_cap) {
+                merged_headers_tls[i] = x402_receipt_tls;
+                i += 1;
+            }
+            result_resp.headers = merged_headers_tls[0..i];
         }
 
         // Post-response hooks: access logging, metrics, etc.

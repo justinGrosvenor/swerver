@@ -123,6 +123,8 @@ pub const BufferPoolConfig = struct {
 pub const X402Config = struct {
     enabled: bool = false,
     payment_required_b64: []const u8 = "",
+    facilitator_url: []const u8 = "",
+    facilitator_timeout_ms: u32 = 5_000,
 };
 
 pub const Http2Config = struct {
@@ -130,9 +132,11 @@ pub const Http2Config = struct {
     max_streams: usize = 128,
     /// Maximum header list size in bytes
     max_header_list_size: usize = 8192,
-    /// Initial flow control window size
-    initial_window_size: u32 = 65535,
-    /// Maximum frame size (must be 16384..16777215 per RFC 7540)
+    /// Initial flow control window size (RFC 9113 §6.5.2 default is 65535,
+    /// but larger windows improve throughput for multiplexed body-bearing
+    /// requests by reducing WINDOW_UPDATE round-trips under load)
+    initial_window_size: u32 = 1048576,
+    /// Maximum frame size (must be 16384..16777215 per RFC 9113 §4.2)
     max_frame_size: u32 = 16384,
     /// Maximum HPACK dynamic table size in bytes
     max_dynamic_table_size: usize = 4096,

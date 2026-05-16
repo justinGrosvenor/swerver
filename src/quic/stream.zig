@@ -208,8 +208,14 @@ pub const Stream = struct {
                 self.allocator.free(data_copy);
                 return Error.OutOfMemory;
             };
+        } else if (fin and self.recv_fin_offset != null and self.recv_offset >= self.recv_fin_offset.?) {
+            // Duplicate data carrying FIN whose end_offset we already reached.
+            if (self.state == .open) {
+                self.state = .half_closed_remote;
+            } else if (self.state == .half_closed_local) {
+                self.state = .closed;
+            }
         }
-        // Ignore duplicate/old data
 
         // Check if we should send MAX_STREAM_DATA
         if (self.recv_offset > self.recv_max_offset / 2) {

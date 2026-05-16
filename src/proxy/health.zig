@@ -253,11 +253,14 @@ pub const HealthChecker = struct {
             return false;
         }
 
-        // Check body if configured
         if (self.config.expected_body) |expected| {
-            const body = response_data[parsed.body_start..parsed.body_end];
-            if (!std.mem.eql(u8, body, expected)) {
-                return false;
+            const raw_body = response_data[parsed.body_start..parsed.body_end];
+            if (parsed.is_chunked) {
+                var decoded_buf: [4096]u8 = undefined;
+                const decoded_len = forward.decodeChunkedInto(raw_body, &decoded_buf) orelse return false;
+                if (!std.mem.eql(u8, decoded_buf[0..decoded_len], expected)) return false;
+            } else {
+                if (!std.mem.eql(u8, raw_body, expected)) return false;
             }
         }
 

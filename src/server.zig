@@ -765,7 +765,7 @@ test "metrics middleware response queued for http2" {
     conn.protocol = .http2;
 
     try http2_mod.queueHttp2Response(&server, conn, 1, result.resp, false);
-    try std.testing.expect(conn.write_count >= 2);
+    try std.testing.expect(conn.write_count >= 1);
 
     const expected = result.resp.bodyBytes();
     var found_data = false;
@@ -773,16 +773,20 @@ test "metrics middleware response queued for http2" {
 
     while (conn.peekWrite()) |entry_ptr| {
         const entry = entry_ptr.*;
-        const frame_type = entry.handle.bytes[3];
         if (entry.handle.index == managed.handle.index) {
             saw_managed_handle = true;
         }
-        if (frame_type == @intFromEnum(http2.FrameType.data)) {
-            const len = (@as(usize, entry.handle.bytes[0]) << 16) |
-                (@as(usize, entry.handle.bytes[1]) << 8) |
-                @as(usize, entry.handle.bytes[2]);
-            try std.testing.expectEqualStrings(expected, entry.handle.bytes[9 .. 9 + len]);
-            found_data = true;
+        var off: usize = 0;
+        while (off + 9 <= entry.len) {
+            const frame_type = entry.handle.bytes[off + 3];
+            const flen = (@as(usize, entry.handle.bytes[off]) << 16) |
+                (@as(usize, entry.handle.bytes[off + 1]) << 8) |
+                @as(usize, entry.handle.bytes[off + 2]);
+            if (frame_type == @intFromEnum(http2.FrameType.data)) {
+                try std.testing.expectEqualStrings(expected, entry.handle.bytes[off + 9 .. off + 9 + flen]);
+                found_data = true;
+            }
+            off += 9 + flen;
         }
         server.io.releaseBuffer(entry.handle);
         conn.popWrite();
@@ -958,7 +962,7 @@ test "metrics middleware end-to-end http2" {
     conn.http2_stack = &stack;
 
     try http2_mod.queueHttp2Response(&server, conn, 1, result.resp, false);
-    try std.testing.expect(conn.write_count >= 2);
+    try std.testing.expect(conn.write_count >= 1);
 
     const expected = result.resp.bodyBytes();
     var collected = try std.testing.allocator.alloc(u8, expected.len);
@@ -967,13 +971,17 @@ test "metrics middleware end-to-end http2" {
 
     while (conn.peekWrite()) |entry_ptr| {
         const entry = entry_ptr.*;
-        const frame_type = entry.handle.bytes[3];
-        if (frame_type == @intFromEnum(http2.FrameType.data)) {
-            const len = (@as(usize, entry.handle.bytes[0]) << 16) |
-                (@as(usize, entry.handle.bytes[1]) << 8) |
-                @as(usize, entry.handle.bytes[2]);
-            @memcpy(collected[collected_len .. collected_len + len], entry.handle.bytes[9 .. 9 + len]);
-            collected_len += len;
+        var off: usize = 0;
+        while (off + 9 <= entry.len) {
+            const frame_type = entry.handle.bytes[off + 3];
+            const flen = (@as(usize, entry.handle.bytes[off]) << 16) |
+                (@as(usize, entry.handle.bytes[off + 1]) << 8) |
+                @as(usize, entry.handle.bytes[off + 2]);
+            if (frame_type == @intFromEnum(http2.FrameType.data)) {
+                @memcpy(collected[collected_len .. collected_len + flen], entry.handle.bytes[off + 9 .. off + 9 + flen]);
+                collected_len += flen;
+            }
+            off += 9 + flen;
         }
         server.io.releaseBuffer(entry.handle);
         conn.popWrite();
