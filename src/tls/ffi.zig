@@ -40,6 +40,11 @@ pub const TLS1_2_VERSION: c_int = 0x0303;
 // SSL control options
 pub const SSL_CTRL_SET_MIN_PROTO_VERSION: c_int = 123;
 pub const SSL_CTRL_SET_MAX_PROTO_VERSION: c_int = 124;
+pub const SSL_CTRL_OPTIONS: c_int = 32;
+
+// SSL_OP flags
+pub const SSL_OP_NO_COMPRESSION: c_long = 0x00020000;
+pub const SSL_OP_NO_RENEGOTIATION: c_long = 0x00400000;
 
 // ALPN callback return values
 pub const SSL_TLSEXT_ERR_OK: c_int = 0;
@@ -84,8 +89,8 @@ pub const HandshakeResult = enum {
 };
 
 // External C functions - these are resolved at link time
-extern fn SSL_CTX_new(method: *const SSL_METHOD) ?*SSL_CTX;
-extern fn SSL_CTX_free(ctx: *SSL_CTX) void;
+pub extern fn SSL_CTX_new(method: *const SSL_METHOD) ?*SSL_CTX;
+pub extern fn SSL_CTX_free(ctx: *SSL_CTX) void;
 extern fn SSL_CTX_use_certificate_chain_file(ctx: *SSL_CTX, file: [*:0]const u8) c_int;
 extern fn SSL_CTX_use_PrivateKey_file(ctx: *SSL_CTX, file: [*:0]const u8, typ: c_int) c_int;
 extern fn SSL_CTX_check_private_key(ctx: *SSL_CTX) c_int;
@@ -94,15 +99,15 @@ extern fn SSL_CTX_ctrl(ctx: *SSL_CTX, cmd: c_int, larg: c_long, parg: ?*anyopaqu
 extern fn SSL_CTX_set_ciphersuites(ctx: *SSL_CTX, str: [*:0]const u8) c_int;
 extern fn SSL_CTX_set_alpn_protos(ctx: *SSL_CTX, protos: [*]const u8, protos_len: c_uint) c_int;
 
-extern fn SSL_new(ctx: *SSL_CTX) ?*SSL;
-extern fn SSL_free(ssl: *SSL) void;
+pub extern fn SSL_new(ctx: *SSL_CTX) ?*SSL;
+pub extern fn SSL_free(ssl: *SSL) void;
 extern fn SSL_set_accept_state(ssl: *SSL) void;
 extern fn SSL_set_connect_state(ssl: *SSL) void;
 extern fn SSL_do_handshake(ssl: *SSL) c_int;
 extern fn SSL_get_error(ssl: *const SSL, ret: c_int) c_int;
 extern fn SSL_is_init_finished(ssl: *const SSL) c_int;
-extern fn SSL_read(ssl: *SSL, buf: [*]u8, num: c_int) c_int;
-extern fn SSL_write(ssl: *SSL, buf: [*]const u8, num: c_int) c_int;
+pub extern fn SSL_read(ssl: *SSL, buf: [*]u8, num: c_int) c_int;
+pub extern fn SSL_write(ssl: *SSL, buf: [*]const u8, num: c_int) c_int;
 extern fn SSL_get0_alpn_selected(ssl: *const SSL, data: *[*]const u8, len: *c_uint) void;
 extern fn SSL_export_keying_material(
     ssl: *SSL,
@@ -116,7 +121,7 @@ extern fn SSL_export_keying_material(
 ) c_int;
 
 extern fn TLS_server_method() *const SSL_METHOD;
-extern fn TLS_client_method() *const SSL_METHOD;
+pub extern fn TLS_client_method() *const SSL_METHOD;
 
 extern fn BIO_new(typ: *const BIO_METHOD) ?*BIO;
 extern fn BIO_free(bio: *BIO) c_int;
@@ -128,10 +133,10 @@ extern fn BIO_ctrl_pending(bio: *BIO) usize;
 extern fn SSL_set_bio(ssl: *SSL, rbio: ?*BIO, wbio: ?*BIO) void;
 extern fn SSL_get_rbio(ssl: *const SSL) ?*BIO;
 extern fn SSL_get_wbio(ssl: *const SSL) ?*BIO;
-extern fn SSL_set_fd(ssl: *SSL, fd: c_int) c_int;
+pub extern fn SSL_set_fd(ssl: *SSL, fd: c_int) c_int;
 extern fn SSL_accept(ssl: *SSL) c_int;
-extern fn SSL_connect(ssl: *SSL) c_int;
-extern fn SSL_shutdown(ssl: *SSL) c_int;
+pub extern fn SSL_connect(ssl: *SSL) c_int;
+pub extern fn SSL_shutdown(ssl: *SSL) c_int;
 
 extern fn ERR_get_error() c_ulong;
 extern fn ERR_error_string_n(e: c_ulong, buf: [*]u8, len: usize) void;
@@ -354,10 +359,12 @@ pub fn createContext(is_server: bool) !*SSL_CTX {
     if (!tls_enabled) return error.TlsNotAvailable;
     const method = if (is_server) TLS_server_method() else TLS_client_method();
     const ctx = SSL_CTX_new(method) orelse return error.ContextCreationFailed;
+    errdefer SSL_CTX_free(ctx);
 
-    // Set minimum TLS version to 1.3 for QUIC
-    _ = SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, TLS1_3_VERSION, null);
-    _ = SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MAX_PROTO_VERSION, TLS1_3_VERSION, null);
+    if (SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, TLS1_3_VERSION, null) == 0)
+        return error.ContextCreationFailed;
+    if (SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MAX_PROTO_VERSION, TLS1_3_VERSION, null) == 0)
+        return error.ContextCreationFailed;
 
     return ctx;
 }
@@ -424,11 +431,11 @@ pub fn createTcpContext(is_server: bool) !*SSL_CTX {
     if (!tls_enabled) return error.TlsNotAvailable;
     const method = if (is_server) TLS_server_method() else TLS_client_method();
     const ctx = SSL_CTX_new(method) orelse return error.ContextCreationFailed;
+    errdefer SSL_CTX_free(ctx);
 
-    // Library defaults allow TLS 1.2+ which is correct for TCP.
-    // No explicit version pinning needed (unlike QUIC which requires 1.3).
+    _ = SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, TLS1_2_VERSION, null);
+    _ = SSL_CTX_ctrl(ctx, SSL_CTRL_OPTIONS, SSL_OP_NO_COMPRESSION | SSL_OP_NO_RENEGOTIATION, null);
 
-    // Set ALPN callback for server to negotiate h2 or http/1.1
     if (is_server) {
         SSL_CTX_set_alpn_select_cb(ctx, tcpAlpnSelectCallback, null);
     }

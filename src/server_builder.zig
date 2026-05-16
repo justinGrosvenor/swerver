@@ -2,6 +2,7 @@ const std = @import("std");
 
 const config_mod = @import("config.zig");
 const middleware_mod = @import("middleware/middleware.zig");
+const x402 = @import("middleware/x402.zig");
 const router_mod = @import("router/router.zig");
 const server = @import("server.zig");
 const proxy_mod = @import("proxy/proxy.zig");
@@ -110,6 +111,14 @@ pub const ServerBuilder = struct {
             .require_payment = self.cfg.x402.enabled,
             .payment_required_b64 = self.cfg.x402.payment_required_b64,
         });
+
+        if (self.cfg.x402.facilitator_url.len > 0) {
+            if (x402.parseFacilitatorUrl(self.cfg.x402.facilitator_url)) |fac| {
+                var fac_config = fac;
+                fac_config.timeout_ms = self.cfg.x402.facilitator_timeout_ms;
+                app_router.facilitator = fac_config;
+            }
+        }
 
         if (self.middleware_chain) |chain| {
             app_router.setMiddleware(chain);

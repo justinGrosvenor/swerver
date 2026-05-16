@@ -174,6 +174,8 @@ pub const Master = struct {
             };
 
             std.log.info("[w{d}] worker exiting cleanly", .{worker_id});
+            srv.deinit();
+            self.allocator.destroy(srv);
             std.process.exit(0);
         }
 
@@ -266,14 +268,15 @@ pub const Master = struct {
     }
 
     fn rollingRestart(self: *Master) void {
-        // Simple rolling restart: signal old workers, fork new ones
-        self.signalAllWorkers(std.posix.SIG.TERM);
-        self.waitAllWorkers();
-
         for (0..self.worker_count) |i| {
-            self.forkWorker(@intCast(i));
+            const wid: u16 = @intCast(i);
+            if (self.worker_pids[wid] > 0) {
+                std.posix.kill(self.worker_pids[wid], std.posix.SIG.TERM) catch {};
+                _ = std.c.waitpid(self.worker_pids[wid], null, 0);
+                self.worker_pids[wid] = 0;
+            }
+            self.forkWorker(wid);
         }
-
         std.log.info("[master] rolling restart complete", .{});
     }
 
@@ -332,15 +335,16 @@ fn resetChildSignals() void {
 }
 
 fn sleepMs(ms: u32) void {
-    const ts = std.posix.timespec{
+    var ts = std.posix.timespec{
         .sec = @intCast(ms / 1000),
         .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
     };
     while (true) {
-        const rc = std.posix.system.nanosleep(&ts, null);
+        var rem: std.posix.timespec = undefined;
+        const rc = std.posix.system.nanosleep(&ts, &rem);
         if (rc == 0) return;
         switch (std.posix.errno(rc)) {
-            .INTR => continue,
+            .INTR => ts = rem,
             else => return,
         }
     }

@@ -27,7 +27,7 @@ pub const EpollBackend = struct {
         const events = try allocator.alloc(EpollEvent, max_events);
         errdefer allocator.free(events);
 
-        const rc = linux.epoll_create1(0);
+        const rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
         const epfd = unwrapSyscallI32(rc) catch return error.EpollCreateFailed;
 
         return .{

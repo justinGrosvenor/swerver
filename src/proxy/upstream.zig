@@ -95,6 +95,17 @@ pub const ProxyRoute = struct {
     timeouts: ProxyTimeouts = .{},
     /// Retry configuration
     retry: RetryConfig = .{},
+    /// Per-route x402 payment gating
+    x402: ?ProxyRouteX402 = null,
+};
+
+pub const ProxyRouteX402 = struct {
+    price: []const u8,
+    asset: []const u8,
+    network: []const u8,
+    pay_to: []const u8,
+    scheme: []const u8 = "exact",
+    max_timeout_seconds: u32 = 60,
 };
 
 /// Path rewrite rule

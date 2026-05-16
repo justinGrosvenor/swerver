@@ -7,7 +7,9 @@ const health = @import("health.zig");
 const request = @import("../protocol/request.zig");
 const response = @import("../response/response.zig");
 const middleware = @import("../middleware/middleware.zig");
+const x402 = @import("../middleware/x402.zig");
 const net = @import("../runtime/net.zig");
+const clock = @import("../runtime/clock.zig");
 
 /// Reverse Proxy Handler
 ///
@@ -55,6 +57,8 @@ pub const Proxy = struct {
     /// Number of free buffers
     free_request_count: usize,
     free_response_count: usize,
+    /// Pre-computed x402 policies for proxy routes (parallel to config.routes)
+    route_x402_policies: []x402.RoutePaymentConfig,
 
     const REQUEST_BUF_SIZE = 8192;
     const RESPONSE_BUF_SIZE = 65536;
@@ -91,6 +95,20 @@ pub const Proxy = struct {
             free_response_stack[i] = BUFFER_POOL_SIZE - 1 - i;
         }
 
+        // Pre-compute x402 policies for proxy routes
+        const route_x402_policies = try allocator.alloc(x402.RoutePaymentConfig, config.routes.len);
+        errdefer allocator.free(route_x402_policies);
+        for (config.routes, 0..) |route, i| {
+            if (route.x402) |rx| {
+                route_x402_policies[i] = x402.configFromProxyRoute(&rx, allocator, route.path_prefix) catch {
+                    route_x402_policies[i] = .{};
+                    continue;
+                };
+            } else {
+                route_x402_policies[i] = .{};
+            }
+        }
+
         // Phase 2: Create proxy with empty upstream registrations
         var proxy = Proxy{
             .allocator = allocator,
@@ -106,6 +124,7 @@ pub const Proxy = struct {
             .free_response_stack = free_response_stack,
             .free_request_count = BUFFER_POOL_SIZE,
             .free_response_count = BUFFER_POOL_SIZE,
+            .route_x402_policies = route_x402_policies,
         };
 
         // Phase 3: Register upstreams - use errdefer to cleanup proxy internals only
@@ -155,11 +174,19 @@ pub const Proxy = struct {
         self.pool_manager.deinit();
         self.health_manager.deinit();
 
+        self.allocator.free(self.route_x402_policies);
         self.allocator.free(self.free_request_stack);
         self.allocator.free(self.free_response_stack);
         self.allocator.free(self.request_bufs);
         self.allocator.free(self.response_bufs);
         self.allocator.free(self.response_header_bufs);
+    }
+
+    /// Return the index of a matched route (for looking up parallel arrays like x402 policies).
+    pub fn routeIndex(self: *const Proxy, route: *const upstream.ProxyRoute) usize {
+        const base = @intFromPtr(self.config.routes.ptr);
+        const this = @intFromPtr(route);
+        return (this - base) / @sizeOf(upstream.ProxyRoute);
     }
 
     /// Find a matching proxy route for a request.
@@ -276,9 +303,23 @@ pub const Proxy = struct {
         const retry_config = route.retry;
         var attempts: u8 = 0;
         const max_attempts = retry_config.max_retries + 1;
+        const start_instant = clock.Instant.now();
+        const total_limit_ns: u64 = @as(u64, route.timeouts.total_ms) * 1_000_000;
 
         while (attempts < max_attempts) {
             attempts += 1;
+
+            // Enforce total_ms deadline on retries
+            if (attempts > 1) {
+                if (start_instant) |start| {
+                    if (clock.Instant.now()) |current| {
+                        if (current.since(start) >= total_limit_ns) {
+                            self.releaseResponseBuffer(resp_buf_idx);
+                            return .{ .resp = forward.createErrorResponse(504), .proxy = self };
+                        }
+                    }
+                }
+            }
 
             // Select upstream server
             const selection = bal.select(client_ip_u32, now_ms) orelse {
@@ -491,9 +532,22 @@ pub const Proxy = struct {
         var attempts: u8 = 0;
         const max_attempts = retry_config.max_retries + 1;
         const body_len = body_view.totalLen();
+        const start_instant = clock.Instant.now();
+        const total_limit_ns: u64 = @as(u64, route.timeouts.total_ms) * 1_000_000;
 
         while (attempts < max_attempts) {
             attempts += 1;
+
+            if (attempts > 1) {
+                if (start_instant) |start| {
+                    if (clock.Instant.now()) |current| {
+                        if (current.since(start) >= total_limit_ns) {
+                            self.releaseResponseBuffer(resp_buf_idx);
+                            return .{ .resp = forward.createErrorResponse(504), .proxy = self };
+                        }
+                    }
+                }
+            }
 
             const selection = bal.select(client_ip_u32, now_ms) orelse {
                 self.releaseResponseBuffer(resp_buf_idx);
@@ -811,6 +865,7 @@ test "Proxy route matching" {
         .free_response_stack = &.{},
         .free_request_count = 0,
         .free_response_count = 0,
+        .route_x402_policies = &.{},
     };
     defer {
         proxy.pool_manager.deinit();

@@ -1,6 +1,7 @@
 const std = @import("std");
 const upstream = @import("upstream.zig");
 const pool_mod = @import("pool.zig");
+const clock = @import("../runtime/clock.zig");
 
 /// Load Balancer
 ///
@@ -46,7 +47,7 @@ pub const Balancer = struct {
             .pool = conn_pool,
             .round_robin_index = 0,
             .weighted_state = .{},
-            .rng = std.Random.DefaultPrng.init(0),
+            .rng = std.Random.DefaultPrng.init(if (clock.Instant.now()) |i| i.ns else 0),
         };
 
         // Initialize weighted state if using weighted_round_robin

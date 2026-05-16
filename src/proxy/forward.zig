@@ -714,21 +714,17 @@ pub fn buildClientResponse(
     const raw_body = upstream_buf[upstream_response.body_start..upstream_response.body_end];
 
     if (upstream_response.is_chunked) {
-        // Decode chunked body: calculate decoded size for Content-Length
-        const decoded_size = chunkedDecodedSize(raw_body) orelse raw_body.len;
-        pos += (std.fmt.bufPrint(buf[pos..], "Content-Length: {d}\r\n", .{decoded_size}) catch return error.BufferFull).len;
-
-        // End of headers
-        if (pos + 2 > buf.len) return error.BufferFull;
-        buf[pos] = '\r';
-        buf[pos + 1] = '\n';
-        pos += 2;
-
-        // Decode chunked body directly into output buffer
-        if (decodeChunkedInto(raw_body, buf[pos..])) |written| {
+        // Try decoding first so Content-Length matches actual body
+        var decode_buf: [65536]u8 = undefined;
+        const decoded = decodeChunkedInto(raw_body, &decode_buf);
+        if (decoded) |written| {
+            pos += (std.fmt.bufPrint(buf[pos..], "Content-Length: {d}\r\n\r\n", .{written}) catch return error.BufferFull).len;
+            if (pos + written > buf.len) return error.BufferFull;
+            @memcpy(buf[pos .. pos + written], decode_buf[0..written]);
             pos += written;
         } else {
-            // Fallback: copy raw data if decode fails
+            // Decode failed — send raw body with matching Content-Length
+            pos += (std.fmt.bufPrint(buf[pos..], "Content-Length: {d}\r\n\r\n", .{raw_body.len}) catch return error.BufferFull).len;
             if (pos + raw_body.len > buf.len) return error.BufferFull;
             @memcpy(buf[pos .. pos + raw_body.len], raw_body);
             pos += raw_body.len;
@@ -773,7 +769,7 @@ fn chunkedDecodedSize(data: []const u8) ?usize {
 
 /// Copy decoded chunked body into output buffer, stripping chunk framing.
 /// Returns bytes written, or null on parse failure.
-fn decodeChunkedInto(data: []const u8, out: []u8) ?usize {
+pub fn decodeChunkedInto(data: []const u8, out: []u8) ?usize {
     var src: usize = 0;
     var dst: usize = 0;
     while (src < data.len) {

@@ -40,6 +40,13 @@ pub fn main(init: std.process.Init) !void {
         .require_payment = cfg.x402.enabled,
         .payment_required_b64 = cfg.x402.payment_required_b64,
     });
+    if (cfg.x402.facilitator_url.len > 0) {
+        if (swerver.middleware.x402.parseFacilitatorUrl(cfg.x402.facilitator_url)) |fac| {
+            var fac_config = fac;
+            fac_config.timeout_ms = cfg.x402.facilitator_timeout_ms;
+            app_router.facilitator = fac_config;
+        }
+    }
     try swerver.benchmark.registerRoutes(&app_router);
     swerver.benchmark.loadDataset();
     if (!cfg.disable_middleware) {

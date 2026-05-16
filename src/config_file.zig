@@ -141,6 +141,13 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
         if (q.max_streams_uni) |v| cfg.quic.max_streams_uni = v;
     }
 
+    // x402
+    if (file_cfg.x402) |x| {
+        if (x.enabled) |v| cfg.x402.enabled = v;
+        if (x.facilitator_url) |v| cfg.x402.facilitator_url = v;
+        if (x.facilitator_timeout_ms) |v| cfg.x402.facilitator_timeout_ms = v;
+    }
+
     // Upstreams
     const upstream_defs = file_cfg.upstreams orelse &[_]UpstreamJson{};
     const upstreams_out = try alloc.alloc(upstream_mod.Upstream, upstream_defs.len);
@@ -208,6 +215,18 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
             };
         }
 
+        var route_x402: ?upstream_mod.ProxyRouteX402 = null;
+        if (r.x402) |x| {
+            route_x402 = .{
+                .price = x.price orelse return error.ConfigParseError,
+                .asset = x.asset orelse return error.ConfigParseError,
+                .network = x.network orelse return error.ConfigParseError,
+                .pay_to = x.pay_to orelse return error.ConfigParseError,
+                .scheme = x.scheme orelse "exact",
+                .max_timeout_seconds = x.max_timeout_seconds orelse 60,
+            };
+        }
+
         routes_out[ri] = .{
             .path_prefix = r.path_prefix,
             .host = r.host,
@@ -219,6 +238,7 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
                 .read_ms = r.read_timeout_ms orelse 60_000,
                 .total_ms = r.total_timeout_ms orelse 120_000,
             },
+            .x402 = route_x402,
         };
     }
 
@@ -273,6 +293,7 @@ const FileConfig = struct {
     tls: ?TlsJson = null,
     http2: ?Http2Json = null,
     quic: ?QuicJson = null,
+    x402: ?X402Json = null,
     upstreams: ?[]const UpstreamJson = null,
     routes: ?[]const RouteJson = null,
 };
@@ -329,6 +350,21 @@ const QuicJson = struct {
     max_streams_uni: ?u64 = null,
 };
 
+const X402Json = struct {
+    enabled: ?bool = null,
+    facilitator_url: ?[]const u8 = null,
+    facilitator_timeout_ms: ?u32 = null,
+};
+
+const RouteX402Json = struct {
+    price: ?[]const u8 = null,
+    asset: ?[]const u8 = null,
+    network: ?[]const u8 = null,
+    pay_to: ?[]const u8 = null,
+    scheme: ?[]const u8 = null,
+    max_timeout_seconds: ?u32 = null,
+};
+
 const UpstreamJson = struct {
     name: []const u8,
     servers: []const ServerEntryJson,
@@ -373,6 +409,7 @@ const RouteJson = struct {
     send_timeout_ms: ?u32 = null,
     read_timeout_ms: ?u32 = null,
     total_timeout_ms: ?u32 = null,
+    x402: ?RouteX402Json = null,
 };
 
 // Tests

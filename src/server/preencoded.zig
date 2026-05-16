@@ -182,9 +182,13 @@ pub fn initPreencodedH3(server: *Server) void {
     const plaintext_headers = [_]response_mod.Header{
         .{ .name = "Content-Type", .value = "text/plain" },
     };
+    const json_headers = [_]response_mod.Header{
+        .{ .name = "Content-Type", .value = "application/json" },
+    };
     registerPreencodedH3(server, "GET", "/health", 200, &[_]response_mod.Header{}, "");
     registerPreencodedH3(server, "GET", "/plaintext", 200, &plaintext_headers, "Hello, World!");
     registerPreencodedH3(server, "GET", "/pipeline", 200, &plaintext_headers, "ok");
+    registerPreencodedH3(server, "GET", "/echo", 200, &json_headers, "{\"status\":\"ok\"}");
 }
 
 /// Append a pre-encoded entry and encode its initial bytes using
@@ -418,7 +422,7 @@ pub fn findAndRefreshPreencodedH1(server: *Server, method: []const u8, path: []c
 /// those aren't GET).
 pub fn tryDispatchPreencodedH1(server: *Server, conn: *connection.Connection, req_view: request.RequestView) PreencodedResult {
     if (conn.close_after_write) return .not_cached;
-    if (server.app_router.x402_policy.require_payment) return .not_cached;
+    if (server.app_router.has_any_paid_routes) return .not_cached;
     const method_str = req_view.getMethodName();
     if (findAndRefreshPreencodedH1(server, method_str, req_view.path)) |entry| {
         if (sendH1PreencodedBytes(server, conn, entry.bytes[0..entry.len]))
@@ -467,9 +471,13 @@ pub fn initPreencodedH2(server: *Server) void {
     const plaintext_headers = [_]response_mod.Header{
         .{ .name = "Content-Type", .value = "text/plain" },
     };
+    const json_headers = [_]response_mod.Header{
+        .{ .name = "Content-Type", .value = "application/json" },
+    };
     registerPreencodedH2(server, "GET", "/health", 200, &[_]response_mod.Header{}, "");
     registerPreencodedH2(server, "GET", "/plaintext", 200, &plaintext_headers, "Hello, World!");
     registerPreencodedH2(server, "GET", "/pipeline", 200, &plaintext_headers, "ok");
+    registerPreencodedH2(server, "GET", "/echo", 200, &json_headers, "{\"status\":\"ok\"}");
 }
 
 fn registerPreencodedH2(

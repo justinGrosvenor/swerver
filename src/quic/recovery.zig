@@ -223,17 +223,13 @@ pub const Recovery = struct {
         }
 
         // Mark packets as acknowledged and detect newly acked
-        self.markAcked(space, largest_acked);
+        self.markAckedRange(space, 0, largest_acked);
 
         // Detect lost packets
         self.detectLost(space, now);
 
         // Reset PTO count on successful ACK
         self.pto_count = 0;
-    }
-
-    fn markAcked(self: *Recovery, space: types.PacketNumberSpace, largest_acked: u64) void {
-        self.markAckedRange(space, 0, largest_acked);
     }
 
     /// Mark only packets within [smallest, largest] range as acknowledged

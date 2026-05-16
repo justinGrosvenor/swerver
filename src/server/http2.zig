@@ -45,10 +45,14 @@ pub fn matchesHttp2Preface(candidate: []const u8) bool {
     return std.mem.eql(u8, candidate[0..n], http2.Preface[0..n]);
 }
 
-/// Send the HTTP/2 server connection preface (SETTINGS frame)
+/// Send the HTTP/2 server connection preface (SETTINGS frame +
+/// connection-level WINDOW_UPDATE). SETTINGS_INITIAL_WINDOW_SIZE
+/// only governs per-stream windows (RFC 9113 §6.5.2); the
+/// connection-level window starts at 65535 and must be raised
+/// via WINDOW_UPDATE (RFC 9113 §6.9.2).
 pub fn sendHttp2ServerPreface(server: *Server, conn: *connection.Connection) !void {
     const buf = server.io.acquireBuffer() orelse return error.OutOfMemory;
-    const len = http2.writeServerSettings(buf.bytes, .{
+    var len = http2.writeServerSettings(buf.bytes, .{
         .max_streams = server.cfg.http2.max_streams,
         .max_header_list_size = server.cfg.http2.max_header_list_size,
         .initial_window_size = server.cfg.http2.initial_window_size,
@@ -58,6 +62,12 @@ pub fn sendHttp2ServerPreface(server: *Server, conn: *connection.Connection) !vo
         server.io.releaseBuffer(buf);
         return error.OutOfMemory;
     };
+    const conn_window = server.cfg.http2.initial_window_size;
+    if (conn_window > 65535) {
+        const increment = conn_window - 65535;
+        const wu_len = http2.writeWindowUpdate(buf.bytes[len..], 0, increment) catch 0;
+        len += wu_len;
+    }
     if (!conn.enqueueWrite(buf, len)) {
         server.io.releaseBuffer(buf);
         return error.OutOfMemory;
@@ -121,15 +131,15 @@ pub fn handleHttp2Read(server: *Server, conn: *connection.Connection) !void {
         // dropped — visible on the Mixed GET+POST benchmark
         // where swerver was at 12K vs actix's 33K.
         //
-        // Scope: single-ingest-batch. For small POST bodies
-        // (curl-sized, benchmark-sized) the HEADERS and DATA
-        // frames fit in one TCP read and one ingest call, so
-        // they're both in this events array together. Large
-        // POST bodies that span multiple TCP reads still fall
-        // through to 501 — tracked as a follow-up alongside
-        // Connection-level pending state.
+        // Scope: single-ingest-batch for small bodies, persistent
+        // conn.h2_pending slots for bodies spanning TCP reads.
         var pending_headers: [16]?http2.HeadersEvent = [_]?http2.HeadersEvent{null} ** 16;
         var pending_count: usize = 0;
+        // Stack buffer for batching control frames (SETTINGS ACK,
+        // PING ACK, WINDOW_UPDATE) from a single ingest. Avoids
+        // acquiring a 1MB pool buffer per 9-17 byte control frame.
+        var ctrl_buf: [256]u8 = undefined;
+        var ctrl_len: usize = 0;
 
         for (events[0..ingest.event_count]) |event| {
             switch (event) {
@@ -142,11 +152,11 @@ pub fn handleHttp2Read(server: *Server, conn: *connection.Connection) !void {
                         // pre-encoded cache; otherwise dispatch
                         // normally.
                         const method_str = hdr.request.getMethodName();
-                        // x402 gate: skip cache when payment required
-                        if (!server.app_router.x402_policy.require_payment and
-                            preencoded.findAndRefreshPreencodedH2(server, method_str, hdr.request.path) != null)
-                        {
-                            const entry = preencoded.findAndRefreshPreencodedH2(server, method_str, hdr.request.path).?;
+                        const h2_cached = if (!server.app_router.has_any_paid_routes)
+                            preencoded.findAndRefreshPreencodedH2(server, method_str, hdr.request.path)
+                        else
+                            null;
+                        if (h2_cached) |entry| {
                             preencoded.sendH2PreencodedBytes(server, conn, hdr.stream_id, entry);
                         } else if (server.cfg.static_root.len > 0 and std.mem.startsWith(u8, hdr.request.path, "/static/")) {
                             // Static file serving over h2 — same
@@ -161,16 +171,33 @@ pub fn handleHttp2Read(server: *Server, conn: *connection.Connection) !void {
                             try dispatchHttp2Request(server, conn, hdr.stream_id, hdr.request, "");
                         }
                     } else {
-                        // Body-bearing request. Stash the HEADERS
-                        // until a matching DATA(end_stream=true)
-                        // arrives in this batch.
+                        // Body-bearing request. Stash in batch-local
+                        // array AND persist to connection for cross-
+                        // TCP-read delivery.
                         if (pending_count < pending_headers.len) {
                             pending_headers[pending_count] = hdr;
                             pending_count += 1;
-                        } else {
-                            // Pending table full — fall back to
-                            // the legacy 501 path for this stream.
-                            try queueHttp2Response(server, conn, hdr.stream_id, Server.notImplementedResponse(), hdr.request.method == .HEAD);
+                        }
+                        // Persist to connection-level slots so DATA
+                        // arriving in a later TCP read can find them.
+                        var stashed = false;
+                        for (&conn.h2_pending) |*slot| {
+                            if (!slot.active) {
+                                stashed = slot.stash(hdr.stream_id, hdr.request);
+                                break;
+                            }
+                        }
+                        if (!stashed) {
+                            // All persistent slots full — RST_STREAM so the
+                            // client retries on a new stream rather than
+                            // hanging forever waiting for a response.
+                            var rst_buf: [13]u8 = undefined;
+                            const rst_len = http2.writeRstStream(&rst_buf, hdr.stream_id, 0x7) catch 0; // REFUSED_STREAM
+                            if (rst_len > 0 and ctrl_len + rst_len <= ctrl_buf.len) {
+                                @memcpy(ctrl_buf[ctrl_len .. ctrl_len + rst_len], rst_buf[0..rst_len]);
+                                ctrl_len += rst_len;
+                            }
+                            if (conn.http2_stack) |s| s.closeStream(hdr.stream_id);
                         }
                     }
                 },
@@ -191,53 +218,79 @@ pub fn handleHttp2Read(server: *Server, conn: *connection.Connection) !void {
                         pending_headers[idx] = null;
                         if (hdr_opt) |hdr| {
                             if (data_ev.end_stream) {
-                                // Single-DATA-frame body complete —
-                                // dispatch the request with the body slice.
-                                // DataEvent.data is a slice into the
-                                // connection's read buffer, valid for the
-                                // synchronous handler call.
                                 try dispatchHttp2Request(server, conn, hdr.stream_id, hdr.request, data_ev.data);
+                                // Clear persistent slot too
+                                for (&conn.h2_pending) |*slot| {
+                                    if (slot.active and slot.stream_id == data_ev.stream_id) {
+                                        slot.clear();
+                                        break;
+                                    }
+                                }
                             } else {
-                                // Multi-DATA-frame body not supported in
-                                // this fix. Return 501 instead of silently
-                                // buffering across DATA events.
-                                try queueHttp2Response(server, conn, hdr.stream_id, Server.notImplementedResponse(), hdr.request.method == .HEAD);
+                                // Multi-DATA: accumulate in persistent slot
+                                accumulateH2Body(server, conn, data_ev);
                             }
                         }
+                    } else {
+                        // No batch-local match — check persistent slots
+                        // for headers that arrived in a previous TCP read.
+                        var found_persistent = false;
+                        for (&conn.h2_pending) |*slot| {
+                            if (slot.active and slot.stream_id == data_ev.stream_id) {
+                                found_persistent = true;
+                                if (data_ev.end_stream) {
+                                    // Collect full body: slot body + this DATA frame
+                                    const body = if (slot.body_handle) |bh|
+                                        bh.bytes[0..slot.body_len]
+                                    else
+                                        "";
+                                    // If slot has accumulated body, combine with final chunk
+                                    if (body.len > 0 and data_ev.data.len > 0) {
+                                        // Append final chunk to accumulated buffer
+                                        if (slot.body_len + data_ev.data.len <= slot.body_handle.?.bytes.len) {
+                                            @memcpy(slot.body_handle.?.bytes[slot.body_len .. slot.body_len + data_ev.data.len], data_ev.data);
+                                            slot.body_len += data_ev.data.len;
+                                        }
+                                        const full_body = slot.body_handle.?.bytes[0..slot.body_len];
+                                        try dispatchHttp2Request(server, conn, slot.stream_id, slot.toRequestView(full_body), full_body);
+                                    } else {
+                                        // Only this frame's data (or only accumulated)
+                                        const final_body = if (data_ev.data.len > 0) data_ev.data else body;
+                                        try dispatchHttp2Request(server, conn, slot.stream_id, slot.toRequestView(final_body), final_body);
+                                    }
+                                    if (slot.body_handle) |bh| server.io.releaseBuffer(bh);
+                                    slot.clear();
+                                } else {
+                                    accumulateH2Body(server, conn, data_ev);
+                                }
+                                break;
+                            }
+                        }
+                        if (!found_persistent) {
+                            // Orphaned DATA frame — stream will time out on the client side.
+                            // Nothing we can do without headers.
+                        }
                     }
-                    // Data frame with no matching pending HEADERS: drop.
-                    // Either the headers were already dispatched (impossible
-                    // for a well-formed client, HEADERS come before DATA) or
-                    // the pending table was full. Either way nothing to do.
                 },
                 .settings => |settings_event| {
                     if (!settings_event.ack) {
-                        // RFC 9113 §6.5.3: MUST send SETTINGS ACK
-                        var ack_buf: [9]u8 = undefined;
-                        const ack_len = http2.writeSettingsAck(&ack_buf) catch 0;
-                        if (ack_len > 0) {
-                            sendHttp2ControlFrame(server, conn, ack_buf[0..ack_len]);
-                        }
+                        const n = http2.writeSettingsAck(ctrl_buf[ctrl_len..]) catch 0;
+                        ctrl_len += n;
                     }
                 },
                 .ping => |ping_event| {
-                    // RFC 9113 §6.7: MUST respond with PING ACK
-                    var ping_buf: [17]u8 = undefined;
-                    const ping_len = http2.writePingAck(&ping_buf, ping_event.opaque_data) catch 0;
-                    if (ping_len > 0) {
-                        sendHttp2ControlFrame(server, conn, ping_buf[0..ping_len]);
-                    }
+                    const n = http2.writePingAck(ctrl_buf[ctrl_len..], ping_event.opaque_data) catch 0;
+                    ctrl_len += n;
                 },
                 .window_update_needed => |wu| {
-                    // RFC 9113 §6.9: Send WINDOW_UPDATE
-                    var wu_buf: [13]u8 = undefined;
-                    const wu_len = http2.writeWindowUpdate(&wu_buf, wu.stream_id, wu.increment) catch 0;
-                    if (wu_len > 0) {
-                        sendHttp2ControlFrame(server, conn, wu_buf[0..wu_len]);
-                    }
+                    const n = http2.writeWindowUpdate(ctrl_buf[ctrl_len..], wu.stream_id, wu.increment) catch 0;
+                    ctrl_len += n;
                 },
                 .err => {},
             }
+        }
+        if (ctrl_len > 0) {
+            sendHttp2ControlFrame(server, conn, ctrl_buf[0..ctrl_len]);
         }
         if (conn.read_buffered_bytes == 0) break;
     }
@@ -276,12 +329,18 @@ fn queueFileResponseH2(
     const file_fd = std.posix.openatZ(root_fd, path_z, o_flags, 0) catch return error.NotFound;
     defer clock.closeFd(file_fd);
 
-    // Read file into a managed buffer
+    // Read file into a managed buffer (loop to handle short reads)
     const buf_handle = server.io.acquireBuffer() orelse return error.NotFound;
-    const n = std.posix.read(file_fd, buf_handle.bytes) catch {
-        server.io.releaseBuffer(buf_handle);
-        return error.NotFound;
-    };
+    var total_read: usize = 0;
+    while (total_read < buf_handle.bytes.len) {
+        const n = std.posix.read(file_fd, buf_handle.bytes[total_read..]) catch {
+            server.io.releaseBuffer(buf_handle);
+            return error.NotFound;
+        };
+        if (n == 0) break;
+        total_read += n;
+    }
+    const n = total_read;
 
     const resp: response_mod.Response = .{
         .status = 200,
@@ -301,70 +360,106 @@ pub fn queueHttp2Response(server: *Server, conn: *connection.Connection, stream_
         else => null,
     };
     defer if (managed_body) |managed| server.io.releaseBuffer(managed.handle);
-    const header_buf = server.io.acquireBuffer() orelse {
-        server.closeConnection(conn);
-        return;
-    };
-    // Build headers array with Alt-Svc if enabled
-    var headers_with_alt_svc: [65]response_mod.Header = undefined;
-    var header_count = resp.headers.len;
-    for (resp.headers, 0..) |h, i| {
-        headers_with_alt_svc[i] = h;
-    }
-    // Add Alt-Svc header to advertise HTTP/3
-    if (server.alt_svc_len > 0 and header_count < headers_with_alt_svc.len) {
-        headers_with_alt_svc[header_count] = .{
-            .name = "alt-svc",
-            .value = server.alt_svc_value[0..server.alt_svc_len],
-        };
-        header_count += 1;
-    }
-    const header_block_len = http2.encodeResponseHeaders(header_buf.bytes[9..], resp.status, headers_with_alt_svc[0..header_count], body_len) catch {
-        server.io.releaseBuffer(header_buf);
+    const buf = server.io.acquireBuffer() orelse {
         server.closeConnection(conn);
         return;
     };
     const max_frame_size: usize = if (conn.http2_stack) |stack| @intCast(stack.max_frame_size) else 16384;
+    const has_body = body_len > 0 and !is_head;
+
+    // Build HPACK headers directly into the buffer after the 9-byte
+    // frame header slot. Only copy the header array when Alt-Svc
+    // needs to be appended; otherwise pass resp.headers straight through.
+    const hpack_start: usize = 9;
+    const header_block_len = blk: {
+        if (server.alt_svc_len > 0) {
+            var hdrs_with_alt: [65]response_mod.Header = undefined;
+            const n = @min(resp.headers.len, hdrs_with_alt.len - 1);
+            for (resp.headers[0..n], 0..) |h, i| hdrs_with_alt[i] = h;
+            hdrs_with_alt[n] = .{ .name = "alt-svc", .value = server.alt_svc_value[0..server.alt_svc_len] };
+            break :blk http2.encodeResponseHeaders(buf.bytes[hpack_start..], resp.status, hdrs_with_alt[0 .. n + 1], body_len) catch {
+                server.io.releaseBuffer(buf);
+                server.closeConnection(conn);
+                return;
+            };
+        } else {
+            break :blk http2.encodeResponseHeaders(buf.bytes[hpack_start..], resp.status, resp.headers, body_len) catch {
+                server.io.releaseBuffer(buf);
+                server.closeConnection(conn);
+                return;
+            };
+        }
+    };
     if (header_block_len > max_frame_size) {
-        server.io.releaseBuffer(header_buf);
+        server.io.releaseBuffer(buf);
         server.closeConnection(conn);
         return;
     }
-    // RFC 9110 §9.3.2: HEAD response MUST NOT contain a message body
-    const headers_flags: u8 = if (body_len == 0 or is_head) 0x5 else 0x4;
-    // RFC 9113 §8.1: Response MUST be on the stream that carried the request
-    const resp_stream_id: u32 = stream_id;
-    http2.writeFrameHeader(header_buf.bytes, .headers, headers_flags, resp_stream_id, header_block_len) catch {
-        server.io.releaseBuffer(header_buf);
+    const headers_flags: u8 = if (!has_body) 0x5 else 0x4; // END_HEADERS + maybe END_STREAM
+    http2.writeFrameHeader(buf.bytes, .headers, headers_flags, stream_id, header_block_len) catch {
+        server.io.releaseBuffer(buf);
         server.closeConnection(conn);
         return;
     };
-    const header_frame_len = 9 + header_block_len;
-    if (!conn.enqueueWrite(header_buf, header_frame_len)) {
-        server.io.releaseBuffer(header_buf);
+    var total_len: usize = 9 + header_block_len;
+
+    if (!has_body) {
+        if (!conn.enqueueWrite(buf, total_len)) {
+            server.io.releaseBuffer(buf);
+            server.closeConnection(conn);
+            return;
+        }
+        server.io.onWriteBuffered(conn, total_len);
+        server.io.setTimeoutPhase(conn, .write);
+        if (conn.http2_stack) |stack| stack.closeStream(stream_id);
+        return;
+    }
+
+    // Small body: pack HEADERS + DATA into the same buffer. This
+    // halves buffer acquisitions and write-queue slots for the
+    // overwhelmingly common case (bodies < max_frame_size).
+    if (body_len <= max_frame_size and total_len + 9 + body_len <= buf.bytes.len) {
+        const data_offset = total_len;
+        http2.writeFrameHeader(buf.bytes[data_offset..], .data, 0x1, stream_id, body_len) catch {
+            server.io.releaseBuffer(buf);
+            server.closeConnection(conn);
+            return;
+        };
+        @memcpy(buf.bytes[data_offset + 9 .. data_offset + 9 + body_len], body_bytes);
+        total_len += 9 + body_len;
+
+        if (!conn.enqueueWrite(buf, total_len)) {
+            server.io.releaseBuffer(buf);
+            server.closeConnection(conn);
+            return;
+        }
+        server.io.onWriteBuffered(conn, total_len);
+        server.io.setTimeoutPhase(conn, .write);
+        if (conn.http2_stack) |stack| stack.closeStream(stream_id);
+        return;
+    }
+
+    // Large body: enqueue HEADERS first, then chunk DATA frames into
+    // separate buffers (each up to max_frame_size).
+    if (!conn.enqueueWrite(buf, total_len)) {
+        server.io.releaseBuffer(buf);
         server.closeConnection(conn);
         return;
     }
-    server.io.onWriteBuffered(conn, header_frame_len);
+    server.io.onWriteBuffered(conn, total_len);
     server.io.setTimeoutPhase(conn, .write);
 
-    if (body_len == 0 or is_head) {
-        // END_STREAM was set on HEADERS frame — stream is fully closed
-        if (conn.http2_stack) |stack| stack.closeStream(resp_stream_id);
-        return;
-    }
     var remaining = body_bytes;
     while (remaining.len > 0) {
         const data_buf = server.io.acquireBuffer() orelse {
-            // Cannot complete response - close connection
             server.closeConnection(conn);
             return;
         };
         const max_payload = @min(data_buf.bytes.len - 9, max_frame_size);
-        const chunk_len = if (remaining.len < max_payload) remaining.len else max_payload;
+        const chunk_len = @min(remaining.len, max_payload);
         @memcpy(data_buf.bytes[9 .. 9 + chunk_len], remaining[0..chunk_len]);
         const flags: u8 = if (remaining.len == chunk_len) 0x1 else 0x0;
-        http2.writeFrameHeader(data_buf.bytes, .data, flags, resp_stream_id, chunk_len) catch {
+        http2.writeFrameHeader(data_buf.bytes, .data, flags, stream_id, chunk_len) catch {
             server.io.releaseBuffer(data_buf);
             server.closeConnection(conn);
             return;
@@ -378,8 +473,24 @@ pub fn queueHttp2Response(server: *Server, conn: *connection.Connection, stream_
         server.io.onWriteBuffered(conn, frame_len);
         remaining = remaining[chunk_len..];
     }
-    // END_STREAM was set on last DATA frame — stream is fully closed
-    if (conn.http2_stack) |stack| stack.closeStream(resp_stream_id);
+    if (conn.http2_stack) |stack| stack.closeStream(stream_id);
+}
+
+fn accumulateH2Body(server: *Server, conn: *connection.Connection, data_ev: http2.DataEvent) void {
+    for (&conn.h2_pending) |*slot| {
+        if (slot.active and slot.stream_id == data_ev.stream_id) {
+            if (slot.body_handle == null) {
+                slot.body_handle = server.io.acquireBuffer() orelse return;
+                slot.body_len = 0;
+            }
+            const buf = slot.body_handle.?.bytes;
+            const avail = buf.len - slot.body_len;
+            const to_copy = @min(data_ev.data.len, avail);
+            @memcpy(buf[slot.body_len .. slot.body_len + to_copy], data_ev.data[0..to_copy]);
+            slot.body_len += to_copy;
+            return;
+        }
+    }
 }
 
 fn dispatchHttp2Request(

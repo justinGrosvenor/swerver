@@ -112,6 +112,9 @@ pub const IngestResult = struct {
 /// Maximum size of body data per DATA frame (16KB)
 pub const MAX_DATA_FRAME_SIZE: usize = 16 * 1024;
 
+/// Maximum concatenated body size for multi-DATA-frame requests (64KB)
+pub const MAX_H3_BODY_CONCAT: usize = 64 * 1024;
+
 /// Format current time as IMF-fixdate (RFC 9110 §5.6.7) for HTTP/3
 fn formatImfDateHttp3(buf: *[29]u8) []const u8 {
     const day_names = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
@@ -436,6 +439,9 @@ pub const Stack = struct {
         var body: []const u8 = "";
         var have_headers = false;
         var data_frame_count: usize = 0;
+        var concat_storage: [MAX_H3_BODY_CONCAT]u8 = undefined;
+        var concat_buf: ?*[MAX_H3_BODY_CONCAT]u8 = null;
+        var concat_len: usize = 0;
 
         var offset: usize = 0;
         while (offset < data.len) {
@@ -461,16 +467,19 @@ pub const Stack = struct {
                 .data => |d| {
                     data_frame_count += 1;
                     if (data_frame_count == 1) {
-                        // Zero-copy body: slice into caller's input buffer.
                         body = d.data;
                     } else {
-                        // Multi-DATA-frame request body: not supported
-                        // in PR A. Returning ConnectionError closes the
-                        // QUIC connection with H3_INTERNAL_ERROR via
-                        // `quic.connection::processHttp3Stream`, which
-                        // is strictly better than the pre-PR-A silent
-                        // drop.
-                        return error.ConnectionError;
+                        if (concat_buf == null) {
+                            if (body.len + d.data.len > MAX_H3_BODY_CONCAT) return error.BufferTooSmall;
+                            @memcpy(concat_storage[0..body.len], body);
+                            @memcpy(concat_storage[body.len..][0..d.data.len], d.data);
+                            concat_len = body.len + d.data.len;
+                            concat_buf = &concat_storage;
+                        } else {
+                            if (concat_len + d.data.len > MAX_H3_BODY_CONCAT) return error.BufferTooSmall;
+                            @memcpy(concat_storage[concat_len..][0..d.data.len], d.data);
+                            concat_len += d.data.len;
+                        }
                     }
                 },
                 else => {
@@ -490,11 +499,12 @@ pub const Stack = struct {
             return error.InvalidFrame;
         }
 
+        const final_body = if (concat_buf != null) concat_storage[0..concat_len] else body;
         self.events.append(self.allocator, .{
             .request_ready = .{
                 .stream_id = stream_id,
                 .headers = owned_headers,
-                .body = body,
+                .body = final_body,
             },
         }) catch return error.BufferTooSmall;
 
@@ -1233,7 +1243,7 @@ test "request stream: HEADERS + single DATA frame body is zero-copy slice" {
     try std.testing.expect(body_ptr_addr >= buf_start and body_ptr_addr < buf_end);
 }
 
-test "request stream: multi-DATA-frame body rejected (PR A limitation)" {
+test "request stream: multi-DATA-frame body concatenated" {
     const allocator = std.testing.allocator;
     var stack = Stack.init(allocator, true);
     defer stack.deinit();
@@ -1244,7 +1254,45 @@ test "request stream: multi-DATA-frame body rejected (PR A limitation)" {
     const data2_len = try frame.writeDataFrame(buf[hdr_len + data1_len ..], "part2");
     const total = hdr_len + data1_len + data2_len;
 
-    try std.testing.expectError(error.ConnectionError, stack.ingest(0, buf[0..total], true));
+    const result = try stack.ingest(0, buf[0..total], true);
+    try std.testing.expect(!result.need_more);
+    try std.testing.expect(result.events.len == 1);
+    const evt = result.events[0].request_ready;
+    try std.testing.expectEqualStrings("part1part2", evt.body);
+}
+
+test "request stream: slow-path multi-ingest with 8KB POST body" {
+    const allocator = std.testing.allocator;
+    var stack = Stack.init(allocator, true);
+    defer stack.deinit();
+
+    // Build a complete H3 request: HEADERS + DATA(8KB body)
+    var buf: [16384]u8 = undefined;
+    const hdr_len = try encodeRequestHeadersFrame(&stack, &buf, "POST", "/echo", "https", "example.com");
+    const body = [_]u8{'x'} ** 8192;
+    const data_len = try frame.writeDataFrame(buf[hdr_len..], &body);
+    const total = hdr_len + data_len;
+
+    // Simulate the slow path: multiple ingest calls with end_stream=false
+    // (mimicking the handler feeding recv_buffer contents on each packet),
+    // then one final call with end_stream=true.
+    const chunk_size: usize = 1200;
+    var offset: usize = chunk_size;
+    while (offset < total) : (offset += chunk_size) {
+        const partial = @min(offset, total);
+        const result = try stack.ingest(4, buf[0..partial], false);
+        try std.testing.expect(result.need_more);
+        try std.testing.expectEqual(@as(usize, 0), result.events.len);
+    }
+
+    // Final call with all data and end_stream=true
+    const result = try stack.ingest(4, buf[0..total], true);
+    try std.testing.expect(!result.need_more);
+    try std.testing.expectEqual(@as(usize, 1), result.events.len);
+    const req = result.events[0].request_ready;
+    try std.testing.expectEqual(@as(u64, 4), req.stream_id);
+    try std.testing.expectEqual(@as(usize, 8192), req.body.len);
+    try std.testing.expectEqualStrings(&body, req.body);
 }
 
 test "request stream: FIN without HEADERS frame is malformed" {

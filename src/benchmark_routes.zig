@@ -23,6 +23,7 @@ const response_mod = @import("response/response.zig");
 const middleware = @import("middleware/middleware.zig");
 const metrics_mw = @import("middleware/metrics_mw.zig");
 const clock = @import("runtime/clock.zig");
+const json_write = @import("runtime/json_write.zig");
 
 // ============================================================
 // Route registration
@@ -175,10 +176,18 @@ fn renderDataset(raw: []const u8, out: []u8) ?[]const u8 {
         const p_whole = @divTrunc(price_cents, 100);
         const p_frac: u64 = @intCast(@abs(@rem(price_cents, 100)));
 
-        const written = std.fmt.bufPrint(out[off..], "{{\"id\":{d},\"name\":\"{s}\",\"category\":\"{s}\",\"price\":{d}.{d:0>2},\"quantity\":{d},\"total\":{d}.{d:0>2}}}", .{
-            item.id, item.name, item.category, p_whole, p_frac, item.quantity, whole, frac,
+        const id_part = std.fmt.bufPrint(out[off..], "{{\"id\":{d},\"name\":\"", .{item.id}) catch return null;
+        off += id_part.len;
+        const esc_name = json_write.writeEscaped(out[off..], item.name) catch return null;
+        off += esc_name.len;
+        const mid_part = std.fmt.bufPrint(out[off..], "\",\"category\":\"", .{}) catch return null;
+        off += mid_part.len;
+        const esc_cat = json_write.writeEscaped(out[off..], item.category) catch return null;
+        off += esc_cat.len;
+        const tail_part = std.fmt.bufPrint(out[off..], "\",\"price\":{d}.{d:0>2},\"quantity\":{d},\"total\":{d}.{d:0>2}}}", .{
+            p_whole, p_frac, item.quantity, whole, frac,
         }) catch return null;
-        off += written.len;
+        off += tail_part.len;
     }
 
     const tail = std.fmt.bufPrint(out[off..], "]}}", .{}) catch return null;

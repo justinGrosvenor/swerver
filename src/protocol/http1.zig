@@ -23,6 +23,7 @@ pub const ErrorCode = enum {
     invalid_request_line,
     invalid_version,
     missing_host,
+    invalid_path,
     invalid_header_name,
     invalid_header_value,
     invalid_content_length,
@@ -130,6 +131,21 @@ fn parseHeadersInternal(_bytes: []u8, _limits: Limits) HeaderParseResult {
     };
     const method_str = line[0..first_space];
     const request_target = line[first_space + 1 .. second_space];
+    // Reject paths containing NUL or control characters (0x00-0x1F, 0x7F)
+    for (request_target) |c| {
+        if (c <= 0x1f or c == 0x7f) {
+            return .{
+                .state = .err,
+                .view = emptyView(),
+                .error_code = .invalid_path,
+                .content_length = 0,
+                .is_chunked = false,
+                .keep_alive = true,
+                .expect_continue = false,
+                .headers_consumed = 0,
+            };
+        }
+    }
     const version = line[second_space + 1 ..];
     const method = request.Method.fromStringExtended(method_str) orelse {
         return .{

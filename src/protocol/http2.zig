@@ -260,6 +260,8 @@ const StreamState = enum {
     closed,
 };
 
+const MAX_CONTINUATION_FRAMES = 64;
+
 const Stream = struct {
     id: u32,
     state: StreamState,
@@ -270,6 +272,7 @@ const Stream = struct {
     end_stream_pending: bool,
     saw_headers: bool,
     saw_data: bool,
+    continuation_count: u16,
 
     fn reset(self: *Stream, id: u32, initial_window: i32) void {
         self.id = id;
@@ -280,6 +283,7 @@ const Stream = struct {
         self.end_stream_pending = false;
         self.saw_headers = false;
         self.saw_data = false;
+        self.continuation_count = 0;
     }
 };
 
@@ -329,7 +333,7 @@ pub const HpackDecoder = struct {
     }
 
     fn setMaxSize(self: *HpackDecoder, size: usize) void {
-        self.max_dynamic_size = size;
+        self.max_dynamic_size = @min(size, MaxDynamicBytes);
         while (self.dynamic_size > self.max_dynamic_size) {
             self.evictOldest();
         }
@@ -709,6 +713,7 @@ pub const Stack = struct {
     max_header_list_size: usize,
     header_block: [HeaderBlockBytes]u8,
     headers_storage: [MaxHeaders]request.Header,
+    max_concurrent_streams: usize,
     goaway_received: bool,
     goaway_last_stream_id: u32,
     // Cache for last accessed stream to optimize repeated lookups
@@ -738,6 +743,7 @@ pub const Stack = struct {
             .max_header_list_size = cfg.max_header_list_size,
             .header_block = undefined,
             .headers_storage = undefined,
+            .max_concurrent_streams = cfg.max_streams,
             .goaway_received = false,
             .goaway_last_stream_id = 0,
             .cached_stream_id = 0,
@@ -916,6 +922,10 @@ pub const Stack = struct {
         if (frame.header.stream_id == 0) return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
         const stream = self.findStream(frame.header.stream_id) orelse return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
         if (!stream.header_block_in_progress) return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
+        stream.continuation_count += 1;
+        if (stream.continuation_count > MAX_CONTINUATION_FRAMES) {
+            return .{ .state = .err, .error_code = .enhance_your_calm, .event_count = 0 };
+        }
         if (stream.header_block_len + frame.payload.len > self.header_block.len) {
             return .{ .state = .err, .error_code = .header_list_too_large, .event_count = 0 };
         }
@@ -1137,6 +1147,12 @@ pub const Stack = struct {
         }
         // Reject new streams after GOAWAY received
         if (self.goaway_received) return null;
+        // Enforce configured max concurrent streams
+        var active_count: usize = 0;
+        for (self.streams[0..self.stream_count]) |s| {
+            if (s.state != .closed and s.state != .idle) active_count += 1;
+        }
+        if (active_count >= self.max_concurrent_streams) return null;
         // Try to find a closed stream slot to reuse
         for (self.streams[0..self.stream_count], 0..) |*stream, idx| {
             if (stream.state == .closed) {
@@ -1395,8 +1411,7 @@ fn decodeInt(buf: []const u8, idx: *usize, prefix: u8) !usize {
     while (idx.* < buf.len) {
         const b = buf[idx.*];
         idx.* += 1;
-        // Guard against overflow BEFORE the shift+add operation
-        if (m >= 28) return error.InvalidInt;
+        if (m >= @min(28, @bitSizeOf(usize) - 7)) return error.InvalidInt;
         value += (@as(usize, b & 0x7f) << m);
         if ((b & 0x80) == 0) return value;
         m += 7;

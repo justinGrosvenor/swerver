@@ -1,5 +1,166 @@
 # Changelog
 
+## 0.1.0-alpha.2 — 2026-05-15
+
+Full-codebase correctness audit: 41 findings across 24 files, 35 fixed.
+H1 benchmarks unchanged (165K req/s, +16% vs nginx). H2 throughput gap closed
+(82K → 145K rps after preencoded cache + flow control fixes). H2/H3 paths
+substantially hardened. Per-route x402 payment gating with optional local
+signature verification.
+
+### HTTP/2 Performance
+
+- **perf: `/echo` added to H2 and H3 preencoded caches** — the throughput
+  benchmark hits `/echo`, which was missing from the H2/H3 caches. Adding it
+  bypasses HPACK encoding, router dispatch, and middleware on the hot path
+  (+77% throughput, 82K → 145K rps).
+- **perf: combined HEADERS+DATA buffer** — small-body responses pack both
+  frames into a single pool buffer, halving buffer acquisitions and write-queue
+  entries for the common case.
+- **perf: control frame batching** — SETTINGS ACK, PING ACK, and WINDOW_UPDATE
+  from a single ingest batch are coalesced into one 256-byte stack-allocated
+  write instead of acquiring a pool buffer per 9–17 byte control frame.
+- **fix: connection-level flow control deadlock** — `SETTINGS_INITIAL_WINDOW_SIZE`
+  only governs per-stream windows (RFC 9113 §6.5.2). The connection-level window
+  starts at 65535 and must be raised via WINDOW_UPDATE on stream 0 (RFC 9113
+  §6.9.2). Without this, multiplexed POST bodies deadlock after ~65KB of data
+  across all streams. Server preface now sends a connection-level WINDOW_UPDATE
+  to raise the window to the configured `initial_window_size` (default 1MB).
+- **fix: persistent cross-TCP-read body slots** — body-bearing requests whose
+  HEADERS and DATA frames span TCP reads now use 32 persistent per-connection
+  slots (`PendingH2Body`) with body accumulation via pool buffers. Previously
+  only same-batch HEADERS→DATA matching worked.
+- **fix: RST_STREAM(REFUSED_STREAM) on slot overflow** — when all 32 pending
+  body slots are full, the stream is refused with RST_STREAM(0x7) so the client
+  can retry, instead of silently dropping the request.
+- **config: `initial_window_size` default raised to 1MB** — reduces
+  WINDOW_UPDATE round-trips for multiplexed body-bearing requests.
+
+### x402 Payment Protocol
+
+- **feat: per-route payment configuration** — routes can require payment via
+  `.withPayment()` on `RouteBuilder` / `GroupBuilder`. Each route specifies
+  price, asset, network, pay_to address, and scheme (`exact` or `upto`).
+  `has_any_paid_routes` flag on the router skips payment evaluation entirely
+  when no routes are gated.
+- **feat: facilitator URL for remote verification** — `x402.facilitator_url`
+  in server config points to a facilitator service for payment header
+  validation. Parsed into host/port/path at init, with configurable timeout.
+- **feat: local signature verification** — `enable-x402-crypto` build flag
+  links libcrypto and enables `x402_crypto.zig` for secp256k1 ECDSA
+  verification of payment headers without a facilitator round-trip.
+- **feat: `HandlerContext.setChargeAmount()`** — handlers using the `upto`
+  scheme can set the actual charge amount after computing the result.
+- **config: proxy route x402 policies** — proxy routes in the JSON config
+  can specify `x402: { price, asset, network, pay_to, scheme }` for payment
+  gating on proxied endpoints.
+
+### QUIC / HTTP/3
+
+- **fix: dynamic packet number encoding** — packet numbers now use 1–4 bytes based
+  on the distance from largest acknowledged, per RFC 9000 Appendix A. Previously
+  hardcoded to 1 byte, causing undecryptable packets after PN 255.
+- **fix: CRYPTO frame offset tracking** — handshake CRYPTO frames carry the correct
+  stream offset instead of hardcoded 0. Fixes handshake failure with certificate
+  chains spanning multiple QUIC packets.
+- **fix: FIN preserved on retransmitted STREAM frames** — duplicate STREAM frames
+  carrying FIN no longer silently drop the flag; streams transition to half-closed
+  correctly under packet loss.
+- **fix: multi-DATA-frame H3 request bodies** — POST bodies spanning multiple DATA
+  frames are concatenated into a 64KB stack buffer instead of killing the entire
+  QUIC connection. Two new tests cover concatenation and slow-path multi-ingest
+  with 8KB bodies.
+- **fix: MAX_DATA flow control capped at 256MB** — connection-level receive window
+  doubling no longer grows unbounded on long-lived connections.
+- **fix: connection IDs use OpenSSL CSPRNG** — `RAND_bytes` replaces the
+  clock-seeded PRNG for CID and PATH_CHALLENGE generation.
+- **fix: remove dead `markAcked` wrapper** — unused recovery helper deleted.
+
+### HTTP/2
+
+- **fix: POST/PUT bodies spanning TCP reads** — HEADERS and DATA frames arriving in
+  separate TCP reads no longer hang. Headers are persisted to per-connection slots
+  and matched when the DATA frame arrives.
+- **fix: static file responses no longer truncated** — `queueFileResponseH2` loops
+  on short reads instead of silently truncating files larger than one buffer.
+- **fix: CONTINUATION flood mitigation** — CONTINUATION frames capped at 64 per
+  header block (CVE-2024-27316).
+- **fix: HPACK dynamic table size bounded** — `SETTINGS_HEADER_TABLE_SIZE` and
+  dynamic-table size update instructions capped to physical storage size.
+- **fix: `max_concurrent_streams` enforced** — configured stream limit checked on
+  stream creation.
+- **fix: response header array bounds-checked** — prevents OOB writes from upstream
+  responses with many headers.
+- **fix: `decodeInt` portable to 32-bit** — HPACK integer overflow guard adapts to
+  target `usize` width.
+- **perf: eliminate double preencoded H2 lookup** — `findAndRefreshPreencodedH2`
+  called once per cache hit instead of twice.
+
+### HTTP/1.1
+
+- **fix: request target validated for control characters** — bytes ≤0x1f or 0x7f
+  return 400, preventing NUL-byte path truncation in static file serving.
+- **fix: pre-encoded error cache checks body match** — custom 404 handler bodies no
+  longer silently replaced by the cached template.
+
+### Router
+
+- **fix: bloom filter handles parameterized first segments** — routes like
+  `/:tenant/api` no longer 404 due to bloom filter mismatch.
+
+### Proxy
+
+- **fix: `total_ms` timeout enforced** — proxy retry loop checks a wall-clock
+  deadline.
+- **fix: BSD sendfile `done` flag** — short sends on macOS/FreeBSD no longer report
+  "transfer complete."
+- **fix: chunked decode uses scratch buffer** — Content-Length matches actual body
+  bytes on chunked decode fallback.
+- **fix: health check decodes chunked responses** — body comparison decodes
+  chunked transfer-encoding before matching.
+- **fix: balancer RNG seeded from clock** — random load balancing no longer produces
+  identical sequences across forked workers.
+
+### TLS
+
+- **fix: `createContext` errdefer + checked version pinning** — QUIC TLS context
+  frees on error and verifies version pinning succeeded.
+- **fix: TCP TLS minimum version set to 1.2** — no longer relies on OpenSSL
+  build-time defaults.
+- **fix: TCP TLS hardening flags** — `SSL_OP_NO_COMPRESSION` and
+  `SSL_OP_NO_RENEGOTIATION` set on all TCP TLS contexts.
+
+### Server
+
+- **fix: peer IP cached unconditionally** — `getpeername` runs on every accepted
+  connection; IP-based rate limiting works without a proxy.
+- **fix: `shutdown_requested` reset on `runLoop` entry** — second `run()` call in
+  the same process no longer exits immediately.
+- **fix: IPv4/IPv6 detection by `sockaddr.family`** — replaces fragile `addr_len`
+  comparison.
+
+### Middleware
+
+- **fix: rate limiter TOCTOU eliminated** — check + info computed under single
+  mutex acquisition.
+- **fix: logfmt path sanitized** — control characters replaced with `_`, preventing
+  log injection.
+
+### Master process
+
+- **fix: rolling restart cycles workers one at a time** — no longer kills all
+  workers simultaneously.
+- **fix: clean worker exit runs `deinit`** — access logs flushed on clean exit.
+- **fix: `nanosleep` EINTR uses remaining time** — interrupted sleeps resume
+  correctly.
+
+### Infrastructure
+
+- **fix: epoll fd created with `CLOEXEC`** — no longer leaks to child processes.
+- **fix: JSON escaping in benchmark routes** — uses `json_write.writeEscaped`.
+
+---
+
 ## Unreleased — targeting `v0.1.0-alpha.1`
 
 **Headline:** swerver is now consumable as a Zig package via `b.dependency` + `b.addModule`. HttpArena benchmark handlers decoupled out of the core server module into a standalone `examples/httparena/` downstream example. QUIC multi-range ACK encoding added for lossy-path throughput. 26 previously-invisible modules now analyzed by the test runner, which surfaced and fixed 8 latent bugs. Public API types have real doc comments. CI runs `test-matrix` on a native Linux runner. Release workflow publishes cross-platform binaries on tag push. No known bugs ship with the tag.
