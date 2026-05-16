@@ -6,6 +6,7 @@ const clock = @import("../clock.zig");
 pub const EV_ADD: u16 = 0x0001;
 pub const EV_DELETE: u16 = 0x0002;
 pub const EV_ENABLE: u16 = 0x0004;
+pub const EV_ONESHOT: u16 = 0x0010;
 pub const EV_ERROR: u16 = 0x4000;
 pub const EVFILT_READ: i16 = -1;
 pub const EVFILT_WRITE: i16 = -2;
@@ -72,13 +73,18 @@ pub const KqueueBackend = struct {
         if (!is_supported) return error.Unsupported;
         const token: usize = @intCast(conn_id);
         try self.registerEvent(fd, EVFILT_READ, token);
-        try self.registerEvent(fd, EVFILT_WRITE, token);
+    }
+
+    pub fn armWritable(self: *KqueueBackend, conn_id: u64, fd: std.posix.fd_t) !void {
+        if (!is_supported) return error.Unsupported;
+        const token: usize = @intCast(conn_id);
+        try self.registerOneshotEvent(fd, EVFILT_WRITE, token);
     }
 
     pub fn unregister(self: *KqueueBackend, fd: std.posix.fd_t) !void {
         if (!is_supported) return error.Unsupported;
-        try self.unregisterEvent(fd, EVFILT_READ);
-        try self.unregisterEvent(fd, EVFILT_WRITE);
+        self.unregisterEvent(fd, EVFILT_READ);
+        self.unregisterEvent(fd, EVFILT_WRITE);
     }
 
     fn registerEvent(self: *KqueueBackend, fd: std.posix.fd_t, filter: i16, udata: usize) !void {
@@ -94,7 +100,20 @@ pub const KqueueBackend = struct {
         _ = try std.Io.Kqueue.kevent(self.kq, &[_]Kevent{ev}, out[0..], null);
     }
 
-    fn unregisterEvent(self: *KqueueBackend, fd: std.posix.fd_t, filter: i16) !void {
+    fn registerOneshotEvent(self: *KqueueBackend, fd: std.posix.fd_t, filter: i16, udata: usize) !void {
+        const ev = Kevent{
+            .ident = @intCast(fd),
+            .filter = filter,
+            .flags = EV_ADD | EV_ENABLE | EV_ONESHOT,
+            .fflags = 0,
+            .data = 0,
+            .udata = udata,
+        };
+        var out: [0]Kevent = .{};
+        _ = try std.Io.Kqueue.kevent(self.kq, &[_]Kevent{ev}, out[0..], null);
+    }
+
+    fn unregisterEvent(self: *KqueueBackend, fd: std.posix.fd_t, filter: i16) void {
         const ev = Kevent{
             .ident = @intCast(fd),
             .filter = filter,

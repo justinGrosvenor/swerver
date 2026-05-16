@@ -378,6 +378,7 @@ pub const IoRuntime = struct {
     pub fn armWritable(self: *IoRuntime, conn_id: u32, fd: std.posix.fd_t) !void {
         switch (self.backend_state) {
             .linux_io_uring_native => |*ur| try ur.armWritable(conn_id, @intCast(fd)),
+            .bsd_kqueue => |*kq| try kq.armWritable(conn_id + 1, fd),
             else => {},
         }
     }
@@ -565,12 +566,12 @@ fn translateKqueueEvents(events: []const kqueue_backend.Kevent, out: []Event) us
         const bytes: usize = @intCast(ev.data);
         if (ev.filter == kqueue_backend.EVFILT_READ) {
             if (ev.udata == 0) {
-                // TCP listener socket
+                // TCP listener socket — readiness only, caller must accept()
                 out[count] = .{
                     .kind = .accept,
                     .conn_id = 0,
                     .bytes = 0,
-                    .handle = @intCast(ev.ident),
+                    .handle = null,
                 };
             } else if (ev.udata == std.math.maxInt(usize) - 1) {
                 // UDP socket - datagram ready

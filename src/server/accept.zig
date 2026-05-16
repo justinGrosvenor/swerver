@@ -136,13 +136,16 @@ fn setupAcceptedConnection(server: *Server, client_fd: std.posix.fd_t) !void {
             clock.closeFd(client_fd);
             return err;
         };
-        // With edge-triggered epoll, we must try to read immediately after accept
-        // because data may have arrived before we registered the socket.
-        // If we don't do this, we'll miss the EPOLLIN notification.
         server.handleRead(conn.index) catch {
             server.closeConnection(conn);
             return;
         };
+        // Flush any response queued by handleRead (no write event
+        // is registered yet since kqueue only arms EVFILT_WRITE
+        // on EAGAIN from writev).
+        const rconn = server.io.getConnection(conn.index) orelse return;
+        if (rconn.write_count > 0) {
+            server.handleWrite(conn.index) catch {};
+        }
     }
 }
-
