@@ -800,7 +800,7 @@ test "metrics middleware handles buffer exhaustion" {
         .method = .GET,
         .path = "/metrics",
         .headers = &[_]request.Header{},
-        .body = "",
+        .body = .{ .slice = "" },
     };
 
     var no_buffers = TestBufferOps{ .fail_acquire = true };
@@ -877,7 +877,7 @@ test "metrics middleware returns managed body" {
         .method = .GET,
         .path = "/metrics",
         .headers = &[_]request.Header{},
-        .body = "",
+        .body = .{ .slice = "" },
     };
     const decision = evaluate(&ctx, req);
     switch (decision) {
@@ -904,7 +904,7 @@ test "metrics postResponse updates counters" {
         .method = .GET,
         .path = "/metrics",
         .headers = &[_]request.Header{},
-        .body = "",
+        .body = .{ .slice = "" },
     };
     const resp = response.Response{
         .status = 500,

@@ -139,8 +139,9 @@ pub fn buildUpstreamRequest(
     }
 
     // Ensure Content-Length is present when forwarding a body (e.g., after stripping Transfer-Encoding)
-    if (ctx.client_request.body.len > 0 and ctx.client_request.getHeader("Content-Length") == null) {
-        pos += (std.fmt.bufPrint(buf[pos..], "Content-Length: {d}\r\n", .{ctx.client_request.body.len}) catch return error.BufferFull).len;
+    const body_len = ctx.client_request.body.len();
+    if (body_len > 0 and ctx.client_request.getHeader("Content-Length") == null) {
+        pos += (std.fmt.bufPrint(buf[pos..], "Content-Length: {d}\r\n", .{body_len}) catch return error.BufferFull).len;
     }
 
     // Connection header for keep-alive
@@ -152,11 +153,13 @@ pub fn buildUpstreamRequest(
     buf[pos + 1] = '\n';
     pos += 2;
 
-    // Body (if any)
-    if (ctx.client_request.body.len > 0) {
-        if (pos + ctx.client_request.body.len > buf.len) return error.BufferFull;
-        @memcpy(buf[pos .. pos + ctx.client_request.body.len], ctx.client_request.body);
-        pos += ctx.client_request.body.len;
+    // Body (if any) — proxy forward only handles small bodies (slice)
+    if (ctx.client_request.body.sliceOrNull()) |body_slice| {
+        if (body_slice.len > 0) {
+            if (pos + body_slice.len > buf.len) return error.BufferFull;
+            @memcpy(buf[pos .. pos + body_slice.len], body_slice);
+            pos += body_slice.len;
+        }
     }
 
     return pos;
@@ -954,7 +957,7 @@ test "buildUpstreamRequest basic" {
         .method = .GET,
         .path = "/api/users",
         .headers = &headers,
-        .body = "",
+        .body = .{ .slice = "" },
     };
 
     const server = upstream.Server{

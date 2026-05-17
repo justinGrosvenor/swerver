@@ -398,7 +398,7 @@ pub const Proxy = struct {
                 };
 
                 // Send request to upstream
-                const body_sent = req.body.len > 0;
+                const body_sent = req.body.len() > 0;
                 net.sendAll(c.fd, self.request_bufs[req_buf_idx][0..request_len]) catch {
                     pool.markConnectionFailed(c, now_ms, selection.server.max_fails);
                     // RFC 9110 §9.2.2: Only retry if method is idempotent or body not sent
@@ -879,7 +879,7 @@ test "Proxy route matching" {
         .method = .GET,
         .path = "/api/v1/users",
         .headers = &.{},
-        .body = "",
+        .body = .{ .slice = "" },
     };
     const match1 = proxy.matchRoute(&req1);
     try std.testing.expect(match1 != null);
@@ -890,7 +890,7 @@ test "Proxy route matching" {
         .method = .GET,
         .path = "/api/v2/items",
         .headers = &.{},
-        .body = "",
+        .body = .{ .slice = "" },
     };
     const match2 = proxy.matchRoute(&req2);
     try std.testing.expect(match2 != null);
@@ -901,7 +901,7 @@ test "Proxy route matching" {
         .method = .GET,
         .path = "/api/v1/users%2Fjohn%20smith",
         .headers = &.{},
-        .body = "",
+        .body = .{ .slice = "" },
     };
     const match_enc = proxy.matchRoute(&req_encoded);
     try std.testing.expect(match_enc != null);
@@ -912,7 +912,7 @@ test "Proxy route matching" {
         .method = .GET,
         .path = "/api/v1/%00admin",
         .headers = &.{},
-        .body = "",
+        .body = .{ .slice = "" },
     };
     const match_null = proxy.matchRoute(&req_null);
     try std.testing.expect(match_null == null);
@@ -922,7 +922,7 @@ test "Proxy route matching" {
         .method = .GET,
         .path = "/api/v1/%GG",
         .headers = &.{},
-        .body = "",
+        .body = .{ .slice = "" },
     };
     const match_bad = proxy.matchRoute(&req_bad);
     try std.testing.expect(match_bad == null);

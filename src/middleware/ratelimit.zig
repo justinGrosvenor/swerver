@@ -410,7 +410,7 @@ test "excluded paths bypass rate limit" {
         .method = .GET,
         .path = "/.healthz",
         .headers = &.{},
-        .body = "",
+        .body = .{ .slice = "" },
     };
 
     // Health check always allowed

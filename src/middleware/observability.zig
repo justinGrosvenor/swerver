@@ -682,7 +682,7 @@ test "observability postResponse updates ebpf counters" {
         .method = .GET,
         .path = "/",
         .headers = &[_]request.Header{},
-        .body = "",
+        .body = .{ .slice = "" },
     };
 
     const resp_err = response.Response{

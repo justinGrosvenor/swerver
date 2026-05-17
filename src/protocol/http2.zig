@@ -907,7 +907,7 @@ pub const Stack = struct {
                     .method = decoded.method,
                     .path = decoded.path,
                     .headers = decoded.headers,
-                    .body = "",
+                    .body = .{ .slice = "" },
                 },
                 .end_stream = end_stream,
             } };
@@ -943,7 +943,7 @@ pub const Stack = struct {
                     .method = decoded.method,
                     .path = decoded.path,
                     .headers = decoded.headers,
-                    .body = "",
+                    .body = .{ .slice = "" },
                 },
                 .end_stream = stream.end_stream_pending,
             } };

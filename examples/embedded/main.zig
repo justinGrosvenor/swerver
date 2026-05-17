@@ -26,7 +26,7 @@ fn echo(ctx: *swerver.router.HandlerContext) swerver.response.Response {
         .body = .{ .bytes = "No buffers available" },
     };
     defer ctx.releaseBuilder(&builder);
-    return builder.json(200, ctx.request.body) catch swerver.response.Response{
+    return builder.json(200, ctx.request.body.sliceOrNull() orelse "") catch swerver.response.Response{
         .status = 500,
         .headers = &.{},
         .body = .{ .bytes = "Response buffer full" },

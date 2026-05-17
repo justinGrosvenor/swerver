@@ -342,7 +342,7 @@ test "chain executes middleware in order" {
         .method = .GET,
         .path = "/test",
         .headers = &.{},
-        .body = "",
+        .body = .{ .slice = "" },
     };
 
     const result = chain.executePre(&ctx, req);

@@ -1146,7 +1146,7 @@ test "route matching with params" {
         .method = .GET,
         .path = "/users/123",
         .headers = &.{},
-        .body = "",
+        .body = .{ .slice = "" },
     };
     var response_buf: [RESPONSE_BUF_SIZE]u8 = undefined;
     var response_headers: [MAX_RESPONSE_HEADERS]response.Header = undefined;
@@ -1172,7 +1172,7 @@ test "route not found" {
         .method = .GET,
         .path = "/nonexistent",
         .headers = &.{},
-        .body = "",
+        .body = .{ .slice = "" },
     };
     var response_buf: [RESPONSE_BUF_SIZE]u8 = undefined;
     var response_headers: [MAX_RESPONSE_HEADERS]response.Header = undefined;
@@ -1206,7 +1206,7 @@ test "method mismatch" {
         .method = .POST,
         .path = "/users",
         .headers = &.{},
-        .body = "",
+        .body = .{ .slice = "" },
     };
     var response_buf: [RESPONSE_BUF_SIZE]u8 = undefined;
     var response_headers: [MAX_RESPONSE_HEADERS]response.Header = undefined;

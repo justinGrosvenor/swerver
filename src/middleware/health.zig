@@ -145,7 +145,7 @@ test "liveness probe returns 200" {
         .method = .GET,
         .path = "/.healthz",
         .headers = &.{},
-        .body = "",
+        .body = .{ .slice = "" },
     };
 
     const decision = evaluate(&ctx, req);
@@ -166,7 +166,7 @@ test "readiness probe returns 503 when not ready" {
         .method = .GET,
         .path = "/.ready",
         .headers = &.{},
-        .body = "",
+        .body = .{ .slice = "" },
     };
 
     const decision = evaluate(&ctx, req);
@@ -186,7 +186,7 @@ test "readiness probe returns 200 when ready" {
         .method = .GET,
         .path = "/.ready",
         .headers = &.{},
-        .body = "",
+        .body = .{ .slice = "" },
     };
 
     const decision = evaluate(&ctx, req);
@@ -204,7 +204,7 @@ test "non-health paths pass through" {
         .method = .GET,
         .path = "/api/users",
         .headers = &.{},
-        .body = "",
+        .body = .{ .slice = "" },
     };
 
     const decision = evaluate(&ctx, req);

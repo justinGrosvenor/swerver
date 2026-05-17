@@ -341,7 +341,7 @@ test "security headers added on TLS" {
         .headers = &[_]request.Header{
             .{ .name = "Host", .value = "example.com" },
         },
-        .body = "",
+        .body = .{ .slice = "" },
     };
 
     const decision = evaluate(&ctx, req);
@@ -373,7 +373,7 @@ test "HSTS not added on non-TLS when tls_only" {
         .headers = &[_]request.Header{
             .{ .name = "Host", .value = "example.com" },
         },
-        .body = "",
+        .body = .{ .slice = "" },
     };
 
     const decision = evaluate(&ctx, req);
@@ -395,7 +395,7 @@ test "CORS preflight handled" {
             .{ .name = "Host", .value = "example.com" },
             .{ .name = "Access-Control-Request-Method", .value = "POST" },
         },
-        .body = "",
+        .body = .{ .slice = "" },
     };
 
     const decision = evaluate(&ctx, req);

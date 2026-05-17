@@ -1,4 +1,5 @@
 const std = @import("std");
+const buffer_pool = @import("../runtime/buffer_pool.zig");
 
 /// A single HTTP header. Both `name` and `value` are borrowed slices.
 ///
@@ -81,38 +82,61 @@ pub const Method = enum {
     }
 };
 
-/// A parsed HTTP request, with all field slices borrowed from the
-/// connection's receive buffer.
-///
-/// This type is uniform across HTTP/1.1, HTTP/2, and HTTP/3:
-///   - **HTTP/1.1**: the parser slices headers and body out of the
-///     raw request bytes in place.
-///   - **HTTP/2**: HPACK decodes into a per-worker scratch buffer;
-///     the decoded slices then live there for the duration of the
-///     handler call.
-///   - **HTTP/3**: QPACK decodes into a per-Stack scratch buffer;
-///     single-DATA-frame bodies are a direct slice into the
-///     decrypted packet payload (zero-copy).
-///
-/// All fields are stable across the handler's synchronous execution
-/// — protocol layer guarantees the underlying buffers aren't reused
-/// until the handler returns. Stashing `path` / `headers` / `body`
-/// slices beyond the handler call is a use-after-reuse bug.
-///
-/// `body` is `[]const u8` — always non-null; an empty body is
-/// represented as an empty slice, not `null`. `method_raw` is
-/// non-empty only when `method == .OTHER` (extension methods like
-/// `PROPFIND`).
+pub const RequestBody = union(enum) {
+    slice: []const u8,
+    scattered: ScatteredBuffers,
+
+    pub const ScatteredBuffers = struct {
+        handles: []const buffer_pool.BufferHandle,
+        last_buf_len: usize,
+        total_len: usize,
+        buffer_size: usize,
+    };
+
+    pub fn len(self: RequestBody) usize {
+        return switch (self) {
+            .slice => |s| s.len,
+            .scattered => |b| b.total_len,
+        };
+    }
+
+    pub fn sliceOrNull(self: RequestBody) ?[]const u8 {
+        return switch (self) {
+            .slice => |s| s,
+            .scattered => null,
+        };
+    }
+
+    pub fn copyTo(self: RequestBody, dst: []u8) ?[]const u8 {
+        const total = self.len();
+        if (total > dst.len) return null;
+        switch (self) {
+            .slice => |s| {
+                @memcpy(dst[0..s.len], s);
+                return dst[0..s.len];
+            },
+            .scattered => |b| {
+                var off: usize = 0;
+                for (b.handles, 0..) |handle, i| {
+                    const chunk_len = if (i == b.handles.len - 1) b.last_buf_len else b.buffer_size;
+                    @memcpy(dst[off .. off + chunk_len], handle.bytes[0..chunk_len]);
+                    off += chunk_len;
+                }
+                return dst[0..total];
+            },
+        }
+    }
+
+    pub const empty: RequestBody = .{ .slice = "" };
+};
+
 pub const RequestView = struct {
     method: Method,
-    /// Raw method string (useful when method == .OTHER for extension methods)
     method_raw: []const u8 = "",
     path: []const u8,
     headers: []const Header,
-    body: []const u8,
+    body: RequestBody = .{ .slice = "" },
 
-    /// Get the method name as a string
-    /// Returns the raw method string for known methods or extension methods
     pub fn getMethodName(self: RequestView) []const u8 {
         if (self.method == .OTHER) {
             return self.method_raw;
@@ -120,7 +144,6 @@ pub const RequestView = struct {
         return self.method.toString();
     }
 
-    /// Get header value by name (case-insensitive)
     pub fn getHeader(self: RequestView, name: []const u8) ?[]const u8 {
         for (self.headers) |hdr| {
             if (std.ascii.eqlIgnoreCase(hdr.name, name)) {
@@ -130,7 +153,6 @@ pub const RequestView = struct {
         return null;
     }
 
-    /// Check if request has a specific header
     pub fn hasHeader(self: RequestView, name: []const u8) bool {
         return self.getHeader(name) != null;
     }

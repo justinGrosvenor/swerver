@@ -898,7 +898,7 @@ fn bodyComplete(conn: *connection.Connection) bool {
 pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection) !void {
     const accum = &(conn.body_accum orelse return);
     const hparse = accum.header_result;
-    const fd = conn.fd orelse return;
+    _ = conn.fd orelse return;
 
     // Build BodyView from accumulated buffers
     const body_view = forward_mod.BodyView{
@@ -947,97 +947,63 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
         }
     }
 
-    // Handler path: linearize body into contiguous allocation
+    // Build RequestView with scattered body (no linearization)
     const total_len = accum.bytes_decoded;
-    if (total_len > 0) {
-        const buffer_count = accum.buffer_count;
-        const last_buf_len = accum.current_buf_offset;
-        const buffer_size = server.io.bodyBufferSize();
+    const req_view = request.RequestView{
+        .method = hparse.view.method,
+        .method_raw = hparse.view.method_raw,
+        .path = hparse.view.path,
+        .headers = hparse.view.headers,
+        .body = if (total_len > 0) .{ .scattered = .{
+            .handles = accum.body_buffers[0..accum.buffer_count],
+            .last_buf_len = accum.current_buf_offset,
+            .total_len = total_len,
+            .buffer_size = server.io.bodyBufferSize(),
+        } } else .{ .slice = "" },
+    };
 
-        const body_mem = server.allocator.alloc(u8, total_len) catch {
-            abortBodyAccumulation(server, conn, 503);
-            return;
-        };
-
-        // Copy from body buffers into contiguous memory
-        var copied: usize = 0;
-        for (0..buffer_count) |i| {
-            const handle = accum.body_buffers[i];
-            const buf_len = if (i == buffer_count - 1)
-                last_buf_len
-            else
-                buffer_size;
-            @memcpy(body_mem[copied .. copied + buf_len], handle.bytes[0..buf_len]);
-            copied += buf_len;
-        }
-
-        // Build RequestView with body
-        const req_view = request.RequestView{
-            .method = hparse.view.method,
-            .method_raw = hparse.view.method_raw,
-            .path = hparse.view.path,
-            .headers = hparse.view.headers,
-            .body = body_mem[0..total_len],
-        };
-
-        if (!server.isAllowedHost(req_view)) {
-            conn.close_after_write = true;
-            cleanupBodyAccumulation(server, conn);
-            queueResponse(server, conn, Server.badRequestResponse()) catch {};
-            server.allocator.free(body_mem);
-            return;
-        }
-
-        // Dispatch to router, but check result before queueing to detect echo responses
-        // that can use scattered body buffers instead of re-copying.
-        var mw_ctx = middleware.Context{
-            .protocol = .http1,
-            .buffer_ops = .{
-                .ctx = &server.io,
-                .acquire = write_queue.acquireBufferOpaque,
-                .release = write_queue.releaseBufferOpaque,
-            },
-        };
-        if (conn.cached_peer_ip) |ip4| {
-            mw_ctx.client_ip = ip4;
-        } else if (conn.cached_peer_ip6) |ip6| {
-            mw_ctx.client_ip6 = ip6;
-        }
-        var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
-        var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
-        const arena_handle = server.io.acquireBuffer();
-        var empty_arena: [0]u8 = undefined;
-        const arena_buf = if (arena_handle) |handle| handle.bytes else empty_arena[0..];
-        var scratch = router.HandlerScratch{
-            .response_buf = response_buf[0..],
-            .response_headers = response_headers[0..],
-            .arena_buf = arena_buf,
-            .arena_handle = arena_handle,
-            .buffer_ops = mw_ctx.buffer_ops,
-        };
-        const result = server.app_router.handle(req_view, &mw_ctx, &scratch);
-        if (scratch.arena_handle) |handle| server.io.releaseBuffer(handle);
-        if (result.pause_reads_ms) |pause_ms| {
-            conn.setRateLimitPause(server.io.nowMs(), pause_ms);
-        }
-
-        // Previously a zero-copy echo path transferred body buffers
-        // to the write queue as a scattered response. Disabled now
-        // that body buffers are from a separate pool with different
-        // size — the transfer would require per-handle pool tagging.
-        // The echo case still works via the normal copy path below.
-        {
-            // Non-echo response: cleanup body buffers and queue normally
-            cleanupBodyAccumulation(server, conn);
-            queueResponse(server, conn, result.resp) catch {};
-            if (conn.pending_body.len > 0) {
-                materializePendingBody(server, conn);
-            }
-            server.allocator.free(body_mem);
-        }
-    } else {
+    if (!server.isAllowedHost(req_view)) {
+        conn.close_after_write = true;
         cleanupBodyAccumulation(server, conn);
-        dispatchToRouter(server, conn, hparse.view, fd);
+        queueResponse(server, conn, Server.badRequestResponse()) catch {};
+        return;
+    }
+
+    var mw_ctx = middleware.Context{
+        .protocol = .http1,
+        .buffer_ops = .{
+            .ctx = &server.io,
+            .acquire = write_queue.acquireBufferOpaque,
+            .release = write_queue.releaseBufferOpaque,
+        },
+    };
+    if (conn.cached_peer_ip) |ip4| {
+        mw_ctx.client_ip = ip4;
+    } else if (conn.cached_peer_ip6) |ip6| {
+        mw_ctx.client_ip6 = ip6;
+    }
+    var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
+    var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
+    const arena_handle = server.io.acquireBuffer();
+    var empty_arena: [0]u8 = undefined;
+    const arena_buf = if (arena_handle) |handle| handle.bytes else empty_arena[0..];
+    var scratch = router.HandlerScratch{
+        .response_buf = response_buf[0..],
+        .response_headers = response_headers[0..],
+        .arena_buf = arena_buf,
+        .arena_handle = arena_handle,
+        .buffer_ops = mw_ctx.buffer_ops,
+    };
+    const result = server.app_router.handle(req_view, &mw_ctx, &scratch);
+    if (scratch.arena_handle) |handle| server.io.releaseBuffer(handle);
+    if (result.pause_reads_ms) |pause_ms| {
+        conn.setRateLimitPause(server.io.nowMs(), pause_ms);
+    }
+
+    cleanupBodyAccumulation(server, conn);
+    queueResponse(server, conn, result.resp) catch {};
+    if (conn.pending_body.len > 0) {
+        materializePendingBody(server, conn);
     }
 }
 

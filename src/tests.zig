@@ -401,7 +401,7 @@ test "http1 parses chunked with trailers" {
     defer parsed.deinit();
 
     try std.testing.expectEqual(http1.ParseState.complete, parsed.result.state);
-    try std.testing.expectEqualStrings("Wiki", parsed.result.view.body);
+    try std.testing.expectEqualStrings("Wiki", parsed.result.view.body.sliceOrNull().?);
 }
 
 test "http1 rejects invalid chunked trailers" {

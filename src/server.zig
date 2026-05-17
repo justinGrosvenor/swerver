@@ -530,7 +530,7 @@ pub const Server = struct {
             .method_raw = if (parsed_method == .OTHER) method_str else "",
             .path = path_str,
             .headers = headers_out[0..header_count],
-            .body = req.body,
+            .body = .{ .slice = req.body },
         };
     }
 
@@ -644,7 +644,7 @@ test "metrics middleware response queued for http1" {
         .method = .GET,
         .path = "/metrics",
         .headers = &[_]request.Header{},
-        .body = "",
+        .body = .{ .slice = "" },
     };
 
     var mw_ctx = middleware.Context{
@@ -722,7 +722,7 @@ test "metrics middleware response queued for http2" {
         .method = .GET,
         .path = "/metrics",
         .headers = &[_]request.Header{},
-        .body = "",
+        .body = .{ .slice = "" },
     };
 
     var mw_ctx = middleware.Context{

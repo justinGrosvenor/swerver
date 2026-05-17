@@ -516,10 +516,10 @@ fn dispatchHttp2Request(
         mw_ctx.client_ip6 = ip6;
     }
     // Inject the body into the request view. HEADERS events from
-    // the h2 stack carry request.body = "" because the body arrives
+    // the h2 stack carry request.body = .{ .slice = "" } because the body arrives
     // in separate DATA frames; we patch it here at dispatch time.
     var request_with_body = hdr_request;
-    request_with_body.body = body;
+    request_with_body.body = .{ .slice = body };
 
     var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
     var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;

@@ -590,7 +590,7 @@ fn makeRequest(path: []const u8, headers: []const request.Header) request.Reques
         .method_raw = "",
         .path = path,
         .headers = headers,
-        .body = "",
+        .body = .{ .slice = "" },
     };
 }
 

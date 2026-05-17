@@ -39,7 +39,7 @@ pub const ErrorCode = enum {
 /// Does NOT require or validate the request body.
 pub const HeaderParseResult = struct {
     state: ParseState,
-    view: request.RequestView, // .body = "" (empty)
+    view: request.RequestView, // .body = .empty
     error_code: ErrorCode,
     content_length: usize,
     is_chunked: bool,
@@ -576,7 +576,7 @@ fn parseHeadersInternal(_bytes: []u8, _limits: Limits) HeaderParseResult {
             .method_raw = method_str,
             .path = path,
             .headers = headers,
-            .body = "",
+            .body = .{ .slice = "" },
         },
         .error_code = .none,
         .content_length = content_length,
@@ -1234,7 +1234,7 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
                 .method_raw = method_str,
                 .path = path,
                 .headers = headers,
-                .body = body,
+                .body = .{ .slice = body },
             },
             .error_code = .none,
             .consumed_bytes = chunked.consumed_bytes,
@@ -1262,7 +1262,7 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
             .method_raw = method_str,
             .path = path,
             .headers = headers,
-            .body = body,
+            .body = .{ .slice = body },
         },
         .error_code = .none,
         .consumed_bytes = total_needed,
@@ -1283,7 +1283,7 @@ fn emptyView() request.RequestView {
         .method = .GET,
         .path = "",
         .headers = &[_]request.Header{},
-        .body = "",
+        .body = .{ .slice = "" },
     };
 }
 

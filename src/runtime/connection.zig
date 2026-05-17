@@ -101,7 +101,7 @@ pub const PendingH2Body = struct {
             .method = self.method,
             .path = self.path(),
             .headers = self.header_entries[0..self.header_count],
-            .body = body,
+            .body = .{ .slice = body },
         };
     }
 

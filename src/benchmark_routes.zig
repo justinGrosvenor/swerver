@@ -227,8 +227,21 @@ fn handleBenchEchoGet(_: *router.HandlerContext) response_mod.Response {
 /// `queueResponse` copies body into the write buffer synchronously
 /// before the next `read()`.
 fn handleBenchEchoPost(ctx: *router.HandlerContext) response_mod.Response {
-    const body = ctx.request.body;
-    if (body.len == 0) {
+    const body_slice = ctx.request.body.sliceOrNull() orelse {
+        const buf = ctx.request.body.copyTo(ctx.response_buf) orelse return .{
+            .status = 413,
+            .headers = &[_]response_mod.Header{},
+            .body = .{ .bytes = "Body too large to echo" },
+        };
+        return .{
+            .status = 200,
+            .headers = &[_]response_mod.Header{
+                .{ .name = "Content-Type", .value = "application/json" },
+            },
+            .body = .{ .bytes = buf },
+        };
+    };
+    if (body_slice.len == 0) {
         return handleBenchEchoGet(ctx);
     }
     return .{
@@ -236,7 +249,7 @@ fn handleBenchEchoPost(ctx: *router.HandlerContext) response_mod.Response {
         .headers = &[_]response_mod.Header{
             .{ .name = "Content-Type", .value = "application/json" },
         },
-        .body = .{ .bytes = body },
+        .body = .{ .bytes = body_slice },
     };
 }
 
@@ -285,7 +298,7 @@ fn handleBenchPipeline(_: *router.HandlerContext) response_mod.Response {
 /// POST /upload — upload throughput endpoint.
 /// Returns the byte count of the request body as text/plain.
 fn handleBenchUpload(ctx: *router.HandlerContext) response_mod.Response {
-    const body_len = ctx.request.body.len;
+    const body_len = ctx.request.body.len();
     const body = std.fmt.bufPrint(ctx.response_buf, "{d}", .{body_len}) catch "0";
     return .{
         .status = 200,
@@ -340,8 +353,9 @@ fn handleBenchBaseline11(ctx: *router.HandlerContext) response_mod.Response {
         }
     }
     // POST body: single integer, summed into total
-    if (ctx.request.method == .POST and ctx.request.body.len > 0) {
-        const trimmed = std.mem.trim(u8, ctx.request.body, " \t\r\n");
+    if (ctx.request.method == .POST and ctx.request.body.len() > 0) {
+        const body_bytes = ctx.request.body.sliceOrNull() orelse "";
+        const trimmed = std.mem.trim(u8, body_bytes, " \t\r\n");
         if (std.fmt.parseInt(i64, trimmed, 10)) |n| {
             sum += n;
         } else |_| {}
