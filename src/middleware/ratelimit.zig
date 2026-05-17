@@ -9,6 +9,18 @@ const clock = @import("../runtime/clock.zig");
 /// Implements token bucket rate limiting per IP address.
 /// Zero heap allocations using fixed-size bucket storage.
 
+const SpinMutex = struct {
+    state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+
+    fn lock(self: *SpinMutex) void {
+        while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {}
+    }
+
+    fn unlock(self: *SpinMutex) void {
+        self.state.store(0, .release);
+    }
+};
+
 /// Maximum number of tracked IPs
 const MAX_TRACKED_IPS = 4096;
 
@@ -115,8 +127,7 @@ pub const RateLimiter = struct {
     count: usize,
     /// Configuration
     config: Config,
-    /// Mutex for thread-safe access
-    mutex: std.Thread.Mutex = .{},
+    mutex: SpinMutex = .{},
 
     pub const Config = struct {
         /// Maximum requests per second per IP

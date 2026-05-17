@@ -225,7 +225,7 @@ fn hexToBytes(out: []u8, hex: []const u8) ![]u8 {
 }
 
 test "buffer pool acquire and release" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -248,7 +248,7 @@ test "buffer pool acquire and release" {
 }
 
 test "connection pool acquire and release" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

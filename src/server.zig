@@ -616,7 +616,7 @@ pub const Server = struct {
 };
 
 test "metrics middleware response queued for http1" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -694,7 +694,7 @@ test "metrics middleware response queued for http1" {
 test "metrics middleware response queued for http2" {
     if (!build_options.enable_http2) return;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -792,7 +792,7 @@ test "metrics middleware response queued for http2" {
 }
 
 test "metrics middleware end-to-end http1" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -874,7 +874,7 @@ test "metrics middleware end-to-end http1" {
 test "metrics middleware end-to-end http2" {
     if (!build_options.enable_http2) return;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -1004,7 +1004,7 @@ fn buildHeaderBlockAuthority(buffer: []u8, authority: []const u8) []u8 {
 }
 
 test "http1 response bytes from write queue" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -1047,7 +1047,7 @@ test "http1 response bytes from write queue" {
 }
 
 test "http1 managed response bytes from write queue" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

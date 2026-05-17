@@ -17,7 +17,7 @@ on:
         type: string
 
 env:
-  ZIG_VERSION: "0.16.0-dev.2135+7c0b42ba0"
+  ZIG_VERSION: "0.16.0"
 
 jobs:
   build:
@@ -27,10 +27,10 @@ jobs:
         include:
           - name: linux-x86_64
             target: x86_64-linux-musl
-            runner: ubuntu-latest
+            runner: macos-latest
           - name: linux-aarch64
             target: aarch64-linux-musl
-            runner: ubuntu-latest
+            runner: macos-latest
           - name: macos-x86_64
             target: x86_64-macos
             runner: macos-latest
@@ -38,7 +38,7 @@ jobs:
             target: aarch64-macos
             runner: macos-latest
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -51,11 +51,6 @@ jobs:
 
       - name: Build ReleaseFast for ${{ matrix.target }}
         run: |
-          # The main build enables TLS by default on native targets only
-          # because OpenSSL linking requires the host toolchain. Release
-          # binaries cross-compile without TLS — users who need TLS can
-          # build from source or use the Docker image. The README's
-          # Install section discloses this.
           zig build -Dtarget=${{ matrix.target }} -Denable-tls=false -Doptimize=ReleaseFast --summary all
 
       - name: Smoke test (native targets only)

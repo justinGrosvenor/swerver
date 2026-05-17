@@ -10,7 +10,7 @@ on:
 # minimum_zig_version field in build.zig.zon and the comment in
 # MEMORY.md. Bump both together.
 env:
-  ZIG_VERSION: "0.16.0-dev.2135+7c0b42ba0"
+  ZIG_VERSION: "0.16.0"
 
 jobs:
   test-linux:
