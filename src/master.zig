@@ -127,8 +127,8 @@ pub const Master = struct {
             }
 
             if (master_reload_requested.swap(false, .acq_rel)) {
-                std.log.info("[master] reload requested, rolling restart", .{});
-                self.rollingRestart();
+                std.log.info("[master] reload requested, signaling workers", .{});
+                self.signalAllWorkers(std.posix.SIG.HUP);
             }
 
             if (master_child_exited.swap(false, .acq_rel)) {

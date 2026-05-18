@@ -123,6 +123,10 @@ pub const Server = struct {
     proxy: ?*proxy_mod.Proxy = null,
     /// Config file path for hot reload (null if not using config file)
     config_path: ?[]const u8 = null,
+    /// Arena owning the route/upstream string data from the last config reload.
+    /// Freed on next reload or on server deinit. Null when proxy was set up
+    /// via ServerBuilder (strings owned by the caller's arena instead).
+    reload_arena: ?std.heap.ArenaAllocator = null,
     /// Buffer for receiving UDP datagrams
     udp_recv_buf: [2048]u8 = undefined,
     /// Pre-computed Alt-Svc header value for HTTP/3 advertisement
@@ -309,6 +313,7 @@ pub const Server = struct {
         if (self.udp_fd) |fd| clock.closeFd(fd);
         if (self.static_root_fd) |fd| clock.closeFd(fd);
         if (self.quic) |*q| q.deinit();
+        if (self.reload_arena) |*a| a.deinit();
         self.io.deinit();
     }
 
@@ -319,8 +324,8 @@ pub const Server = struct {
     }
 
     /// Apply hot reload from config file.
-    /// Safe-to-change fields (value types only): timeouts, limits.
-    /// Requires restart: address, port, max_connections, buffer pool, allowed_hosts.
+    /// Reloads timeouts, limits, and (if present) routes + upstreams.
+    /// Requires restart: address, port, max_connections, buffer pool, TLS certs.
     pub fn applyReload(self: *Server) void {
         const path = self.config_path orelse {
             std.log.info("SIGHUP received but no config file path set, ignoring", .{});
@@ -331,19 +336,60 @@ pub const Server = struct {
             std.log.err("Config reload failed: {}", .{err});
             return;
         };
-        defer loaded.deinit();
 
-        // Validate the new config before applying
         loaded.server_config.validate() catch |err| {
             std.log.err("Config reload validation failed: {}", .{err});
+            loaded.deinit();
             return;
         };
 
         const new = loaded.server_config;
-        // Hot-reload value-type fields (no pointer/slice ownership issues)
         self.cfg.timeouts = new.timeouts;
         self.cfg.limits = new.limits;
-        std.log.info("Config reloaded from {s}", .{path});
+
+        if (loaded.upstreams.len > 0 and loaded.routes.len > 0) {
+            var new_proxy = proxy_mod.Proxy.init(self.allocator, .{
+                .upstreams = loaded.upstreams,
+                .routes = loaded.routes,
+            }) catch |err| {
+                std.log.err("Config reload: proxy rebuild failed: {}", .{err});
+                loaded.deinit();
+                return;
+            };
+
+            if (self.proxy) |old| {
+                old.deinit();
+                self.allocator.destroy(old);
+            }
+
+            const proxy_ptr = self.allocator.create(proxy_mod.Proxy) catch {
+                new_proxy.deinit();
+                loaded.deinit();
+                return;
+            };
+            proxy_ptr.* = new_proxy;
+            self.proxy = proxy_ptr;
+
+            if (self.reload_arena) |*old_arena| old_arena.deinit();
+            self.reload_arena = loaded.arena;
+            std.log.info("Config reloaded from {s} (routes: {d}, upstreams: {d})", .{
+                path, loaded.routes.len, loaded.upstreams.len,
+            });
+        } else {
+            if (self.proxy != null and loaded.upstreams.len == 0 and loaded.routes.len == 0) {
+                if (self.proxy) |old| {
+                    old.deinit();
+                    self.allocator.destroy(old);
+                    self.proxy = null;
+                }
+                if (self.reload_arena) |*old_arena| old_arena.deinit();
+                self.reload_arena = loaded.arena;
+                std.log.info("Config reloaded from {s} (proxy removed)", .{path});
+            } else {
+                loaded.deinit();
+                std.log.info("Config reloaded from {s}", .{path});
+            }
+        }
     }
 
     pub fn run(self: *Server, run_for_ms: ?u64) !void {
