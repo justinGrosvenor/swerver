@@ -47,6 +47,7 @@ const preencoded = @import("preencoded.zig");
 const server_tls = @import("tls.zig");
 const write_queue = @import("write_queue.zig");
 const admin_mod = @import("../admin/admin.zig");
+const cache_mod = @import("../proxy/cache.zig");
 
 /// Global shutdown flag set by signal handler (atomic for signal safety)
 var shutdown_requested = std.atomic.Value(bool).init(false);
@@ -743,16 +744,72 @@ pub fn handleRead(server: *Server, index: u32) !void {
                 }
                 var cert_dn_buf: [256]u8 = undefined;
                 const cert_dn: ?[]const u8 = if (conn.tls_session) |*session| session.getPeerCertSubject(&cert_dn_buf) else null;
+                const now_ms = server.io.nowMs();
+
+                // Response cache: check before forwarding to upstream
+                const cache_cfg = matched_route.cache;
+                const vary_keys: []const []const u8 = if (cache_cfg) |cc| cc.vary else &.{};
+                if (cache_cfg != null) {
+                    if (proxy.route_caches[route_idx]) |*rc| {
+                        switch (rc.lookup(parse.view.method, parse.view.path, parse.view.headers, vary_keys, now_ms)) {
+                            .hit => |info| {
+                                var resp_headers_buf: [64]response_mod.Header = undefined;
+                                const hdr_count = @min(info.headers.len, resp_headers_buf.len);
+                                for (info.headers[0..hdr_count], 0..) |sh, hi| {
+                                    resp_headers_buf[hi] = .{ .name = sh.name, .value = sh.value };
+                                }
+                                try http1_mod.queueResponse(server, conn, .{
+                                    .status = info.status,
+                                    .headers = resp_headers_buf[0..hdr_count],
+                                    .body = .{ .bytes = info.body },
+                                });
+                                if (conn.read_buffered_bytes == 0) break;
+                                continue;
+                            },
+                            .not_modified => {
+                                try http1_mod.queueResponse(server, conn, response_mod.Response.notModified());
+                                if (conn.read_buffered_bytes == 0) break;
+                                continue;
+                            },
+                            .miss => {},
+                        }
+                    }
+                }
+
                 var proxy_result = proxy.handle(
                     parse.view,
                     &mw_ctx,
                     client_ip_str,
                     conn.tls_session != null,
-                    server.io.nowMs(),
+                    now_ms,
                     auth_info_ptr,
                     cert_dn,
                 );
                 defer proxy_result.release();
+
+                // Cache store: cache successful GET responses
+                if (cache_cfg) |cc| {
+                    if (parse.view.method == .GET and proxy_result.resp.status == 200) {
+                        if (proxy.route_caches[route_idx]) |*rc| {
+                            rc.store(
+                                parse.view.path,
+                                parse.view.headers,
+                                vary_keys,
+                                proxy_result.resp.status,
+                                proxy_result.resp.headers,
+                                proxy_result.resp.bodyBytes(),
+                                @as(u64, cc.ttl_s) * 1000,
+                                now_ms,
+                            );
+                        }
+                    }
+                }
+                // Invalidate cache on mutating methods
+                if (cache_cfg != null and parse.view.method != .GET and parse.view.method != .HEAD) {
+                    if (proxy.route_caches[route_idx]) |*rc| {
+                        rc.invalidate(parse.view.path);
+                    }
+                }
 
                 try http1_mod.queueResponse(server, conn, proxy_result.resp);
                 if (proxy_result.resp.status >= 200 and proxy_result.resp.status < 300) {

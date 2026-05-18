@@ -9,6 +9,7 @@ const response = @import("../response/response.zig");
 const middleware = @import("../middleware/middleware.zig");
 const auth_mod = @import("../middleware/auth.zig");
 const x402 = @import("../middleware/x402.zig");
+const cache_mod = @import("cache.zig");
 const net = @import("../runtime/net.zig");
 const clock = @import("../runtime/clock.zig");
 
@@ -60,6 +61,8 @@ pub const Proxy = struct {
     free_response_count: usize,
     /// Pre-computed x402 policies for proxy routes (parallel to config.routes)
     route_x402_policies: []x402.RoutePaymentConfig,
+    /// Per-route response caches (parallel to config.routes, null if route has no cache config)
+    route_caches: []?cache_mod.ResponseCache,
 
     const REQUEST_BUF_SIZE = 8192;
     const RESPONSE_BUF_SIZE = 65536;
@@ -110,6 +113,17 @@ pub const Proxy = struct {
             }
         }
 
+        // Initialize per-route response caches
+        const route_caches = try allocator.alloc(?cache_mod.ResponseCache, config.routes.len);
+        errdefer allocator.free(route_caches);
+        for (config.routes, 0..) |route, i| {
+            if (route.cache) |cc| {
+                route_caches[i] = cache_mod.ResponseCache.init(allocator, cc.max_entries) catch null;
+            } else {
+                route_caches[i] = null;
+            }
+        }
+
         // Phase 2: Create proxy with empty upstream registrations
         var proxy = Proxy{
             .allocator = allocator,
@@ -126,6 +140,7 @@ pub const Proxy = struct {
             .free_request_count = BUFFER_POOL_SIZE,
             .free_response_count = BUFFER_POOL_SIZE,
             .route_x402_policies = route_x402_policies,
+            .route_caches = route_caches,
         };
 
         // Phase 3: Register upstreams - use errdefer to cleanup proxy internals only
@@ -175,6 +190,10 @@ pub const Proxy = struct {
         self.pool_manager.deinit();
         self.health_manager.deinit();
 
+        for (self.route_caches) |*rc| {
+            if (rc.*) |*c| c.deinit();
+        }
+        self.allocator.free(self.route_caches);
         self.allocator.free(self.route_x402_policies);
         self.allocator.free(self.free_request_stack);
         self.allocator.free(self.free_response_stack);
@@ -879,6 +898,7 @@ test "Proxy route matching" {
         .free_request_count = 0,
         .free_response_count = 0,
         .route_x402_policies = &.{},
+        .route_caches = &.{},
     };
     defer {
         proxy.pool_manager.deinit();

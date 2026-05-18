@@ -1,6 +1,7 @@
 const std = @import("std");
 const auth = @import("../middleware/auth.zig");
 const ratelimit = @import("../middleware/ratelimit.zig");
+const cache_mod = @import("cache.zig");
 
 /// Upstream Configuration
 ///
@@ -113,6 +114,8 @@ pub const ProxyRoute = struct {
     /// Traffic splitting: weighted routing to multiple upstreams (canary/blue-green).
     /// When set, overrides `upstream` — the upstream is selected by weight.
     traffic_split: ?[]const TrafficTarget = null,
+    /// Per-route response caching configuration.
+    cache: ?cache_mod.CacheConfig = null,
 
     /// Resolve the upstream name, applying traffic split if configured.
     pub fn selectUpstream(self: *const ProxyRoute) []const u8 {

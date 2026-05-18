@@ -4,6 +4,7 @@ const upstream_mod = @import("proxy/upstream.zig");
 const balancer_mod = @import("proxy/balancer.zig");
 const auth_mod = @import("middleware/auth.zig");
 const ratelimit_mod = @import("middleware/ratelimit.zig");
+const cache_mod = @import("proxy/cache.zig");
 const clock = @import("runtime/clock.zig");
 
 /// Config file schema version. Bump the minor component when fields are
@@ -266,6 +267,21 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
             };
         }
 
+        var route_cache: ?cache_mod.CacheConfig = null;
+        if (r.cache) |c| {
+            var vary: []const []const u8 = &.{};
+            if (c.vary) |v| {
+                const vary_copy = try alloc.alloc([]const u8, v.len);
+                for (v, 0..) |vk, vi| vary_copy[vi] = vk;
+                vary = vary_copy;
+            }
+            route_cache = .{
+                .ttl_s = c.ttl_s orelse 60,
+                .max_entries = c.max_entries orelse 1024,
+                .vary = vary,
+            };
+        }
+
         var traffic_split: ?[]const upstream_mod.TrafficTarget = null;
         if (r.traffic_split) |ts_json| {
             const targets = try alloc.alloc(upstream_mod.TrafficTarget, ts_json.len);
@@ -293,6 +309,7 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
             .auth = route_auth,
             .rate_limit = route_rate_limit,
             .traffic_split = traffic_split,
+            .cache = route_cache,
         };
     }
 
@@ -549,6 +566,13 @@ const RouteJson = struct {
     auth: ?RouteAuthJson = null,
     rate_limit: ?RateLimitJson = null,
     traffic_split: ?[]const TrafficSplitJson = null,
+    cache: ?CacheJson = null,
+};
+
+const CacheJson = struct {
+    ttl_s: ?u32 = null,
+    max_entries: ?u16 = null,
+    vary: ?[]const []const u8 = null,
 };
 
 const RouteAuthJson = struct {
@@ -765,6 +789,33 @@ test "parse route with traffic_split" {
     try std.testing.expectEqual(@as(u16, 90), ts[0].weight);
     try std.testing.expectEqualStrings("v2", ts[1].upstream);
     try std.testing.expectEqual(@as(u16, 10), ts[1].weight);
+}
+
+test "parse route with cache config" {
+    const json =
+        \\{
+        \\  "upstreams": [
+        \\    { "name": "backend", "servers": [{ "address": "10.0.0.1", "port": 8080 }] }
+        \\  ],
+        \\  "routes": [{
+        \\    "path_prefix": "/api/",
+        \\    "upstream": "backend",
+        \\    "cache": {
+        \\      "ttl_s": 120,
+        \\      "max_entries": 500,
+        \\      "vary": ["Accept", "Accept-Encoding"]
+        \\    }
+        \\  }]
+        \\}
+    ;
+    var loaded = try parseJsonFromBytes(std.testing.allocator, json);
+    defer loaded.deinit();
+    const cc = loaded.routes[0].cache orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 120), cc.ttl_s);
+    try std.testing.expectEqual(@as(u16, 500), cc.max_entries);
+    try std.testing.expectEqual(@as(usize, 2), cc.vary.len);
+    try std.testing.expectEqualStrings("Accept", cc.vary[0]);
+    try std.testing.expectEqualStrings("Accept-Encoding", cc.vary[1]);
 }
 
 test "traffic_split rejects unknown upstream" {

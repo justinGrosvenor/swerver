@@ -46,6 +46,7 @@ const forward_mod = @import("../proxy/forward.zig");
 const clock = @import("../runtime/clock.zig");
 const preencoded = @import("preencoded.zig");
 const write_queue = @import("write_queue.zig");
+const cache_mod = @import("../proxy/cache.zig");
 
 pub const connection_close_hdr = "Connection: close\r\n";
 pub const date_prefix = "Date: ";
@@ -986,17 +987,26 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
             }
             var cert_dn_buf: [256]u8 = undefined;
             const cert_dn: ?[]const u8 = if (conn.tls_session) |*session| session.getPeerCertSubject(&cert_dn_buf) else null;
+            const now_ms = server.io.nowMs();
             var proxy_result = proxy.handleWithBody(
                 hparse.view,
                 body_view,
                 &mw_ctx,
                 client_ip_str,
                 conn.tls_session != null,
-                server.io.nowMs(),
+                now_ms,
                 auth_info_ptr,
                 cert_dn,
             );
             defer proxy_result.release();
+
+            // Invalidate cache on mutating methods (body-accumulated requests are typically POST/PUT)
+            if (matched_route.cache != null) {
+                const route_idx = proxy.routeIndex(matched_route);
+                if (proxy.route_caches[route_idx]) |*rc| {
+                    rc.invalidate(hparse.view.path);
+                }
+            }
 
             cleanupBodyAccumulation(server, conn);
             try queueResponse(server, conn, proxy_result.resp);

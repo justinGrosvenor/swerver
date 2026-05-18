@@ -526,6 +526,24 @@ fn writeRouteJson(buf: []u8, route: upstream_mod.ProxyRoute) usize {
         }
         off += copyInto(buf[off..], "]");
     }
+    if (route.cache) |cc| {
+        const n = std.fmt.bufPrint(buf[off..], ",\"cache\":{{\"ttl_s\":{d},\"max_entries\":{d}", .{ cc.ttl_s, cc.max_entries }) catch {
+            off += copyInto(buf[off..], "}");
+            return off;
+        };
+        off += n.len;
+        if (cc.vary.len > 0) {
+            off += copyInto(buf[off..], ",\"vary\":[");
+            for (cc.vary, 0..) |v, vi| {
+                if (vi > 0) off += copyInto(buf[off..], ",");
+                off += copyInto(buf[off..], "\"");
+                off += copyEscaped(buf[off..], v);
+                off += copyInto(buf[off..], "\"");
+            }
+            off += copyInto(buf[off..], "]");
+        }
+        off += copyInto(buf[off..], "}");
+    }
     off += copyInto(buf[off..], "}");
     return off;
 }
