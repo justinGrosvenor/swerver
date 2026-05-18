@@ -36,6 +36,7 @@ const middleware = @import("../middleware/middleware.zig");
 
 const x402_mod = @import("../middleware/x402.zig");
 const auth_mod = @import("../middleware/auth.zig");
+const ratelimit_mod = @import("../middleware/ratelimit.zig");
 const accept_mod = @import("accept.zig");
 const http1_mod = @import("http1.zig");
 const http2_mod = @import("http2.zig");
@@ -676,6 +677,21 @@ pub fn handleRead(server: *Server, index: u32) !void {
                     .allow => |*info| info,
                     .reject => null,
                 };
+                if (matched_route.rate_limit) |rl_cfg| {
+                    const consumer = if (auth_info_ptr) |ai| ai.consumerName() else "";
+                    const client_key = if (conn.cached_peer_ip) |ip4|
+                        ratelimit_mod.IpKey.fromIpv4(ip4)
+                    else if (conn.cached_peer_ip6) |ip6|
+                        ratelimit_mod.IpKey.fromIpv6(ip6)
+                    else
+                        null;
+                    if (ratelimit_mod.evaluateRoute(consumer, client_key, rl_cfg)) |rl_resp| {
+                        conn.setRateLimitPause(server.io.nowMs(), rl_resp.pause_ms);
+                        try http1_mod.queueResponse(server, conn, rl_resp.resp);
+                        if (conn.read_buffered_bytes == 0) break;
+                        continue;
+                    }
+                }
                 var mw_ctx = middleware.Context{
                     .protocol = .http1,
                     .buffer_ops = .{

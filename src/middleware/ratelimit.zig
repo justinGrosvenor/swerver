@@ -269,6 +269,201 @@ pub const RateLimiter = struct {
     }
 };
 
+// ── Per-consumer / per-route rate limiting ─────────────────────
+
+pub const RouteRateLimit = struct {
+    requests_per_second: u32 = 100,
+    burst_size: u32 = 200,
+    key: KeyType = .consumer,
+
+    pub const KeyType = enum { ip, consumer };
+};
+
+const MAX_CONSUMER_BUCKETS = 4096;
+
+const ConsumerKey = struct {
+    hash_val: u64,
+
+    pub fn fromName(name: []const u8) ConsumerKey {
+        return .{ .hash_val = std.hash.Wyhash.hash(0, name) };
+    }
+
+    pub fn fromIp(ip: IpKey) ConsumerKey {
+        return .{ .hash_val = ip.hash() };
+    }
+
+    pub fn eql(a: ConsumerKey, b: ConsumerKey) bool {
+        return a.hash_val == b.hash_val;
+    }
+};
+
+const ConsumerBucketEntry = struct {
+    key: ConsumerKey,
+    bucket: TokenBucket,
+    last_access_ns: i128,
+    active: bool,
+};
+
+pub const ConsumerRateLimiter = struct {
+    entries: [MAX_CONSUMER_BUCKETS]ConsumerBucketEntry,
+    count: usize,
+    mutex: SpinMutex = .{},
+
+    pub fn init() ConsumerRateLimiter {
+        @setEvalBranchQuota(MAX_CONSUMER_BUCKETS * 8);
+        var rl = ConsumerRateLimiter{
+            .entries = undefined,
+            .count = 0,
+        };
+        for (&rl.entries) |*entry| {
+            entry.active = false;
+        }
+        return rl;
+    }
+
+    pub fn checkAndGetInfo(
+        self: *ConsumerRateLimiter,
+        key: ConsumerKey,
+        rps: u32,
+        burst: u32,
+    ) CheckResult {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const entry = self.getOrCreate(key, burst, rps);
+        const remaining = entry.bucket.tokens;
+        const limit = entry.bucket.max_tokens;
+
+        if (entry.bucket.tryConsume(1)) {
+            return .{
+                .allowed = true,
+                .limit = limit,
+                .remaining = if (remaining > 0) remaining - 1 else 0,
+                .retry_after_ms = 0,
+            };
+        }
+
+        const retry_ms = entry.bucket.timeUntilToken();
+        return .{
+            .allowed = false,
+            .limit = limit,
+            .remaining = 0,
+            .retry_after_ms = retry_ms,
+        };
+    }
+
+    fn getOrCreate(self: *ConsumerRateLimiter, key: ConsumerKey, burst: u32, rps: u32) *ConsumerBucketEntry {
+        const now = clock.realtimeNanos() orelse 0;
+
+        for (&self.entries) |*entry| {
+            if (entry.active and entry.key.eql(key)) {
+                entry.last_access_ns = now;
+                return entry;
+            }
+        }
+
+        var target: *ConsumerBucketEntry = &self.entries[0];
+        var oldest_ns: i128 = std.math.maxInt(i128);
+
+        for (&self.entries) |*entry| {
+            if (!entry.active) {
+                target = entry;
+                break;
+            }
+            if (entry.last_access_ns < oldest_ns) {
+                oldest_ns = entry.last_access_ns;
+                target = entry;
+            }
+        }
+
+        const was_inactive = !target.active;
+        target.* = .{
+            .key = key,
+            .bucket = TokenBucket.init(burst, rps),
+            .last_access_ns = now,
+            .active = true,
+        };
+        if (was_inactive) self.count += 1;
+
+        return target;
+    }
+};
+
+pub const CheckResult = struct {
+    allowed: bool,
+    limit: u32,
+    remaining: u32,
+    retry_after_ms: u64,
+};
+
+var consumer_limiter: ConsumerRateLimiter = ConsumerRateLimiter.init();
+
+pub fn initConsumerLimiter() void {
+    consumer_limiter = ConsumerRateLimiter.init();
+}
+
+const rate_limit_header_strings = blk: {
+    @setEvalBranchQuota(200_000);
+    var strs: [1001][]const u8 = undefined;
+    for (0..1001) |i| {
+        strs[i] = std.fmt.comptimePrint("{d}", .{i});
+    }
+    break :blk strs;
+};
+
+fn numStr(n: u32) []const u8 {
+    if (n < rate_limit_header_strings.len) return rate_limit_header_strings[n];
+    return "1000";
+}
+
+fn retryStr(ms: u64) []const u8 {
+    const s = (ms + 999) / 1000;
+    if (s < retry_after_strings.len) return retry_after_strings[s];
+    return "60";
+}
+
+pub const RateLimitResponse = struct {
+    resp: response.Response,
+    pause_ms: u64,
+};
+
+pub fn evaluateRoute(
+    consumer_name: []const u8,
+    client_ip: ?IpKey,
+    cfg: RouteRateLimit,
+) ?RateLimitResponse {
+    const key: ConsumerKey = switch (cfg.key) {
+        .consumer => if (consumer_name.len > 0)
+            ConsumerKey.fromName(consumer_name)
+        else if (client_ip) |ip|
+            ConsumerKey.fromIp(ip)
+        else
+            return null,
+        .ip => if (client_ip) |ip|
+            ConsumerKey.fromIp(ip)
+        else
+            return null,
+    };
+
+    const result = consumer_limiter.checkAndGetInfo(key, cfg.requests_per_second, cfg.burst_size);
+    if (result.allowed) return null;
+
+    return .{
+        .resp = .{
+            .status = 429,
+            .headers = &[_]response.Header{
+                .{ .name = "Retry-After", .value = retryStr(result.retry_after_ms) },
+                .{ .name = "X-RateLimit-Limit", .value = numStr(result.limit) },
+                .{ .name = "X-RateLimit-Remaining", .value = "0" },
+                .{ .name = "Content-Type", .value = "application/json" },
+                .{ .name = "Content-Length", .value = "29" },
+            },
+            .body = .{ .bytes = "{\"error\":\"too many requests\"}" },
+        },
+        .pause_ms = result.retry_after_ms,
+    };
+}
+
 /// Global rate limiter
 var limiter: RateLimiter = RateLimiter.init(.{});
 

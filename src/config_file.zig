@@ -3,6 +3,7 @@ const config_mod = @import("config.zig");
 const upstream_mod = @import("proxy/upstream.zig");
 const balancer_mod = @import("proxy/balancer.zig");
 const auth_mod = @import("middleware/auth.zig");
+const ratelimit_mod = @import("middleware/ratelimit.zig");
 const clock = @import("runtime/clock.zig");
 
 /// Config file schema version. Bump the minor component when fields are
@@ -233,6 +234,18 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
             route_auth = try parseAuthMethod(alloc, a);
         }
 
+        var route_rate_limit: ?ratelimit_mod.RouteRateLimit = null;
+        if (r.rate_limit) |rl| {
+            route_rate_limit = .{
+                .requests_per_second = rl.requests_per_second orelse 100,
+                .burst_size = rl.burst_size orelse 200,
+                .key = if (rl.key) |k|
+                    if (std.mem.eql(u8, k, "ip")) .ip else .consumer
+                else
+                    .consumer,
+            };
+        }
+
         routes_out[ri] = .{
             .path_prefix = r.path_prefix,
             .host = r.host,
@@ -246,6 +259,7 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
             },
             .x402 = route_x402,
             .auth = route_auth,
+            .rate_limit = route_rate_limit,
         };
     }
 
@@ -468,6 +482,7 @@ const RouteJson = struct {
     total_timeout_ms: ?u32 = null,
     x402: ?RouteX402Json = null,
     auth: ?RouteAuthJson = null,
+    rate_limit: ?RateLimitJson = null,
 };
 
 const RouteAuthJson = struct {
@@ -499,6 +514,12 @@ const ApiKeyJson = struct {
 const ClaimHeaderJson = struct {
     claim: []const u8,
     header: []const u8,
+};
+
+const RateLimitJson = struct {
+    requests_per_second: ?u32 = null,
+    burst_size: ?u32 = null,
+    key: ?[]const u8 = null,
 };
 
 // Tests
@@ -594,4 +615,55 @@ test "reject invalid JSON" {
     const json = "{ not valid json";
     const result = parseJsonFromBytes(std.testing.allocator, json);
     try std.testing.expectError(error.ConfigParseError, result);
+}
+
+test "parse route with rate_limit" {
+    const json =
+        \\{
+        \\  "upstreams": [{
+        \\    "name": "api",
+        \\    "servers": [{ "address": "10.0.0.1", "port": 8080 }]
+        \\  }],
+        \\  "routes": [{
+        \\    "path_prefix": "/api/",
+        \\    "upstream": "api",
+        \\    "rate_limit": {
+        \\      "requests_per_second": 50,
+        \\      "burst_size": 100,
+        \\      "key": "ip"
+        \\    }
+        \\  }]
+        \\}
+    ;
+    var loaded = try parseJsonFromBytes(std.testing.allocator, json);
+    defer loaded.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.routes.len);
+    const rl = loaded.routes[0].rate_limit orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 50), rl.requests_per_second);
+    try std.testing.expectEqual(@as(u32, 100), rl.burst_size);
+    try std.testing.expect(rl.key == .ip);
+}
+
+test "parse route with rate_limit defaults" {
+    const json =
+        \\{
+        \\  "upstreams": [{
+        \\    "name": "api",
+        \\    "servers": [{ "address": "10.0.0.1", "port": 8080 }]
+        \\  }],
+        \\  "routes": [{
+        \\    "path_prefix": "/api/",
+        \\    "upstream": "api",
+        \\    "rate_limit": {}
+        \\  }]
+        \\}
+    ;
+    var loaded = try parseJsonFromBytes(std.testing.allocator, json);
+    defer loaded.deinit();
+
+    const rl = loaded.routes[0].rate_limit orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 100), rl.requests_per_second);
+    try std.testing.expectEqual(@as(u32, 200), rl.burst_size);
+    try std.testing.expect(rl.key == .consumer);
 }

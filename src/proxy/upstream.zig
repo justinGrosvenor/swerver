@@ -1,5 +1,6 @@
 const std = @import("std");
 const auth = @import("../middleware/auth.zig");
+const ratelimit = @import("../middleware/ratelimit.zig");
 
 /// Upstream Configuration
 ///
@@ -100,6 +101,8 @@ pub const ProxyRoute = struct {
     x402: ?ProxyRouteX402 = null,
     /// Per-route authentication
     auth: auth.AuthMethod = .none,
+    /// Per-route rate limiting (consumer or IP keyed)
+    rate_limit: ?ratelimit.RouteRateLimit = null,
 };
 
 pub const ProxyRouteX402 = struct {

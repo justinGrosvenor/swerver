@@ -41,6 +41,7 @@ const http1_proto = @import("../protocol/http1.zig");
 const router = @import("../router/router.zig");
 const middleware = @import("../middleware/middleware.zig");
 const auth_mod = @import("../middleware/auth.zig");
+const ratelimit_mod = @import("../middleware/ratelimit.zig");
 const forward_mod = @import("../proxy/forward.zig");
 const clock = @import("../runtime/clock.zig");
 const preencoded = @import("preencoded.zig");
@@ -954,6 +955,21 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
                 .allow => |*info| info,
                 .reject => null,
             };
+            if (matched_route.rate_limit) |rl_cfg| {
+                const consumer = if (auth_info_ptr) |ai| ai.consumerName() else "";
+                const client_key: ?ratelimit_mod.IpKey = if (conn.cached_peer_ip) |ip4|
+                    ratelimit_mod.IpKey.fromIpv4(ip4)
+                else if (conn.cached_peer_ip6) |ip6|
+                    ratelimit_mod.IpKey.fromIpv6(ip6)
+                else
+                    null;
+                if (ratelimit_mod.evaluateRoute(consumer, client_key, rl_cfg)) |rl_resp| {
+                    conn.setRateLimitPause(server.io.nowMs(), rl_resp.pause_ms);
+                    cleanupBodyAccumulation(server, conn);
+                    queueResponse(server, conn, rl_resp.resp) catch {};
+                    return;
+                }
+            }
             var mw_ctx = middleware.Context{
                 .protocol = .http1,
                 .buffer_ops = .{
