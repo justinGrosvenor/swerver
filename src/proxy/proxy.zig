@@ -11,6 +11,7 @@ const auth_mod = @import("../middleware/auth.zig");
 const x402 = @import("../middleware/x402.zig");
 const cache_mod = @import("cache.zig");
 const dns_mod = @import("dns.zig");
+const consul_mod = @import("consul.zig");
 const compress_mod = @import("../middleware/compress.zig");
 const net = @import("../runtime/net.zig");
 const clock = @import("../runtime/clock.zig");
@@ -67,6 +68,8 @@ pub const Proxy = struct {
     route_caches: []?cache_mod.ResponseCache,
     /// DNS service discovery (resolves upstream addresses periodically)
     dns_discovery: dns_mod.DnsDiscovery,
+    /// Consul service discovery (polls Consul HTTP API periodically)
+    consul_discovery: consul_mod.ConsulDiscovery,
 
     const REQUEST_BUF_SIZE = 8192;
     const RESPONSE_BUF_SIZE = 65536;
@@ -185,6 +188,10 @@ pub const Proxy = struct {
         var dns_discovery = try dns_mod.DnsDiscovery.init(allocator, config.upstreams);
         errdefer dns_discovery.deinit();
 
+        // Initialize Consul service discovery
+        var consul_discovery = try consul_mod.ConsulDiscovery.init(allocator, config.upstreams);
+        errdefer consul_discovery.deinit();
+
         // Phase 2: Create proxy with empty upstream registrations
         var proxy = Proxy{
             .allocator = allocator,
@@ -203,6 +210,7 @@ pub const Proxy = struct {
             .route_x402_policies = route_x402_policies,
             .route_caches = route_caches,
             .dns_discovery = dns_discovery,
+            .consul_discovery = consul_discovery,
         };
 
         // Phase 3: Register upstreams - use errdefer to cleanup proxy internals only
@@ -253,6 +261,7 @@ pub const Proxy = struct {
         self.health_manager.deinit();
 
         self.dns_discovery.deinit();
+        self.consul_discovery.deinit();
         for (self.route_caches) |*rc| {
             if (rc.*) |*c| c.deinit();
         }
@@ -408,13 +417,13 @@ pub const Proxy = struct {
                 }
             }
 
-            // Select upstream server — prefer DNS-resolved addresses
-            const dns_server = self.selectDnsServer(effective_upstream);
-            const selection = bal.select(client_ip_u32, now_ms) orelse if (dns_server == null) {
+            // Select upstream server — prefer dynamically-discovered addresses
+            const discovered_server = self.selectDnsServer(effective_upstream) orelse self.selectConsulServer(effective_upstream);
+            const selection = bal.select(client_ip_u32, now_ms) orelse if (discovered_server == null) {
                 self.releaseResponseBuffer(resp_buf_idx);
                 return .{ .resp = forward.createErrorResponse(502), .proxy = self };
             } else null;
-            const connect_server = dns_server orelse selection.?.server;
+            const connect_server = discovered_server orelse selection.?.server;
 
             // Try to get an existing idle connection
             const server_idx = if (selection) |s| s.server_index else 0;
@@ -651,12 +660,12 @@ pub const Proxy = struct {
                 }
             }
 
-            const dns_server_b = self.selectDnsServer(effective_upstream_b);
-            const selection = bal.select(client_ip_u32, now_ms) orelse if (dns_server_b == null) {
+            const discovered_server_b = self.selectDnsServer(effective_upstream_b) orelse self.selectConsulServer(effective_upstream_b);
+            const selection = bal.select(client_ip_u32, now_ms) orelse if (discovered_server_b == null) {
                 self.releaseResponseBuffer(resp_buf_idx);
                 return .{ .resp = forward.createErrorResponse(502), .proxy = self };
             } else null;
-            const connect_server_b = dns_server_b orelse selection.?.server;
+            const connect_server_b = discovered_server_b orelse selection.?.server;
             const server_idx_b = if (selection) |s| s.server_index else 0;
 
             var conn = pool.acquireForServer(server_idx_b, now_ms);
@@ -838,6 +847,15 @@ pub const Proxy = struct {
         return &servers[dns_rr_counter % servers.len];
     }
 
+    threadlocal var consul_rr_counter: u32 = 0;
+
+    fn selectConsulServer(self: *const Proxy, upstream_name: []const u8) ?*const upstream.Server {
+        const servers = self.consul_discovery.resolvedServers(upstream_name) orelse return null;
+        if (servers.len == 0) return null;
+        consul_rr_counter +%= 1;
+        return &servers[consul_rr_counter % servers.len];
+    }
+
     threadlocal var mirror_req_buf: [REQUEST_BUF_SIZE]u8 = undefined;
 
     fn fireMirror(
@@ -871,14 +889,14 @@ pub const Proxy = struct {
 
         if (body_view) |bv| {
             const header_len = forward.buildUpstreamRequestHeaders(&mirror_req_buf, &ctx, bv.totalLen()) catch return;
-            _ = net.sendAll(fd, mirror_req_buf[0..header_len], 500) catch return;
+            net.sendAll(fd, mirror_req_buf[0..header_len]) catch return;
             var it = bv.iterator();
             while (it.next()) |chunk| {
-                _ = net.sendAll(fd, chunk, 500) catch return;
+                net.sendAll(fd, chunk) catch return;
             }
         } else {
             const req_len = forward.buildUpstreamRequest(&mirror_req_buf, &ctx) catch return;
-            _ = net.sendAll(fd, mirror_req_buf[0..req_len], 500) catch return;
+            net.sendAll(fd, mirror_req_buf[0..req_len]) catch return;
         }
     }
 
@@ -892,6 +910,9 @@ pub const Proxy = struct {
 
         // DNS service discovery re-resolution
         _ = self.dns_discovery.tick(now_ms);
+
+        // Consul service discovery polling
+        _ = self.consul_discovery.tick(now_ms);
     }
 
     /// Get proxy statistics
@@ -1037,6 +1058,7 @@ test "Proxy route matching" {
         .route_x402_policies = &.{},
         .route_caches = &.{},
         .dns_discovery = .{ .allocator = allocator, .entries = &.{}, .entry_count = 0 },
+        .consul_discovery = .{ .allocator = allocator, .entries = &.{}, .entry_count = 0 },
     };
     defer {
         proxy.pool_manager.deinit();

@@ -85,6 +85,7 @@ const proxy_health = @import("proxy/health.zig");
 const proxy_handler = @import("proxy/proxy.zig");
 const proxy_cache = @import("proxy/cache.zig");
 const proxy_dns = @import("proxy/dns.zig");
+const proxy_consul = @import("proxy/consul.zig");
 const proxy_websocket = @import("proxy/websocket.zig");
 
 // Force tests in these modules to be included. Lazy analysis means
@@ -177,6 +178,7 @@ comptime {
     // Proxy
     _ = proxy_cache;
     _ = proxy_dns;
+    _ = proxy_consul;
     _ = proxy_upstream;
     _ = proxy_pool;
     _ = proxy_balancer;

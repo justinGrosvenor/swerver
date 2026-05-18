@@ -166,6 +166,7 @@ test "isCompressible" {
 }
 
 test "gzipCompress basic" {
+    if (!has_zlib) return error.SkipZigTest;
     const input = "Hello, World! " ** 50;
     var output: [4096]u8 = undefined;
     const len = gzipCompress(input, &output) orelse return error.CompressFailed;
@@ -177,6 +178,7 @@ test "gzipCompress basic" {
 }
 
 test "deflateCompress basic" {
+    if (!has_zlib) return error.SkipZigTest;
     const input = "Hello, World! " ** 50;
     var output: [4096]u8 = undefined;
     const len = deflateCompress(input, &output) orelse return error.CompressFailed;
@@ -185,15 +187,16 @@ test "deflateCompress basic" {
 }
 
 test "gzipCompress skips small input" {
+    if (!has_zlib) return error.SkipZigTest;
     var buf: [64]u8 = .{0} ** 64;
     try std.testing.expectEqual(@as(?usize, null), gzipCompress("tiny", &buf));
 }
 
 test "gzipCompress skips if no savings" {
+    if (!has_zlib) return error.SkipZigTest;
     var random_data: [300]u8 = undefined;
     for (&random_data, 0..) |*b, i| b.* = @truncate(i *% 251 +% 97);
     var output: [4096]u8 = undefined;
-    // Random data doesn't compress well — result may be null
     _ = gzipCompress(&random_data, &output);
 }
 

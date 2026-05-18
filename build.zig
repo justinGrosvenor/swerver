@@ -180,6 +180,7 @@ const FeatureFlags = struct {
     enable_proxy: bool = false,
     enable_io_uring: bool = false,
     enable_x402_crypto: bool = false,
+    enable_compression: bool = false,
 };
 
 fn makeOptions(b: *std.Build, flags: FeatureFlags) *std.Build.Step.Options {
@@ -190,6 +191,7 @@ fn makeOptions(b: *std.Build, flags: FeatureFlags) *std.Build.Step.Options {
     opts.addOption(bool, "enable_proxy", flags.enable_proxy);
     opts.addOption(bool, "enable_io_uring", flags.enable_io_uring);
     opts.addOption(bool, "enable_x402_crypto", flags.enable_x402_crypto);
+    opts.addOption(bool, "enable_compression", flags.enable_compression);
     return opts;
 }
 

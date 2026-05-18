@@ -3,6 +3,7 @@ const auth = @import("../middleware/auth.zig");
 const ratelimit = @import("../middleware/ratelimit.zig");
 const cache_mod = @import("cache.zig");
 const dns_mod = @import("dns.zig");
+const consul_mod = @import("consul.zig");
 const body_schema = @import("../middleware/body_schema.zig");
 
 /// Upstream Configuration
@@ -24,6 +25,8 @@ pub const Upstream = struct {
     connection_pool: PoolConfig = .{},
     /// DNS service discovery configuration
     dns_discovery: ?dns_mod.DnsConfig = null,
+    /// Consul service discovery configuration
+    consul_discovery: ?consul_mod.ConsulConfig = null,
 };
 
 /// Individual backend server definition

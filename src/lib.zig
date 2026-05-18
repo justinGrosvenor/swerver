@@ -133,6 +133,7 @@ pub const proxy = struct {
     pub const handler = @import("proxy/proxy.zig");
     pub const cache = @import("proxy/cache.zig");
     pub const dns = @import("proxy/dns.zig");
+    pub const consul = @import("proxy/consul.zig");
     pub const websocket = @import("proxy/websocket.zig");
 };
 

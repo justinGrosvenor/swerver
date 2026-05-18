@@ -6,6 +6,7 @@ const auth_mod = @import("middleware/auth.zig");
 const ratelimit_mod = @import("middleware/ratelimit.zig");
 const cache_mod = @import("proxy/cache.zig");
 const dns_mod = @import("proxy/dns.zig");
+const consul_mod = @import("proxy/consul.zig");
 const body_schema_mod = @import("middleware/body_schema.zig");
 const clock = @import("runtime/clock.zig");
 
@@ -235,6 +236,17 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
             };
         }
 
+        var consul_discovery: ?consul_mod.ConsulConfig = null;
+        if (u.consul_discovery) |cd| {
+            consul_discovery = .{
+                .service = cd.service,
+                .address = cd.address orelse "127.0.0.1",
+                .port = cd.port orelse 8500,
+                .interval_s = cd.interval_s orelse 15,
+                .token = cd.token orelse "",
+            };
+        }
+
         upstreams_out[ui] = .{
             .name = u.name,
             .servers = servers_out,
@@ -242,6 +254,7 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
             .health_check = health_check,
             .connection_pool = pool_config,
             .dns_discovery = dns_discovery,
+            .consul_discovery = consul_discovery,
         };
     }
 
@@ -580,12 +593,21 @@ const UpstreamJson = struct {
     health_check: ?HealthCheckJson = null,
     connection_pool: ?PoolConfigJson = null,
     dns_discovery: ?DnsDiscoveryJson = null,
+    consul_discovery: ?ConsulDiscoveryJson = null,
 };
 
 const DnsDiscoveryJson = struct {
     hostname: []const u8,
     port: ?u16 = null,
     interval_s: ?u32 = null,
+};
+
+const ConsulDiscoveryJson = struct {
+    service: []const u8,
+    address: ?[]const u8 = null,
+    port: ?u16 = null,
+    interval_s: ?u32 = null,
+    token: ?[]const u8 = null,
 };
 
 const ServerEntryJson = struct {
@@ -904,6 +926,34 @@ test "parse upstream with dns_discovery" {
     try std.testing.expectEqualStrings("api.internal.svc.cluster.local", dd.hostname);
     try std.testing.expectEqual(@as(u16, 8080), dd.port);
     try std.testing.expectEqual(@as(u32, 15), dd.interval_s);
+}
+
+test "parse upstream with consul_discovery" {
+    const json =
+        \\{
+        \\  "upstreams": [
+        \\    {
+        \\      "name": "api",
+        \\      "servers": [],
+        \\      "consul_discovery": {
+        \\        "service": "api-prod",
+        \\        "address": "consul.internal",
+        \\        "port": 8501,
+        \\        "interval_s": 10,
+        \\        "token": "secret-token"
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var loaded = try parseJsonFromBytes(std.testing.allocator, json);
+    defer loaded.deinit();
+    const cd = loaded.upstreams[0].consul_discovery orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("api-prod", cd.service);
+    try std.testing.expectEqualStrings("consul.internal", cd.address);
+    try std.testing.expectEqual(@as(u16, 8501), cd.port);
+    try std.testing.expectEqual(@as(u32, 10), cd.interval_s);
+    try std.testing.expectEqualStrings("secret-token", cd.token);
 }
 
 test "parse otel config" {
