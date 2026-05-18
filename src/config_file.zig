@@ -340,6 +340,7 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
             .traffic_split = traffic_split,
             .cache = route_cache,
             .body_schema = route_body_schema,
+            .mirror = r.mirror,
         };
     }
 
@@ -370,6 +371,20 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
                     std.log.warn("config: traffic_split references unknown upstream '{s}'", .{t.upstream});
                     return error.ConfigParseError;
                 }
+            }
+        }
+
+        if (route.mirror) |mirror_name| {
+            var m_found = false;
+            for (upstreams_out) |u| {
+                if (std.mem.eql(u8, mirror_name, u.name)) {
+                    m_found = true;
+                    break;
+                }
+            }
+            if (!m_found) {
+                std.log.warn("config: mirror references unknown upstream '{s}'", .{mirror_name});
+                return error.ConfigParseError;
             }
         }
     }
@@ -615,6 +630,7 @@ const RouteJson = struct {
     traffic_split: ?[]const TrafficSplitJson = null,
     cache: ?CacheJson = null,
     body_schema: ?std.json.Value = null,
+    mirror: ?[]const u8 = null,
 };
 
 const CacheJson = struct {
@@ -940,6 +956,43 @@ test "parse route with body_schema" {
     try std.testing.expect(schema.schema_type == .object);
     try std.testing.expectEqual(@as(usize, 2), schema.required.len);
     try std.testing.expectEqual(@as(usize, 2), schema.properties.len);
+}
+
+test "parse route with mirror" {
+    const json =
+        \\{
+        \\  "upstreams": [
+        \\    { "name": "api", "servers": [{ "address": "10.0.0.1", "port": 8080 }] },
+        \\    { "name": "shadow", "servers": [{ "address": "10.0.0.2", "port": 8080 }] }
+        \\  ],
+        \\  "routes": [{
+        \\    "path_prefix": "/api/",
+        \\    "upstream": "api",
+        \\    "mirror": "shadow"
+        \\  }]
+        \\}
+    ;
+    var loaded = try parseJsonFromBytes(std.testing.allocator, json);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), loaded.routes.len);
+    try std.testing.expectEqualStrings("shadow", loaded.routes[0].mirror.?);
+}
+
+test "mirror rejects unknown upstream" {
+    const json =
+        \\{
+        \\  "upstreams": [
+        \\    { "name": "api", "servers": [{ "address": "10.0.0.1", "port": 8080 }] }
+        \\  ],
+        \\  "routes": [{
+        \\    "path_prefix": "/api/",
+        \\    "upstream": "api",
+        \\    "mirror": "nonexistent"
+        \\  }]
+        \\}
+    ;
+    const result = parseJsonFromBytes(std.testing.allocator, json);
+    try std.testing.expectError(error.ConfigParseError, result);
 }
 
 test "traffic_split rejects unknown upstream" {

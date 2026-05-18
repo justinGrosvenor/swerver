@@ -122,6 +122,9 @@ pub const ProxyRoute = struct {
     cache: ?cache_mod.CacheConfig = null,
     /// Per-route request body JSON schema validation.
     body_schema: ?*const body_schema.Schema = null,
+    /// Traffic mirroring: name of upstream to shadow-send requests to.
+    /// Fire-and-forget — mirror response is discarded.
+    mirror: ?[]const u8 = null,
 
     /// Resolve the upstream name, applying traffic split if configured.
     pub fn selectUpstream(self: *const ProxyRoute) []const u8 {

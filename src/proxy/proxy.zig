@@ -564,6 +564,9 @@ pub const Proxy = struct {
                 pool.release(c, now_ms, parsed.keep_alive);
 
                 maybeCompress(&normalized, req.headers, self.response_header_bufs[resp_buf_idx][0..]);
+                if (route.mirror) |mirror_name| {
+                    self.fireMirror(mirror_name, req, null, now_ms);
+                }
                 return .{
                     .resp = normalized,
                     .proxy = self,
@@ -811,6 +814,9 @@ pub const Proxy = struct {
                 pool.release(c, now_ms, parsed.keep_alive);
 
                 maybeCompress(&normalized_b, req.headers, self.response_header_bufs[resp_buf_idx][0..]);
+                if (route.mirror) |mirror_name| {
+                    self.fireMirror(mirror_name, req, body_view, now_ms);
+                }
                 return .{
                     .resp = normalized_b,
                     .proxy = self,
@@ -830,6 +836,50 @@ pub const Proxy = struct {
         if (servers.len == 0) return null;
         dns_rr_counter +%= 1;
         return &servers[dns_rr_counter % servers.len];
+    }
+
+    threadlocal var mirror_req_buf: [REQUEST_BUF_SIZE]u8 = undefined;
+
+    fn fireMirror(
+        self: *Proxy,
+        mirror_name: []const u8,
+        req: request.RequestView,
+        body_view: ?forward.BodyView,
+        now_ms: u64,
+    ) void {
+        const bal_m = self.balancers.get(mirror_name) orelse return;
+        const selection = bal_m.select(null, now_ms) orelse return;
+        const server_m = selection.server;
+
+        const fd = net.connectBlocking(server_m.address, server_m.port, 500) catch return;
+        defer clock.closeFd(fd);
+
+        const dummy_route = upstream.ProxyRoute{
+            .path_prefix = "",
+            .upstream = mirror_name,
+        };
+        const ctx = forward.ForwardContext{
+            .client_request = req,
+            .client_ip = null,
+            .client_tls = false,
+            .route = &dummy_route,
+            .server = server_m,
+            .upstream_conn = undefined,
+            .request_buf = &mirror_req_buf,
+            .response_buf = undefined,
+        };
+
+        if (body_view) |bv| {
+            const header_len = forward.buildUpstreamRequestHeaders(&mirror_req_buf, &ctx, bv.totalLen()) catch return;
+            _ = net.sendAll(fd, mirror_req_buf[0..header_len], 500) catch return;
+            var it = bv.iterator();
+            while (it.next()) |chunk| {
+                _ = net.sendAll(fd, chunk, 500) catch return;
+            }
+        } else {
+            const req_len = forward.buildUpstreamRequest(&mirror_req_buf, &ctx) catch return;
+            _ = net.sendAll(fd, mirror_req_buf[0..req_len], 500) catch return;
+        }
     }
 
     /// Run periodic maintenance tasks
