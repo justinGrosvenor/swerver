@@ -85,6 +85,7 @@ pub const Method = enum {
 pub const RequestBody = union(enum) {
     slice: []const u8,
     scattered: ScatteredBuffers,
+    length_only: usize,
 
     pub const ScatteredBuffers = struct {
         handles: []const buffer_pool.BufferHandle,
@@ -97,13 +98,14 @@ pub const RequestBody = union(enum) {
         return switch (self) {
             .slice => |s| s.len,
             .scattered => |b| b.total_len,
+            .length_only => |n| n,
         };
     }
 
     pub fn sliceOrNull(self: RequestBody) ?[]const u8 {
         return switch (self) {
             .slice => |s| s,
-            .scattered => null,
+            .scattered, .length_only => null,
         };
     }
 
@@ -124,6 +126,7 @@ pub const RequestBody = union(enum) {
                 }
                 return dst[0..total];
             },
+            .length_only => return null,
         }
     }
 

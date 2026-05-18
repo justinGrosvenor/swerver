@@ -23,6 +23,7 @@ pub const BodyAccumState = struct {
     header_result: http1.HeaderParseResult,
     /// Retains the original read buffer so header slices (path, headers) remain valid.
     original_read_buffer: ?buffer_pool.BufferHandle,
+    discard_body: bool = false,
 };
 
 pub const State = enum {

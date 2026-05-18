@@ -2,6 +2,7 @@ const std = @import("std");
 const config_mod = @import("config.zig");
 const upstream_mod = @import("proxy/upstream.zig");
 const balancer_mod = @import("proxy/balancer.zig");
+const auth_mod = @import("middleware/auth.zig");
 const clock = @import("runtime/clock.zig");
 
 /// Config file schema version. Bump the minor component when fields are
@@ -227,6 +228,30 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
             };
         }
 
+        var route_auth: auth_mod.AuthMethod = .none;
+        if (r.auth) |a| {
+            if (std.mem.eql(u8, a.type, "api_key")) {
+                const json_keys = a.keys orelse return error.ConfigParseError;
+                const keys_out = try alloc.alloc(auth_mod.ApiKey, json_keys.len);
+                for (json_keys, 0..) |k, ki| {
+                    keys_out[ki] = .{ .key = k.key, .name = k.name };
+                }
+                route_auth = .{ .api_key = .{
+                    .keys = keys_out,
+                    .header_name = a.header_name orelse "X-API-Key",
+                    .query_param = a.query_param orelse "api_key",
+                } };
+            } else if (std.mem.eql(u8, a.type, "jwt")) {
+                route_auth = .{ .jwt = .{
+                    .secret = a.secret orelse return error.ConfigParseError,
+                    .issuer = a.issuer,
+                    .audience = a.audience,
+                } };
+            } else {
+                return error.ConfigParseError;
+            }
+        }
+
         routes_out[ri] = .{
             .path_prefix = r.path_prefix,
             .host = r.host,
@@ -239,6 +264,7 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
                 .total_ms = r.total_timeout_ms orelse 120_000,
             },
             .x402 = route_x402,
+            .auth = route_auth,
         };
     }
 
@@ -410,6 +436,23 @@ const RouteJson = struct {
     read_timeout_ms: ?u32 = null,
     total_timeout_ms: ?u32 = null,
     x402: ?RouteX402Json = null,
+    auth: ?RouteAuthJson = null,
+};
+
+const RouteAuthJson = struct {
+    type: []const u8,
+    keys: ?[]const ApiKeyJson = null,
+    header_name: ?[]const u8 = null,
+    query_param: ?[]const u8 = null,
+    secret: ?[]const u8 = null,
+    algorithm: ?[]const u8 = null,
+    issuer: ?[]const u8 = null,
+    audience: ?[]const u8 = null,
+};
+
+const ApiKeyJson = struct {
+    key: []const u8,
+    name: []const u8,
 };
 
 // Tests

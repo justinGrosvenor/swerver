@@ -1,4 +1,5 @@
 const std = @import("std");
+const auth = @import("../middleware/auth.zig");
 
 /// Upstream Configuration
 ///
@@ -97,6 +98,8 @@ pub const ProxyRoute = struct {
     retry: RetryConfig = .{},
     /// Per-route x402 payment gating
     x402: ?ProxyRouteX402 = null,
+    /// Per-route authentication
+    auth: auth.AuthMethod = .none,
 };
 
 pub const ProxyRouteX402 = struct {

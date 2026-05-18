@@ -40,6 +40,7 @@ const request = @import("../protocol/request.zig");
 const http1_proto = @import("../protocol/http1.zig");
 const router = @import("../router/router.zig");
 const middleware = @import("../middleware/middleware.zig");
+const auth_mod = @import("../middleware/auth.zig");
 const forward_mod = @import("../proxy/forward.zig");
 const clock = @import("../runtime/clock.zig");
 const preencoded = @import("preencoded.zig");
@@ -757,6 +758,7 @@ pub fn initBodyAccumulation(
     hparse: http1_proto.HeaderParseResult,
     buffer_handle: buffer_pool.BufferHandle,
 ) !void {
+    const discard = server.app_router.bodyPolicyForRoute(hparse.view.method, hparse.view.path) == .discard;
     conn.body_accum = .{
         .content_length = hparse.content_length,
         .is_chunked = hparse.is_chunked,
@@ -768,6 +770,7 @@ pub fn initBodyAccumulation(
         .chunk_decoder = http1_proto.ChunkDecoder.init(server.cfg.limits.max_body_bytes),
         .header_result = hparse,
         .original_read_buffer = null,
+        .discard_body = discard,
     };
     conn.header_count = hparse.view.headers.len;
     conn.is_head_request = (hparse.view.method == .HEAD);
@@ -829,6 +832,29 @@ pub fn continueBodyAccumulation(server: *Server, conn: *connection.Connection) !
 fn appendBodyData(server: *Server, conn: *connection.Connection, data: []u8) !void {
     const accum = &(conn.body_accum orelse return);
     var remaining = data;
+
+    if (accum.discard_body) {
+        if (accum.is_chunked) {
+            var scratch: [4096]u8 = undefined;
+            while (remaining.len > 0 and !accum.chunk_decoder.isDone()) {
+                const result = accum.chunk_decoder.feed(remaining, &scratch) catch |err| {
+                    return switch (err) {
+                        error.BodyTooLarge => error.BodyTooLarge,
+                        error.InvalidChunk => error.InvalidRequest,
+                    };
+                };
+                accum.bytes_decoded += result.decoded;
+                remaining = remaining[result.consumed..];
+                accum.bytes_received += result.consumed;
+            }
+        } else {
+            const left = accum.content_length - accum.bytes_received;
+            const to_consume = @min(remaining.len, left);
+            accum.bytes_received += to_consume;
+            accum.bytes_decoded += to_consume;
+        }
+        return;
+    }
 
     if (accum.is_chunked) {
         // Feed through chunk decoder
@@ -912,7 +938,15 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
 
     // Check proxy routes first
     if (server.proxy) |proxy| {
-        if (proxy.matchRoute(&hparse.view) != null) {
+        if (proxy.matchRoute(&hparse.view)) |matched_route| {
+            switch (auth_mod.evaluate(hparse.view, matched_route.auth)) {
+                .allow => {},
+                .reject => |resp| {
+                    cleanupBodyAccumulation(server, conn);
+                    queueResponse(server, conn, resp) catch {};
+                    return;
+                },
+            }
             var mw_ctx = middleware.Context{
                 .protocol = .http1,
                 .buffer_ops = .{
@@ -947,19 +981,25 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
         }
     }
 
-    // Build RequestView with scattered body (no linearization)
+    // Build RequestView with body representation
     const total_len = accum.bytes_decoded;
+    const body: request.RequestBody = if (accum.discard_body)
+        .{ .length_only = total_len }
+    else if (total_len > 0)
+        .{ .scattered = .{
+            .handles = accum.body_buffers[0..accum.buffer_count],
+            .last_buf_len = accum.current_buf_offset,
+            .total_len = total_len,
+            .buffer_size = server.io.bodyBufferSize(),
+        } }
+    else
+        .{ .slice = "" };
     const req_view = request.RequestView{
         .method = hparse.view.method,
         .method_raw = hparse.view.method_raw,
         .path = hparse.view.path,
         .headers = hparse.view.headers,
-        .body = if (total_len > 0) .{ .scattered = .{
-            .handles = accum.body_buffers[0..accum.buffer_count],
-            .last_buf_len = accum.current_buf_offset,
-            .total_len = total_len,
-            .buffer_size = server.io.bodyBufferSize(),
-        } } else .{ .slice = "" },
+        .body = body,
     };
 
     if (!server.isAllowedHost(req_view)) {

@@ -5,17 +5,6 @@
 //! `src/lib.zig`'s stable surface references it directly. Downstream
 //! consumers reach it through `swerver.benchmark`, which is clearly
 //! labeled as "benchmark-app helpers, not core library."
-//!
-//! Moving the handlers out of `src/server.zig` accomplishes three things:
-//!  1. The main server module stays focused on the event loop, protocol
-//!     dispatch, and preencoded cache — none of which are benchmark-
-//!     specific.
-//!  2. The `examples/httparena/` downstream consumer has a real reference
-//!     point for "how do I register the HttpArena endpoints from
-//!     swerver-as-library?" — just call `swerver.benchmark.registerRoutes`.
-//!  3. The `lib.zig` surface can be trimmed without losing functionality
-//!     (see 2.2 in the launch grind — `registerDefaultRoutes` and friends
-//!     moved out of the core library namespace into `swerver.benchmark`).
 
 const std = @import("std");
 const router = @import("router/router.zig");
@@ -62,8 +51,8 @@ pub fn registerRoutes(app_router: *router.Router) !void {
     // Falls back to {"message":"Hello, World!"} when no dataset.
     try app_router.get("/json", handleBenchJson);
 
-    // Upload: return byte count of POST body
-    try app_router.post("/upload", handleBenchUpload);
+    // Upload: return byte count of POST body (discard mode — count only, no buffering)
+    try app_router.postDiscard("/upload", handleBenchUpload);
 }
 
 /// Register the post-response middleware chain that the benchmark

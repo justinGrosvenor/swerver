@@ -35,6 +35,7 @@ const router = @import("../router/router.zig");
 const middleware = @import("../middleware/middleware.zig");
 
 const x402_mod = @import("../middleware/x402.zig");
+const auth_mod = @import("../middleware/auth.zig");
 const accept_mod = @import("accept.zig");
 const http1_mod = @import("http1.zig");
 const http2_mod = @import("http2.zig");
@@ -658,6 +659,14 @@ pub fn handleRead(server: *Server, index: u32) !void {
                     .allow => {},
                     .reject => |info| {
                         try http1_mod.queueResponse(server, conn, info.resp);
+                        if (conn.read_buffered_bytes == 0) break;
+                        continue;
+                    },
+                }
+                switch (auth_mod.evaluate(parse.view, matched_route.auth)) {
+                    .allow => {},
+                    .reject => |resp| {
+                        try http1_mod.queueResponse(server, conn, resp);
                         if (conn.read_buffered_bytes == 0) break;
                         continue;
                     },

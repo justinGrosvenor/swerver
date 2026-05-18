@@ -104,6 +104,7 @@ pub const router = @import("router/router.zig");
 pub const request = @import("protocol/request.zig");
 pub const response = @import("response/response.zig");
 pub const middleware = @import("middleware/middleware.zig");
+pub const auth = @import("middleware/auth.zig");
 
 /// Runtime primitives: clock helpers, buffer pool, connection state.
 ///

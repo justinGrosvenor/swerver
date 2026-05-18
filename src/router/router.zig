@@ -381,6 +381,8 @@ pub const RouterLimits = struct {
     max_params: u8 = MAX_PARAMS,
 };
 
+pub const BodyPolicy = enum { accumulate, discard };
+
 /// Route entry
 pub const Route = struct {
     method: request.Method,
@@ -388,6 +390,7 @@ pub const Route = struct {
     handler: HandlerFn,
     middleware_chain: ?*middleware.Chain = null,
     x402_policy: x402.RoutePaymentConfig = .{},
+    body_policy: BodyPolicy = .accumulate,
     pattern_buf: [MAX_PATTERN_LEN]u8 = undefined,
     pattern_len: usize = 0,
     param_count: u8 = 0,
@@ -624,7 +627,17 @@ pub const Router = struct {
         return self.routeWithOptions(method, pattern, handler, null, payment);
     }
 
+    /// Register a POST route with body discard policy (body bytes are
+    /// counted but not buffered — handler receives `.length_only`).
+    pub fn postDiscard(self: *Router, pattern: []const u8, handler: HandlerFn) RouterError!void {
+        return self.routeWithFullOptions(.POST, pattern, handler, null, .{}, .discard);
+    }
+
     fn routeWithOptions(self: *Router, method: request.Method, pattern: []const u8, handler: HandlerFn, chain: ?*middleware.Chain, payment: x402.RoutePaymentConfig) RouterError!void {
+        return self.routeWithFullOptions(method, pattern, handler, chain, payment, .accumulate);
+    }
+
+    fn routeWithFullOptions(self: *Router, method: request.Method, pattern: []const u8, handler: HandlerFn, chain: ?*middleware.Chain, payment: x402.RoutePaymentConfig, body_policy: BodyPolicy) RouterError!void {
         if (self.route_count >= self.limits.max_routes) return error.RouteLimitExceeded;
 
         var r = try Route.compile(pattern, self.limits);
@@ -633,6 +646,7 @@ pub const Router = struct {
         r.handler = handler;
         r.middleware_chain = chain;
         r.x402_policy = payment;
+        r.body_policy = body_policy;
         self.routes[self.route_count] = r;
         self.route_count += 1;
         self.updateBloomFilter(pattern);
@@ -704,6 +718,34 @@ pub const Router = struct {
     /// Set custom error handler
     pub fn setErrorHandler(self: *Router, handler: HandlerFn) void {
         self.error_handler = handler;
+    }
+
+    /// Look up the body policy for a request before body accumulation.
+    pub fn bodyPolicyForRoute(self: *const Router, method: request.Method, path: []const u8) BodyPolicy {
+        const clean = if (std.mem.indexOfScalar(u8, path, '?')) |qi| path[0..qi] else path;
+        for (self.routes[0..self.route_count]) |*r| {
+            if (r.method != method) continue;
+            if (self.quickMatchRoute(r, clean)) return r.body_policy;
+        }
+        return .accumulate;
+    }
+
+    fn quickMatchRoute(_: *const Router, r: *const Route, path: []const u8) bool {
+        var path_it = std.mem.splitScalar(u8, path, '/');
+        var seg_idx: u8 = 0;
+        while (path_it.next()) |path_seg| {
+            if (path_seg.len == 0) continue;
+            if (seg_idx >= r.segment_count) return false;
+            switch (r.segments[seg_idx]) {
+                .literal => |lit| {
+                    if (!std.mem.eql(u8, lit, path_seg)) return false;
+                },
+                .param => {},
+                .wildcard => return true,
+            }
+            seg_idx += 1;
+        }
+        return seg_idx == r.segment_count;
     }
 
     /// Handle an incoming request

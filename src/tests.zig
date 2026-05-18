@@ -67,6 +67,7 @@ const x402_crypto = @import("middleware/x402_crypto.zig");
 const health = @import("middleware/health.zig");
 const ratelimit = @import("middleware/ratelimit.zig");
 const security = @import("middleware/security.zig");
+const auth = @import("middleware/auth.zig");
 
 // Proxy
 const proxy_upstream = @import("proxy/upstream.zig");
@@ -154,6 +155,7 @@ comptime {
     _ = health;
     _ = ratelimit;
     _ = security;
+    _ = auth;
 
     // Proxy
     _ = proxy_upstream;
