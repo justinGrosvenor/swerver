@@ -128,6 +128,7 @@ pub const proxy = struct {
     pub const health = @import("proxy/health.zig");
     pub const handler = @import("proxy/proxy.zig");
     pub const cache = @import("proxy/cache.zig");
+    pub const dns = @import("proxy/dns.zig");
     pub const websocket = @import("proxy/websocket.zig");
 };
 

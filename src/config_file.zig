@@ -5,6 +5,7 @@ const balancer_mod = @import("proxy/balancer.zig");
 const auth_mod = @import("middleware/auth.zig");
 const ratelimit_mod = @import("middleware/ratelimit.zig");
 const cache_mod = @import("proxy/cache.zig");
+const dns_mod = @import("proxy/dns.zig");
 const clock = @import("runtime/clock.zig");
 
 /// Config file schema version. Bump the minor component when fields are
@@ -214,12 +215,22 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
             if (pc.connect_timeout_ms) |v| pool_config.connect_timeout_ms = v;
         }
 
+        var dns_discovery: ?dns_mod.DnsConfig = null;
+        if (u.dns_discovery) |dd| {
+            dns_discovery = .{
+                .hostname = dd.hostname,
+                .port = dd.port orelse 80,
+                .interval_s = dd.interval_s orelse 30,
+            };
+        }
+
         upstreams_out[ui] = .{
             .name = u.name,
             .servers = servers_out,
             .load_balancer = parseLoadBalancer(u.load_balancer),
             .health_check = health_check,
             .connection_pool = pool_config,
+            .dns_discovery = dns_discovery,
         };
     }
 
@@ -524,6 +535,13 @@ const UpstreamJson = struct {
     load_balancer: ?[]const u8 = null,
     health_check: ?HealthCheckJson = null,
     connection_pool: ?PoolConfigJson = null,
+    dns_discovery: ?DnsDiscoveryJson = null,
+};
+
+const DnsDiscoveryJson = struct {
+    hostname: []const u8,
+    port: ?u16 = null,
+    interval_s: ?u32 = null,
 };
 
 const ServerEntryJson = struct {
@@ -816,6 +834,30 @@ test "parse route with cache config" {
     try std.testing.expectEqual(@as(usize, 2), cc.vary.len);
     try std.testing.expectEqualStrings("Accept", cc.vary[0]);
     try std.testing.expectEqualStrings("Accept-Encoding", cc.vary[1]);
+}
+
+test "parse upstream with dns_discovery" {
+    const json =
+        \\{
+        \\  "upstreams": [
+        \\    {
+        \\      "name": "api",
+        \\      "servers": [],
+        \\      "dns_discovery": {
+        \\        "hostname": "api.internal.svc.cluster.local",
+        \\        "port": 8080,
+        \\        "interval_s": 15
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var loaded = try parseJsonFromBytes(std.testing.allocator, json);
+    defer loaded.deinit();
+    const dd = loaded.upstreams[0].dns_discovery orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("api.internal.svc.cluster.local", dd.hostname);
+    try std.testing.expectEqual(@as(u16, 8080), dd.port);
+    try std.testing.expectEqual(@as(u32, 15), dd.interval_s);
 }
 
 test "traffic_split rejects unknown upstream" {

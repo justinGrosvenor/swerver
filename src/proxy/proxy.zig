@@ -10,6 +10,7 @@ const middleware = @import("../middleware/middleware.zig");
 const auth_mod = @import("../middleware/auth.zig");
 const x402 = @import("../middleware/x402.zig");
 const cache_mod = @import("cache.zig");
+const dns_mod = @import("dns.zig");
 const net = @import("../runtime/net.zig");
 const clock = @import("../runtime/clock.zig");
 
@@ -63,6 +64,8 @@ pub const Proxy = struct {
     route_x402_policies: []x402.RoutePaymentConfig,
     /// Per-route response caches (parallel to config.routes, null if route has no cache config)
     route_caches: []?cache_mod.ResponseCache,
+    /// DNS service discovery (resolves upstream addresses periodically)
+    dns_discovery: dns_mod.DnsDiscovery,
 
     const REQUEST_BUF_SIZE = 8192;
     const RESPONSE_BUF_SIZE = 65536;
@@ -124,6 +127,10 @@ pub const Proxy = struct {
             }
         }
 
+        // Initialize DNS service discovery
+        var dns_discovery = try dns_mod.DnsDiscovery.init(allocator, config.upstreams);
+        errdefer dns_discovery.deinit();
+
         // Phase 2: Create proxy with empty upstream registrations
         var proxy = Proxy{
             .allocator = allocator,
@@ -141,6 +148,7 @@ pub const Proxy = struct {
             .free_response_count = BUFFER_POOL_SIZE,
             .route_x402_policies = route_x402_policies,
             .route_caches = route_caches,
+            .dns_discovery = dns_discovery,
         };
 
         // Phase 3: Register upstreams - use errdefer to cleanup proxy internals only
@@ -190,6 +198,7 @@ pub const Proxy = struct {
         self.pool_manager.deinit();
         self.health_manager.deinit();
 
+        self.dns_discovery.deinit();
         for (self.route_caches) |*rc| {
             if (rc.*) |*c| c.deinit();
         }
@@ -345,14 +354,17 @@ pub const Proxy = struct {
                 }
             }
 
-            // Select upstream server
-            const selection = bal.select(client_ip_u32, now_ms) orelse {
+            // Select upstream server — prefer DNS-resolved addresses
+            const dns_server = self.selectDnsServer(effective_upstream);
+            const selection = bal.select(client_ip_u32, now_ms) orelse if (dns_server == null) {
                 self.releaseResponseBuffer(resp_buf_idx);
                 return .{ .resp = forward.createErrorResponse(502), .proxy = self };
-            };
+            } else null;
+            const connect_server = dns_server orelse selection.?.server;
 
             // Try to get an existing idle connection
-            var conn = pool.acquireForServer(selection.server_index, now_ms);
+            const server_idx = if (selection) |s| s.server_index else 0;
+            var conn = pool.acquireForServer(server_idx, now_ms);
             var created_new = false;
 
             if (conn == null) {
@@ -364,16 +376,18 @@ pub const Proxy = struct {
                 };
 
                 const fd = net.connectBlocking(
-                    selection.server.address,
-                    selection.server.port,
+                    connect_server.address,
+                    connect_server.port,
                     route.timeouts.connect_ms,
                 ) catch {
                     // Connect failed — mark server failure
-                    if (selection.server_index < pool.server_failures.len) {
-                        pool.server_failures[selection.server_index].consecutive_failures += 1;
-                        pool.server_failures[selection.server_index].last_failure_ms = now_ms;
-                        if (pool.server_failures[selection.server_index].consecutive_failures >= selection.server.max_fails) {
-                            pool.server_failures[selection.server_index].available = false;
+                    if (selection) |s| {
+                        if (s.server_index < pool.server_failures.len) {
+                            pool.server_failures[s.server_index].consecutive_failures += 1;
+                            pool.server_failures[s.server_index].last_failure_ms = now_ms;
+                            if (pool.server_failures[s.server_index].consecutive_failures >= s.server.max_fails) {
+                                pool.server_failures[s.server_index].available = false;
+                            }
                         }
                     }
                     continue;
@@ -382,10 +396,10 @@ pub const Proxy = struct {
                 // Set send/recv timeouts
                 net.setSocketTimeouts(fd, route.timeouts.send_ms, route.timeouts.read_ms);
 
-                var new_conn = pool_mod.UpstreamConnection.init(fd, selection.server_index, now_ms, slot);
+                var new_conn = pool_mod.UpstreamConnection.init(fd, server_idx, now_ms, slot);
                 new_conn.state = .idle;
                 pool.addConnection(slot, new_conn);
-                conn = pool.acquireForServer(selection.server_index, now_ms);
+                conn = pool.acquireForServer(server_idx, now_ms);
                 created_new = true;
             }
 
@@ -410,7 +424,7 @@ pub const Proxy = struct {
                     .client_ip = client_ip,
                     .client_tls = client_tls,
                     .route = route,
-                    .server = selection.server,
+                    .server = connect_server,
                     .upstream_conn = c,
                     .request_buf = &self.request_bufs[req_buf_idx],
                     .response_buf = &self.response_bufs[resp_buf_idx],
@@ -419,14 +433,14 @@ pub const Proxy = struct {
                 };
 
                 const request_len = forward.buildUpstreamRequest(&self.request_bufs[req_buf_idx], &ctx) catch {
-                    pool.markConnectionFailed(c, now_ms, selection.server.max_fails);
+                    pool.markConnectionFailed(c, now_ms, connect_server.max_fails);
                     continue;
                 };
 
                 // Send request to upstream
                 const body_sent = req.body.len() > 0;
                 net.sendAll(c.fd, self.request_bufs[req_buf_idx][0..request_len]) catch {
-                    pool.markConnectionFailed(c, now_ms, selection.server.max_fails);
+                    pool.markConnectionFailed(c, now_ms, connect_server.max_fails);
                     // RFC 9110 §9.2.2: Only retry if method is idempotent or body not sent
                     if (body_sent and !forward.isIdempotent(req.method)) {
                         self.releaseResponseBuffer(resp_buf_idx);
@@ -440,7 +454,7 @@ pub const Proxy = struct {
                 var read_failed = false;
                 while (total_read < RESPONSE_BUF_SIZE) {
                     const n = net.recvBlocking(c.fd, self.response_bufs[resp_buf_idx][total_read..]) catch {
-                        pool.markConnectionFailed(c, now_ms, selection.server.max_fails);
+                        pool.markConnectionFailed(c, now_ms, connect_server.max_fails);
                         read_failed = true;
                         break;
                     };
@@ -464,13 +478,13 @@ pub const Proxy = struct {
                 }
 
                 if (total_read == 0) {
-                    pool.markConnectionFailed(c, now_ms, selection.server.max_fails);
+                    pool.markConnectionFailed(c, now_ms, connect_server.max_fails);
                     continue;
                 }
 
                 // Parse the upstream response
                 const parsed = forward.parseUpstreamResponse(self.response_bufs[resp_buf_idx][0..total_read]) catch {
-                    pool.markConnectionFailed(c, now_ms, selection.server.max_fails);
+                    pool.markConnectionFailed(c, now_ms, connect_server.max_fails);
                     continue;
                 };
 
@@ -489,10 +503,10 @@ pub const Proxy = struct {
                     route,
                     self.response_header_bufs[resp_buf_idx][0..],
                 ) catch {
-                    pool.markConnectionFailed(c, now_ms, selection.server.max_fails);
+                    pool.markConnectionFailed(c, now_ms, connect_server.max_fails);
                     continue;
                 };
-                pool.markServerSuccess(selection.server_index);
+                pool.markServerSuccess(server_idx);
                 pool.release(c, now_ms, parsed.keep_alive);
 
                 return .{
@@ -579,12 +593,15 @@ pub const Proxy = struct {
                 }
             }
 
-            const selection = bal.select(client_ip_u32, now_ms) orelse {
+            const dns_server_b = self.selectDnsServer(effective_upstream_b);
+            const selection = bal.select(client_ip_u32, now_ms) orelse if (dns_server_b == null) {
                 self.releaseResponseBuffer(resp_buf_idx);
                 return .{ .resp = forward.createErrorResponse(502), .proxy = self };
-            };
+            } else null;
+            const connect_server_b = dns_server_b orelse selection.?.server;
+            const server_idx_b = if (selection) |s| s.server_index else 0;
 
-            var conn = pool.acquireForServer(selection.server_index, now_ms);
+            var conn = pool.acquireForServer(server_idx_b, now_ms);
             var created_new = false;
 
             if (conn == null) {
@@ -595,15 +612,17 @@ pub const Proxy = struct {
                 };
 
                 const fd = net.connectBlocking(
-                    selection.server.address,
-                    selection.server.port,
+                    connect_server_b.address,
+                    connect_server_b.port,
                     route.timeouts.connect_ms,
                 ) catch {
-                    if (selection.server_index < pool.server_failures.len) {
-                        pool.server_failures[selection.server_index].consecutive_failures += 1;
-                        pool.server_failures[selection.server_index].last_failure_ms = now_ms;
-                        if (pool.server_failures[selection.server_index].consecutive_failures >= selection.server.max_fails) {
-                            pool.server_failures[selection.server_index].available = false;
+                    if (selection) |s| {
+                        if (s.server_index < pool.server_failures.len) {
+                            pool.server_failures[s.server_index].consecutive_failures += 1;
+                            pool.server_failures[s.server_index].last_failure_ms = now_ms;
+                            if (pool.server_failures[s.server_index].consecutive_failures >= s.server.max_fails) {
+                                pool.server_failures[s.server_index].available = false;
+                            }
                         }
                     }
                     continue;
@@ -611,10 +630,10 @@ pub const Proxy = struct {
 
                 net.setSocketTimeouts(fd, route.timeouts.send_ms, route.timeouts.read_ms);
 
-                var new_conn = pool_mod.UpstreamConnection.init(fd, selection.server_index, now_ms, slot);
+                var new_conn = pool_mod.UpstreamConnection.init(fd, server_idx_b, now_ms, slot);
                 new_conn.state = .idle;
                 pool.addConnection(slot, new_conn);
-                conn = pool.acquireForServer(selection.server_index, now_ms);
+                conn = pool.acquireForServer(server_idx_b, now_ms);
                 created_new = true;
             }
 
@@ -639,7 +658,7 @@ pub const Proxy = struct {
                     .client_ip = client_ip,
                     .client_tls = client_tls,
                     .route = route,
-                    .server = selection.server,
+                    .server = connect_server_b,
                     .upstream_conn = c,
                     .request_buf = &self.request_bufs[req_buf_idx],
                     .response_buf = &self.response_bufs[resp_buf_idx],
@@ -648,13 +667,13 @@ pub const Proxy = struct {
                 };
 
                 const header_len = forward.buildUpstreamRequestHeaders(&self.request_bufs[req_buf_idx], &ctx, body_len) catch {
-                    pool.markConnectionFailed(c, now_ms, selection.server.max_fails);
+                    pool.markConnectionFailed(c, now_ms, connect_server_b.max_fails);
                     continue;
                 };
 
                 // Send headers to upstream
                 net.sendAll(c.fd, self.request_bufs[req_buf_idx][0..header_len]) catch {
-                    pool.markConnectionFailed(c, now_ms, selection.server.max_fails);
+                    pool.markConnectionFailed(c, now_ms, connect_server_b.max_fails);
                     if (!forward.isIdempotent(req.method)) {
                         self.releaseResponseBuffer(resp_buf_idx);
                         return .{ .resp = forward.createErrorResponse(502), .proxy = self };
@@ -667,7 +686,7 @@ pub const Proxy = struct {
                 var body_iter = body_view.iterator();
                 while (body_iter.next()) |chunk| {
                     net.sendAll(c.fd, chunk) catch {
-                        pool.markConnectionFailed(c, now_ms, selection.server.max_fails);
+                        pool.markConnectionFailed(c, now_ms, connect_server_b.max_fails);
                         body_send_failed = true;
                         break;
                     };
@@ -686,7 +705,7 @@ pub const Proxy = struct {
                 var read_failed = false;
                 while (total_read < RESPONSE_BUF_SIZE) {
                     const n = net.recvBlocking(c.fd, self.response_bufs[resp_buf_idx][total_read..]) catch {
-                        pool.markConnectionFailed(c, now_ms, selection.server.max_fails);
+                        pool.markConnectionFailed(c, now_ms, connect_server_b.max_fails);
                         read_failed = true;
                         break;
                     };
@@ -707,12 +726,12 @@ pub const Proxy = struct {
                 }
 
                 if (total_read == 0) {
-                    pool.markConnectionFailed(c, now_ms, selection.server.max_fails);
+                    pool.markConnectionFailed(c, now_ms, connect_server_b.max_fails);
                     continue;
                 }
 
                 const parsed = forward.parseUpstreamResponse(self.response_bufs[resp_buf_idx][0..total_read]) catch {
-                    pool.markConnectionFailed(c, now_ms, selection.server.max_fails);
+                    pool.markConnectionFailed(c, now_ms, connect_server_b.max_fails);
                     continue;
                 };
 
@@ -730,10 +749,10 @@ pub const Proxy = struct {
                     route,
                     self.response_header_bufs[resp_buf_idx][0..],
                 ) catch {
-                    pool.markConnectionFailed(c, now_ms, selection.server.max_fails);
+                    pool.markConnectionFailed(c, now_ms, connect_server_b.max_fails);
                     continue;
                 };
-                pool.markServerSuccess(selection.server_index);
+                pool.markServerSuccess(server_idx_b);
                 pool.release(c, now_ms, parsed.keep_alive);
 
                 return .{
@@ -748,6 +767,15 @@ pub const Proxy = struct {
         return .{ .resp = forward.createErrorResponse(502), .proxy = self };
     }
 
+    threadlocal var dns_rr_counter: u32 = 0;
+
+    fn selectDnsServer(self: *const Proxy, upstream_name: []const u8) ?*const upstream.Server {
+        const servers = self.dns_discovery.resolvedServers(upstream_name) orelse return null;
+        if (servers.len == 0) return null;
+        dns_rr_counter +%= 1;
+        return &servers[dns_rr_counter % servers.len];
+    }
+
     /// Run periodic maintenance tasks
     pub fn runMaintenance(self: *Proxy, now_ms: u64) void {
         // Evict expired connections
@@ -755,6 +783,9 @@ pub const Proxy = struct {
 
         // Run health checks
         self.health_manager.runAllChecks(now_ms, &self.pool_manager);
+
+        // DNS service discovery re-resolution
+        _ = self.dns_discovery.tick(now_ms);
     }
 
     /// Get proxy statistics
@@ -899,6 +930,7 @@ test "Proxy route matching" {
         .free_response_count = 0,
         .route_x402_policies = &.{},
         .route_caches = &.{},
+        .dns_discovery = .{ .allocator = allocator, .entries = &.{}, .entry_count = 0 },
     };
     defer {
         proxy.pool_manager.deinit();

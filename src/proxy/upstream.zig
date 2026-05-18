@@ -2,6 +2,7 @@ const std = @import("std");
 const auth = @import("../middleware/auth.zig");
 const ratelimit = @import("../middleware/ratelimit.zig");
 const cache_mod = @import("cache.zig");
+const dns_mod = @import("dns.zig");
 
 /// Upstream Configuration
 ///
@@ -20,6 +21,8 @@ pub const Upstream = struct {
     health_check: ?HealthCheck = null,
     /// Connection pool settings
     connection_pool: PoolConfig = .{},
+    /// DNS service discovery configuration
+    dns_discovery: ?dns_mod.DnsConfig = null,
 };
 
 /// Individual backend server definition
