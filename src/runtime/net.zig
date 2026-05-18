@@ -473,7 +473,7 @@ fn setReusePort(fd: std.posix.fd_t) ListenError!void {
     }
 }
 
-fn setNonBlocking(fd: std.posix.fd_t) NonBlockingError!void {
+pub fn setNonBlocking(fd: std.posix.fd_t) NonBlockingError!void {
     const flags = std.c.fcntl(fd, std.posix.F.GETFL);
     if (flags < 0) return error.NonBlockingFailed;
     const nonblock: c_int = @bitCast(@as(c_uint, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK"));

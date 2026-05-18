@@ -76,6 +76,7 @@ const proxy_balancer = @import("proxy/balancer.zig");
 const proxy_forward = @import("proxy/forward.zig");
 const proxy_health = @import("proxy/health.zig");
 const proxy_handler = @import("proxy/proxy.zig");
+const proxy_websocket = @import("proxy/websocket.zig");
 
 // Force tests in these modules to be included. Lazy analysis means
 // `_ = module` is the only way to pull test blocks into the test
@@ -164,6 +165,7 @@ comptime {
     _ = proxy_forward;
     _ = proxy_health;
     _ = proxy_handler;
+    _ = proxy_websocket;
 
     // I/O backend — `io_uring_poll` is the portable one
     _ = io_uring;

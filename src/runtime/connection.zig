@@ -192,6 +192,10 @@ pub const Connection = struct {
     /// Used only for diagnostics — the CQE's `res` carries the real
     /// bytes-written count which the server trusts for queue advancement.
     async_send_total_bytes: usize = 0,
+    /// WebSocket tunnel: index of the peer connection (client↔upstream).
+    tunnel_peer_index: ?u32 = null,
+    /// True when this connection is in bidirectional tunnel mode (WebSocket).
+    is_tunnel: bool = false,
 
     pub fn init(index: u32) Connection {
         return .{
@@ -284,6 +288,8 @@ pub const Connection = struct {
         self.send_in_flight = false;
         self.async_send_iov_count = 0;
         self.async_send_total_bytes = 0;
+        self.tunnel_peer_index = null;
+        self.is_tunnel = false;
         // active_list_pos is set by ConnectionPool.acquire
     }
 
@@ -541,6 +547,8 @@ pub const ConnectionPool = struct {
         conn.write_tail = 0;
         conn.write_count = 0;
         conn.header_count = 0;
+        conn.tunnel_peer_index = null;
+        conn.is_tunnel = false;
         std.debug.assert(conn.index < self.entries.len);
         std.debug.assert(self.free_len < self.free_stack.len);
         self.free_stack[self.free_len] = conn.index;

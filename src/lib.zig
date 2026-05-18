@@ -127,6 +127,7 @@ pub const proxy = struct {
     pub const forward = @import("proxy/forward.zig");
     pub const health = @import("proxy/health.zig");
     pub const handler = @import("proxy/proxy.zig");
+    pub const websocket = @import("proxy/websocket.zig");
 };
 
 /// Benchmark route handlers (HttpArena / TechEmpower). **Not part of

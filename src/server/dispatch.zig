@@ -28,6 +28,7 @@ const Server = server_mod.Server;
 const connection = @import("../runtime/connection.zig");
 const clock = @import("../runtime/clock.zig");
 const net = @import("../runtime/net.zig");
+const request_mod = @import("../protocol/request.zig");
 const http1 = @import("../protocol/http1.zig");
 const http2 = @import("../protocol/http2.zig");
 const response_mod = @import("../response/response.zig");
@@ -37,6 +38,7 @@ const middleware = @import("../middleware/middleware.zig");
 const x402_mod = @import("../middleware/x402.zig");
 const auth_mod = @import("../middleware/auth.zig");
 const ratelimit_mod = @import("../middleware/ratelimit.zig");
+const ws_mod = @import("../proxy/websocket.zig");
 const accept_mod = @import("accept.zig");
 const http1_mod = @import("http1.zig");
 const http2_mod = @import("http2.zig");
@@ -370,6 +372,13 @@ pub fn handleRead(server: *Server, index: u32) !void {
     const conn = server.io.getConnection(index) orelse return;
     if (conn.fd == null) return;
     if (!server.io.canRead(conn)) return;
+
+    // WebSocket tunnel: forward raw bytes to peer, no HTTP parsing.
+    if (conn.is_tunnel) {
+        handleTunnelRead(server, conn);
+        return;
+    }
+
     if (conn.timeout_phase == .idle) server.io.setTimeoutPhase(conn, .header);
     const buffer_handle = conn.read_buffer orelse return;
 
@@ -692,6 +701,18 @@ pub fn handleRead(server: *Server, index: u32) !void {
                         continue;
                     }
                 }
+                // WebSocket upgrade: detect and set up bidirectional tunnel
+                if (ws_mod.isWebSocketUpgrade(parse.view)) {
+                    var ws_ip_buf: [64]u8 = undefined;
+                    var ws_client_ip: ?[]const u8 = null;
+                    if (conn.cached_peer_ip) |ip4| {
+                        const ip_len = std.fmt.bufPrint(&ws_ip_buf, "{d}.{d}.{d}.{d}", .{ ip4[0], ip4[1], ip4[2], ip4[3] }) catch "";
+                        if (ip_len.len > 0) ws_client_ip = ws_ip_buf[0..ip_len.len];
+                    }
+                    setupWebSocketTunnel(server, conn, parse.view, matched_route, proxy, ws_client_ip);
+                    return;
+                }
+
                 var mw_ctx = middleware.Context{
                     .protocol = .http1,
                     .buffer_ops = .{
@@ -833,6 +854,182 @@ pub fn handleRead(server: *Server, index: u32) !void {
             .eof, .again, .err => {},
         }
         // No more data available, continue normally
+    }
+}
+
+// ── WebSocket tunnel relay ────────────────────────────────────
+
+const proxy_mod = @import("../proxy/proxy.zig");
+const upstream_mod = @import("../proxy/upstream.zig");
+
+fn handleTunnelRead(server: *Server, conn: *connection.Connection) void {
+    const read_buf = conn.read_buffer orelse return;
+    const offset = conn.read_offset + conn.read_buffered_bytes;
+    if (offset >= read_buf.bytes.len) return;
+
+    const count = switch (connRead(server, conn, read_buf.bytes[offset..])) {
+        .bytes => |n| n,
+        .eof => {
+            closeTunnel(server, conn);
+            return;
+        },
+        .again => return,
+        .err => {
+            closeTunnel(server, conn);
+            return;
+        },
+    };
+    if (count == 0) {
+        closeTunnel(server, conn);
+        return;
+    }
+    conn.markActive(server.io.nowMs());
+
+    const peer_index = conn.tunnel_peer_index orelse {
+        closeTunnel(server, conn);
+        return;
+    };
+    const peer = server.io.getConnection(peer_index) orelse {
+        closeTunnel(server, conn);
+        return;
+    };
+    if (!peer.is_tunnel or peer.fd == null) {
+        closeTunnel(server, conn);
+        return;
+    }
+
+    if (!peer.canEnqueueWrite()) {
+        closeTunnel(server, conn);
+        return;
+    }
+
+    const write_handle = server.io.acquireBuffer() orelse {
+        closeTunnel(server, conn);
+        return;
+    };
+    const copy_len = @min(count, write_handle.bytes.len);
+    @memcpy(write_handle.bytes[0..copy_len], read_buf.bytes[offset .. offset + copy_len]);
+
+    if (!peer.enqueueWrite(write_handle, copy_len)) {
+        server.io.releaseBuffer(write_handle);
+        closeTunnel(server, conn);
+        return;
+    }
+    peer.markActive(server.io.nowMs());
+
+    // Kick a write on the peer
+    handleWrite(server, peer.index) catch {
+        closeTunnel(server, conn);
+    };
+}
+
+fn closeTunnel(server: *Server, conn: *connection.Connection) void {
+    const peer_index = conn.tunnel_peer_index;
+    conn.tunnel_peer_index = null;
+    conn.is_tunnel = false;
+    server.closeConnection(conn);
+
+    if (peer_index) |pi| {
+        if (server.io.getConnection(pi)) |peer| {
+            if (peer.is_tunnel) {
+                peer.tunnel_peer_index = null;
+                peer.is_tunnel = false;
+                server.closeConnection(peer);
+            }
+        }
+    }
+}
+
+fn setupWebSocketTunnel(
+    server: *Server,
+    conn: *connection.Connection,
+    req: request_mod.RequestView,
+    matched_route: *const upstream_mod.ProxyRoute,
+    proxy: *proxy_mod.Proxy,
+    client_ip: ?[]const u8,
+) void {
+    const bal = proxy.balancers.get(matched_route.upstream) orelse {
+        http1_mod.queueResponse(server, conn, ws_mod.errorResp(502)) catch {};
+        return;
+    };
+
+    const selection = bal.select(null, server.io.nowMs()) orelse {
+        http1_mod.queueResponse(server, conn, ws_mod.errorResp(502)) catch {};
+        return;
+    };
+
+    var resp_buf: [4096]u8 = undefined;
+    const result = ws_mod.performUpgrade(req, selection.server.address, selection.server.port, matched_route, client_ip, &resp_buf);
+
+    switch (result) {
+        .err => |resp| {
+            http1_mod.queueResponse(server, conn, resp) catch {};
+        },
+        .ok => |info| {
+            const upstream_fd = info.upstream_fd;
+            const raw_101 = info.resp_data[0..info.resp_len];
+
+            // Queue the raw 101 response to the client
+            const write_handle = server.io.acquireBuffer() orelse {
+                clock.closeFd(upstream_fd);
+                return;
+            };
+            const copy_len = @min(raw_101.len, write_handle.bytes.len);
+            @memcpy(write_handle.bytes[0..copy_len], raw_101[0..copy_len]);
+            if (!conn.enqueueWrite(write_handle, copy_len)) {
+                server.io.releaseBuffer(write_handle);
+                clock.closeFd(upstream_fd);
+                return;
+            }
+
+            // Acquire a connection slot for the upstream side of the tunnel
+            const upstream_conn = server.io.acquireConnection(server.io.nowMs()) orelse {
+                clock.closeFd(upstream_fd);
+                return;
+            };
+            upstream_conn.fd = upstream_fd;
+            upstream_conn.state = .active;
+            upstream_conn.is_tunnel = true;
+            upstream_conn.tunnel_peer_index = conn.index;
+            upstream_conn.is_tls = false;
+
+            // Give upstream connection a read buffer
+            const upstream_read_buf = server.io.acquireBuffer() orelse {
+                server.io.releaseConnection(upstream_conn);
+                clock.closeFd(upstream_fd);
+                return;
+            };
+            upstream_conn.read_buffer = upstream_read_buf;
+
+            // Set upstream FD to non-blocking for event loop
+            net.setNonBlocking(upstream_fd) catch {
+                server.io.releaseBuffer(upstream_read_buf);
+                upstream_conn.read_buffer = null;
+                server.io.releaseConnection(upstream_conn);
+                clock.closeFd(upstream_fd);
+                return;
+            };
+
+            // Register upstream FD in the event loop
+            server.io.registerConnection(upstream_conn.index, upstream_fd) catch {
+                server.io.releaseBuffer(upstream_read_buf);
+                upstream_conn.read_buffer = null;
+                upstream_conn.fd = null;
+                server.io.releaseConnection(upstream_conn);
+                clock.closeFd(upstream_fd);
+                return;
+            };
+
+            // Mark client connection as tunnel
+            conn.is_tunnel = true;
+            conn.tunnel_peer_index = upstream_conn.index;
+
+            // Consume all buffered data from client read (the HTTP request)
+            server.io.onReadConsumed(conn, conn.read_buffered_bytes);
+
+            // Kick a write on client to send the 101 response
+            handleWrite(server, conn.index) catch {};
+        },
     }
 }
 
