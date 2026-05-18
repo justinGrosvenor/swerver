@@ -122,6 +122,17 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
     if (file_cfg.tls) |t| {
         if (t.cert_path) |c| cfg.tls.cert_path = c;
         if (t.key_path) |k| cfg.tls.key_path = k;
+        if (t.certificates) |json_certs| {
+            const certs = try alloc.alloc(config_mod.TlsCertificate, json_certs.len);
+            for (json_certs, 0..) |jc, ci| {
+                certs[ci] = .{
+                    .hostnames = jc.hostnames,
+                    .cert_path = jc.cert_path,
+                    .key_path = jc.key_path,
+                };
+            }
+            cfg.tls.certificates = certs;
+        }
     }
 
     // HTTP/2
@@ -402,6 +413,13 @@ const BufferPoolJson = struct {
 const TlsJson = struct {
     cert_path: ?[:0]const u8 = null,
     key_path: ?[:0]const u8 = null,
+    certificates: ?[]const TlsCertJson = null,
+};
+
+const TlsCertJson = struct {
+    hostnames: []const [:0]const u8,
+    cert_path: [:0]const u8,
+    key_path: [:0]const u8,
 };
 
 const Http2Json = struct {

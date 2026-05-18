@@ -99,6 +99,15 @@ extern fn SSL_CTX_ctrl(ctx: *SSL_CTX, cmd: c_int, larg: c_long, parg: ?*anyopaqu
 extern fn SSL_CTX_set_ciphersuites(ctx: *SSL_CTX, str: [*:0]const u8) c_int;
 extern fn SSL_CTX_set_alpn_protos(ctx: *SSL_CTX, protos: [*]const u8, protos_len: c_uint) c_int;
 
+// SNI (Server Name Indication)
+extern fn SSL_get_servername(ssl: *const SSL, typ: c_int) ?[*:0]const u8;
+extern fn SSL_set_SSL_CTX(ssl: *SSL, ctx: *SSL_CTX) ?*SSL_CTX;
+extern fn SSL_CTX_callback_ctrl(ctx: *SSL_CTX, cmd: c_int, fp: ?*const anyopaque) c_long;
+pub const SSL_CTRL_SET_TLSEXT_SERVERNAME_CB: c_int = 53;
+pub const SSL_CTRL_SET_TLSEXT_SERVERNAME_ARG: c_int = 54;
+pub const TLSEXT_NAMETYPE_host_name: c_int = 0;
+pub const SSL_TLSEXT_ERR_OK_NOACK: c_int = 0;
+
 pub extern fn SSL_new(ctx: *SSL_CTX) ?*SSL;
 pub extern fn SSL_free(ssl: *SSL) void;
 extern fn SSL_set_accept_state(ssl: *SSL) void;
@@ -506,6 +515,25 @@ pub fn loadPrivateKey(ctx: *SSL_CTX, path: [:0]const u8) !void {
     if (SSL_CTX_check_private_key(ctx) != 1) {
         return error.PrivateKeyMismatch;
     }
+}
+
+pub const SniCallback = *const fn (*SSL, *c_int, ?*anyopaque) callconv(.c) c_int;
+
+pub fn setSniCallback(ctx: *SSL_CTX, cb: SniCallback, arg: ?*anyopaque) void {
+    if (!tls_enabled) return;
+    _ = SSL_CTX_callback_ctrl(ctx, SSL_CTRL_SET_TLSEXT_SERVERNAME_CB, @ptrCast(cb));
+    _ = SSL_CTX_ctrl(ctx, SSL_CTRL_SET_TLSEXT_SERVERNAME_ARG, 0, arg);
+}
+
+pub fn getServername(ssl: *const SSL) ?[]const u8 {
+    if (!tls_enabled) return null;
+    const ptr = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name) orelse return null;
+    return std.mem.sliceTo(ptr, 0);
+}
+
+pub fn setSslCtx(ssl: *SSL, ctx: *SSL_CTX) void {
+    if (!tls_enabled) return;
+    _ = SSL_set_SSL_CTX(ssl, ctx);
 }
 
 pub fn createSession(ctx: *SSL_CTX, is_server: bool) !*SSL {

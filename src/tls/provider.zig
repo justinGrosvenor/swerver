@@ -6,11 +6,55 @@ pub const QuicState = quic_session.QuicState;
 pub const QuicLevel = quic_session.Level;
 pub const QuicDirection = quic_session.Direction;
 
-/// TLS 1.3 provider for QUIC handshake and key derivation.
+pub const MAX_SNI_ENTRIES = 64;
+
+pub const SniEntry = struct {
+    hostname: [:0]const u8,
+    ctx: *ffi.SSL_CTX,
+    is_wildcard: bool,
+};
+
+pub const CertStore = struct {
+    entries: [MAX_SNI_ENTRIES]SniEntry,
+    count: usize,
+    default_ctx: *ffi.SSL_CTX,
+
+    pub fn lookup(self: *const CertStore, hostname: []const u8) *ffi.SSL_CTX {
+        for (self.entries[0..self.count]) |entry| {
+            if (entry.is_wildcard) {
+                if (matchWildcard(entry.hostname, hostname)) return entry.ctx;
+            } else {
+                if (std.ascii.eqlIgnoreCase(entry.hostname, hostname)) return entry.ctx;
+            }
+        }
+        return self.default_ctx;
+    }
+
+    fn matchWildcard(pattern: [:0]const u8, hostname: []const u8) bool {
+        if (!std.mem.startsWith(u8, pattern, "*.")) return false;
+        const suffix = pattern[1..]; // ".example.com"
+        if (hostname.len <= suffix.len) return false;
+        const host_suffix = hostname[hostname.len - suffix.len ..];
+        if (!std.ascii.eqlIgnoreCase(host_suffix, suffix)) return false;
+        const prefix = hostname[0 .. hostname.len - suffix.len];
+        return std.mem.indexOfScalar(u8, prefix, '.') == null;
+    }
+};
+
+fn sniCallback(ssl: *ffi.SSL, _: *c_int, arg: ?*anyopaque) callconv(.c) c_int {
+    const store: *const CertStore = @ptrCast(@alignCast(arg orelse return ffi.SSL_TLSEXT_ERR_OK_NOACK));
+    const hostname = ffi.getServername(ssl) orelse return ffi.SSL_TLSEXT_ERR_OK_NOACK;
+    const ctx = store.lookup(hostname);
+    ffi.setSslCtx(ssl, ctx);
+    return ffi.SSL_TLSEXT_ERR_OK_NOACK;
+}
+
+/// TLS provider for QUIC handshake and key derivation, and TCP TLS.
 /// Uses OpenSSL/BoringSSL via C FFI.
 pub const Provider = struct {
     ctx: *ffi.SSL_CTX,
     allocator: std.mem.Allocator,
+    cert_store: ?*CertStore = null,
 
     pub const Error = error{
         ContextCreationFailed,
@@ -66,6 +110,69 @@ pub const Provider = struct {
         };
     }
 
+    pub const CertEntry = struct {
+        hostnames: []const [:0]const u8,
+        cert_path: [:0]const u8,
+        key_path: [:0]const u8,
+    };
+
+    /// Initialize a TLS provider with SNI support for multiple certificates.
+    /// The first cert_path/key_path is the default (used when no SNI match).
+    /// Additional certificates are routed via SNI hostname matching.
+    pub fn initTcpSni(
+        allocator: std.mem.Allocator,
+        default_cert: [:0]const u8,
+        default_key: [:0]const u8,
+        extra_certs: []const CertEntry,
+    ) Error!Provider {
+        const default_ctx = ffi.createTcpContext(true) catch return error.ContextCreationFailed;
+        errdefer ffi.freeContext(default_ctx);
+
+        ffi.loadCertificateChain(default_ctx, default_cert) catch return error.CertificateLoadFailed;
+        ffi.loadPrivateKey(default_ctx, default_key) catch return error.PrivateKeyLoadFailed;
+
+        if (extra_certs.len == 0) {
+            return .{ .ctx = default_ctx, .allocator = allocator };
+        }
+
+        const store = allocator.create(CertStore) catch return error.ContextCreationFailed;
+        store.* = .{
+            .entries = undefined,
+            .count = 0,
+            .default_ctx = default_ctx,
+        };
+        errdefer {
+            for (store.entries[0..store.count]) |entry| ffi.freeContext(entry.ctx);
+            allocator.destroy(store);
+        }
+
+        for (extra_certs) |cert| {
+            const ctx = ffi.createTcpContext(true) catch return error.ContextCreationFailed;
+            errdefer ffi.freeContext(ctx);
+
+            ffi.loadCertificateChain(ctx, cert.cert_path) catch return error.CertificateLoadFailed;
+            ffi.loadPrivateKey(ctx, cert.key_path) catch return error.PrivateKeyLoadFailed;
+
+            for (cert.hostnames) |hostname| {
+                if (store.count >= MAX_SNI_ENTRIES) break;
+                store.entries[store.count] = .{
+                    .hostname = hostname,
+                    .ctx = ctx,
+                    .is_wildcard = std.mem.startsWith(u8, hostname, "*."),
+                };
+                store.count += 1;
+            }
+        }
+
+        ffi.setSniCallback(default_ctx, sniCallback, @ptrCast(store));
+
+        return .{
+            .ctx = default_ctx,
+            .allocator = allocator,
+            .cert_store = store,
+        };
+    }
+
     /// Initialize a TLS provider for client connections (no certificates needed).
     pub fn initClient(allocator: std.mem.Allocator) Error!Provider {
         const ctx = ffi.createContext(false) catch return error.ContextCreationFailed;
@@ -77,6 +184,13 @@ pub const Provider = struct {
     }
 
     pub fn deinit(self: *Provider) void {
+        if (self.cert_store) |store| {
+            for (store.entries[0..store.count]) |entry| {
+                if (entry.ctx != self.ctx) ffi.freeContext(entry.ctx);
+            }
+            self.allocator.destroy(store);
+            self.cert_store = null;
+        }
         ffi.freeContext(self.ctx);
     }
 
@@ -333,3 +447,23 @@ pub const QuicKeyLabels = struct {
     pub const client_application = ffi.QUIC_CLIENT_APPLICATION_LABEL;
     pub const server_application = ffi.QUIC_SERVER_APPLICATION_LABEL;
 };
+
+test "wildcard matching" {
+    try std.testing.expect(CertStore.matchWildcard("*.example.com", "api.example.com"));
+    try std.testing.expect(CertStore.matchWildcard("*.example.com", "www.example.com"));
+    try std.testing.expect(!CertStore.matchWildcard("*.example.com", "example.com"));
+    try std.testing.expect(!CertStore.matchWildcard("*.example.com", "sub.api.example.com"));
+    try std.testing.expect(!CertStore.matchWildcard("*.example.com", "other.com"));
+    try std.testing.expect(!CertStore.matchWildcard("api.example.com", "api.example.com"));
+}
+
+test "config parsing with certificates" {
+    const config_mod = @import("../config.zig");
+    const cert = config_mod.TlsCertificate{
+        .hostnames = &.{},
+        .cert_path = "test.pem",
+        .key_path = "test.key",
+    };
+    try std.testing.expectEqual(@as(usize, 0), cert.hostnames.len);
+    try std.testing.expectEqualStrings("test.pem", cert.cert_path);
+}

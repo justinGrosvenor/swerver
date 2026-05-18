@@ -146,11 +146,19 @@ pub const Http2Config = struct {
     max_dynamic_table_size: usize = 4096,
 };
 
+pub const TlsCertificate = struct {
+    hostnames: []const [:0]const u8,
+    cert_path: [:0]const u8,
+    key_path: [:0]const u8,
+};
+
 pub const TlsConfig = struct {
     /// Path to PEM certificate file (empty = TLS disabled on TCP)
     cert_path: [:0]const u8 = "",
     /// Path to PEM private key file
     key_path: [:0]const u8 = "",
+    /// Additional certificates for SNI-based routing (optional)
+    certificates: []const TlsCertificate = &.{},
 };
 
 pub const QuicConfig = struct {

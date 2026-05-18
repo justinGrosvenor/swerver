@@ -193,13 +193,27 @@ pub const Server = struct {
         if (cfg.limits.max_header_count > connection.HeaderCapacity) return error.InvalidHeaderTable;
         const io_runtime = try runtime.IoRuntime.init(allocator, cfg);
         // TLS for TCP (HTTP/1.1 + HTTP/2): separate from QUIC
-        const tcp_tls_provider: ?tls.Provider = if (build_options.enable_tls and cfg.tls.cert_path.len > 0)
-            tls.Provider.initTcp(allocator, cfg.tls.cert_path, cfg.tls.key_path) catch |err| {
+        const tcp_tls_provider: ?tls.Provider = if (build_options.enable_tls and cfg.tls.cert_path.len > 0) blk: {
+            const extra_certs = cfg.tls.certificates;
+            var cert_entries: [tls.MAX_SNI_ENTRIES]tls.Provider.CertEntry = undefined;
+            const n = @min(extra_certs.len, tls.MAX_SNI_ENTRIES);
+            for (extra_certs[0..n], 0..) |c, i| {
+                cert_entries[i] = .{
+                    .hostnames = c.hostnames,
+                    .cert_path = c.cert_path,
+                    .key_path = c.key_path,
+                };
+            }
+            break :blk tls.Provider.initTcpSni(
+                allocator,
+                cfg.tls.cert_path,
+                cfg.tls.key_path,
+                cert_entries[0..n],
+            ) catch |err| {
                 std.log.err("TLS init failed: {}", .{err});
                 return error.TlsInitFailed;
-            }
-        else
-            null;
+            };
+        } else null;
         // TLS for QUIC: TLS 1.3 only, AES-128-GCM ciphersuite, h3 ALPN.
         // Uses the OpenSSL 3.5+ SSL_set_quic_tls_cbs callback API instead of
         // memory BIOs — see src/tls/quic_session.zig.
