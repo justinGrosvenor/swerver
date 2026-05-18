@@ -227,6 +227,13 @@ pub fn isHopByHop(name: []const u8) bool {
     return false;
 }
 
+/// For gRPC requests: `te: trailers` and `trailer` must be forwarded.
+pub fn isHopByHopGrpc(name: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(name, "te")) return false;
+    if (std.ascii.eqlIgnoreCase(name, "trailer")) return false;
+    return isHopByHop(name);
+}
+
 // Tests
 test "isHopByHop identifies hop-by-hop headers" {
     try std.testing.expect(isHopByHop("Connection"));
@@ -235,6 +242,16 @@ test "isHopByHop identifies hop-by-hop headers" {
     try std.testing.expect(isHopByHop("Transfer-Encoding"));
     try std.testing.expect(!isHopByHop("Content-Type"));
     try std.testing.expect(!isHopByHop("X-Custom-Header"));
+}
+
+test "isHopByHopGrpc preserves te and trailer" {
+    try std.testing.expect(!isHopByHopGrpc("te"));
+    try std.testing.expect(!isHopByHopGrpc("TE"));
+    try std.testing.expect(!isHopByHopGrpc("trailer"));
+    try std.testing.expect(!isHopByHopGrpc("Trailer"));
+    try std.testing.expect(isHopByHopGrpc("Connection"));
+    try std.testing.expect(isHopByHopGrpc("Keep-Alive"));
+    try std.testing.expect(isHopByHopGrpc("Transfer-Encoding"));
 }
 
 test "default configurations are valid" {

@@ -5,6 +5,7 @@ const request = @import("../protocol/request.zig");
 const response = @import("../response/response.zig");
 const buffer_pool = @import("../runtime/buffer_pool.zig");
 const auth_mod = @import("../middleware/auth.zig");
+const grpc_mod = @import("../middleware/grpc.zig");
 
 /// Request/Response Forwarding
 ///
@@ -100,10 +101,16 @@ pub fn buildUpstreamRequest(
         }
     }
 
-    // Forward non-hop-by-hop headers
+    // Forward non-hop-by-hop headers (gRPC requests preserve te/trailer)
+    const is_grpc = grpc_mod.isGrpcRequest(ctx.client_request.headers);
     for (ctx.client_request.headers) |hdr| {
         // Skip static hop-by-hop headers
-        if (upstream.isHopByHop(hdr.name)) continue;
+        if (if (is_grpc) upstream.isHopByHopGrpc(hdr.name) else upstream.isHopByHop(hdr.name)) continue;
+
+        // For gRPC: only forward "te: trailers", not other te values
+        if (is_grpc and std.ascii.eqlIgnoreCase(hdr.name, "te")) {
+            if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, hdr.value, " \t"), "trailers")) continue;
+        }
 
         // Skip dynamic hop-by-hop headers from Connection header
         var is_dynamic_hop = false;
@@ -261,9 +268,14 @@ pub fn buildUpstreamRequestHeaders(
         }
     }
 
-    // Forward non-hop-by-hop headers
+    // Forward non-hop-by-hop headers (gRPC requests preserve te/trailer)
+    const is_grpc_b = grpc_mod.isGrpcRequest(ctx.client_request.headers);
     for (ctx.client_request.headers) |hdr| {
-        if (upstream.isHopByHop(hdr.name)) continue;
+        if (if (is_grpc_b) upstream.isHopByHopGrpc(hdr.name) else upstream.isHopByHop(hdr.name)) continue;
+
+        if (is_grpc_b and std.ascii.eqlIgnoreCase(hdr.name, "te")) {
+            if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, hdr.value, " \t"), "trailers")) continue;
+        }
 
         var is_dynamic_hop = false;
         for (dynamic_hop_by_hop[0..dynamic_hop_count]) |dh| {
@@ -275,7 +287,6 @@ pub fn buildUpstreamRequestHeaders(
         if (is_dynamic_hop) continue;
         if (std.ascii.eqlIgnoreCase(hdr.name, "host")) continue;
         if (std.ascii.eqlIgnoreCase(hdr.name, "via")) continue;
-        // Skip Content-Length — we'll write our own based on body_len
         if (std.ascii.eqlIgnoreCase(hdr.name, "content-length")) continue;
 
         var should_remove = false;

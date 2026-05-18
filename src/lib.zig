@@ -107,6 +107,7 @@ pub const middleware = @import("middleware/middleware.zig");
 pub const auth = @import("middleware/auth.zig");
 pub const otel = @import("middleware/otel.zig");
 pub const body_schema = @import("middleware/body_schema.zig");
+pub const grpc = @import("middleware/grpc.zig");
 
 /// Runtime primitives: clock helpers, buffer pool, connection state.
 ///
