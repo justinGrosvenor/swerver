@@ -6,6 +6,7 @@ const auth_mod = @import("middleware/auth.zig");
 const ratelimit_mod = @import("middleware/ratelimit.zig");
 const cache_mod = @import("proxy/cache.zig");
 const dns_mod = @import("proxy/dns.zig");
+const body_schema_mod = @import("middleware/body_schema.zig");
 const clock = @import("runtime/clock.zig");
 
 /// Config file schema version. Bump the minor component when fields are
@@ -315,6 +316,13 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
             traffic_split = targets;
         }
 
+        var route_body_schema: ?*const body_schema_mod.Schema = null;
+        if (r.body_schema) |bs_val| {
+            const schema_ptr = try alloc.create(body_schema_mod.Schema);
+            schema_ptr.* = body_schema_mod.parseSchema(alloc, bs_val) catch return error.ConfigParseError;
+            route_body_schema = schema_ptr;
+        }
+
         routes_out[ri] = .{
             .path_prefix = r.path_prefix,
             .host = r.host,
@@ -331,6 +339,7 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
             .rate_limit = route_rate_limit,
             .traffic_split = traffic_split,
             .cache = route_cache,
+            .body_schema = route_body_schema,
         };
     }
 
@@ -605,6 +614,7 @@ const RouteJson = struct {
     rate_limit: ?RateLimitJson = null,
     traffic_split: ?[]const TrafficSplitJson = null,
     cache: ?CacheJson = null,
+    body_schema: ?std.json.Value = null,
 };
 
 const CacheJson = struct {
@@ -901,6 +911,35 @@ test "parse otel config" {
     try std.testing.expectEqual(@as(u32, 10), loaded.server_config.otel.flush_interval_s);
     try std.testing.expectEqual(@as(u16, 50), loaded.server_config.otel.sample_rate);
     try std.testing.expectEqual(@as(u16, 128), loaded.server_config.otel.max_batch_size);
+}
+
+test "parse route with body_schema" {
+    const json =
+        \\{
+        \\  "upstreams": [
+        \\    { "name": "api", "servers": [{ "address": "10.0.0.1", "port": 8080 }] }
+        \\  ],
+        \\  "routes": [{
+        \\    "path_prefix": "/api/",
+        \\    "upstream": "api",
+        \\    "body_schema": {
+        \\      "type": "object",
+        \\      "required": ["name", "email"],
+        \\      "properties": {
+        \\        "name": { "type": "string", "minLength": 1, "maxLength": 100 },
+        \\        "age": { "type": "integer", "minimum": 0, "maximum": 150 }
+        \\      }
+        \\    }
+        \\  }]
+        \\}
+    ;
+    var loaded = try parseJsonFromBytes(std.testing.allocator, json);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), loaded.routes.len);
+    const schema = loaded.routes[0].body_schema orelse return error.MissingSchema;
+    try std.testing.expect(schema.schema_type == .object);
+    try std.testing.expectEqual(@as(usize, 2), schema.required.len);
+    try std.testing.expectEqual(@as(usize, 2), schema.properties.len);
 }
 
 test "traffic_split rejects unknown upstream" {

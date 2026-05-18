@@ -48,6 +48,7 @@ const preencoded = @import("preencoded.zig");
 const write_queue = @import("write_queue.zig");
 const cache_mod = @import("../proxy/cache.zig");
 const otel_mod = @import("../middleware/otel.zig");
+const body_schema = @import("../middleware/body_schema.zig");
 
 pub const connection_close_hdr = "Connection: close\r\n";
 pub const date_prefix = "Date: ";
@@ -972,6 +973,24 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
                     return;
                 }
             }
+            if (matched_route.body_schema) |route_schema| {
+                if (!accum.discard_body and body_view.totalLen() > 0 and body_view.totalLen() <= 1024 * 1024) {
+                    const vr = validateBodyAgainstSchema(route_schema, &body_view);
+                    if (!vr.valid) {
+                        var err_buf: [1024]u8 = undefined;
+                        const err_json = body_schema.formatErrorResponse(&vr, &err_buf);
+                        cleanupBodyAccumulation(server, conn);
+                        const json_ct = [_]response_mod.Header{.{ .name = "Content-Type", .value = "application/json" }};
+                        const resp = response_mod.Response{
+                            .status = 400,
+                            .headers = &json_ct,
+                            .body = .{ .bytes = err_json },
+                        };
+                        queueResponse(server, conn, resp) catch {};
+                        return;
+                    }
+                }
+            }
             var mw_ctx = middleware.Context{
                 .protocol = .http1,
                 .buffer_ops = .{
@@ -1221,4 +1240,28 @@ pub fn abortBodyAccumulation(server: *Server, conn: *connection.Connection, stat
         .body = .{ .bytes = if (status == 413) "Payload Too Large\n" else "Bad Request\n" },
     };
     queueResponse(server, conn, resp) catch {};
+}
+
+fn validateBodyAgainstSchema(schema: *const body_schema.Schema, bv: *const forward_mod.BodyView) body_schema.ValidationResult {
+    switch (bv.*) {
+        .slice => |s| return body_schema.validate(schema, s),
+        .buffers => |b| {
+            if (b.handles.len == 1) {
+                return body_schema.validate(schema, b.handles[0].bytes[0..b.last_buf_len]);
+            }
+            var flat: [1024 * 1024]u8 = undefined;
+            if (b.total_len > flat.len) {
+                var r = body_schema.ValidationResult{};
+                r.valid = true;
+                return r;
+            }
+            var pos: usize = 0;
+            for (b.handles, 0..) |handle, i| {
+                const len = if (i == b.handles.len - 1) b.last_buf_len else b.buffer_size;
+                @memcpy(flat[pos..][0..len], handle.bytes[0..len]);
+                pos += len;
+            }
+            return body_schema.validate(schema, flat[0..pos]);
+        },
+    }
 }

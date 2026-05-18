@@ -3,6 +3,7 @@ const auth = @import("../middleware/auth.zig");
 const ratelimit = @import("../middleware/ratelimit.zig");
 const cache_mod = @import("cache.zig");
 const dns_mod = @import("dns.zig");
+const body_schema = @import("../middleware/body_schema.zig");
 
 /// Upstream Configuration
 ///
@@ -119,6 +120,8 @@ pub const ProxyRoute = struct {
     traffic_split: ?[]const TrafficTarget = null,
     /// Per-route response caching configuration.
     cache: ?cache_mod.CacheConfig = null,
+    /// Per-route request body JSON schema validation.
+    body_schema: ?*const body_schema.Schema = null,
 
     /// Resolve the upstream name, applying traffic split if configured.
     pub fn selectUpstream(self: *const ProxyRoute) []const u8 {
