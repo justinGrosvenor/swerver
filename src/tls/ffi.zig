@@ -108,6 +108,40 @@ pub const SSL_CTRL_SET_TLSEXT_SERVERNAME_ARG: c_int = 54;
 pub const TLSEXT_NAMETYPE_host_name: c_int = 0;
 pub const SSL_TLSEXT_ERR_OK_NOACK: c_int = 0;
 
+// mTLS (mutual TLS)
+pub const SSL_VERIFY_NONE: c_int = 0x00;
+pub const SSL_VERIFY_PEER: c_int = 0x01;
+pub const SSL_VERIFY_FAIL_IF_NO_PEER_CERT: c_int = 0x02;
+
+pub const X509_NAME = opaque {};
+
+extern fn SSL_CTX_set_verify(ctx: *SSL_CTX, mode: c_int, callback: ?*const anyopaque) void;
+extern fn SSL_CTX_load_verify_locations(ctx: *SSL_CTX, ca_file: ?[*:0]const u8, ca_path: ?[*:0]const u8) c_int;
+extern fn SSL_get1_peer_certificate(ssl: *const SSL) ?*X509;
+extern fn X509_get_subject_name(x: *const X509) ?*X509_NAME;
+extern fn X509_NAME_oneline(name: *const X509_NAME, buf: ?[*]u8, size: c_int) ?[*:0]const u8;
+pub extern fn X509_free(x: *X509) void;
+
+pub fn setVerifyPeer(ctx: *SSL_CTX, require: bool) void {
+    if (!tls_enabled) return;
+    const mode = if (require) SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT else SSL_VERIFY_PEER;
+    SSL_CTX_set_verify(ctx, mode, null);
+}
+
+pub fn loadCaCert(ctx: *SSL_CTX, ca_path: [:0]const u8) !void {
+    if (!tls_enabled) return error.TlsNotAvailable;
+    if (SSL_CTX_load_verify_locations(ctx, ca_path.ptr, null) != 1) return error.CaCertLoadFailed;
+}
+
+pub fn getPeerCertSubject(ssl: *const SSL, buf: []u8) ?[]const u8 {
+    if (!tls_enabled) return null;
+    const cert = SSL_get1_peer_certificate(ssl) orelse return null;
+    defer X509_free(cert);
+    const name = X509_get_subject_name(cert) orelse return null;
+    const result = X509_NAME_oneline(name, buf.ptr, @intCast(buf.len)) orelse return null;
+    return std.mem.sliceTo(result, 0);
+}
+
 pub extern fn SSL_new(ctx: *SSL_CTX) ?*SSL;
 pub extern fn SSL_free(ssl: *SSL) void;
 extern fn SSL_set_accept_state(ssl: *SSL) void;

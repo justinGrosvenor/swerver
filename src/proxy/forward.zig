@@ -32,6 +32,8 @@ pub const ForwardContext = struct {
     response_buf: []u8,
     /// Auth-injected headers to add to upstream request
     auth_headers: []const auth_mod.InjectedHeader = &.{},
+    /// Client certificate subject DN (mTLS), e.g. "/CN=myservice/O=MyOrg"
+    client_cert_dn: ?[]const u8 = null,
 };
 
 /// Result of forwarding a request
@@ -377,6 +379,13 @@ fn addProxyHeaders(buf: []u8, start_pos: usize, ctx: *const ForwardContext) !usi
         }
     } else {
         pos += (std.fmt.bufPrint(buf[pos..], "Via: 1.1 swerver\r\n", .{}) catch return error.BufferFull).len;
+    }
+
+    // X-Client-Cert-DN (mTLS: client certificate subject)
+    if (ctx.client_cert_dn) |dn| {
+        if (isSafeHeaderValue(dn)) {
+            pos += (std.fmt.bufPrint(buf[pos..], "X-Client-Cert-DN: {s}\r\n", .{dn}) catch return error.BufferFull).len;
+        }
     }
 
     return pos;

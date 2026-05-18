@@ -210,11 +210,16 @@ pub const Server = struct {
                     .key_path = c.key_path,
                 };
             }
-            break :blk tls.Provider.initTcpSni(
+            const mtls_cfg: ?tls.Provider.MtlsConfig = if (cfg.tls.client_ca_path.len > 0) .{
+                .ca_path = cfg.tls.client_ca_path,
+                .require = cfg.tls.client_cert_required,
+            } else null;
+            break :blk tls.Provider.initTcpSniMtls(
                 allocator,
                 cfg.tls.cert_path,
                 cfg.tls.key_path,
                 cert_entries[0..n],
+                mtls_cfg,
             ) catch |err| {
                 std.log.err("TLS init failed: {}", .{err});
                 return error.TlsInitFailed;

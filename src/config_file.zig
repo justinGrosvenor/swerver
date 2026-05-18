@@ -122,6 +122,8 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
     if (file_cfg.tls) |t| {
         if (t.cert_path) |c| cfg.tls.cert_path = c;
         if (t.key_path) |k| cfg.tls.key_path = k;
+        if (t.client_ca_path) |v| cfg.tls.client_ca_path = v;
+        if (t.client_cert_required) |v| cfg.tls.client_cert_required = v;
         if (t.certificates) |json_certs| {
             const certs = try alloc.alloc(config_mod.TlsCertificate, json_certs.len);
             for (json_certs, 0..) |jc, ci| {
@@ -451,6 +453,8 @@ const TlsJson = struct {
     cert_path: ?[:0]const u8 = null,
     key_path: ?[:0]const u8 = null,
     certificates: ?[]const TlsCertJson = null,
+    client_ca_path: ?[:0]const u8 = null,
+    client_cert_required: ?bool = null,
 };
 
 const TlsCertJson = struct {

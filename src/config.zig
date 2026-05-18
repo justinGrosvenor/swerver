@@ -161,6 +161,10 @@ pub const TlsConfig = struct {
     key_path: [:0]const u8 = "",
     /// Additional certificates for SNI-based routing (optional)
     certificates: []const TlsCertificate = &.{},
+    /// mTLS: path to CA certificate for client verification (empty = no mTLS)
+    client_ca_path: [:0]const u8 = "",
+    /// mTLS: require client certificate (vs optional verification)
+    client_cert_required: bool = true,
 };
 
 pub const QuicConfig = struct {

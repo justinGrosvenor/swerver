@@ -263,6 +263,7 @@ pub const Proxy = struct {
         client_tls: bool,
         now_ms: u64,
         auth_info: ?*const auth_mod.AuthInfo,
+        client_cert_dn: ?[]const u8,
     ) ProxyResult {
         _ = mw_ctx;
 
@@ -395,6 +396,7 @@ pub const Proxy = struct {
                     .request_buf = &self.request_bufs[req_buf_idx],
                     .response_buf = &self.response_bufs[resp_buf_idx],
                     .auth_headers = if (auth_info) |ai| ai.headers() else &.{},
+                    .client_cert_dn = client_cert_dn,
                 };
 
                 const request_len = forward.buildUpstreamRequest(&self.request_bufs[req_buf_idx], &ctx) catch {
@@ -499,6 +501,7 @@ pub const Proxy = struct {
         client_tls: bool,
         now_ms: u64,
         auth_info: ?*const auth_mod.AuthInfo,
+        client_cert_dn: ?[]const u8,
     ) ProxyResult {
         _ = mw_ctx;
 
@@ -622,6 +625,7 @@ pub const Proxy = struct {
                     .request_buf = &self.request_bufs[req_buf_idx],
                     .response_buf = &self.response_bufs[resp_buf_idx],
                     .auth_headers = if (auth_info) |ai| ai.headers() else &.{},
+                    .client_cert_dn = client_cert_dn,
                 };
 
                 const header_len = forward.buildUpstreamRequestHeaders(&self.request_bufs[req_buf_idx], &ctx, body_len) catch {

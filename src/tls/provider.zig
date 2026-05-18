@@ -116,20 +116,43 @@ pub const Provider = struct {
         key_path: [:0]const u8,
     };
 
+    pub const MtlsConfig = struct {
+        ca_path: [:0]const u8 = "",
+        require: bool = true,
+    };
+
     /// Initialize a TLS provider with SNI support for multiple certificates.
     /// The first cert_path/key_path is the default (used when no SNI match).
     /// Additional certificates are routed via SNI hostname matching.
+    /// Optional mTLS configuration enables client certificate verification.
     pub fn initTcpSni(
         allocator: std.mem.Allocator,
         default_cert: [:0]const u8,
         default_key: [:0]const u8,
         extra_certs: []const CertEntry,
     ) Error!Provider {
+        return initTcpSniMtls(allocator, default_cert, default_key, extra_certs, null);
+    }
+
+    pub fn initTcpSniMtls(
+        allocator: std.mem.Allocator,
+        default_cert: [:0]const u8,
+        default_key: [:0]const u8,
+        extra_certs: []const CertEntry,
+        mtls: ?MtlsConfig,
+    ) Error!Provider {
         const default_ctx = ffi.createTcpContext(true) catch return error.ContextCreationFailed;
         errdefer ffi.freeContext(default_ctx);
 
         ffi.loadCertificateChain(default_ctx, default_cert) catch return error.CertificateLoadFailed;
         ffi.loadPrivateKey(default_ctx, default_key) catch return error.PrivateKeyLoadFailed;
+
+        if (mtls) |m| {
+            if (m.ca_path.len > 0) {
+                ffi.loadCaCert(default_ctx, m.ca_path) catch return error.CertificateLoadFailed;
+                ffi.setVerifyPeer(default_ctx, m.require);
+            }
+        }
 
         if (extra_certs.len == 0) {
             return .{ .ctx = default_ctx, .allocator = allocator };
@@ -152,6 +175,13 @@ pub const Provider = struct {
 
             ffi.loadCertificateChain(ctx, cert.cert_path) catch return error.CertificateLoadFailed;
             ffi.loadPrivateKey(ctx, cert.key_path) catch return error.PrivateKeyLoadFailed;
+
+            if (mtls) |m| {
+                if (m.ca_path.len > 0) {
+                    ffi.loadCaCert(ctx, m.ca_path) catch return error.CertificateLoadFailed;
+                    ffi.setVerifyPeer(ctx, m.require);
+                }
+            }
 
             for (cert.hostnames) |hostname| {
                 if (store.count >= MAX_SNI_ENTRIES) break;
@@ -409,6 +439,10 @@ pub const Session = struct {
     /// Get the negotiated ALPN protocol (should be "h3" for HTTP/3).
     pub fn getAlpn(self: *const Session) ?[]const u8 {
         return ffi.getSelectedAlpn(self.ssl);
+    }
+
+    pub fn getPeerCertSubject(self: *const Session, buf: []u8) ?[]const u8 {
+        return ffi.getPeerCertSubject(self.ssl, buf);
     }
 
     /// Export keying material for QUIC packet protection.

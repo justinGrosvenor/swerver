@@ -984,14 +984,17 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
                 const ip_len = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ ip4[0], ip4[1], ip4[2], ip4[3] }) catch "";
                 if (ip_len.len > 0) client_ip_str = ip_buf[0..ip_len.len];
             }
+            var cert_dn_buf: [256]u8 = undefined;
+            const cert_dn: ?[]const u8 = if (conn.tls_session) |*session| session.getPeerCertSubject(&cert_dn_buf) else null;
             var proxy_result = proxy.handleWithBody(
                 hparse.view,
                 body_view,
                 &mw_ctx,
                 client_ip_str,
-                false,
+                conn.tls_session != null,
                 server.io.nowMs(),
                 auth_info_ptr,
+                cert_dn,
             );
             defer proxy_result.release();
 
