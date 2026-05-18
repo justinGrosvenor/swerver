@@ -926,15 +926,17 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
     const hparse = accum.header_result;
     _ = conn.fd orelse return;
 
-    // Build BodyView from accumulated buffers
-    const body_view = forward_mod.BodyView{
-        .buffers = .{
+    // Build BodyView from accumulated buffers.
+    // Discard mode has no buffered body data — use empty slice for proxy path.
+    const body_view: forward_mod.BodyView = if (accum.discard_body)
+        .{ .slice = "" }
+    else
+        .{ .buffers = .{
             .handles = accum.body_buffers[0..accum.buffer_count],
             .last_buf_len = accum.current_buf_offset,
             .total_len = accum.bytes_decoded,
             .buffer_size = server.io.bodyBufferSize(),
-        },
-    };
+        } };
 
     // Check proxy routes first
     if (server.proxy) |proxy| {

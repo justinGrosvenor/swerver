@@ -136,9 +136,9 @@ pub fn buildUpstreamRequest(
         pos += (std.fmt.bufPrint(buf[pos..], "{s}: {s}\r\n", .{ hdr.name, hdr.value }) catch return error.BufferFull).len;
     }
 
-    // Auth-injected identity headers
-    for (ctx.auth_headers) |hdr| {
-        pos += (std.fmt.bufPrint(buf[pos..], "{s}: {s}\r\n", .{ hdr.name, hdr.value }) catch return error.BufferFull).len;
+    // Auth-injected identity headers (values owned by AuthInfo inline buffers)
+    for (ctx.auth_headers) |*hdr| {
+        pos += (std.fmt.bufPrint(buf[pos..], "{s}: {s}\r\n", .{ hdr.name, hdr.value() }) catch return error.BufferFull).len;
     }
 
     // Add proxy headers if enabled
@@ -293,9 +293,9 @@ pub fn buildUpstreamRequestHeaders(
         pos += (std.fmt.bufPrint(buf[pos..], "{s}: {s}\r\n", .{ hdr.name, hdr.value }) catch return error.BufferFull).len;
     }
 
-    // Auth-injected identity headers
-    for (ctx.auth_headers) |hdr| {
-        pos += (std.fmt.bufPrint(buf[pos..], "{s}: {s}\r\n", .{ hdr.name, hdr.value }) catch return error.BufferFull).len;
+    // Auth-injected identity headers (values owned by AuthInfo inline buffers)
+    for (ctx.auth_headers) |*hdr| {
+        pos += (std.fmt.bufPrint(buf[pos..], "{s}: {s}\r\n", .{ hdr.name, hdr.value() }) catch return error.BufferFull).len;
     }
 
     // Add proxy headers if enabled
