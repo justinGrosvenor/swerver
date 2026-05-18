@@ -121,6 +121,8 @@ pub const Server = struct {
     quic: ?quic_handler.Handler,
     /// Reverse proxy handler (null if proxy not configured)
     proxy: ?*proxy_mod.Proxy = null,
+    /// Admin API listener (null if admin API not enabled)
+    admin_listener_fd: ?std.posix.fd_t = null,
     /// Config file path for hot reload (null if not using config file)
     config_path: ?[]const u8 = null,
     /// Arena owning the route/upstream string data from the last config reload.
@@ -312,6 +314,7 @@ pub const Server = struct {
         if (self.listener_fd) |fd| clock.closeFd(fd);
         if (self.udp_fd) |fd| clock.closeFd(fd);
         if (self.static_root_fd) |fd| clock.closeFd(fd);
+        if (self.admin_listener_fd) |fd| clock.closeFd(fd);
         if (self.quic) |*q| q.deinit();
         if (self.reload_arena) |*a| a.deinit();
         self.io.deinit();

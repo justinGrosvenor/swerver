@@ -12,6 +12,7 @@ pub const ServerConfig = struct {
     http2: Http2Config,
     tls: TlsConfig,
     quic: QuicConfig,
+    admin: AdminConfig,
     /// Root directory for static file serving. Empty means disabled.
     static_root: []const u8,
     /// Allowed Host header values. Empty slice means all hosts are accepted.
@@ -40,6 +41,7 @@ pub const ServerConfig = struct {
             .http2 = .{},
             .tls = .{},
             .quic = .{},
+            .admin = .{},
             .static_root = "",
             .allowed_hosts = &.{},
             .workers = 1,
@@ -185,6 +187,12 @@ pub const QuicConfig = struct {
         if (!self.enabled) return "";
         return std.fmt.bufPrint(buf, "h3=\":{d}\"; ma={d}", .{ self.port, self.alt_svc_max_age }) catch return error.BufferTooSmall;
     }
+};
+
+pub const AdminConfig = struct {
+    enabled: bool = false,
+    port: u16 = 9180,
+    api_key: []const u8 = "",
 };
 
 pub const ConfigError = error{

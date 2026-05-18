@@ -130,6 +130,9 @@ pub const proxy = struct {
     pub const websocket = @import("proxy/websocket.zig");
 };
 
+/// Admin API for runtime route/upstream management
+pub const admin = @import("admin/admin.zig");
+
 /// Benchmark route handlers (HttpArena / TechEmpower). **Not part of
 /// the stable API** — this namespace exists so benchmark-oriented
 /// consumers (the bundled `src/main.zig` binary, `examples/httparena/`,

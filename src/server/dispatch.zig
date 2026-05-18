@@ -46,6 +46,7 @@ const http3_mod = @import("http3.zig");
 const preencoded = @import("preencoded.zig");
 const server_tls = @import("tls.zig");
 const write_queue = @import("write_queue.zig");
+const admin_mod = @import("../admin/admin.zig");
 
 /// Global shutdown flag set by signal handler (atomic for signal safety)
 var shutdown_requested = std.atomic.Value(bool).init(false);
@@ -117,6 +118,16 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
             };
         }
     }
+    // Bind admin API listener if enabled
+    if (server.cfg.admin.enabled and server.admin_listener_fd == null) {
+        if (admin_mod.bindAdminSocket(server.cfg.address, server.cfg.admin.port)) |fd| {
+            server.admin_listener_fd = fd;
+            std.log.info("Admin API listening on :{d}", .{server.cfg.admin.port});
+        } else |err| {
+            std.log.warn("Admin API: failed to bind port {}: {}", .{ server.cfg.admin.port, err });
+        }
+    }
+
     const deadline = if (run_for_ms) |ms| server.io.nowMs() + ms else null;
     var last_housekeeping_ms: u64 = server.io.nowMs();
     while (true) {
@@ -158,6 +169,8 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
             if (server.proxy) |proxy| {
                 proxy.runMaintenance(now_ms);
             }
+            // Poll admin API (non-blocking accept + handle)
+            admin_mod.pollAdmin(server);
         }
         if (events.len == 0) continue;
         for (events) |event| {

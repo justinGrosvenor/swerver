@@ -154,6 +154,13 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
         if (q.max_streams_uni) |v| cfg.quic.max_streams_uni = v;
     }
 
+    // Admin API
+    if (file_cfg.admin) |a| {
+        if (a.enabled) |v| cfg.admin.enabled = v;
+        if (a.port) |v| cfg.admin.port = v;
+        if (a.api_key) |v| cfg.admin.api_key = v;
+    }
+
     // x402
     if (file_cfg.x402) |x| {
         if (x.enabled) |v| cfg.x402.enabled = v;
@@ -405,6 +412,7 @@ const FileConfig = struct {
     http2: ?Http2Json = null,
     quic: ?QuicJson = null,
     x402: ?X402Json = null,
+    admin: ?AdminJson = null,
     upstreams: ?[]const UpstreamJson = null,
     routes: ?[]const RouteJson = null,
 };
@@ -472,6 +480,12 @@ const X402Json = struct {
     enabled: ?bool = null,
     facilitator_url: ?[]const u8 = null,
     facilitator_timeout_ms: ?u32 = null,
+};
+
+const AdminJson = struct {
+    enabled: ?bool = null,
+    port: ?u16 = null,
+    api_key: ?[]const u8 = null,
 };
 
 const RouteX402Json = struct {
