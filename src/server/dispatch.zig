@@ -663,7 +663,8 @@ pub fn handleRead(server: *Server, index: u32) !void {
                         continue;
                     },
                 }
-                switch (auth_mod.evaluate(parse.view, matched_route.auth)) {
+                const auth_result = auth_mod.evaluate(parse.view, matched_route.auth);
+                switch (auth_result) {
                     .allow => {},
                     .reject => |resp| {
                         try http1_mod.queueResponse(server, conn, resp);
@@ -671,6 +672,10 @@ pub fn handleRead(server: *Server, index: u32) !void {
                         continue;
                     },
                 }
+                const auth_info_ptr: ?*const auth_mod.AuthInfo = switch (auth_result) {
+                    .allow => |*info| info,
+                    .reject => null,
+                };
                 var mw_ctx = middleware.Context{
                     .protocol = .http1,
                     .buffer_ops = .{
@@ -690,8 +695,9 @@ pub fn handleRead(server: *Server, index: u32) !void {
                     parse.view,
                     &mw_ctx,
                     client_ip_str,
-                    false, // HTTP/1.1 listener is non-TLS; QUIC/HTTP3 connections don't use this proxy path
+                    false,
                     server.io.nowMs(),
+                    auth_info_ptr,
                 );
                 defer proxy_result.release();
 

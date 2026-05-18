@@ -939,7 +939,8 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
     // Check proxy routes first
     if (server.proxy) |proxy| {
         if (proxy.matchRoute(&hparse.view)) |matched_route| {
-            switch (auth_mod.evaluate(hparse.view, matched_route.auth)) {
+            const auth_result = auth_mod.evaluate(hparse.view, matched_route.auth);
+            switch (auth_result) {
                 .allow => {},
                 .reject => |resp| {
                     cleanupBodyAccumulation(server, conn);
@@ -947,6 +948,10 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
                     return;
                 },
             }
+            const auth_info_ptr: ?*const auth_mod.AuthInfo = switch (auth_result) {
+                .allow => |*info| info,
+                .reject => null,
+            };
             var mw_ctx = middleware.Context{
                 .protocol = .http1,
                 .buffer_ops = .{
@@ -968,6 +973,7 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
                 client_ip_str,
                 false,
                 server.io.nowMs(),
+                auth_info_ptr,
             );
             defer proxy_result.release();
 

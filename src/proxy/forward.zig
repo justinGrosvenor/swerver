@@ -4,6 +4,7 @@ const pool_mod = @import("pool.zig");
 const request = @import("../protocol/request.zig");
 const response = @import("../response/response.zig");
 const buffer_pool = @import("../runtime/buffer_pool.zig");
+const auth_mod = @import("../middleware/auth.zig");
 
 /// Request/Response Forwarding
 ///
@@ -29,6 +30,8 @@ pub const ForwardContext = struct {
     request_buf: []u8,
     /// Buffer for reading upstream response
     response_buf: []u8,
+    /// Auth-injected headers to add to upstream request
+    auth_headers: []const auth_mod.InjectedHeader = &.{},
 };
 
 /// Result of forwarding a request
@@ -130,6 +133,11 @@ pub fn buildUpstreamRequest(
 
     // Add configured request headers
     for (ctx.route.headers.set_request) |hdr| {
+        pos += (std.fmt.bufPrint(buf[pos..], "{s}: {s}\r\n", .{ hdr.name, hdr.value }) catch return error.BufferFull).len;
+    }
+
+    // Auth-injected identity headers
+    for (ctx.auth_headers) |hdr| {
         pos += (std.fmt.bufPrint(buf[pos..], "{s}: {s}\r\n", .{ hdr.name, hdr.value }) catch return error.BufferFull).len;
     }
 
@@ -282,6 +290,11 @@ pub fn buildUpstreamRequestHeaders(
 
     // Add configured request headers
     for (ctx.route.headers.set_request) |hdr| {
+        pos += (std.fmt.bufPrint(buf[pos..], "{s}: {s}\r\n", .{ hdr.name, hdr.value }) catch return error.BufferFull).len;
+    }
+
+    // Auth-injected identity headers
+    for (ctx.auth_headers) |hdr| {
         pos += (std.fmt.bufPrint(buf[pos..], "{s}: {s}\r\n", .{ hdr.name, hdr.value }) catch return error.BufferFull).len;
     }
 

@@ -7,6 +7,7 @@ const health = @import("health.zig");
 const request = @import("../protocol/request.zig");
 const response = @import("../response/response.zig");
 const middleware = @import("../middleware/middleware.zig");
+const auth_mod = @import("../middleware/auth.zig");
 const x402 = @import("../middleware/x402.zig");
 const net = @import("../runtime/net.zig");
 const clock = @import("../runtime/clock.zig");
@@ -261,6 +262,7 @@ pub const Proxy = struct {
         client_ip: ?[]const u8,
         client_tls: bool,
         now_ms: u64,
+        auth_info: ?*const auth_mod.AuthInfo,
     ) ProxyResult {
         _ = mw_ctx;
 
@@ -390,6 +392,7 @@ pub const Proxy = struct {
                     .upstream_conn = c,
                     .request_buf = &self.request_bufs[req_buf_idx],
                     .response_buf = &self.response_bufs[resp_buf_idx],
+                    .auth_headers = if (auth_info) |ai| ai.headers() else &.{},
                 };
 
                 const request_len = forward.buildUpstreamRequest(&self.request_bufs[req_buf_idx], &ctx) catch {
@@ -493,6 +496,7 @@ pub const Proxy = struct {
         client_ip: ?[]const u8,
         client_tls: bool,
         now_ms: u64,
+        auth_info: ?*const auth_mod.AuthInfo,
     ) ProxyResult {
         _ = mw_ctx;
 
@@ -613,6 +617,7 @@ pub const Proxy = struct {
                     .upstream_conn = c,
                     .request_buf = &self.request_bufs[req_buf_idx],
                     .response_buf = &self.response_bufs[resp_buf_idx],
+                    .auth_headers = if (auth_info) |ai| ai.headers() else &.{},
                 };
 
                 const header_len = forward.buildUpstreamRequestHeaders(&self.request_bufs[req_buf_idx], &ctx, body_len) catch {

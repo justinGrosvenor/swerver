@@ -230,26 +230,7 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
 
         var route_auth: auth_mod.AuthMethod = .none;
         if (r.auth) |a| {
-            if (std.mem.eql(u8, a.type, "api_key")) {
-                const json_keys = a.keys orelse return error.ConfigParseError;
-                const keys_out = try alloc.alloc(auth_mod.ApiKey, json_keys.len);
-                for (json_keys, 0..) |k, ki| {
-                    keys_out[ki] = .{ .key = k.key, .name = k.name };
-                }
-                route_auth = .{ .api_key = .{
-                    .keys = keys_out,
-                    .header_name = a.header_name orelse "X-API-Key",
-                    .query_param = a.query_param orelse "api_key",
-                } };
-            } else if (std.mem.eql(u8, a.type, "jwt")) {
-                route_auth = .{ .jwt = .{
-                    .secret = a.secret orelse return error.ConfigParseError,
-                    .issuer = a.issuer,
-                    .audience = a.audience,
-                } };
-            } else {
-                return error.ConfigParseError;
-            }
+            route_auth = try parseAuthMethod(alloc, a);
         }
 
         routes_out[ri] = .{
@@ -289,6 +270,56 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
         .routes = routes_out,
         .arena = arena,
     };
+}
+
+fn parseAuthMethod(alloc: std.mem.Allocator, a: RouteAuthJson) !auth_mod.AuthMethod {
+    if (std.mem.eql(u8, a.type, "api_key")) {
+        const json_keys = a.keys orelse return error.ConfigParseError;
+        const keys_out = try alloc.alloc(auth_mod.ApiKey, json_keys.len);
+        for (json_keys, 0..) |k, ki| {
+            keys_out[ki] = .{ .key = k.key, .name = k.name };
+        }
+        return .{ .api_key = .{
+            .keys = keys_out,
+            .header_name = a.header_name orelse "X-API-Key",
+            .query_param = a.query_param orelse "api_key",
+        } };
+    } else if (std.mem.eql(u8, a.type, "jwt")) {
+        var claims_to_headers: []const auth_mod.ClaimHeader = &.{};
+        if (a.claims_to_headers) |json_mappings| {
+            const mappings = try alloc.alloc(auth_mod.ClaimHeader, json_mappings.len);
+            for (json_mappings, 0..) |m, mi| {
+                mappings[mi] = .{ .claim = m.claim, .header = m.header };
+            }
+            claims_to_headers = mappings;
+        }
+        return .{ .jwt = .{
+            .secret = a.secret orelse return error.ConfigParseError,
+            .issuer = a.issuer,
+            .audience = a.audience,
+            .claims_to_headers = claims_to_headers,
+        } };
+    } else if (std.mem.eql(u8, a.type, "anonymous")) {
+        return .{ .anonymous = .{
+            .subject = a.subject orelse "anonymous",
+        } };
+    } else if (std.mem.eql(u8, a.type, "forward_auth")) {
+        return .{ .forward_auth = .{
+            .url = a.url orelse return error.ConfigParseError,
+            .headers_forward = a.headers_forward orelse &.{},
+            .headers_upstream = a.headers_upstream orelse &.{},
+            .timeout_ms = a.timeout_ms orelse 5000,
+        } };
+    } else if (std.mem.eql(u8, a.type, "chain")) {
+        const json_methods = a.methods orelse return error.ConfigParseError;
+        const methods = try alloc.alloc(auth_mod.AuthMethod, json_methods.len);
+        for (json_methods, 0..) |m, mi| {
+            methods[mi] = try parseAuthMethod(alloc, m);
+        }
+        return .{ .chain = .{ .methods = methods } };
+    } else {
+        return error.ConfigParseError;
+    }
 }
 
 /// Validate that a string contains no control characters (CR, LF, null)
@@ -448,11 +479,26 @@ const RouteAuthJson = struct {
     algorithm: ?[]const u8 = null,
     issuer: ?[]const u8 = null,
     audience: ?[]const u8 = null,
+    claims_to_headers: ?[]const ClaimHeaderJson = null,
+    // anonymous
+    subject: ?[]const u8 = null,
+    // forward_auth
+    url: ?[]const u8 = null,
+    headers_forward: ?[]const []const u8 = null,
+    headers_upstream: ?[]const []const u8 = null,
+    timeout_ms: ?u32 = null,
+    // chain
+    methods: ?[]const RouteAuthJson = null,
 };
 
 const ApiKeyJson = struct {
     key: []const u8,
     name: []const u8,
+};
+
+const ClaimHeaderJson = struct {
+    claim: []const u8,
+    header: []const u8,
 };
 
 // Tests
