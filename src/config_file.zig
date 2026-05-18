@@ -172,6 +172,16 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
         if (x.facilitator_timeout_ms) |v| cfg.x402.facilitator_timeout_ms = v;
     }
 
+    // OpenTelemetry
+    if (file_cfg.otel) |o| {
+        if (o.enabled) |v| cfg.otel.enabled = v;
+        if (o.collector_url) |v| cfg.otel.collector_url = v;
+        if (o.service_name) |v| cfg.otel.service_name = v;
+        if (o.flush_interval_s) |v| cfg.otel.flush_interval_s = v;
+        if (o.sample_rate) |v| cfg.otel.sample_rate = v;
+        if (o.max_batch_size) |v| cfg.otel.max_batch_size = v;
+    }
+
     // Upstreams
     const upstream_defs = file_cfg.upstreams orelse &[_]UpstreamJson{};
     const upstreams_out = try alloc.alloc(upstream_mod.Upstream, upstream_defs.len);
@@ -443,6 +453,7 @@ const FileConfig = struct {
     quic: ?QuicJson = null,
     x402: ?X402Json = null,
     admin: ?AdminJson = null,
+    otel: ?OtelJson = null,
     upstreams: ?[]const UpstreamJson = null,
     routes: ?[]const RouteJson = null,
 };
@@ -518,6 +529,15 @@ const AdminJson = struct {
     enabled: ?bool = null,
     port: ?u16 = null,
     api_key: ?[]const u8 = null,
+};
+
+const OtelJson = struct {
+    enabled: ?bool = null,
+    collector_url: ?[]const u8 = null,
+    service_name: ?[]const u8 = null,
+    flush_interval_s: ?u32 = null,
+    sample_rate: ?u16 = null,
+    max_batch_size: ?u16 = null,
 };
 
 const RouteX402Json = struct {
@@ -858,6 +878,29 @@ test "parse upstream with dns_discovery" {
     try std.testing.expectEqualStrings("api.internal.svc.cluster.local", dd.hostname);
     try std.testing.expectEqual(@as(u16, 8080), dd.port);
     try std.testing.expectEqual(@as(u32, 15), dd.interval_s);
+}
+
+test "parse otel config" {
+    const json =
+        \\{
+        \\  "otel": {
+        \\    "enabled": true,
+        \\    "collector_url": "http://otel.internal:4318",
+        \\    "service_name": "my-gateway",
+        \\    "flush_interval_s": 10,
+        \\    "sample_rate": 50,
+        \\    "max_batch_size": 128
+        \\  }
+        \\}
+    ;
+    var loaded = try parseJsonFromBytes(std.testing.allocator, json);
+    defer loaded.deinit();
+    try std.testing.expect(loaded.server_config.otel.enabled);
+    try std.testing.expectEqualStrings("http://otel.internal:4318", loaded.server_config.otel.collector_url);
+    try std.testing.expectEqualStrings("my-gateway", loaded.server_config.otel.service_name);
+    try std.testing.expectEqual(@as(u32, 10), loaded.server_config.otel.flush_interval_s);
+    try std.testing.expectEqual(@as(u16, 50), loaded.server_config.otel.sample_rate);
+    try std.testing.expectEqual(@as(u16, 128), loaded.server_config.otel.max_batch_size);
 }
 
 test "traffic_split rejects unknown upstream" {

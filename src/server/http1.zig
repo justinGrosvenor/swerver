@@ -47,6 +47,7 @@ const clock = @import("../runtime/clock.zig");
 const preencoded = @import("preencoded.zig");
 const write_queue = @import("write_queue.zig");
 const cache_mod = @import("../proxy/cache.zig");
+const otel_mod = @import("../middleware/otel.zig");
 
 pub const connection_close_hdr = "Connection: close\r\n";
 pub const date_prefix = "Date: ";
@@ -988,6 +989,7 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
             var cert_dn_buf: [256]u8 = undefined;
             const cert_dn: ?[]const u8 = if (conn.tls_session) |*session| session.getPeerCertSubject(&cert_dn_buf) else null;
             const now_ms = server.io.nowMs();
+            const otel_start = clock.realtimeNanos() orelse 0;
             var proxy_result = proxy.handleWithBody(
                 hparse.view,
                 body_view,
@@ -1010,6 +1012,9 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
 
             cleanupBodyAccumulation(server, conn);
             try queueResponse(server, conn, proxy_result.resp);
+            if (server.otel) |otel_exp| {
+                otel_exp.recordSpan(hparse.view.method, hparse.view.path, proxy_result.resp.status, otel_start, clock.realtimeNanos() orelse 0);
+            }
             // Materialize pending_body before proxy_result.release() frees the upstream buffer
             if (conn.pending_body.len > 0) {
                 materializePendingBody(server, conn);
@@ -1071,6 +1076,7 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
         .arena_handle = arena_handle,
         .buffer_ops = mw_ctx.buffer_ops,
     };
+    const otel_start = clock.realtimeNanos() orelse 0;
     const result = server.app_router.handle(req_view, &mw_ctx, &scratch);
     if (scratch.arena_handle) |handle| server.io.releaseBuffer(handle);
     if (result.pause_reads_ms) |pause_ms| {
@@ -1079,6 +1085,9 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
 
     cleanupBodyAccumulation(server, conn);
     queueResponse(server, conn, result.resp) catch {};
+    if (server.otel) |otel_exp| {
+        otel_exp.recordSpan(req_view.method, req_view.path, result.resp.status, otel_start, clock.realtimeNanos() orelse 0);
+    }
     if (conn.pending_body.len > 0) {
         materializePendingBody(server, conn);
     }
@@ -1140,12 +1149,16 @@ pub fn dispatchToRouter(server: *Server, conn: *connection.Connection, req_view:
         .arena_handle = arena_handle,
         .buffer_ops = mw_ctx.buffer_ops,
     };
+    const otel_start = clock.realtimeNanos() orelse 0;
     const result = server.app_router.handle(req_view, &mw_ctx, &scratch);
     if (scratch.arena_handle) |handle| server.io.releaseBuffer(handle);
     if (result.pause_reads_ms) |pause_ms| {
         conn.setRateLimitPause(server.io.nowMs(), pause_ms);
     }
     queueResponse(server, conn, result.resp) catch {};
+    if (server.otel) |otel_exp| {
+        otel_exp.recordSpan(req_view.method, req_view.path, result.resp.status, otel_start, clock.realtimeNanos() orelse 0);
+    }
 }
 
 /// Release all acquired body buffers and free BodyAccumState.

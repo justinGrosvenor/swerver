@@ -48,6 +48,7 @@ const server_tls = @import("tls.zig");
 const write_queue = @import("write_queue.zig");
 const admin_mod = @import("../admin/admin.zig");
 const cache_mod = @import("../proxy/cache.zig");
+const otel_mod = @import("../middleware/otel.zig");
 
 /// Global shutdown flag set by signal handler (atomic for signal safety)
 var shutdown_requested = std.atomic.Value(bool).init(false);
@@ -169,6 +170,10 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
             // Periodic proxy maintenance (pool eviction + health checks)
             if (server.proxy) |proxy| {
                 proxy.runMaintenance(now_ms);
+            }
+            // OpenTelemetry flush
+            if (server.otel) |otel_exp| {
+                otel_exp.tick(now_ms);
             }
             // Poll admin API (non-blocking accept + handle)
             admin_mod.pollAdmin(server);
@@ -776,6 +781,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
                     }
                 }
 
+                const otel_start = clock.realtimeNanos() orelse 0;
                 var proxy_result = proxy.handle(
                     parse.view,
                     &mw_ctx,
@@ -812,6 +818,9 @@ pub fn handleRead(server: *Server, index: u32) !void {
                 }
 
                 try http1_mod.queueResponse(server, conn, proxy_result.resp);
+                if (server.otel) |otel_exp| {
+                    otel_exp.recordSpan(parse.view.method, parse.view.path, proxy_result.resp.status, otel_start, clock.realtimeNanos() orelse 0);
+                }
                 if (proxy_result.resp.status >= 200 and proxy_result.resp.status < 300) {
                     if (x402_result == .allow and x402_result.allow.needs_settlement) {
                         if (server.app_router.facilitator) |fac| {
@@ -893,6 +902,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
             .arena_handle = arena_handle,
             .buffer_ops = mw_ctx.buffer_ops,
         };
+        const otel_start = clock.realtimeNanos() orelse 0;
         const result = server.app_router.handle(parse.view, &mw_ctx, &scratch);
         if (scratch.arena_handle) |handle| server.io.releaseBuffer(handle);
         // Apply rate limit backpressure if signaled
@@ -900,6 +910,9 @@ pub fn handleRead(server: *Server, index: u32) !void {
             conn.setRateLimitPause(server.io.nowMs(), pause_ms);
         }
         try http1_mod.queueResponse(server, conn, result.resp);
+        if (server.otel) |otel_exp| {
+            otel_exp.recordSpan(parse.view.method, parse.view.path, result.resp.status, otel_start, clock.realtimeNanos() orelse 0);
+        }
         if (conn.read_buffered_bytes == 0) break;
     }
 

@@ -23,6 +23,7 @@ const proxy_mod = @import("proxy/proxy.zig");
 const forward_mod = @import("proxy/forward.zig");
 const preencoded = @import("server/preencoded.zig");
 const server_tls = @import("server/tls.zig");
+const otel_mod = @import("middleware/otel.zig");
 const accept_mod = @import("server/accept.zig");
 const http3_mod = @import("server/http3.zig");
 const http2_mod = @import("server/http2.zig");
@@ -123,6 +124,8 @@ pub const Server = struct {
     proxy: ?*proxy_mod.Proxy = null,
     /// Admin API listener (null if admin API not enabled)
     admin_listener_fd: ?std.posix.fd_t = null,
+    /// OpenTelemetry trace exporter (null if otel not enabled)
+    otel: ?*otel_mod.TraceExporter = null,
     /// Config file path for hot reload (null if not using config file)
     config_path: ?[]const u8 = null,
     /// Arena owning the route/upstream string data from the last config reload.
@@ -312,6 +315,12 @@ pub const Server = struct {
             preencoded.initPreencodedH1(self);
             if (build_options.enable_http2) preencoded.initPreencodedH2(self);
         }
+
+        if (cfg.otel.enabled) {
+            const otel_ptr = try allocator.create(otel_mod.TraceExporter);
+            otel_ptr.* = otel_mod.TraceExporter.init(cfg.otel);
+            self.otel = otel_ptr;
+        }
     }
 
     pub fn deinit(self: *Server) void {
@@ -321,6 +330,7 @@ pub const Server = struct {
         if (self.static_root_fd) |fd| clock.closeFd(fd);
         if (self.admin_listener_fd) |fd| clock.closeFd(fd);
         if (self.quic) |*q| q.deinit();
+        if (self.otel) |otel_ptr| self.allocator.destroy(otel_ptr);
         if (self.reload_arena) |*a| a.deinit();
         self.io.deinit();
     }

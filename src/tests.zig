@@ -68,6 +68,7 @@ const health = @import("middleware/health.zig");
 const ratelimit = @import("middleware/ratelimit.zig");
 const security = @import("middleware/security.zig");
 const auth = @import("middleware/auth.zig");
+const otel = @import("middleware/otel.zig");
 
 // Admin
 const admin = @import("admin/admin.zig");
@@ -162,6 +163,7 @@ comptime {
     _ = ratelimit;
     _ = security;
     _ = auth;
+    _ = otel;
 
     // Admin
     _ = admin;

@@ -10,6 +10,14 @@ const Server = @import("../server.zig").Server;
 const MAX_REQUEST = 65536;
 const MAX_RESPONSE = 65536;
 
+fn jsonObjPut(obj: *std.json.ObjectMap, alloc: std.mem.Allocator, key: []const u8, value: std.json.Value) !void {
+    if (comptime @typeInfo(@TypeOf(std.json.ObjectMap.put)).@"fn".params.len == 4) {
+        try obj.put(alloc, key, value);
+    } else {
+        try obj.put(key, value);
+    }
+}
+
 pub const AdminConfig = struct {
     enabled: bool = false,
     port: u16 = 9180,
@@ -397,7 +405,7 @@ fn ensureRoutesArray(tree: *std.json.Value, alloc: std.mem.Allocator) !*std.json
         if (val.* == .array) return &val.array;
         return error.BadStructure;
     }
-    obj.put("routes", .{ .array = std.json.Array.init(alloc) }) catch return error.BadStructure;
+    jsonObjPut(obj, alloc, "routes", .{ .array = std.json.Array.init(alloc) }) catch return error.BadStructure;
     return &obj.getPtr("routes").?.array;
 }
 
@@ -408,7 +416,7 @@ fn ensureUpstreamsArray(tree: *std.json.Value, alloc: std.mem.Allocator) !*std.j
         if (val.* == .array) return &val.array;
         return error.BadStructure;
     }
-    obj.put("upstreams", .{ .array = std.json.Array.init(alloc) }) catch return error.BadStructure;
+    jsonObjPut(obj, alloc, "upstreams", .{ .array = std.json.Array.init(alloc) }) catch return error.BadStructure;
     return &obj.getPtr("upstreams").?.array;
 }
 

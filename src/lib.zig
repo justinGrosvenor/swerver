@@ -105,6 +105,7 @@ pub const request = @import("protocol/request.zig");
 pub const response = @import("response/response.zig");
 pub const middleware = @import("middleware/middleware.zig");
 pub const auth = @import("middleware/auth.zig");
+pub const otel = @import("middleware/otel.zig");
 
 /// Runtime primitives: clock helpers, buffer pool, connection state.
 ///

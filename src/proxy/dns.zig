@@ -188,7 +188,7 @@ extern "c" fn getaddrinfo(
 extern "c" fn freeaddrinfo(res: *addrinfo) void;
 
 const SockAddrIn = extern struct {
-    len_or_family: if (has_bsd_addrinfo) packed struct { len: u8, family: u8 } else u16,
+    len_or_family: if (has_bsd_addrinfo) packed struct(u16) { len: u8, family: u8 } else u16,
     port: u16,
     addr: [4]u8,
     zero: [8]u8 = .{0} ** 8,

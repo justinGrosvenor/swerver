@@ -13,6 +13,7 @@ pub const ServerConfig = struct {
     tls: TlsConfig,
     quic: QuicConfig,
     admin: AdminConfig,
+    otel: OtelConfig,
     /// Root directory for static file serving. Empty means disabled.
     static_root: []const u8,
     /// Allowed Host header values. Empty slice means all hosts are accepted.
@@ -42,6 +43,7 @@ pub const ServerConfig = struct {
             .tls = .{},
             .quic = .{},
             .admin = .{},
+            .otel = .{},
             .static_root = "",
             .allowed_hosts = &.{},
             .workers = 1,
@@ -197,6 +199,15 @@ pub const AdminConfig = struct {
     enabled: bool = false,
     port: u16 = 9180,
     api_key: []const u8 = "",
+};
+
+pub const OtelConfig = struct {
+    enabled: bool = false,
+    collector_url: []const u8 = "http://localhost:4318",
+    service_name: []const u8 = "swerver",
+    flush_interval_s: u32 = 5,
+    sample_rate: u16 = 100,
+    max_batch_size: u16 = 256,
 };
 
 pub const ConfigError = error{
