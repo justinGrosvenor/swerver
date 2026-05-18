@@ -257,6 +257,18 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
             };
         }
 
+        var traffic_split: ?[]const upstream_mod.TrafficTarget = null;
+        if (r.traffic_split) |ts_json| {
+            const targets = try alloc.alloc(upstream_mod.TrafficTarget, ts_json.len);
+            for (ts_json, 0..) |t, ti| {
+                targets[ti] = .{
+                    .upstream = t.upstream,
+                    .weight = t.weight orelse 100,
+                };
+            }
+            traffic_split = targets;
+        }
+
         routes_out[ri] = .{
             .path_prefix = r.path_prefix,
             .host = r.host,
@@ -271,6 +283,7 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
             .x402 = route_x402,
             .auth = route_auth,
             .rate_limit = route_rate_limit,
+            .traffic_split = traffic_split,
         };
     }
 
@@ -284,8 +297,24 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
             }
         }
         if (!found) {
-            std.log.err("config: route references unknown upstream '{s}'", .{route.upstream});
+            std.log.warn("config: route references unknown upstream '{s}'", .{route.upstream});
             return error.ConfigParseError;
+        }
+
+        if (route.traffic_split) |targets| {
+            for (targets) |t| {
+                var t_found = false;
+                for (upstreams_out) |u| {
+                    if (std.mem.eql(u8, t.upstream, u.name)) {
+                        t_found = true;
+                        break;
+                    }
+                }
+                if (!t_found) {
+                    std.log.warn("config: traffic_split references unknown upstream '{s}'", .{t.upstream});
+                    return error.ConfigParseError;
+                }
+            }
         }
     }
 
@@ -501,6 +530,7 @@ const RouteJson = struct {
     x402: ?RouteX402Json = null,
     auth: ?RouteAuthJson = null,
     rate_limit: ?RateLimitJson = null,
+    traffic_split: ?[]const TrafficSplitJson = null,
 };
 
 const RouteAuthJson = struct {
@@ -538,6 +568,11 @@ const RateLimitJson = struct {
     requests_per_second: ?u32 = null,
     burst_size: ?u32 = null,
     key: ?[]const u8 = null,
+};
+
+const TrafficSplitJson = struct {
+    upstream: []const u8,
+    weight: ?u16 = null,
 };
 
 // Tests
@@ -684,4 +719,52 @@ test "parse route with rate_limit defaults" {
     try std.testing.expectEqual(@as(u32, 100), rl.requests_per_second);
     try std.testing.expectEqual(@as(u32, 200), rl.burst_size);
     try std.testing.expect(rl.key == .consumer);
+}
+
+test "parse route with traffic_split" {
+    const json =
+        \\{
+        \\  "upstreams": [
+        \\    { "name": "v1", "servers": [{ "address": "10.0.0.1", "port": 8080 }] },
+        \\    { "name": "v2", "servers": [{ "address": "10.0.0.2", "port": 8080 }] }
+        \\  ],
+        \\  "routes": [{
+        \\    "path_prefix": "/api/",
+        \\    "upstream": "v1",
+        \\    "traffic_split": [
+        \\      { "upstream": "v1", "weight": 90 },
+        \\      { "upstream": "v2", "weight": 10 }
+        \\    ]
+        \\  }]
+        \\}
+    ;
+    var loaded = try parseJsonFromBytes(std.testing.allocator, json);
+    defer loaded.deinit();
+
+    const ts = loaded.routes[0].traffic_split orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), ts.len);
+    try std.testing.expectEqualStrings("v1", ts[0].upstream);
+    try std.testing.expectEqual(@as(u16, 90), ts[0].weight);
+    try std.testing.expectEqualStrings("v2", ts[1].upstream);
+    try std.testing.expectEqual(@as(u16, 10), ts[1].weight);
+}
+
+test "traffic_split rejects unknown upstream" {
+    const json =
+        \\{
+        \\  "upstreams": [
+        \\    { "name": "v1", "servers": [{ "address": "10.0.0.1", "port": 8080 }] }
+        \\  ],
+        \\  "routes": [{
+        \\    "path_prefix": "/api/",
+        \\    "upstream": "v1",
+        \\    "traffic_split": [
+        \\      { "upstream": "v1", "weight": 90 },
+        \\      { "upstream": "v2_missing", "weight": 10 }
+        \\    ]
+        \\  }]
+        \\}
+    ;
+    const result = parseJsonFromBytes(std.testing.allocator, json);
+    try std.testing.expectError(error.ConfigParseError, result);
 }

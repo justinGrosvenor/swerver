@@ -271,18 +271,20 @@ pub const Proxy = struct {
             return .{ .resp = forward.createErrorResponse(502), .proxy = self };
         };
 
+        const effective_upstream = route.selectUpstream();
+
         // Get upstream configuration
-        const upstream_def = self.upstreams_by_name.get(route.upstream) orelse {
+        const upstream_def = self.upstreams_by_name.get(effective_upstream) orelse {
             return .{ .resp = forward.createErrorResponse(502), .proxy = self };
         };
         _ = upstream_def;
 
         // Get balancer and pool
-        const bal = self.balancers.get(route.upstream) orelse {
+        const bal = self.balancers.get(effective_upstream) orelse {
             return .{ .resp = forward.createErrorResponse(502), .proxy = self };
         };
 
-        const pool = self.pool_manager.getPool(route.upstream) orelse {
+        const pool = self.pool_manager.getPool(effective_upstream) orelse {
             return .{ .resp = forward.createErrorResponse(502), .proxy = self };
         };
 
@@ -505,18 +507,20 @@ pub const Proxy = struct {
             return .{ .resp = forward.createErrorResponse(502), .proxy = self };
         };
 
+        const effective_upstream_b = route.selectUpstream();
+
         // Get upstream configuration
-        const upstream_def = self.upstreams_by_name.get(route.upstream) orelse {
+        const upstream_def_b = self.upstreams_by_name.get(effective_upstream_b) orelse {
             return .{ .resp = forward.createErrorResponse(502), .proxy = self };
         };
-        _ = upstream_def;
+        _ = upstream_def_b;
 
         // Get balancer and pool
-        const bal = self.balancers.get(route.upstream) orelse {
+        const bal = self.balancers.get(effective_upstream_b) orelse {
             return .{ .resp = forward.createErrorResponse(502), .proxy = self };
         };
 
-        const pool = self.pool_manager.getPool(route.upstream) orelse {
+        const pool = self.pool_manager.getPool(effective_upstream_b) orelse {
             return .{ .resp = forward.createErrorResponse(502), .proxy = self };
         };
 

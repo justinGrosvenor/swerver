@@ -82,6 +82,13 @@ pub const HealthCheck = struct {
 };
 
 /// Proxy route configuration
+pub const TrafficTarget = struct {
+    upstream: []const u8,
+    weight: u16 = 100,
+};
+
+var split_counter: u32 = 0;
+
 pub const ProxyRoute = struct {
     /// Path prefix to match (e.g., "/api/")
     path_prefix: []const u8,
@@ -103,6 +110,29 @@ pub const ProxyRoute = struct {
     auth: auth.AuthMethod = .none,
     /// Per-route rate limiting (consumer or IP keyed)
     rate_limit: ?ratelimit.RouteRateLimit = null,
+    /// Traffic splitting: weighted routing to multiple upstreams (canary/blue-green).
+    /// When set, overrides `upstream` — the upstream is selected by weight.
+    traffic_split: ?[]const TrafficTarget = null,
+
+    /// Resolve the upstream name, applying traffic split if configured.
+    pub fn selectUpstream(self: *const ProxyRoute) []const u8 {
+        const targets = self.traffic_split orelse return self.upstream;
+        if (targets.len == 0) return self.upstream;
+        if (targets.len == 1) return targets[0].upstream;
+
+        var total_weight: u32 = 0;
+        for (targets) |t| total_weight += t.weight;
+        if (total_weight == 0) return self.upstream;
+
+        split_counter +%= 1;
+        const pick = split_counter % total_weight;
+        var cumulative: u32 = 0;
+        for (targets) |t| {
+            cumulative += t.weight;
+            if (pick < cumulative) return t.upstream;
+        }
+        return targets[targets.len - 1].upstream;
+    }
 };
 
 pub const ProxyRouteX402 = struct {

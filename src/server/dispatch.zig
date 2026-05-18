@@ -948,7 +948,8 @@ fn setupWebSocketTunnel(
     proxy: *proxy_mod.Proxy,
     client_ip: ?[]const u8,
 ) void {
-    const bal = proxy.balancers.get(matched_route.upstream) orelse {
+    const effective_upstream = matched_route.selectUpstream();
+    const bal = proxy.balancers.get(effective_upstream) orelse {
         http1_mod.queueResponse(server, conn, ws_mod.errorResp(502)) catch {};
         return;
     };
