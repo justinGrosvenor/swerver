@@ -244,7 +244,7 @@ pub fn base64UrlDecode(input: []const u8, buf: []u8) ?[]const u8 {
     var src_buf: [4096]u8 = undefined;
     if (input.len > src_buf.len) return null;
     @memcpy(src_buf[0..input.len], input);
-    var src = src_buf[0..input.len];
+    const src = src_buf[0..input.len];
     for (src) |*c| {
         switch (c.*) {
             '-' => c.* = '+',
