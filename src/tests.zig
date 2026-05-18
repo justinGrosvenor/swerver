@@ -71,6 +71,7 @@ const auth = @import("middleware/auth.zig");
 const otel = @import("middleware/otel.zig");
 const body_schema = @import("middleware/body_schema.zig");
 const grpc = @import("middleware/grpc.zig");
+const compress = @import("middleware/compress.zig");
 
 // Admin
 const admin = @import("admin/admin.zig");
@@ -168,6 +169,7 @@ comptime {
     _ = otel;
     _ = body_schema;
     _ = grpc;
+    _ = compress;
 
     // Admin
     _ = admin;

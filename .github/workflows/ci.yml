@@ -23,7 +23,7 @@ jobs:
       - name: Install OpenSSL headers
         run: |
           sudo apt-get update
-          sudo apt-get install -y libssl-dev
+          sudo apt-get install -y libssl-dev zlib1g-dev
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:

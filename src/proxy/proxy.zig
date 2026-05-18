@@ -11,6 +11,7 @@ const auth_mod = @import("../middleware/auth.zig");
 const x402 = @import("../middleware/x402.zig");
 const cache_mod = @import("cache.zig");
 const dns_mod = @import("dns.zig");
+const compress_mod = @import("../middleware/compress.zig");
 const net = @import("../runtime/net.zig");
 const clock = @import("../runtime/clock.zig");
 
@@ -70,6 +71,59 @@ pub const Proxy = struct {
     const REQUEST_BUF_SIZE = 8192;
     const RESPONSE_BUF_SIZE = 65536;
     const BUFFER_POOL_SIZE = 64;
+
+    threadlocal var compress_scratch: [RESPONSE_BUF_SIZE]u8 = undefined;
+    threadlocal var compress_ce_header: response.Header = .{ .name = "Content-Encoding", .value = "gzip" };
+
+    fn maybeCompress(
+        resp: *response.Response,
+        client_headers: []const request.Header,
+        header_buf: []response.Header,
+    ) void {
+        const body_bytes = switch (resp.body) {
+            .bytes => |b| b,
+            else => return,
+        };
+        if (body_bytes.len < 256) return;
+        if (compress_mod.alreadyEncoded(resp.headers)) return;
+
+        var accept_enc: ?[]const u8 = null;
+        var content_type: ?[]const u8 = null;
+        for (client_headers) |hdr| {
+            if (accept_enc == null and std.ascii.eqlIgnoreCase(hdr.name, "accept-encoding"))
+                accept_enc = hdr.value;
+            if (content_type == null and std.ascii.eqlIgnoreCase(hdr.name, "content-type"))
+                content_type = hdr.value;
+        }
+        // Also check upstream response Content-Type
+        if (content_type == null) {
+            for (resp.headers) |hdr| {
+                if (std.ascii.eqlIgnoreCase(hdr.name, "Content-Type")) {
+                    content_type = hdr.value;
+                    break;
+                }
+            }
+        }
+        const ct = content_type orelse return;
+        if (!compress_mod.isCompressible(ct)) return;
+        const ae = accept_enc orelse return;
+        const encoding = compress_mod.parseAcceptEncoding(ae);
+        if (encoding == .identity) return;
+
+        const compressed_len = switch (encoding) {
+            .gzip => compress_mod.gzipCompress(body_bytes, &compress_scratch),
+            .deflate => compress_mod.deflateCompress(body_bytes, &compress_scratch),
+            .identity => null,
+        } orelse return;
+
+        compress_ce_header = .{ .name = "Content-Encoding", .value = compress_mod.encodingName(encoding) };
+        if (resp.headers.len < header_buf.len) {
+            @memcpy(header_buf[0..resp.headers.len], resp.headers);
+            header_buf[resp.headers.len] = compress_ce_header;
+            resp.headers = header_buf[0 .. resp.headers.len + 1];
+        }
+        resp.body = .{ .bytes = compress_scratch[0..compressed_len] };
+    }
 
     pub fn init(allocator: std.mem.Allocator, config: ProxyConfig) !Proxy {
         // Use a helper struct to manage partial initialization cleanup
@@ -497,7 +551,7 @@ pub const Proxy = struct {
                     continue;
                 }
 
-                const normalized = forward.normalizeUpstreamResponse(
+                var normalized = forward.normalizeUpstreamResponse(
                     &parsed,
                     self.response_bufs[resp_buf_idx][0..],
                     route,
@@ -509,6 +563,7 @@ pub const Proxy = struct {
                 pool.markServerSuccess(server_idx);
                 pool.release(c, now_ms, parsed.keep_alive);
 
+                maybeCompress(&normalized, req.headers, self.response_header_bufs[resp_buf_idx][0..]);
                 return .{
                     .resp = normalized,
                     .proxy = self,
@@ -743,7 +798,7 @@ pub const Proxy = struct {
                     continue;
                 }
 
-                const normalized = forward.normalizeUpstreamResponse(
+                var normalized_b = forward.normalizeUpstreamResponse(
                     &parsed,
                     self.response_bufs[resp_buf_idx][0..],
                     route,
@@ -755,8 +810,9 @@ pub const Proxy = struct {
                 pool.markServerSuccess(server_idx_b);
                 pool.release(c, now_ms, parsed.keep_alive);
 
+                maybeCompress(&normalized_b, req.headers, self.response_header_bufs[resp_buf_idx][0..]);
                 return .{
-                    .resp = normalized,
+                    .resp = normalized_b,
                     .proxy = self,
                     .resp_buf_idx = resp_buf_idx,
                 };
