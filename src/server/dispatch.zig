@@ -1209,7 +1209,10 @@ pub fn handleWrite(server: *Server, index: u32) !void {
             // that races ahead of the carried record on the wire.
             switch (server_tls.tlsDrainCarry(server, conn)) {
                 .done => {},
-                .again => return,
+                .again => {
+                    server.io.armWritable(conn.index, socket_fd) catch {};
+                    return;
+                },
                 .err => {
                     server.closeConnection(conn);
                     return;
@@ -1242,9 +1245,15 @@ pub fn handleWrite(server: *Server, index: u32) !void {
                         // only partially absorbed), pause the loop —
                         // we'll resume once the next writable event
                         // drains the carry.
-                        if (conn.tls_cipher_carry_handle != null) return;
+                        if (conn.tls_cipher_carry_handle != null) {
+                            server.io.armWritable(conn.index, socket_fd) catch {};
+                            return;
+                        }
                     },
-                    .again => return,
+                    .again => {
+                        server.io.armWritable(conn.index, socket_fd) catch {};
+                        return;
+                    },
                     .err => {
                         server.closeConnection(conn);
                         return;
