@@ -268,7 +268,17 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
                     if (conn.state == .handshake) {
                         server_tls.handleTlsHandshake(server, conn) catch {
                             server.closeConnection(conn);
+                            continue;
                         };
+                        // Re-arm recv on the native backend so the next
+                        // handshake segment (or post-handshake data)
+                        // triggers a read event.
+                        const hconn = server.io.getConnection(index) orelse continue;
+                        if (hconn.state != .closed and !hconn.close_after_write) {
+                            if (hconn.fd) |hfd| {
+                                server.io.rearmRecv(index, hfd);
+                            }
+                        }
                         continue;
                     }
                     switch (event.kind) {
