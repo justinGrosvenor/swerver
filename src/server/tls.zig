@@ -91,6 +91,10 @@ pub fn handleTlsHandshake(server: *Server, conn: *connection.Connection) !void {
                         });
                         conn.http2_stack = stack_ptr;
                     }
+                    if (conn.h2_pending == null) {
+                        conn.h2_pending = try server.allocator.create([connection.MAX_PENDING_H2_BODIES]connection.PendingH2Body);
+                        conn.h2_pending.?.* = [_]connection.PendingH2Body{.{}} ** connection.MAX_PENDING_H2_BODIES;
+                    }
                     conn.protocol = .http2;
                     http2_mod.sendHttp2ServerPreface(server, conn) catch {
                         return error.Http2PrefaceFailed;
