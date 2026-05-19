@@ -753,17 +753,20 @@ pub const Router = struct {
     pub fn handle(self: *Router, req: request.RequestView, mw_ctx: *middleware.Context, scratch: *HandlerScratch) RouteResult {
         x402_has_receipt = false;
 
+        // Strip query/fragment once — reused by bloom filter and route loop.
+        const path_only = if (std.mem.indexOfScalar(u8, req.path, '?')) |q|
+            req.path[0..q]
+        else if (std.mem.indexOfScalar(u8, req.path, '#')) |f|
+            req.path[0..f]
+        else
+            req.path;
+
         // Bloom filter fast-reject: if the request's first path
         // segment doesn't have its hash bit set in the filter, no
         // registered route can match. Return 404 immediately without
-        // running x402 checks, middleware, or the route loop. This
-        // cuts the error-handling benchmark's 404 path from O(N
-        // routes) to O(1).
+        // running x402 checks, middleware, or the route loop.
         if (self.first_segment_bloom != 0) {
-            // Strip query string before hashing — registered routes
-            // don't include query params, but request paths do.
-            const clean = if (std.mem.indexOfScalar(u8, req.path, '?')) |qi| req.path[0..qi] else req.path;
-            const seg = firstPathSegment(clean);
+            const seg = firstPathSegment(path_only);
             if (seg.len > 0) {
                 const hash = std.hash.Wyhash.hash(0, seg);
                 const bit = @as(u64, 1) << @intCast(hash % 64);
@@ -809,15 +812,6 @@ pub const Router = struct {
         var result_resp: response.Response = undefined;
         const result_pause: ?u64 = null;
         var ran_handler = false;
-
-        // Strip query string once before the route loop — matchRoute
-        // was doing this for every route, wasting O(path.len × route_count).
-        const path_only = if (std.mem.indexOfScalar(u8, req.path, '?')) |q|
-            req.path[0..q]
-        else if (std.mem.indexOfScalar(u8, req.path, '#')) |f|
-            req.path[0..f]
-        else
-            req.path;
 
         var path_matched = false;
         for (self.routes[0..self.route_count]) |r| {

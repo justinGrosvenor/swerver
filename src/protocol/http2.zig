@@ -1595,6 +1595,28 @@ pub fn writeFrameHeader(buf: []u8, typ: FrameType, flags: u8, stream_id: u32, pa
     buf[8] = @intCast(stream_id & 0xff);
 }
 
+fn isAlreadyLower(s: []const u8) bool {
+    for (s) |c| {
+        if (c >= 'A' and c <= 'Z') return false;
+    }
+    return true;
+}
+
+fn usizeToBuf(out: *[20]u8, value: usize) []const u8 {
+    if (value == 0) {
+        out[19] = '0';
+        return out[19..20];
+    }
+    var pos: usize = 20;
+    var v = value;
+    while (v > 0) {
+        pos -= 1;
+        out[pos] = @intCast((v % 10) + '0');
+        v /= 10;
+    }
+    return out[pos..20];
+}
+
 pub fn encodeResponseHeaders(
     buf: []u8,
     status: u16,
@@ -1616,7 +1638,7 @@ pub fn encodeResponseHeaders(
     // RFC 9110 §8.6: MUST NOT send content-length in 204 or 304 responses
     if (status != 204 and status != 304) {
         var length_buf: [20]u8 = undefined;
-        const length_slice = try std.fmt.bufPrint(length_buf[0..], "{d}", .{content_length});
+        const length_slice = usizeToBuf(&length_buf, content_length);
         idx += try encodeLiteralHeaderIndexed(buf[idx..], "content-length", length_slice);
     }
     // RFC 9110 §6.6.1: Origin servers MUST send Date header
@@ -1631,7 +1653,9 @@ pub fn encodeResponseHeaders(
         if (std.ascii.eqlIgnoreCase(header.name, "date")) continue;
         // RFC 9113 §8.2: header field names MUST be lowercase in HTTP/2
         var lower_buf: [128]u8 = undefined;
-        const name = if (header.name.len <= lower_buf.len) blk: {
+        const name = if (isAlreadyLower(header.name))
+            header.name
+        else if (header.name.len <= lower_buf.len) blk: {
             for (header.name, 0..) |c, i| {
                 lower_buf[i] = std.ascii.toLower(c);
             }
