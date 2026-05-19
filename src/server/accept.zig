@@ -85,11 +85,13 @@ fn setupAcceptedConnection(server: *Server, client_fd: std.posix.fd_t) !void {
         return;
     }
     conn.fd = client_fd;
-    if (net.getPeerAddress(client_fd)) |peer| {
-        if (peer.getIp4Bytes()) |ip4| {
-            conn.cached_peer_ip = ip4;
-        } else if (peer.getIp6Bytes()) |ip6| {
-            conn.cached_peer_ip6 = ip6;
+    if (server.needs_peer_ip) {
+        if (net.getPeerAddress(client_fd)) |peer| {
+            if (peer.getIp4Bytes()) |ip4| {
+                conn.cached_peer_ip = ip4;
+            } else if (peer.getIp6Bytes()) |ip6| {
+                conn.cached_peer_ip6 = ip6;
+            }
         }
     }
     // If TLS is configured, start handshake before going active

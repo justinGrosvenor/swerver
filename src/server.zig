@@ -137,6 +137,9 @@ pub const Server = struct {
     /// Pre-computed Alt-Svc header value for HTTP/3 advertisement
     alt_svc_value: [64]u8 = undefined,
     alt_svc_len: usize = 0,
+    /// True when proxy, rate limiting, or middleware needs the peer IP.
+    /// When false, accept skips the getpeername syscall.
+    needs_peer_ip: bool = true,
     /// Cached Date header value (updated once per second)
     cached_date: [29]u8 = undefined,
     cached_date_epoch: u64 = 0,
@@ -321,6 +324,10 @@ pub const Server = struct {
             otel_ptr.* = otel_mod.TraceExporter.init(cfg.otel);
             self.otel = otel_ptr;
         }
+
+        // Skip getpeername on accept when nothing needs the peer IP.
+        self.needs_peer_ip = self.proxy != null or
+            app_router.middleware_chain.post.len > 0;
     }
 
     pub fn deinit(self: *Server) void {
@@ -390,6 +397,7 @@ pub const Server = struct {
 
             if (self.reload_arena) |*old_arena| old_arena.deinit();
             self.reload_arena = loaded.arena;
+            self.needs_peer_ip = true;
             std.log.info("Config reloaded from {s} (routes: {d}, upstreams: {d})", .{
                 path, loaded.routes.len, loaded.upstreams.len,
             });
@@ -402,6 +410,7 @@ pub const Server = struct {
                 }
                 if (self.reload_arena) |*old_arena| old_arena.deinit();
                 self.reload_arena = loaded.arena;
+                self.needs_peer_ip = self.app_router.middleware_chain.post.len > 0;
                 std.log.info("Config reloaded from {s} (proxy removed)", .{path});
             } else {
                 loaded.deinit();
