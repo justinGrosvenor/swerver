@@ -93,13 +93,8 @@ fn sendHttp2ControlFrame(server: *Server, conn: *connection.Connection, frame_da
 pub fn handleHttp2Read(server: *Server, conn: *connection.Connection) !void {
     const buffer_handle = conn.read_buffer orelse return;
     const stack = conn.http2_stack orelse return;
-    // Reserve enough write-queue headroom so we never stall mid-ingest.
-    // Each GET produces 1 slot (HEADERS+DATA packed) plus 1 control slot
-    // (SETTINGS ACK / WINDOW_UPDATE). POST adds a second slot for the
-    // DATA frame. 8 slots comfortably handles a 16-frame ingest batch
-    // even if every event emits a response, because most GETs use the
-    // pre-encoded fast path (no write-queue slot at all).
     const min_write_slots: u8 = 8;
+    std.log.warn("h2-read: buffered={} writeAvail={} offset={}", .{ conn.read_buffered_bytes, conn.writeQueueAvailable(), conn.read_offset });
     while (conn.read_buffered_bytes > 0 and conn.writeQueueAvailable() >= min_write_slots) {
         const start = conn.read_offset;
         const end = start + conn.read_buffered_bytes;
