@@ -1811,10 +1811,95 @@ fn encodeInt(buf: []u8, prefix: u8, value: usize, prefix_bits: u8) !usize {
 }
 
 fn staticNameIndex(name: []const u8) usize {
-    for (StaticTable, 0..) |entry, idx| {
-        if (std.mem.eql(u8, entry.name, name) and entry.value.len == 0) {
-            return idx + 1;
-        }
+    return staticNameIndexLookup(name.len, name);
+}
+
+fn staticNameIndexLookup(len: usize, name: []const u8) usize {
+    switch (len) {
+        3 => {
+            if (std.mem.eql(u8, name, "age")) return 21;
+            if (std.mem.eql(u8, name, "via")) return 60;
+        },
+        4 => {
+            if (std.mem.eql(u8, name, "date")) return 33;
+            if (std.mem.eql(u8, name, "etag")) return 34;
+            if (std.mem.eql(u8, name, "from")) return 37;
+            if (std.mem.eql(u8, name, "host")) return 38;
+            if (std.mem.eql(u8, name, "link")) return 45;
+            if (std.mem.eql(u8, name, "vary")) return 59;
+        },
+        5 => {
+            if (std.mem.eql(u8, name, "allow")) return 22;
+            if (std.mem.eql(u8, name, "range")) return 50;
+        },
+        6 => {
+            if (std.mem.eql(u8, name, "accept")) return 19;
+            if (std.mem.eql(u8, name, "cookie")) return 32;
+            if (std.mem.eql(u8, name, "expect")) return 35;
+            if (std.mem.eql(u8, name, "server")) return 54;
+        },
+        7 => {
+            if (std.mem.eql(u8, name, "expires")) return 36;
+            if (std.mem.eql(u8, name, "referer")) return 51;
+            if (std.mem.eql(u8, name, "refresh")) return 52;
+        },
+        8 => {
+            if (std.mem.eql(u8, name, "if-match")) return 39;
+            if (std.mem.eql(u8, name, "if-range")) return 42;
+            if (std.mem.eql(u8, name, "location")) return 46;
+        },
+        10 => {
+            if (std.mem.eql(u8, name, "set-cookie")) return 55;
+            if (std.mem.eql(u8, name, "user-agent")) return 58;
+        },
+        11 => {
+            if (std.mem.eql(u8, name, "retry-after")) return 53;
+        },
+        12 => {
+            if (std.mem.eql(u8, name, "content-type")) return 31;
+            if (std.mem.eql(u8, name, "max-forwards")) return 47;
+        },
+        13 => {
+            if (std.mem.eql(u8, name, "accept-ranges")) return 18;
+            if (std.mem.eql(u8, name, "authorization")) return 23;
+            if (std.mem.eql(u8, name, "cache-control")) return 24;
+            if (std.mem.eql(u8, name, "content-range")) return 30;
+            if (std.mem.eql(u8, name, "if-none-match")) return 41;
+            if (std.mem.eql(u8, name, "last-modified")) return 44;
+        },
+        14 => {
+            if (std.mem.eql(u8, name, "accept-charset")) return 15;
+            if (std.mem.eql(u8, name, "content-length")) return 28;
+        },
+        15 => {
+            if (std.mem.eql(u8, name, "accept-encoding")) return 16;
+            if (std.mem.eql(u8, name, "accept-language")) return 17;
+        },
+        16 => {
+            if (std.mem.eql(u8, name, "content-encoding")) return 26;
+            if (std.mem.eql(u8, name, "content-language")) return 27;
+            if (std.mem.eql(u8, name, "content-location")) return 29;
+            if (std.mem.eql(u8, name, "www-authenticate")) return 61;
+        },
+        17 => {
+            if (std.mem.eql(u8, name, "if-modified-since")) return 40;
+            if (std.mem.eql(u8, name, "transfer-encoding")) return 57;
+        },
+        18 => {
+            if (std.mem.eql(u8, name, "proxy-authenticate")) return 48;
+        },
+        19 => {
+            if (std.mem.eql(u8, name, "content-disposition")) return 25;
+            if (std.mem.eql(u8, name, "if-unmodified-since")) return 43;
+            if (std.mem.eql(u8, name, "proxy-authorization")) return 49;
+        },
+        25 => {
+            if (std.mem.eql(u8, name, "strict-transport-security")) return 56;
+        },
+        27 => {
+            if (std.mem.eql(u8, name, "access-control-allow-origin")) return 20;
+        },
+        else => {},
     }
     return 0;
 }
