@@ -577,6 +577,21 @@ pub fn handleRead(server: *Server, index: u32) !void {
     }
 
     while (conn.read_buffered_bytes > 0 and conn.canEnqueueWrite()) {
+        // Opportunistic inline write drain: push enqueued responses
+        // to the kernel while still processing pipelined requests.
+        // At low connection counts (e.g. 512 conns / 64 workers =
+        // 8 per worker), the pipeline loop enqueues all responses
+        // before any get flushed, so the client can't start its
+        // next batch until a full write event fires. Draining inline
+        // lets the client receive partial responses mid-batch and
+        // overlap its next send with our remaining processing.
+        // Guard: plain TCP only, keep-alive only, no pending body.
+        if (conn.write_count >= 4 and !conn.is_tls and
+            !conn.close_after_write and !conn.send_in_flight and
+            !conn.hasPendingBody())
+        {
+            drainWritesInline(server, conn);
+        }
         const start = conn.read_offset;
         const end = start + conn.read_buffered_bytes;
         if (end > buffer_handle.bytes.len) break;
@@ -1321,6 +1336,48 @@ pub fn handleWrite(server: *Server, index: u32) !void {
             return;
         }
         server.io.setTimeoutPhase(conn, .idle);
+    }
+}
+
+/// Non-blocking writev drain for use inside the pipelining loop.
+/// Pushes enqueued response bytes to the kernel without touching any
+/// close/lifecycle state. On EAGAIN (socket buffer full) it simply
+/// returns — the normal handleWrite path handles the remainder.
+fn drainWritesInline(server: *Server, conn: *connection.Connection) void {
+    const socket_fd = conn.fd orelse return;
+    while (conn.write_count > 0) {
+        var iov: [16]std.posix.iovec_const = undefined;
+        var iov_count: u32 = 0;
+        {
+            var scan_head = conn.write_head;
+            var scan_remaining = conn.write_count;
+            while (scan_remaining > 0 and iov_count < 16) {
+                const e = &conn.write_queue[scan_head];
+                const s = e.handle.bytes[e.offset..e.len];
+                iov[iov_count] = .{ .base = s.ptr, .len = s.len };
+                iov_count += 1;
+                scan_head = if (scan_head + 1 >= conn.write_queue.len) 0 else scan_head + 1;
+                scan_remaining -= 1;
+            }
+        }
+        if (iov_count == 0) break;
+        const bytes_written = std.c.writev(socket_fd, &iov, @intCast(iov_count));
+        if (bytes_written <= 0) return;
+        var written: usize = @intCast(bytes_written);
+        while (written > 0) {
+            const entry = conn.peekWrite() orelse break;
+            const remaining_in_entry = entry.len - entry.offset;
+            if (written >= remaining_in_entry) {
+                written -= remaining_in_entry;
+                server.io.onWriteCompleted(conn, remaining_in_entry);
+                server.io.releaseBuffer(entry.handle);
+                conn.popWrite();
+            } else {
+                entry.offset += written;
+                server.io.onWriteCompleted(conn, written);
+                written = 0;
+            }
+        }
     }
 }
 
