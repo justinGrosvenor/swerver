@@ -152,6 +152,7 @@ pub const Master = struct {
             // Child process
             resetChildSignals();
             worker_id_global = worker_id;
+            pinWorkerCpu(worker_id);
 
             std.log.info("[w{d}] worker starting", .{worker_id});
 
@@ -297,6 +298,17 @@ pub fn getWorkerId() ?u16 {
 fn detectCpuCount() u16 {
     const count = std.Thread.getCpuCount() catch 1;
     return @intCast(@min(count, MAX_WORKERS));
+}
+
+fn pinWorkerCpu(worker_id: u16) void {
+    if (comptime @import("builtin").os.tag != .linux) return;
+    const cpu_count = std.Thread.getCpuCount() catch return;
+    const cpu: usize = worker_id % cpu_count;
+    var set: std.os.linux.cpu_set_t = std.mem.zeroes(std.os.linux.cpu_set_t);
+    const word = cpu / (@sizeOf(usize) * 8);
+    const bit: std.math.Log2Int(usize) = @intCast(cpu % (@sizeOf(usize) * 8));
+    set[word] = @as(usize, 1) << bit;
+    std.os.linux.sched_setaffinity(0, &set) catch return;
 }
 
 fn installMasterSignals() void {
