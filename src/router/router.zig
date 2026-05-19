@@ -982,6 +982,15 @@ pub const Router = struct {
         _ = self;
         ctx.param_count = 0;
 
+        // Fast path: literal-only routes → exact string match.
+        if (r.param_count == 0 and r.segment_count > 0) {
+            const last_is_wildcard = switch (r.segments[r.segment_count - 1]) {
+                .wildcard => true,
+                else => false,
+            };
+            if (!last_is_wildcard) return std.mem.eql(u8, r.pattern_buf[0..r.pattern_len], path);
+        }
+
         var path_it = std.mem.splitScalar(u8, path, '/');
         var seg_idx: u8 = 0;
 
