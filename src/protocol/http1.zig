@@ -741,6 +741,41 @@ pub const ChunkDecoder = struct {
     }
 };
 
+/// Fast request-line extraction for pre-encoded cache fast path.
+/// Finds the first \r\n, extracts method + path + version, and
+/// locates \r\n\r\n. Returns null if incomplete or if the request
+/// has a body (Content-Length / Transfer-Encoding detected).
+pub const QuickLine = struct {
+    method: request.Method,
+    path: []const u8,
+    is_http11: bool,
+    consumed: usize,
+};
+
+pub fn extractQuickLine(bytes: []const u8) ?QuickLine {
+    const line_end = std.mem.indexOfPos(u8, bytes, 0, "\r\n") orelse return null;
+    const line = bytes[0..line_end];
+    if (line.len < 14) return null; // "GET / HTTP/1.1" minimum
+    const first_space = std.mem.indexOfScalar(u8, line, ' ') orelse return null;
+    if (first_space == 0 or first_space > 7) return null;
+    const method = request.Method.fromString(line[0..first_space]) orelse return null;
+    const second_space = std.mem.indexOfScalarPos(u8, line, first_space + 1, ' ') orelse return null;
+    const path = line[first_space + 1 .. second_space];
+    const version = line[second_space + 1 ..];
+    const is_http11 = version.len == 8 and std.mem.eql(u8, version, "HTTP/1.1");
+    if (!is_http11 and !(version.len == 8 and std.mem.eql(u8, version, "HTTP/1.0"))) return null;
+    const header_end = std.mem.indexOfPos(u8, bytes, line_end + 2, "\r\n\r\n") orelse return null;
+    const header_area = bytes[line_end + 2 .. header_end];
+    if (std.mem.indexOf(u8, header_area, "ontent-Length") != null) return null;
+    if (std.mem.indexOf(u8, header_area, "ransfer-Encoding") != null) return null;
+    return .{
+        .method = method,
+        .path = path,
+        .is_http11 = is_http11,
+        .consumed = header_end + 4,
+    };
+}
+
 pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
     if (_limits.headers_storage.len < _limits.max_header_count) {
         return .{

@@ -396,7 +396,7 @@ pub fn seedReadBuffer(server: *Server, conn: *connection.Connection, data: []con
 pub fn handleRead(server: *Server, index: u32) !void {
     const conn = server.io.getConnection(index) orelse return;
     if (conn.fd == null) return;
-    if (!server.io.canRead(conn)) return;
+    if (!conn.canRead(server.io.cfg.backpressure, server.now_ms)) return;
 
     // WebSocket tunnel: forward raw bytes to peer, no HTTP parsing.
     if (conn.is_tunnel) {
@@ -600,7 +600,33 @@ pub fn handleRead(server: *Server, index: u32) !void {
         const start = conn.read_offset;
         const end = start + conn.read_buffered_bytes;
         if (end > buffer_handle.bytes.len) break;
-        const parse = http1.parse(buffer_handle.bytes[start..end], .{
+        const buf_slice = buffer_handle.bytes[start..end];
+
+        // Quick-line fast path: extract method+path from the request
+        // line without parsing headers. On pre-encoded cache hit we
+        // skip the full parse, router, middleware, and response
+        // encoding entirely — saving ~100-130ns per pipelined request.
+        if (!conn.close_after_write and server.proxy == null and
+            server.cfg.allowed_hosts.len == 0 and
+            !server.app_router.has_any_paid_routes)
+        {
+            if (http1.extractQuickLine(buf_slice)) |ql| {
+                if (ql.method == .GET) {
+                    if (preencoded.findAndRefreshPreencodedH1(server, "GET", ql.path)) |entry| {
+                        if (preencoded.sendH1PreencodedBytes(server, conn, entry.bytes[0..entry.len])) {
+                            if (!ql.is_http11) conn.close_after_write = true;
+                            server.io.onReadConsumed(conn, ql.consumed);
+                            if (conn.read_buffered_bytes == 0) break;
+                            continue;
+                        } else {
+                            break; // pool exhausted
+                        }
+                    }
+                }
+            }
+        }
+
+        const parse = http1.parse(buf_slice, .{
             .max_header_bytes = server.cfg.limits.max_header_bytes,
             .max_body_bytes = server.cfg.limits.max_body_bytes,
             .max_header_count = server.cfg.limits.max_header_count,
