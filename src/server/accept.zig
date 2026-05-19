@@ -72,8 +72,7 @@ fn acceptOne(server: *Server, listener_fd: std.posix.fd_t) !void {
 /// `net.getPeerAddress(conn.fd)` directly on the cold path —
 /// benchmark configs pay zero getpeername syscalls this way.
 fn setupAcceptedConnection(server: *Server, client_fd: std.posix.fd_t) !void {
-    const now_ms = server.io.nowMs();
-    const conn = server.io.acquireConnection(now_ms) orelse {
+    const conn = server.io.acquireConnection(server.now_ms) orelse {
         clock.closeFd(client_fd);
         return;
     };
@@ -103,7 +102,7 @@ fn setupAcceptedConnection(server: *Server, client_fd: std.posix.fd_t) !void {
             return;
         };
         conn.is_tls = true;
-        conn.transition(.handshake, now_ms) catch {
+        conn.transition(.handshake, server.now_ms) catch {
             conn.cleanupTls();
             if (conn.read_buffer) |buf| server.io.releaseBuffer(buf);
             server.io.releaseConnection(conn);
@@ -124,7 +123,7 @@ fn setupAcceptedConnection(server: *Server, client_fd: std.posix.fd_t) !void {
             return;
         };
     } else {
-        conn.transition(.active, now_ms) catch {
+        conn.transition(.active, server.now_ms) catch {
             // Invalid state transition - close connection
             if (conn.read_buffer) |buf| server.io.releaseBuffer(buf);
             server.io.releaseConnection(conn);

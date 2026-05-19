@@ -76,7 +76,7 @@ pub fn handleTlsHandshake(server: *Server, conn: *connection.Connection) !void {
     try tlsFlushWbio(server, conn);
     if (accepted) {
         // Handshake complete — check ALPN for h2 and transition to active
-        conn.transition(.active, server.io.nowMs()) catch return error.InvalidTransition;
+        conn.transition(.active, server.now_ms) catch return error.InvalidTransition;
         if (build_options.enable_http2) {
             if (session.getAlpn()) |alpn| {
                 if (std.mem.eql(u8, alpn, "h2")) {
@@ -146,7 +146,7 @@ pub fn tlsPumpRead(server: *Server, conn: *connection.Connection) bool {
             remaining = remaining[fed..];
         }
         any = true;
-        conn.markActive(server.io.nowMs());
+        conn.markActive(server.now_ms);
     }
 }
 
@@ -171,7 +171,7 @@ pub fn tlsDrainCarry(server: *Server, conn: *connection.Connection) CarryFlushRe
         if (raw == 0) return .again;
         conn.tls_cipher_carry_offset += @intCast(raw);
         server.io.onWriteCompleted(conn, @intCast(raw));
-        conn.markActive(server.io.nowMs());
+        conn.markActive(server.now_ms);
     }
     // Carry fully drained — release the buffer.
     server.io.releaseBuffer(handle);
@@ -219,7 +219,7 @@ pub fn tlsFlushWbio(server: *Server, conn: *connection.Connection) !void {
                 return;
             }
             sent += @intCast(raw);
-            conn.markActive(server.io.nowMs());
+            conn.markActive(server.now_ms);
         }
     }
 }

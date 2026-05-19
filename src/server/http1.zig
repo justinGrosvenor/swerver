@@ -967,7 +967,7 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
                 else
                     null;
                 if (ratelimit_mod.evaluateRoute(consumer, client_key, rl_cfg)) |rl_resp| {
-                    conn.setRateLimitPause(server.io.nowMs(), rl_resp.pause_ms);
+                    conn.setRateLimitPause(server.now_ms, rl_resp.pause_ms);
                     cleanupBodyAccumulation(server, conn);
                     queueResponse(server, conn, rl_resp.resp) catch {};
                     return;
@@ -1007,7 +1007,7 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
             }
             var cert_dn_buf: [256]u8 = undefined;
             const cert_dn: ?[]const u8 = if (conn.tls_session) |*session| session.getPeerCertSubject(&cert_dn_buf) else null;
-            const now_ms = server.io.nowMs();
+            const now_ms = server.now_ms;
             const otel_start = clock.realtimeNanos() orelse 0;
             var proxy_result = proxy.handleWithBody(
                 hparse.view,
@@ -1099,7 +1099,7 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
     const result = server.app_router.handle(req_view, &mw_ctx, &scratch);
     if (scratch.arena_handle) |handle| server.io.releaseBuffer(handle);
     if (result.pause_reads_ms) |pause_ms| {
-        conn.setRateLimitPause(server.io.nowMs(), pause_ms);
+        conn.setRateLimitPause(server.now_ms, pause_ms);
     }
 
     cleanupBodyAccumulation(server, conn);
@@ -1172,7 +1172,7 @@ pub fn dispatchToRouter(server: *Server, conn: *connection.Connection, req_view:
     const result = server.app_router.handle(req_view, &mw_ctx, &scratch);
     if (scratch.arena_handle) |handle| server.io.releaseBuffer(handle);
     if (result.pause_reads_ms) |pause_ms| {
-        conn.setRateLimitPause(server.io.nowMs(), pause_ms);
+        conn.setRateLimitPause(server.now_ms, pause_ms);
     }
     queueResponse(server, conn, result.resp) catch {};
     if (server.otel) |otel_exp| {

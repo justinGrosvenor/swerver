@@ -96,7 +96,7 @@ pub fn advanceAsyncWriteQueue(server: *Server, conn: *connection.Connection, byt
     conn.send_in_flight = false;
     conn.async_send_iov_count = 0;
     conn.async_send_total_bytes = 0;
-    conn.markActive(server.io.nowMs());
+    conn.markActive(server.now_ms);
 }
 
 /// Middleware `buffer_ops.acquire` trampoline. `ctx` is an erased

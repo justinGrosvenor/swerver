@@ -538,7 +538,7 @@ fn dispatchHttp2Request(
     const result = server.app_router.handle(request_with_body, &mw_ctx, &scratch);
     if (scratch.arena_handle) |handle| server.io.releaseBuffer(handle);
     if (result.pause_reads_ms) |pause_ms| {
-        conn.setRateLimitPause(server.io.nowMs(), pause_ms);
+        conn.setRateLimitPause(server.now_ms, pause_ms);
     }
     try queueHttp2Response(server, conn, stream_id, result.resp, hdr_request.method == .HEAD);
 }

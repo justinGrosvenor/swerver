@@ -140,6 +140,10 @@ pub const Server = struct {
     /// True when proxy, rate limiting, or middleware needs the peer IP.
     /// When false, accept skips the getpeername syscall.
     needs_peer_ip: bool = true,
+    /// Monotonic timestamp cached once per event-loop tick. Used by
+    /// markActive and other non-critical-timing calls to avoid
+    /// repeated clock_gettime syscalls within the same event batch.
+    now_ms: u64 = 0,
     /// Cached Date header value (updated once per second)
     cached_date: [29]u8 = undefined,
     cached_date_epoch: u64 = 0,

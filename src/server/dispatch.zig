@@ -143,8 +143,11 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
             if (server.io.nowMs() >= limit) return;
         }
         // Single clock call per loop iteration — reused for poll
-        // timeout, timeout enforcement, and proxy maintenance.
+        // timeout, timeout enforcement, proxy maintenance, and all
+        // per-event markActive calls (avoids repeated clock_gettime
+        // within the same event batch).
         const now_ms = server.io.nowMs();
+        server.now_ms = now_ms;
         server.refreshCachedDate();
 
         // Housekeeping (timeout enforcement, QUIC cleanup, proxy
@@ -366,7 +369,7 @@ pub fn seedReadBuffer(server: *Server, conn: *connection.Connection, data: []con
                 if (n == 0) return;
                 remaining = remaining[n..];
             }
-            conn.markActive(server.io.nowMs());
+            conn.markActive(server.now_ms);
         }
         return;
     }
@@ -382,12 +385,12 @@ pub fn seedReadBuffer(server: *Server, conn: *connection.Connection, data: []con
         if (available == 0) return;
         @memcpy(buf.bytes[end..][0..available], data[0..available]);
         server.io.onReadBuffered(conn, available);
-        conn.markActive(server.io.nowMs());
+        conn.markActive(server.now_ms);
         return;
     }
     @memcpy(buf.bytes[end..][0..data.len], data);
     server.io.onReadBuffered(conn, data.len);
-    conn.markActive(server.io.nowMs());
+    conn.markActive(server.now_ms);
 }
 
 pub fn handleRead(server: *Server, index: u32) !void {
@@ -440,7 +443,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
                 },
             };
             server.io.onReadBuffered(conn, count);
-            conn.markActive(server.io.nowMs());
+            conn.markActive(server.now_ms);
             http1_mod.continueBodyAccumulation(server, conn) catch {
                 http1_mod.abortBodyAccumulation(server, conn, 400);
                 return;
@@ -515,7 +518,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
             },
         };
         server.io.onReadBuffered(conn, count);
-        conn.markActive(server.io.nowMs());
+        conn.markActive(server.now_ms);
     } else if (conn.read_buffered_bytes == 0) {
         // Completion backend but no data seeded (shouldn't happen
         // unless the event was spurious). Nothing to do.
@@ -564,7 +567,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
                 switch (connRead(server, conn, drain_slice)) {
                     .bytes => |n| {
                         server.io.onReadBuffered(conn, n);
-                        conn.markActive(server.io.nowMs());
+                        conn.markActive(server.now_ms);
                         try http2_mod.handleHttp2Read(server, conn);
                     },
                     .eof => {
@@ -732,7 +735,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
                     else
                         null;
                     if (ratelimit_mod.evaluateRoute(consumer, client_key, rl_cfg)) |rl_resp| {
-                        conn.setRateLimitPause(server.io.nowMs(), rl_resp.pause_ms);
+                        conn.setRateLimitPause(server.now_ms, rl_resp.pause_ms);
                         try http1_mod.queueResponse(server, conn, rl_resp.resp);
                         if (conn.read_buffered_bytes == 0) break;
                         continue;
@@ -785,14 +788,13 @@ pub fn handleRead(server: *Server, index: u32) !void {
                 }
                 var cert_dn_buf: [256]u8 = undefined;
                 const cert_dn: ?[]const u8 = if (conn.tls_session) |*session| session.getPeerCertSubject(&cert_dn_buf) else null;
-                const now_ms = server.io.nowMs();
 
                 // Response cache: check before forwarding to upstream
                 const cache_cfg = matched_route.cache;
                 const vary_keys: []const []const u8 = if (cache_cfg) |cc| cc.vary else &.{};
                 if (cache_cfg != null) {
                     if (proxy.route_caches[route_idx]) |*rc| {
-                        switch (rc.lookup(parse.view.method, parse.view.path, parse.view.headers, vary_keys, now_ms)) {
+                        switch (rc.lookup(parse.view.method, parse.view.path, parse.view.headers, vary_keys, server.now_ms)) {
                             .hit => |info| {
                                 var resp_headers_buf: [64]response_mod.Header = undefined;
                                 const hdr_count = @min(info.headers.len, resp_headers_buf.len);
@@ -823,7 +825,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
                     &mw_ctx,
                     client_ip_str,
                     conn.tls_session != null,
-                    now_ms,
+                    server.now_ms,
                     auth_info_ptr,
                     cert_dn,
                 );
@@ -841,7 +843,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
                                 proxy_result.resp.headers,
                                 proxy_result.resp.bodyBytes(),
                                 @as(u64, cc.ttl_s) * 1000,
-                                now_ms,
+                                server.now_ms,
                             );
                         }
                     }
@@ -943,7 +945,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
         if (scratch.arena_handle) |handle| server.io.releaseBuffer(handle);
         // Apply rate limit backpressure if signaled
         if (result.pause_reads_ms) |pause_ms| {
-            conn.setRateLimitPause(server.io.nowMs(), pause_ms);
+            conn.setRateLimitPause(server.now_ms, pause_ms);
         }
         try http1_mod.queueResponse(server, conn, result.resp);
         if (server.otel) |otel_exp| {
@@ -970,7 +972,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
         switch (connRead(server, conn, drain_buf.bytes)) {
             .bytes => |drain_count| {
                 server.io.onReadBuffered(conn, drain_count);
-                conn.markActive(server.io.nowMs());
+                conn.markActive(server.now_ms);
                 return handleRead(server, index);
             },
             .eof, .again, .err => {},
@@ -1005,7 +1007,7 @@ fn handleTunnelRead(server: *Server, conn: *connection.Connection) void {
         closeTunnel(server, conn);
         return;
     }
-    conn.markActive(server.io.nowMs());
+    conn.markActive(server.now_ms);
 
     const peer_index = conn.tunnel_peer_index orelse {
         closeTunnel(server, conn);
@@ -1037,7 +1039,7 @@ fn handleTunnelRead(server: *Server, conn: *connection.Connection) void {
         closeTunnel(server, conn);
         return;
     }
-    peer.markActive(server.io.nowMs());
+    peer.markActive(server.now_ms);
 
     // Kick a write on the peer
     handleWrite(server, peer.index) catch {
@@ -1076,7 +1078,7 @@ fn setupWebSocketTunnel(
         return;
     };
 
-    const selection = bal.select(null, server.io.nowMs()) orelse {
+    const selection = bal.select(null, server.now_ms) orelse {
         http1_mod.queueResponse(server, conn, ws_mod.errorResp(502)) catch {};
         return;
     };
@@ -1106,7 +1108,7 @@ fn setupWebSocketTunnel(
             }
 
             // Acquire a connection slot for the upstream side of the tunnel
-            const upstream_conn = server.io.acquireConnection(server.io.nowMs()) orelse {
+            const upstream_conn = server.io.acquireConnection(server.now_ms) orelse {
                 clock.closeFd(upstream_fd);
                 return;
             };
@@ -1185,7 +1187,7 @@ pub fn handleWrite(server: *Server, index: u32) !void {
                 }
                 switch (connWrite(server, conn, data)) {
                     .bytes => |n| {
-                        conn.markActive(server.io.nowMs());
+                        conn.markActive(server.now_ms);
                         if (n >= data.len) {
                             server.io.onWriteCompleted(conn, data.len);
                             server.io.releaseBuffer(entry.handle);
@@ -1272,7 +1274,7 @@ pub fn handleWrite(server: *Server, index: u32) !void {
                 }
                 if (bytes_written == 0) return;
                 var written: usize = @intCast(bytes_written);
-                conn.markActive(server.io.nowMs());
+                conn.markActive(server.now_ms);
 
                 while (written > 0) {
                     const entry = conn.peekWrite() orelse break;
@@ -1312,7 +1314,7 @@ pub fn handleWrite(server: *Server, index: u32) !void {
             };
             if (result.bytes_sent == 0) return;
             conn.pending_file_remaining -= result.bytes_sent;
-            conn.markActive(server.io.nowMs());
+            conn.markActive(server.now_ms);
 
             if (conn.pending_file_remaining == 0) {
                 conn.cleanupPendingFile();
