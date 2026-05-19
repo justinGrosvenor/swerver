@@ -768,6 +768,7 @@ pub fn extractQuickLine(bytes: []const u8) ?QuickLine {
     const header_area = bytes[line_end + 2 .. header_end];
     if (std.mem.indexOf(u8, header_area, "ontent-Length") != null) return null;
     if (std.mem.indexOf(u8, header_area, "ransfer-Encoding") != null) return null;
+    if (std.mem.indexOf(u8, header_area, "onnection:") != null) return null;
     return .{
         .method = method,
         .path = path,
