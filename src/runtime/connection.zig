@@ -149,10 +149,12 @@ pub const Connection = struct {
     is_tls: bool,
     /// Whether current request is HEAD (body suppressed in response per RFC 9110 §9.3.2)
     is_head_request: bool,
-    /// Body accumulation state for large request bodies (inline, no heap alloc)
-    body_accum: ?BodyAccumState = null,
-    /// Pending H2 body-bearing requests (HEADERS received, waiting for DATA)
-    h2_pending: [MAX_PENDING_H2_BODIES]PendingH2Body = [_]PendingH2Body{.{}} ** MAX_PENDING_H2_BODIES,
+    /// Body accumulation state for large request bodies.
+    /// Heap-allocated lazily to avoid ~12KB per connection.
+    body_accum: ?*BodyAccumState = null,
+    /// Pending H2 body-bearing requests (HEADERS received, waiting for DATA).
+    /// Heap-allocated lazily on HTTP/2 upgrade to avoid ~112KB per connection.
+    h2_pending: ?*[MAX_PENDING_H2_BODIES]PendingH2Body = null,
     /// Pending response body for streaming large responses
     pending_body: []const u8,
     /// File descriptor for sendfile-based response (null = no file pending)
@@ -272,7 +274,8 @@ pub const Connection = struct {
         self.is_head_request = false;
         // body_accum is cleaned up by the server before reset
         self.body_accum = null;
-        for (&self.h2_pending) |*p| p.clear();
+        // h2_pending is freed by closeConnection before reset
+        self.h2_pending = null;
         self.pending_body = &[_]u8{};
         self.cleanupPendingFile();
         self.cached_peer_ip = null;
@@ -578,11 +581,11 @@ fn isValidTransition(from: State, to: State) bool {
     };
 }
 
-/// Per-connection write queue capacity. Sized for HTTP/1.1 pipelining (16
-/// pipelined requests × multiple concurrent connections) and HTTP/2
-/// multiplexing (HEADERS + DATA per stream). 256 entries prevents write
-/// queue saturation under heavy pipelining loads.
-const write_queue_capacity: u16 = 256;
+/// Per-connection write queue capacity. Response coalescing packs ~200
+/// pre-encoded responses per 64KB buffer, so 32 entries handles 6000+
+/// pipelined responses. HTTP/2 multiplexing needs at most ~2 entries
+/// per concurrent stream (HEADERS + DATA).
+const write_queue_capacity: u16 = 32;
 /// Max iovec entries per async writev SQE on the native io_uring backend.
 /// Mirrors the gather cap in the sync writev path so the two branches
 /// submit the same-sized batches.

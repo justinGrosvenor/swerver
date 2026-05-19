@@ -763,7 +763,8 @@ pub fn initBodyAccumulation(
     buffer_handle: buffer_pool.BufferHandle,
 ) !void {
     const discard = server.app_router.bodyPolicyForRoute(hparse.view.method, hparse.view.path) == .discard;
-    conn.body_accum = .{
+    const accum_ptr = server.allocator.create(connection.BodyAccumState) catch return error.OutOfMemory;
+    accum_ptr.* = .{
         .content_length = hparse.content_length,
         .is_chunked = hparse.is_chunked,
         .bytes_received = 0,
@@ -776,6 +777,7 @@ pub fn initBodyAccumulation(
         .original_read_buffer = null,
         .discard_body = discard,
     };
+    conn.body_accum = accum_ptr;
     conn.header_count = hparse.view.headers.len;
     conn.is_head_request = (hparse.view.method == .HEAD);
     if (!hparse.keep_alive) conn.close_after_write = true;
@@ -799,7 +801,7 @@ pub fn initBodyAccumulation(
 
     // Retain original read buffer (header slices point into it) and acquire a fresh one.
     // This prevents subsequent body reads from overwriting the header data.
-    const accum = &(conn.body_accum orelse unreachable);
+    const accum = conn.body_accum orelse unreachable;
     accum.original_read_buffer = conn.read_buffer;
     conn.read_buffer = server.io.acquireBuffer() orelse {
         // No buffers available — abort body accumulation
@@ -834,7 +836,7 @@ pub fn continueBodyAccumulation(server: *Server, conn: *connection.Connection) !
 
 /// Append raw body data into body accumulator buffers.
 fn appendBodyData(server: *Server, conn: *connection.Connection, data: []u8) !void {
-    const accum = &(conn.body_accum orelse return);
+    const accum = conn.body_accum orelse return;
     var remaining = data;
 
     if (accum.discard_body) {
@@ -926,7 +928,7 @@ fn bodyComplete(conn: *connection.Connection) bool {
 
 /// Dispatch a request with accumulated body data to handler/proxy.
 pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection) !void {
-    const accum = &(conn.body_accum orelse return);
+    const accum = conn.body_accum orelse return;
     const hparse = accum.header_result;
     _ = conn.fd orelse return;
 
@@ -1182,14 +1184,14 @@ pub fn dispatchToRouter(server: *Server, conn: *connection.Connection, req_view:
 
 /// Release all acquired body buffers and free BodyAccumState.
 pub fn cleanupBodyAccumulation(server: *Server, conn: *connection.Connection) void {
-    if (conn.body_accum) |*accum| {
+    if (conn.body_accum) |accum| {
         for (0..accum.buffer_count) |i| {
             server.io.releaseBodyBuffer(accum.body_buffers[i]);
         }
-        // The original read buffer is from the hot-path pool
         if (accum.original_read_buffer) |buf| {
             server.io.releaseBuffer(buf);
         }
+        server.allocator.destroy(accum);
         conn.body_accum = null;
     }
 }

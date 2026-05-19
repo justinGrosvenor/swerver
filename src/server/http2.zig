@@ -135,11 +135,9 @@ pub fn handleHttp2Read(server: *Server, conn: *connection.Connection) !void {
         // conn.h2_pending slots for bodies spanning TCP reads.
         var pending_headers: [16]?http2.HeadersEvent = [_]?http2.HeadersEvent{null} ** 16;
         var pending_count: usize = 0;
-        // Stack buffer for batching control frames (SETTINGS ACK,
-        // PING ACK, WINDOW_UPDATE) from a single ingest. Avoids
-        // acquiring a 1MB pool buffer per 9-17 byte control frame.
         var ctrl_buf: [256]u8 = undefined;
         var ctrl_len: usize = 0;
+        const h2_pending = conn.h2_pending orelse return;
 
         for (events[0..ingest.event_count]) |event| {
             switch (event) {
@@ -181,7 +179,7 @@ pub fn handleHttp2Read(server: *Server, conn: *connection.Connection) !void {
                         // Persist to connection-level slots so DATA
                         // arriving in a later TCP read can find them.
                         var stashed = false;
-                        for (&conn.h2_pending) |*slot| {
+                        for (h2_pending) |*slot| {
                             if (!slot.active) {
                                 stashed = slot.stash(hdr.stream_id, hdr.request);
                                 break;
@@ -220,7 +218,7 @@ pub fn handleHttp2Read(server: *Server, conn: *connection.Connection) !void {
                             if (data_ev.end_stream) {
                                 try dispatchHttp2Request(server, conn, hdr.stream_id, hdr.request, data_ev.data);
                                 // Clear persistent slot too
-                                for (&conn.h2_pending) |*slot| {
+                                for (h2_pending) |*slot| {
                                     if (slot.active and slot.stream_id == data_ev.stream_id) {
                                         slot.clear();
                                         break;
@@ -235,7 +233,7 @@ pub fn handleHttp2Read(server: *Server, conn: *connection.Connection) !void {
                         // No batch-local match — check persistent slots
                         // for headers that arrived in a previous TCP read.
                         var found_persistent = false;
-                        for (&conn.h2_pending) |*slot| {
+                        for (h2_pending) |*slot| {
                             if (slot.active and slot.stream_id == data_ev.stream_id) {
                                 found_persistent = true;
                                 if (data_ev.end_stream) {
@@ -478,7 +476,8 @@ pub fn queueHttp2Response(server: *Server, conn: *connection.Connection, stream_
 }
 
 fn accumulateH2Body(server: *Server, conn: *connection.Connection, data_ev: http2.DataEvent) void {
-    for (&conn.h2_pending) |*slot| {
+    const pending = conn.h2_pending orelse return;
+    for (pending) |*slot| {
         if (slot.active and slot.stream_id == data_ev.stream_id) {
             if (slot.body_handle == null) {
                 slot.body_handle = server.io.acquireBuffer() orelse return;

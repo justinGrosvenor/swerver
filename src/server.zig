@@ -144,6 +144,7 @@ pub const Server = struct {
     /// markActive and other non-critical-timing calls to avoid
     /// repeated clock_gettime syscalls within the same event batch.
     now_ms: u64 = 0,
+    last_date_check_sec: u64 = 0,
     /// Cached Date header value (updated once per second)
     cached_date: [29]u8 = undefined,
     cached_date_epoch: u64 = 0,
@@ -505,6 +506,9 @@ pub const Server = struct {
     /// Refresh the cached date string. Called once per event-loop
     /// iteration so individual responses never hit clock_gettime.
     pub fn refreshCachedDate(self: *Server) void {
+        const mono_sec = self.now_ms / 1000;
+        if (mono_sec == self.last_date_check_sec and self.cached_date_epoch != 0) return;
+        self.last_date_check_sec = mono_sec;
         const ts = clock.realtimeTimespec() orelse return;
         const epoch_secs: u64 = @intCast(ts.sec);
         if (epoch_secs != self.cached_date_epoch) {
@@ -673,6 +677,13 @@ pub const Server = struct {
         if (conn.http2_stack) |stack| {
             self.allocator.destroy(stack);
             conn.http2_stack = null;
+        }
+        if (conn.h2_pending) |pending| {
+            for (pending) |*slot| {
+                if (slot.body_handle) |bh| self.io.releaseBuffer(bh);
+            }
+            self.allocator.destroy(pending);
+            conn.h2_pending = null;
         }
         // Clean up body accumulation state
         http1_mod.cleanupBodyAccumulation(self, conn);

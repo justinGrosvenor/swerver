@@ -542,6 +542,10 @@ pub fn handleRead(server: *Server, index: u32) !void {
                     });
                     conn.http2_stack = stack_ptr;
                 }
+                if (conn.h2_pending == null) {
+                    conn.h2_pending = try server.allocator.create([connection.MAX_PENDING_H2_BODIES]connection.PendingH2Body);
+                    conn.h2_pending.?.* = [_]connection.PendingH2Body{.{}} ** connection.MAX_PENDING_H2_BODIES;
+                }
                 conn.protocol = .http2;
                 // RFC 9113 §3.4: Server MUST send SETTINGS as first frame
                 http2_mod.sendHttp2ServerPreface(server, conn) catch {
