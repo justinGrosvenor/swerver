@@ -49,6 +49,7 @@ const write_queue = @import("write_queue.zig");
 const admin_mod = @import("../admin/admin.zig");
 const cache_mod = @import("../proxy/cache.zig");
 const otel_mod = @import("../middleware/otel.zig");
+const body_schema_mod = @import("../middleware/body_schema.zig");
 
 /// Global shutdown flag set by signal handler (atomic for signal safety)
 var shutdown_requested = std.atomic.Value(bool).init(false);
@@ -718,6 +719,24 @@ pub fn handleRead(server: *Server, index: u32) !void {
                         try http1_mod.queueResponse(server, conn, rl_resp.resp);
                         if (conn.read_buffered_bytes == 0) break;
                         continue;
+                    }
+                }
+                if (matched_route.body_schema) |route_schema| {
+                    const body_slice = parse.view.body.sliceOrNull() orelse "";
+                    if (body_slice.len > 0 and body_slice.len <= 1024 * 1024) {
+                        const vr = body_schema_mod.validate(route_schema, body_slice);
+                        if (!vr.valid) {
+                            var err_buf: [1024]u8 = undefined;
+                            const err_json = body_schema_mod.formatErrorResponse(&vr, &err_buf);
+                            const json_ct = [_]response_mod.Header{.{ .name = "Content-Type", .value = "application/json" }};
+                            try http1_mod.queueResponse(server, conn, .{
+                                .status = 400,
+                                .headers = &json_ct,
+                                .body = .{ .bytes = err_json },
+                            });
+                            if (conn.read_buffered_bytes == 0) break;
+                            continue;
+                        }
                     }
                 }
                 // WebSocket upgrade: detect and set up bidirectional tunnel
