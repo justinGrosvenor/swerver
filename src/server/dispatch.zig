@@ -516,22 +516,12 @@ pub fn handleRead(server: *Server, index: u32) !void {
     if (!server.io.capabilities().delivers_read_data or conn.is_tls) {
         const slice = buffer_handle.bytes[offset..];
         const count = switch (connRead(server, conn, slice)) {
-            .bytes => |n| blk: {
-                if (conn.is_tls and conn.protocol == .http2) {
-                    std.log.warn("h2-tls-read: SSL_read got {} bytes, first4={x}", .{ n, if (n >= 4) slice[0..4].* else [4]u8{ 0, 0, 0, 0 } });
-                }
-                break :blk n;
-            },
+            .bytes => |n| n,
             .eof => {
                 server.closeConnection(conn);
                 return;
             },
-            .again => {
-                if (conn.is_tls and conn.protocol == .http2) {
-                    std.log.warn("h2-tls-read: SSL_read returned WouldBlock", .{});
-                }
-                return;
-            },
+            .again => return,
             .err => {
                 server.closeConnection(conn);
                 return;

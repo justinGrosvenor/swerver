@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const tls_enabled = build_options.enable_tls;
+const http2_enabled = build_options.enable_http2;
 const http3_enabled = build_options.enable_http3;
 
 /// C FFI bindings for OpenSSL/BoringSSL TLS 1.3 operations.
@@ -486,7 +487,24 @@ pub fn createTcpContext(is_server: bool) !*SSL_CTX {
     return ctx;
 }
 
-/// ALPN selection callback for TCP TLS: prefer h2, fall back to http/1.1
+const AlpnMatch = struct { ptr: [*]const u8, len: u8 };
+
+fn selectAlpnProto(client_list: []const u8, target: []const u8) ?AlpnMatch {
+    var i: usize = 0;
+    while (i < client_list.len) {
+        const proto_len = client_list[i];
+        i += 1;
+        if (i + proto_len > client_list.len) break;
+        if (proto_len == target.len and std.mem.eql(u8, client_list[i .. i + proto_len], target)) {
+            return .{ .ptr = @ptrCast(client_list[i..].ptr), .len = proto_len };
+        }
+        i += proto_len;
+    }
+    return null;
+}
+
+/// ALPN selection callback for TCP TLS: prefer h2 (when compiled in),
+/// fall back to http/1.1
 fn tcpAlpnSelectCallback(
     _: *SSL,
     out: *[*]const u8,
@@ -495,37 +513,19 @@ fn tcpAlpnSelectCallback(
     inlen: c_uint,
     _: ?*anyopaque,
 ) callconv(.c) c_int {
-    // Wire format: each protocol is length-prefixed (1 byte length + protocol bytes)
     const client_list = in_data[0..inlen];
-    // First pass: look for "h2"
-    var i: usize = 0;
-    while (i < client_list.len) {
-        const proto_len = client_list[i];
-        i += 1;
-        if (i + proto_len > client_list.len) break;
-        const proto = client_list[i .. i + proto_len];
-        if (std.mem.eql(u8, proto, "h2")) {
-            out.* = @ptrCast(client_list[i..].ptr);
-            outlen.* = proto_len;
+    if (http2_enabled) {
+        if (selectAlpnProto(client_list, "h2")) |match| {
+            out.* = match.ptr;
+            outlen.* = match.len;
             return SSL_TLSEXT_ERR_OK;
         }
-        i += proto_len;
     }
-    // Second pass: look for "http/1.1"
-    i = 0;
-    while (i < client_list.len) {
-        const proto_len = client_list[i];
-        i += 1;
-        if (i + proto_len > client_list.len) break;
-        const proto = client_list[i .. i + proto_len];
-        if (std.mem.eql(u8, proto, "http/1.1")) {
-            out.* = @ptrCast(client_list[i..].ptr);
-            outlen.* = proto_len;
-            return SSL_TLSEXT_ERR_OK;
-        }
-        i += proto_len;
+    if (selectAlpnProto(client_list, "http/1.1")) |match| {
+        out.* = match.ptr;
+        outlen.* = match.len;
+        return SSL_TLSEXT_ERR_OK;
     }
-    // No matching protocol — accept anyway (will default to HTTP/1.1)
     return SSL_TLSEXT_ERR_NOACK;
 }
 

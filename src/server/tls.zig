@@ -96,11 +96,9 @@ pub fn handleTlsHandshake(server: *Server, conn: *connection.Connection) !void {
                         conn.h2_pending.?.* = [_]connection.PendingH2Body{.{}} ** connection.MAX_PENDING_H2_BODIES;
                     }
                     conn.protocol = .http2;
-                    std.log.warn("h2-tls: ALPN=h2, write_count={} before preface", .{conn.write_count});
                     http2_mod.sendHttp2ServerPreface(server, conn) catch {
                         return error.Http2PrefaceFailed;
                     };
-                    std.log.warn("h2-tls: after preface, write_count={}", .{conn.write_count});
                 }
             }
         }
@@ -108,15 +106,12 @@ pub fn handleTlsHandshake(server: *Server, conn: *connection.Connection) !void {
         // reading. The client won't send its h2 preface until it receives ours.
         if (conn.protocol == .http2) {
             server.handleWrite(conn.index) catch {};
-            std.log.warn("h2-tls: after flush, write_count={}", .{conn.write_count});
         }
         // Try to read immediately (data may already be buffered by TLS/kernel)
-        server.handleRead(conn.index) catch |err| {
-            std.log.warn("h2-tls: handleRead failed: {}", .{err});
+        server.handleRead(conn.index) catch {
             server.closeConnection(conn);
             return;
         };
-        std.log.warn("h2-tls: after handleRead, write_count={} read_buffered={}", .{ conn.write_count, conn.read_buffered_bytes });
         // Flush any response queued by handleRead (the event loop also does
         // this after read events, but we need it here for the initial handshake)
         if (conn.write_count > 0) {

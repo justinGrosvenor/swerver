@@ -94,7 +94,6 @@ pub fn handleHttp2Read(server: *Server, conn: *connection.Connection) !void {
     const buffer_handle = conn.read_buffer orelse return;
     const stack = conn.http2_stack orelse return;
     const min_write_slots: u8 = 8;
-    std.log.warn("h2-read: buffered={} writeAvail={} offset={}", .{ conn.read_buffered_bytes, conn.writeQueueAvailable(), conn.read_offset });
     while (conn.read_buffered_bytes > 0 and conn.writeQueueAvailable() >= min_write_slots) {
         const start = conn.read_offset;
         const end = start + conn.read_buffered_bytes;
