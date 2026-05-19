@@ -97,6 +97,7 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
     std.posix.sigaction(std.posix.SIG.HUP, &reload_sa, null);
 
     try server.io.start();
+    server.refreshCachedDate();
     if (server.listener_fd == null) {
         const fd = try net.listen(server.cfg.address, server.cfg.port, 4096);
         server.listener_fd = fd;
@@ -144,6 +145,7 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
         // Single clock call per loop iteration — reused for poll
         // timeout, timeout enforcement, and proxy maintenance.
         const now_ms = server.io.nowMs();
+        server.refreshCachedDate();
 
         // Housekeeping (timeout enforcement, QUIC cleanup, proxy
         // maintenance) runs at most every 100ms. Under high load

@@ -489,14 +489,20 @@ pub const Server = struct {
         return (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0);
     }
 
-    /// Return cached IMF-fixdate string, updating once per second.
-    pub fn getCachedDate(self: *Server) []const u8 {
-        const ts = clock.realtimeTimespec() orelse return "Thu, 01 Jan 1970 00:00:00 GMT";
+    /// Refresh the cached date string. Called once per event-loop
+    /// iteration so individual responses never hit clock_gettime.
+    pub fn refreshCachedDate(self: *Server) void {
+        const ts = clock.realtimeTimespec() orelse return;
         const epoch_secs: u64 = @intCast(ts.sec);
         if (epoch_secs != self.cached_date_epoch) {
             _ = formatImfDate(&self.cached_date);
             self.cached_date_epoch = epoch_secs;
         }
+    }
+
+    /// Return the pre-computed IMF-fixdate string.
+    pub fn getCachedDate(self: *Server) []const u8 {
+        if (self.cached_date_epoch == 0) self.refreshCachedDate();
         return self.cached_date[0..29];
     }
 
