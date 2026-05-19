@@ -849,7 +849,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
                     }
                 }
 
-                const otel_start = clock.realtimeNanos() orelse 0;
+                const otel_start = if (server.otel != null) clock.realtimeNanos() orelse 0 else 0;
                 var proxy_result = proxy.handle(
                     parse.view,
                     &mw_ctx,
@@ -970,10 +970,9 @@ pub fn handleRead(server: *Server, index: u32) !void {
             .arena_handle = arena_handle,
             .buffer_ops = mw_ctx.buffer_ops,
         };
-        const otel_start = clock.realtimeNanos() orelse 0;
+        const otel_start = if (server.otel != null) clock.realtimeNanos() orelse 0 else 0;
         const result = server.app_router.handle(parse.view, &mw_ctx, &scratch);
         if (scratch.arena_handle) |handle| server.io.releaseBuffer(handle);
-        // Apply rate limit backpressure if signaled
         if (result.pause_reads_ms) |pause_ms| {
             conn.setRateLimitPause(server.now_ms, pause_ms);
         }
