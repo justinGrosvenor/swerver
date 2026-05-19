@@ -346,7 +346,7 @@ pub fn queueResponse(server: *Server, conn: *connection.Connection, resp: respon
     // (no managed/scattered body), and status in the error cache.
     // We don't check headers.len — the pre-encoded template
     // includes its own headers (Content-Type etc.).
-    if (!conn.close_after_write) {
+    if (!conn.close_after_write and resp.status >= 400) {
         const is_simple_body = switch (resp.body) {
             .bytes, .none => true,
             else => false,

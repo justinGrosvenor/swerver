@@ -34,7 +34,6 @@ const response_mod = @import("../response/response.zig");
 const http1 = @import("http1.zig");
 const http2 = @import("../protocol/http2.zig");
 const middleware = @import("../middleware/middleware.zig");
-const clock = @import("../runtime/clock.zig");
 const connection = @import("../runtime/connection.zig");
 const request = @import("../protocol/request.zig");
 
@@ -246,8 +245,7 @@ fn rebuildPreencodedH3(server: *Server, entry: *PreencodedH3Response) void {
         @ptrCast(merged[0..count]),
         body_opt,
     ) catch 0;
-    const ts = clock.realtimeTimespec() orelse return;
-    entry.epoch = @intCast(ts.sec);
+    entry.epoch = server.cached_date_epoch;
 }
 
 /// Look up a hot endpoint by method + path. On a match, refresh
@@ -259,11 +257,8 @@ pub fn findAndRefreshPreencodedH3(server: *Server, method: []const u8, path: []c
     while (i < server.h3_preencoded_count) : (i += 1) {
         const entry = &server.h3_preencoded[i];
         if (std.mem.eql(u8, entry.method, method) and std.mem.eql(u8, entry.path, path)) {
-            // Lazy per-second refresh
-            const ts = clock.realtimeTimespec() orelse return entry;
-            const epoch: u64 = @intCast(ts.sec);
-            if (epoch != entry.epoch) rebuildPreencodedH3(server, entry);
-            if (entry.len == 0) return null; // encode failed; fall through to router
+            if (server.cached_date_epoch != entry.epoch) rebuildPreencodedH3(server, entry);
+            if (entry.len == 0) return null;
             return entry;
         }
     }
@@ -324,9 +319,7 @@ pub fn findPreencodedError(server: *Server, status: u16) ?*PreencodedH1Response 
     while (i < server.h1_error_cache_count) : (i += 1) {
         if (server.h1_error_cache[i].status == status) {
             const entry = &server.h1_error_cache[i];
-            const ts = clock.realtimeTimespec() orelse return entry;
-            const epoch: u64 = @intCast(ts.sec);
-            if (epoch != entry.epoch) rebuildPreencodedH1(server, entry);
+            if (server.cached_date_epoch != entry.epoch) rebuildPreencodedH1(server, entry);
             if (entry.len == 0) return null;
             return entry;
         }
@@ -389,8 +382,7 @@ fn rebuildPreencodedH1(server: *Server, entry: *PreencodedH1Response) void {
         null;
     const date_str = server.getCachedDate();
     entry.len = http1.encodeResponse(&entry.bytes, resp, alt_svc, false, date_str) catch 0;
-    const ts = clock.realtimeTimespec() orelse return;
-    entry.epoch = @intCast(ts.sec);
+    entry.epoch = server.cached_date_epoch;
 }
 
 pub fn findAndRefreshPreencodedH1(server: *Server, method: []const u8, path: []const u8) ?*PreencodedH1Response {
@@ -398,9 +390,7 @@ pub fn findAndRefreshPreencodedH1(server: *Server, method: []const u8, path: []c
     while (i < server.h1_preencoded_count) : (i += 1) {
         const entry = &server.h1_preencoded[i];
         if (std.mem.eql(u8, entry.method, method) and std.mem.eql(u8, entry.path, path)) {
-            const ts = clock.realtimeTimespec() orelse return entry;
-            const epoch: u64 = @intCast(ts.sec);
-            if (epoch != entry.epoch) rebuildPreencodedH1(server, entry);
+            if (server.cached_date_epoch != entry.epoch) rebuildPreencodedH1(server, entry);
             if (entry.len == 0) return null;
             return entry;
         }
@@ -422,9 +412,9 @@ pub fn findAndRefreshPreencodedH1(server: *Server, method: []const u8, path: []c
 /// those aren't GET).
 pub fn tryDispatchPreencodedH1(server: *Server, conn: *connection.Connection, req_view: request.RequestView) PreencodedResult {
     if (conn.close_after_write) return .not_cached;
+    if (req_view.method != .GET) return .not_cached;
     if (server.app_router.has_any_paid_routes) return .not_cached;
-    const method_str = req_view.getMethodName();
-    if (findAndRefreshPreencodedH1(server, method_str, req_view.path)) |entry| {
+    if (findAndRefreshPreencodedH1(server, "GET", req_view.path)) |entry| {
         if (sendH1PreencodedBytes(server, conn, entry.bytes[0..entry.len]))
             return .dispatched
         else
@@ -441,14 +431,20 @@ pub fn tryDispatchPreencodedH1(server: *Server, conn: *connection.Connection, re
 /// bug: previously pool exhaustion called closeConnection, causing
 /// 213K reconnects in 5 seconds.
 pub fn sendH1PreencodedBytes(server: *Server, conn: *connection.Connection, bytes: []const u8) bool {
-    const buf = server.io.acquireBuffer() orelse {
-        // Pool exhausted — do NOT close the connection. The
-        // pipelining loop should break and wait for writes to
-        // flush (freeing buffers). On the next event-loop
-        // iteration the connection is still readable and the
-        // loop picks up where it left off.
-        return false;
-    };
+    // Coalesce: if the last write queue entry has room, append
+    // instead of acquiring a new buffer. Pipelined pre-encoded
+    // responses (~200-300 bytes each) can pack ~200 per 64KB
+    // buffer, eliminating per-response buffer acquire/release.
+    if (conn.peekLastWrite()) |entry| {
+        if (entry.offset == 0 and entry.len + bytes.len <= entry.handle.bytes.len) {
+            @memcpy(entry.handle.bytes[entry.len..][0..bytes.len], bytes);
+            entry.len += bytes.len;
+            server.io.onWriteBuffered(conn, bytes.len);
+            return true;
+        }
+    }
+
+    const buf = server.io.acquireBuffer() orelse return false;
     if (bytes.len > buf.bytes.len) {
         server.io.releaseBuffer(buf);
         return false;
@@ -568,8 +564,7 @@ fn rebuildPreencodedH2(server: *Server, entry: *PreencodedH2Response) void {
         entry.data_offset = @intCast(data_off);
     }
 
-    const ts = clock.realtimeTimespec() orelse return;
-    entry.epoch = @intCast(ts.sec);
+    entry.epoch = server.cached_date_epoch;
 }
 
 pub fn findAndRefreshPreencodedH2(server: *Server, method: []const u8, path: []const u8) ?*PreencodedH2Response {
@@ -577,9 +572,7 @@ pub fn findAndRefreshPreencodedH2(server: *Server, method: []const u8, path: []c
     while (i < server.h2_preencoded_count) : (i += 1) {
         const entry = &server.h2_preencoded[i];
         if (std.mem.eql(u8, entry.method, method) and std.mem.eql(u8, entry.path, path)) {
-            const ts = clock.realtimeTimespec() orelse return entry;
-            const epoch: u64 = @intCast(ts.sec);
-            if (epoch != entry.epoch) rebuildPreencodedH2(server, entry);
+            if (server.cached_date_epoch != entry.epoch) rebuildPreencodedH2(server, entry);
             if (entry.len == 0) return null;
             return entry;
         }

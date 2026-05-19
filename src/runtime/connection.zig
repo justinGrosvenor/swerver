@@ -437,6 +437,12 @@ pub const Connection = struct {
         return &self.write_queue[self.write_head];
     }
 
+    pub fn peekLastWrite(self: *Connection) ?*WriteEntry {
+        if (self.write_count == 0) return null;
+        const idx = if (self.write_tail == 0) write_queue_capacity - 1 else self.write_tail - 1;
+        return &self.write_queue[idx];
+    }
+
     pub fn popWrite(self: *Connection) void {
         if (self.write_count == 0) return;
         self.write_head = nextIndex(self.write_head);
