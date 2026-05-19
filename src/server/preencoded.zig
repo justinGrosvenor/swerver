@@ -535,7 +535,7 @@ fn rebuildPreencodedH2(server: *Server, entry: *PreencodedH2Response) void {
     // HPACK-encode the response headers into bytes[9..] (leaving
     // room for the HEADERS frame header at bytes[0..9]).
     const hpack_dst = entry.bytes[9..];
-    const hpack_len = http2.encodeResponseHeaders(hpack_dst, entry.status, headers_with_alt_svc[0..header_count], entry.body.len) catch {
+    const hpack_len = http2.encodeResponseHeaders(hpack_dst, entry.status, headers_with_alt_svc[0..header_count], entry.body.len, null) catch {
         entry.len = 0;
         return;
     };

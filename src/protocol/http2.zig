@@ -1600,6 +1600,7 @@ pub fn encodeResponseHeaders(
     status: u16,
     headers: []const response.Header,
     content_length: usize,
+    date_str: ?[]const u8,
 ) !usize {
     var idx: usize = 0;
     const status_index = statusStaticIndex(status);
@@ -1619,7 +1620,8 @@ pub fn encodeResponseHeaders(
         idx += try encodeLiteralHeaderIndexed(buf[idx..], "content-length", length_slice);
     }
     // RFC 9110 §6.6.1: Origin servers MUST send Date header
-    idx += try encodeLiteralHeaderIndexed(buf[idx..], "date", formatImfDateHttp2(&date_scratch_buf));
+    const date = date_str orelse formatImfDateHttp2(&date_scratch_buf);
+    idx += try encodeLiteralHeaderIndexed(buf[idx..], "date", date);
     for (headers) |header| {
         // Skip pseudo-headers (already handled)
         if (header.name.len > 0 and header.name[0] == ':') continue;

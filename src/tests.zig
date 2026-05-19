@@ -745,7 +745,7 @@ test "http2 response encoder roundtrip" {
     var decoder = http2.HpackDecoder.init();
     var headers: [8]request.Header = undefined;
     var buf: [256]u8 = undefined;
-    const encoded_len = try http2.encodeResponseHeaders(buf[0..], 200, &[_]response.Header{}, 12);
+    const encoded_len = try http2.encodeResponseHeaders(buf[0..], 200, &[_]response.Header{}, 12, null);
     const decoded = try decoder.decodeResponseBlock(buf[0..encoded_len], headers[0..], 4096);
     try std.testing.expectEqualStrings("200", decoded.status);
     try std.testing.expectEqual(@as(usize, 2), decoded.headers.len);
@@ -763,7 +763,7 @@ test "http2 response encoder includes custom headers" {
         .{ .name = "x-test", .value = "one" },
         .{ .name = "cache-control", .value = "no-cache" },
     };
-    const encoded_len = try http2.encodeResponseHeaders(buf[0..], 200, custom[0..], 0);
+    const encoded_len = try http2.encodeResponseHeaders(buf[0..], 200, custom[0..], 0, null);
     const decoded = try decoder.decodeResponseBlock(buf[0..encoded_len], headers[0..], 4096);
     try std.testing.expectEqualStrings("200", decoded.status);
     try std.testing.expectEqual(@as(usize, 4), decoded.headers.len);
@@ -814,7 +814,7 @@ test "http2 response encoder preserves header order and duplicates" {
         .{ .name = "x-order", .value = "first" },
         .{ .name = "set-cookie", .value = "b=2" },
     };
-    const encoded_len = try http2.encodeResponseHeaders(buf[0..], 200, custom[0..], 0);
+    const encoded_len = try http2.encodeResponseHeaders(buf[0..], 200, custom[0..], 0, null);
     const decoded = try decoder.decodeResponseBlock(buf[0..encoded_len], headers[0..], 4096);
     try std.testing.expectEqualStrings("200", decoded.status);
     try std.testing.expectEqual(@as(usize, 5), decoded.headers.len);
@@ -837,7 +837,7 @@ test "http2 response encoder ignores pseudo headers in custom list" {
         .{ .name = ":status", .value = "418" },
         .{ .name = "x-ok", .value = "yes" },
     };
-    const encoded_len = try http2.encodeResponseHeaders(buf[0..], 200, custom[0..], 0);
+    const encoded_len = try http2.encodeResponseHeaders(buf[0..], 200, custom[0..], 0, null);
     const decoded = try decoder.decodeResponseBlock(buf[0..encoded_len], headers[0..], 4096);
     try std.testing.expectEqualStrings("200", decoded.status);
     try std.testing.expectEqual(@as(usize, 3), decoded.headers.len);

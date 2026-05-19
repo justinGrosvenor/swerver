@@ -371,19 +371,20 @@ pub fn queueHttp2Response(server: *Server, conn: *connection.Connection, stream_
     // frame header slot. Only copy the header array when Alt-Svc
     // needs to be appended; otherwise pass resp.headers straight through.
     const hpack_start: usize = 9;
+    const date_str = server.getCachedDate();
     const header_block_len = blk: {
         if (server.alt_svc_len > 0) {
             var hdrs_with_alt: [65]response_mod.Header = undefined;
             const n = @min(resp.headers.len, hdrs_with_alt.len - 1);
             for (resp.headers[0..n], 0..) |h, i| hdrs_with_alt[i] = h;
             hdrs_with_alt[n] = .{ .name = "alt-svc", .value = server.alt_svc_value[0..server.alt_svc_len] };
-            break :blk http2.encodeResponseHeaders(buf.bytes[hpack_start..], resp.status, hdrs_with_alt[0 .. n + 1], body_len) catch {
+            break :blk http2.encodeResponseHeaders(buf.bytes[hpack_start..], resp.status, hdrs_with_alt[0 .. n + 1], body_len, date_str) catch {
                 server.io.releaseBuffer(buf);
                 server.closeConnection(conn);
                 return;
             };
         } else {
-            break :blk http2.encodeResponseHeaders(buf.bytes[hpack_start..], resp.status, resp.headers, body_len) catch {
+            break :blk http2.encodeResponseHeaders(buf.bytes[hpack_start..], resp.status, resp.headers, body_len, date_str) catch {
                 server.io.releaseBuffer(buf);
                 server.closeConnection(conn);
                 return;
