@@ -648,6 +648,9 @@ pub const Router = struct {
         r.x402_policy = payment;
         r.body_policy = body_policy;
         self.routes[self.route_count] = r;
+        // Fix up the pattern slice to point into the stored Route's
+        // pattern_buf (not the local variable that's about to go out of scope).
+        self.routes[self.route_count].pattern = self.routes[self.route_count].pattern_buf[0..r.pattern_len];
         self.route_count += 1;
         self.updateBloomFilter(pattern);
         if (payment.require_payment) self.has_any_paid_routes = true;
@@ -667,6 +670,7 @@ pub const Router = struct {
         r.middleware_chain = chain;
         r.x402_policy = payment;
         self.routes[self.route_count] = r;
+        self.routes[self.route_count].pattern = self.routes[self.route_count].pattern_buf[0..r.pattern_len];
         self.route_count += 1;
         if (prefix.len > 0) {
             self.updateBloomFilter(prefix);
