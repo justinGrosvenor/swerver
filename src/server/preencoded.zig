@@ -59,7 +59,7 @@ pub const MAX_H1_PREENCODED: usize = 12;
 pub const H1_PREENCODED_BUF_SIZE: usize = 1024;
 
 pub const MAX_H2_PREENCODED: usize = 8;
-pub const H2_PREENCODED_BUF_SIZE: usize = 512;
+pub const H2_PREENCODED_BUF_SIZE: usize = 9216;
 
 /// Pre-encoded HTTP/3 response for a hot static endpoint.
 ///
@@ -470,10 +470,14 @@ pub fn initPreencodedH2(server: *Server) void {
     const json_headers = [_]response_mod.Header{
         .{ .name = "Content-Type", .value = "application/json" },
     };
+    const octet_headers = [_]response_mod.Header{
+        .{ .name = "Content-Type", .value = "application/octet-stream" },
+    };
     registerPreencodedH2(server, "GET", "/health", 200, &[_]response_mod.Header{}, "");
     registerPreencodedH2(server, "GET", "/plaintext", 200, &plaintext_headers, "Hello, World!");
     registerPreencodedH2(server, "GET", "/pipeline", 200, &plaintext_headers, "ok");
     registerPreencodedH2(server, "GET", "/echo", 200, &json_headers, "{\"status\":\"ok\"}");
+    registerPreencodedH2(server, "GET", "/blob", 200, &octet_headers, &([_]u8{0} ** (8 * 1024)));
 }
 
 fn registerPreencodedH2(
@@ -618,9 +622,10 @@ pub fn sendH2PreencodedBytes(
     server.io.onWriteBuffered(conn, entry.len);
     server.io.setTimeoutPhase(conn, .write);
 
-    // Release the stream state — the h2 stack's per-stream
-    // tracking would otherwise leak.
-    if (conn.http2_stack) |stack| stack.closeStream(stream_id);
+    if (conn.http2_stack) |stack| {
+        if (entry.body.len > 0) stack.consumeSendWindow(stream_id, entry.body.len);
+        stack.closeStream(stream_id);
+    }
 }
 
 /// Write a stream_id into the reserved-bit + 31-bit stream_id

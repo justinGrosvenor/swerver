@@ -18,22 +18,25 @@ pub const FrameType = enum(u8) {
     continuation = 0x9,
 };
 
-pub const ErrorCode = enum {
-    none,
-    invalid_preface,
-    frame_size_error,
-    protocol_error,
-    compression_error,
-    header_list_too_large,
-    stream_closed,
-    flow_control_error,
-    enhance_your_calm,
+pub const ErrorCode = enum(u32) {
+    none = 0x0,
+    protocol_error = 0x1,
+    internal_error = 0x2,
+    flow_control_error = 0x3,
+    stream_closed = 0x5,
+    frame_size_error = 0x6,
+    refused_stream = 0x7,
+    compression_error = 0x9,
+    enhance_your_calm = 0xb,
+    header_list_too_large = 0x100,
+    invalid_preface = 0xfe,
 };
 
 pub const ParseState = enum {
     complete,
     partial,
     err,
+    stream_err,
 };
 
 pub const FrameHeader = struct {
@@ -230,14 +233,14 @@ pub const IngestResult = struct {
 };
 
 const MaxHeaders = 64;
-const HeaderScratchBytes = 4096;
-const HeaderBlockBytes = 8192;
+const HeaderScratchBytes = 16384;
+const HeaderBlockBytes = 16384;
 const MaxDynamicEntries = 64;
 const MaxDynamicBytes = 4096;
 /// Default values used when no config is provided.
 /// These can be overridden via StackConfig / ServerConfig.http2.
 pub const DefaultMaxStreams: usize = 128;
-pub const DefaultMaxHeaderListSize: usize = 8192;
+pub const DefaultMaxHeaderListSize: usize = 16384;
 pub const DefaultInitialWindow: u32 = 65535;
 pub const DefaultMaxFrameSize: u32 = 16384;
 pub const DefaultMaxDynamicTableSize: usize = 4096;
@@ -793,6 +796,10 @@ pub const Stack = struct {
                 .partial => {
                     break;
                 },
+                .stream_err => {
+                    consumed = frameConsumed(consumed, frame);
+                    event_count += handle.event_count;
+                },
                 .err => {
                     return .{
                         .state = .err,
@@ -895,7 +902,12 @@ pub const Stack = struct {
             return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
         };
         if (stream.header_block_len + header_block.len > self.header_block.len) {
-            return .{ .state = .err, .error_code = .header_list_too_large, .event_count = 0 };
+            stream.state = .closed;
+            if (events.len > 0) {
+                events[0] = .{ .err = .{ .stream_id = frame.header.stream_id, .code = .refused_stream } };
+                return .{ .state = .stream_err, .error_code = .none, .event_count = 1 };
+            }
+            return .{ .state = .stream_err, .error_code = .none, .event_count = 0 };
         }
         @memcpy(self.header_block[stream.header_block_len .. stream.header_block_len + header_block.len], header_block);
         stream.header_block_len += header_block.len;
@@ -906,7 +918,17 @@ pub const Stack = struct {
         // Persist END_STREAM for deferred use when CONTINUATION completes the header block
         stream.end_stream_pending = end_stream;
         if (!stream.header_block_in_progress) {
-            const decoded = self.decodeHeaders(stream) catch |err| return mapHeaderError(err);
+            const decoded = self.decodeHeaders(stream) catch |err| {
+                if (err == error.HeaderListTooLarge) {
+                    stream.state = .closed;
+                    if (events.len > 0) {
+                        events[0] = .{ .err = .{ .stream_id = frame.header.stream_id, .code = .refused_stream } };
+                        return .{ .state = .stream_err, .error_code = .none, .event_count = 1 };
+                    }
+                    return .{ .state = .stream_err, .error_code = .none, .event_count = 0 };
+                }
+                return mapHeaderError(err);
+            };
             if (events.len == 0) return .{ .state = .complete, .error_code = .none, .event_count = 0 };
             events[0] = .{ .headers = .{
                 .stream_id = frame.header.stream_id,
@@ -934,7 +956,14 @@ pub const Stack = struct {
             return .{ .state = .err, .error_code = .enhance_your_calm, .event_count = 0 };
         }
         if (stream.header_block_len + frame.payload.len > self.header_block.len) {
-            return .{ .state = .err, .error_code = .header_list_too_large, .event_count = 0 };
+            stream.state = .closed;
+            stream.header_block_in_progress = false;
+            self.expecting_continuation = 0;
+            if (events.len > 0) {
+                events[0] = .{ .err = .{ .stream_id = frame.header.stream_id, .code = .refused_stream } };
+                return .{ .state = .stream_err, .error_code = .none, .event_count = 1 };
+            }
+            return .{ .state = .stream_err, .error_code = .none, .event_count = 0 };
         }
         @memcpy(self.header_block[stream.header_block_len .. stream.header_block_len + frame.payload.len], frame.payload);
         stream.header_block_len += frame.payload.len;

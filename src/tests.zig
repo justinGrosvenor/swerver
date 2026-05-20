@@ -235,6 +235,90 @@ fn buildHeaderBlockAuthority(buffer: []u8, authority: []const u8) []u8 {
     return buffer[0..idx];
 }
 
+fn buildHeaderBlockWithCustom(buffer: []u8, authority: []const u8, header_name: []const u8, header_value: []const u8) []u8 {
+    var idx: usize = 0;
+    buffer[idx] = 0x82; // :method GET
+    idx += 1;
+    buffer[idx] = 0x84; // :path /
+    idx += 1;
+    buffer[idx] = 0x86; // :scheme http
+    idx += 1;
+    // :authority
+    buffer[idx] = 0x01;
+    idx += 1;
+    buffer[idx] = @intCast(authority.len);
+    idx += 1;
+    @memcpy(buffer[idx .. idx + authority.len], authority);
+    idx += authority.len;
+    // custom header: literal without indexing, new name
+    buffer[idx] = 0x00;
+    idx += 1;
+    // name length (HPACK 7-bit prefix integer)
+    idx = encodeHpackInt(buffer, idx, header_name.len, 7);
+    @memcpy(buffer[idx .. idx + header_name.len], header_name);
+    idx += header_name.len;
+    // value length
+    idx = encodeHpackInt(buffer, idx, header_value.len, 7);
+    @memcpy(buffer[idx .. idx + header_value.len], header_value);
+    idx += header_value.len;
+    return buffer[0..idx];
+}
+
+fn buildHeaderBlockWithManyHeaders(buffer: []u8, authority: []const u8, count: usize) []u8 {
+    var idx: usize = 0;
+    buffer[idx] = 0x82; // :method GET
+    idx += 1;
+    buffer[idx] = 0x84; // :path /
+    idx += 1;
+    buffer[idx] = 0x86; // :scheme http
+    idx += 1;
+    buffer[idx] = 0x01; // :authority
+    idx += 1;
+    buffer[idx] = @intCast(authority.len);
+    idx += 1;
+    @memcpy(buffer[idx .. idx + authority.len], authority);
+    idx += authority.len;
+    for (0..count) |i| {
+        buffer[idx] = 0x00; // literal without indexing, new name
+        idx += 1;
+        const name = "x-bench-hdr";
+        buffer[idx] = @intCast(name.len);
+        idx += 1;
+        @memcpy(buffer[idx .. idx + name.len], name);
+        idx += name.len;
+        // value: "val-NNN" (padded)
+        const value_len: usize = 24;
+        buffer[idx] = @intCast(value_len);
+        idx += 1;
+        var val_buf: [24]u8 = [_]u8{'x'} ** 24;
+        _ = std.fmt.bufPrint(&val_buf, "val-{d}", .{i}) catch {};
+        @memcpy(buffer[idx .. idx + value_len], &val_buf);
+        idx += value_len;
+    }
+    return buffer[0..idx];
+}
+
+fn encodeHpackInt(buffer: []u8, start: usize, value: usize, prefix: u3) usize {
+    var idx = start;
+    const max: usize = (@as(usize, 1) << prefix) - 1;
+    if (value < max) {
+        buffer[idx] = @intCast(value);
+        idx += 1;
+    } else {
+        buffer[idx] = @intCast(max);
+        idx += 1;
+        var v = value - max;
+        while (v >= 128) {
+            buffer[idx] = @intCast((v & 0x7f) | 0x80);
+            idx += 1;
+            v >>= 7;
+        }
+        buffer[idx] = @intCast(v);
+        idx += 1;
+    }
+    return idx;
+}
+
 fn hexToBytes(out: []u8, hex: []const u8) ![]u8 {
     var out_idx: usize = 0;
     var i: usize = 0;
@@ -846,4 +930,176 @@ test "http2 response encoder ignores pseudo headers in custom list" {
     try std.testing.expectEqualStrings("date", decoded.headers[1].name);
     try std.testing.expectEqualStrings("x-ok", decoded.headers[2].name);
     try std.testing.expectEqualStrings("yes", decoded.headers[2].value);
+}
+
+test "http2 stack accepts 4KB header value" {
+    var stack = http2.Stack.init();
+    var frames: [4]http2.Frame = undefined;
+    var events: [4]http2.Event = undefined;
+    var header_block: [5120]u8 = undefined;
+    var value_buf: [4096]u8 = undefined;
+    @memset(&value_buf, 'v');
+    const header_bytes = buildHeaderBlockWithCustom(&header_block, "localhost", "x-large", &value_buf);
+    var buf: [http2.Preface.len + 9 + 5120]u8 = undefined;
+    @memcpy(buf[0..http2.Preface.len], http2.Preface);
+    const frame_len = try http2.writeFrame(buf[http2.Preface.len..], .headers, 0x5, 1, header_bytes);
+    const total = http2.Preface.len + frame_len;
+    const res = stack.ingest(buf[0..total], frames[0..], events[0..]);
+    try std.testing.expectEqual(http2.ParseState.complete, res.state);
+    try std.testing.expectEqual(@as(usize, 1), res.event_count);
+    switch (events[0]) {
+        .headers => |ev| {
+            try std.testing.expectEqual(@as(u32, 1), ev.stream_id);
+            try std.testing.expectEqual(request.Method.GET, ev.request.method);
+        },
+        else => return error.UnexpectedEvent,
+    }
+}
+
+test "http2 stack accepts 30 small headers" {
+    var stack = http2.Stack.init();
+    var frames: [4]http2.Frame = undefined;
+    var events: [4]http2.Event = undefined;
+    var header_block: [2048]u8 = undefined;
+    const header_bytes = buildHeaderBlockWithManyHeaders(&header_block, "localhost", 30);
+    var buf: [http2.Preface.len + 9 + 2048]u8 = undefined;
+    @memcpy(buf[0..http2.Preface.len], http2.Preface);
+    const frame_len = try http2.writeFrame(buf[http2.Preface.len..], .headers, 0x5, 1, header_bytes);
+    const total = http2.Preface.len + frame_len;
+    const res = stack.ingest(buf[0..total], frames[0..], events[0..]);
+    try std.testing.expectEqual(http2.ParseState.complete, res.state);
+    try std.testing.expectEqual(@as(usize, 1), res.event_count);
+    switch (events[0]) {
+        .headers => |ev| {
+            try std.testing.expectEqual(@as(u32, 1), ev.stream_id);
+            try std.testing.expect(ev.request.headers.len >= 30);
+        },
+        else => return error.UnexpectedEvent,
+    }
+}
+
+test "http2 header list too large returns stream error not connection error" {
+    var stack = http2.Stack.initWithConfig(.{ .max_header_list_size = 256 });
+    var frames: [4]http2.Frame = undefined;
+    var events: [4]http2.Event = undefined;
+    var header_block: [512]u8 = undefined;
+    var value_buf: [256]u8 = undefined;
+    @memset(&value_buf, 'x');
+    const header_bytes = buildHeaderBlockWithCustom(&header_block, "localhost", "x-too-big", &value_buf);
+    var buf: [http2.Preface.len + 9 + 512]u8 = undefined;
+    @memcpy(buf[0..http2.Preface.len], http2.Preface);
+    const frame_len = try http2.writeFrame(buf[http2.Preface.len..], .headers, 0x5, 1, header_bytes);
+    const total = http2.Preface.len + frame_len;
+    const res = stack.ingest(buf[0..total], frames[0..], events[0..]);
+    try std.testing.expectEqual(http2.ParseState.complete, res.state);
+    try std.testing.expect(res.event_count > 0);
+    switch (events[0]) {
+        .err => |err_ev| {
+            try std.testing.expectEqual(@as(u32, 1), err_ev.stream_id);
+            try std.testing.expectEqual(http2.ErrorCode.refused_stream, err_ev.code);
+        },
+        else => return error.UnexpectedEvent,
+    }
+}
+
+test "http2 header list too large does not kill other streams" {
+    var stack = http2.Stack.initWithConfig(.{ .max_header_list_size = 256 });
+    var frames: [8]http2.Frame = undefined;
+    var events: [8]http2.Event = undefined;
+    // First: a normal request on stream 1 (small enough)
+    var hdr1: [64]u8 = undefined;
+    const hdr1_bytes = buildHeaderBlockAuthority(&hdr1, "localhost");
+    // Second: an oversized request on stream 3
+    var hdr2: [512]u8 = undefined;
+    var big_val: [256]u8 = undefined;
+    @memset(&big_val, 'x');
+    const hdr2_bytes = buildHeaderBlockWithCustom(&hdr2, "localhost", "x-big", &big_val);
+    // Third: a normal request on stream 5
+    var hdr3: [64]u8 = undefined;
+    const hdr3_bytes = buildHeaderBlockAuthority(&hdr3, "example.com");
+
+    var buf: [http2.Preface.len + 9 * 3 + 64 + 512 + 64]u8 = undefined;
+    @memcpy(buf[0..http2.Preface.len], http2.Preface);
+    var off = http2.Preface.len;
+    off += try http2.writeFrame(buf[off..], .headers, 0x5, 1, hdr1_bytes);
+    off += try http2.writeFrame(buf[off..], .headers, 0x5, 3, hdr2_bytes);
+    off += try http2.writeFrame(buf[off..], .headers, 0x5, 5, hdr3_bytes);
+    const res = stack.ingest(buf[0..off], frames[0..], events[0..]);
+    try std.testing.expectEqual(http2.ParseState.complete, res.state);
+    try std.testing.expectEqual(@as(usize, 3), res.event_count);
+    // Event 0: headers on stream 1 (success)
+    switch (events[0]) {
+        .headers => |ev| try std.testing.expectEqual(@as(u32, 1), ev.stream_id),
+        else => return error.UnexpectedEvent,
+    }
+    // Event 1: error on stream 3 (refused, not connection kill)
+    switch (events[1]) {
+        .err => |ev| try std.testing.expectEqual(@as(u32, 3), ev.stream_id),
+        else => return error.UnexpectedEvent,
+    }
+    // Event 2: headers on stream 5 (success — connection survived)
+    switch (events[2]) {
+        .headers => |ev| try std.testing.expectEqual(@as(u32, 5), ev.stream_id),
+        else => return error.UnexpectedEvent,
+    }
+}
+
+test "http2 send window tracking" {
+    var stack = http2.Stack.init();
+    var frames: [4]http2.Frame = undefined;
+    var events: [4]http2.Event = undefined;
+    // Set up a stream via HEADERS
+    var header_block: [64]u8 = undefined;
+    const header_bytes = buildHeaderBlockAuthority(&header_block, "localhost");
+    var buf: [http2.Preface.len + 9 + 64]u8 = undefined;
+    @memcpy(buf[0..http2.Preface.len], http2.Preface);
+    const frame_len = try http2.writeFrame(buf[http2.Preface.len..], .headers, 0x4, 1, header_bytes);
+    _ = stack.ingest(buf[0 .. http2.Preface.len + frame_len], frames[0..], events[0..]);
+
+    // Default window is 65535
+    const allowed = stack.canSend(1, 100000);
+    try std.testing.expectEqual(@as(usize, 65535), allowed);
+    // Consume some window
+    stack.consumeSendWindow(1, 1000);
+    const after = stack.canSend(1, 100000);
+    try std.testing.expectEqual(@as(usize, 64535), after);
+    // Consume all remaining
+    stack.consumeSendWindow(1, 64535);
+    const zero = stack.canSend(1, 100);
+    try std.testing.expectEqual(@as(usize, 0), zero);
+}
+
+test "http2 window update emits window_opened event" {
+    var stack = http2.Stack.init();
+    var frames: [4]http2.Frame = undefined;
+    var events: [4]http2.Event = undefined;
+    // Set up stream
+    var header_block: [64]u8 = undefined;
+    const header_bytes = buildHeaderBlockAuthority(&header_block, "localhost");
+    var buf: [http2.Preface.len + 9 + 64 + 9 + 4]u8 = undefined;
+    @memcpy(buf[0..http2.Preface.len], http2.Preface);
+    const hdr_len = try http2.writeFrame(buf[http2.Preface.len..], .headers, 0x4, 1, header_bytes);
+    _ = stack.ingest(buf[0 .. http2.Preface.len + hdr_len], frames[0..], events[0..]);
+
+    // Exhaust connection send window
+    stack.consumeSendWindow(1, 65535);
+    try std.testing.expectEqual(@as(usize, 0), stack.canSend(1, 1));
+
+    // Send WINDOW_UPDATE on connection (stream 0)
+    var wu_buf: [9 + 4]u8 = undefined;
+    var wu_payload: [4]u8 = undefined;
+    std.mem.writeInt(u32, &wu_payload, 32768, .big);
+    const wu_len = try http2.writeFrame(&wu_buf, .window_update, 0, 0, &wu_payload);
+    const wu_res = stack.ingest(wu_buf[0..wu_len], frames[0..], events[0..]);
+    try std.testing.expectEqual(http2.ParseState.complete, wu_res.state);
+    var found_window_opened = false;
+    for (events[0..wu_res.event_count]) |ev| {
+        switch (ev) {
+            .window_opened => {
+                found_window_opened = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(found_window_opened);
 }

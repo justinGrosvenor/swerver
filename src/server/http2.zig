@@ -297,7 +297,11 @@ pub fn handleHttp2Read(server: *Server, conn: *connection.Connection) !void {
                 .window_opened => {
                     drainPendingH2Streams(server, conn);
                 },
-                .err => {},
+                .err => |err_event| {
+                    if (err_event.stream_id != 0) {
+                        sendRstStream(server, conn, err_event.stream_id, @intFromEnum(err_event.code));
+                    }
+                },
             }
         }
         if (ctrl_len > 0) {
