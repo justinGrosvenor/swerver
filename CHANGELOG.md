@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.1.0-alpha.8 — 2026-05-20
+
+HTTP/2 correctness and performance release. Three architectural improvements
+to the H2 data path, a critical header handling fix, and new protocol tests.
+
+### HTTP/2 Performance
+
+- **feat: send-side flow control** — `canSend()` / `consumeSendWindow()` on
+  the H2 stack enforce RFC 7540 send window limits before emitting DATA
+  frames. `handleWindowUpdate` emits a `.window_opened` event when a window
+  transitions from exhausted to available, triggering deferred stream drains.
+- **feat: per-stream fair scheduling** — large response bodies (>
+  max_frame_size) emit one DATA frame then stash the remainder as a
+  `PendingH2Response`. The unified `drainPendingH2Streams` pump round-robins
+  across file and in-memory response slots, preventing head-of-line blocking
+  under multiplexing.
+- **perf: write coalescing** — `sendHttp2ControlFrame` appends control bytes
+  to the last write-queue entry when space permits, eliminating a 64KB buffer
+  acquisition for ~50 bytes of SETTINGS ACK / PING ACK.
+- **perf: pre-encode /blob for H2** — the 8KB `/blob` endpoint is now in the
+  H2 pre-encoded cache, skipping per-request HPACK encoding and buffer
+  acquisition. `H2_PREENCODED_BUF_SIZE` raised from 512 to 9216.
+- **perf: widen write queue** — `write_queue_capacity` raised from 32 to 64
+  to reduce starvation under multiplexed streams.
+
+### HTTP/2 Correctness
+
+- **fix: stream-level error for oversized headers** — header block buffer
+  overflow and `HeaderListTooLarge` now return `RST_STREAM(REFUSED_STREAM)`
+  per stream instead of `GOAWAY` that killed the entire connection. New
+  `ParseState.stream_err` variant lets the ingest loop continue processing
+  subsequent frames.
+- **fix: header buffer sizing** — `HeaderBlockBytes` (HPACK wire buffer),
+  `HeaderScratchBytes` (HPACK string decode scratch), and
+  `DefaultMaxHeaderListSize` (RFC decoded size limit) all raised from
+  4–8KB to 16KB, accommodating 4KB+ header values that the benchmark
+  harness sends.
+- **fix: ErrorCode enum values** — `ErrorCode` is now `enum(u32)` with
+  RFC 7540 wire values, including `refused_stream` (0x7) and
+  `internal_error` (0x2). `@intFromEnum` produces correct RST_STREAM
+  error codes on the wire.
+- **fix: flow control in pre-encoded path** — `sendH2PreencodedBytes` now
+  calls `consumeSendWindow` before closing the stream.
+
+### Tests
+
+- **test: 6 new H2 protocol tests** — 4KB header acceptance, 30 small
+  headers, stream error isolation (oversized header doesn't kill other
+  streams), send window tracking, `window_opened` event emission.
+
+### Benchmarks (Docker Desktop, 50 VUs, 15s)
+
+| Scenario | alpha.7 | alpha.8 | vs nginx |
+|---|---|---|---|
+| h2-many-headers | 10K (12.8% err) | 884K (0% err) | -14% throughput |
+| h2-large-response | 46K req/s | 72K req/s | **+33%** |
+| h2-throughput | 150K | 144K | +49% |
+| h2-concurrent-streams | 128K | 128K | +33% |
+
+---
+
 ## 0.1.0-alpha.7 — 2026-05-19
 
 API gateway feature set, identity-aware proxy, 15 hot-path performance
