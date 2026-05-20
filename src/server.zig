@@ -687,6 +687,16 @@ pub const Server = struct {
             self.allocator.destroy(pending);
             conn.h2_pending = null;
         }
+        if (conn.h2_pending_files) |files| {
+            for (files) |*f| f.cleanup();
+            self.allocator.destroy(files);
+            conn.h2_pending_files = null;
+        }
+        if (conn.h2_pending_responses) |resps| {
+            for (resps) |*r| r.cleanup(&self.io);
+            self.allocator.destroy(resps);
+            conn.h2_pending_responses = null;
+        }
         // Clean up body accumulation state
         http1_mod.cleanupBodyAccumulation(self, conn);
         // Drain write queue before releasing read buffer to avoid double-free

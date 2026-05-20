@@ -186,6 +186,7 @@ pub const Event = union(enum) {
     settings: SettingsEvent,
     ping: PingEvent,
     window_update_needed: WindowUpdateEvent,
+    window_opened: WindowUpdateEvent,
 };
 
 pub const HeadersEvent = struct {
@@ -1022,24 +1023,33 @@ pub const Stack = struct {
     }
 
     fn handleWindowUpdate(self: *Stack, frame: Frame, events: []Event) FrameHandle {
-        _ = events;
         if (frame.payload.len != 4) return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
         const increment = parseWindowIncrement(frame.payload) orelse return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
         const max_window: i32 = 0x7FFF_FFFF; // 2^31-1 per RFC 7540
         if (frame.header.stream_id == 0) {
+            const was_blocked = self.conn_send_window <= 0;
             const new_window = @as(i64, self.conn_send_window) + @as(i64, increment);
             if (new_window > max_window) {
                 return .{ .state = .err, .error_code = .flow_control_error, .event_count = 0 };
             }
             self.conn_send_window = @intCast(new_window);
+            if (was_blocked and self.conn_send_window > 0 and events.len > 0) {
+                events[0] = .{ .window_opened = .{ .stream_id = 0, .increment = increment } };
+                return .{ .state = .complete, .error_code = .none, .event_count = 1 };
+            }
             return .{ .state = .complete, .error_code = .none, .event_count = 0 };
         }
         const stream = self.findStream(frame.header.stream_id) orelse return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
+        const was_blocked = stream.send_window <= 0;
         const new_stream_window = @as(i64, stream.send_window) + @as(i64, increment);
         if (new_stream_window > max_window) {
             return .{ .state = .err, .error_code = .flow_control_error, .event_count = 0 };
         }
         stream.send_window = @intCast(new_stream_window);
+        if (was_blocked and stream.send_window > 0 and events.len > 0) {
+            events[0] = .{ .window_opened = .{ .stream_id = frame.header.stream_id, .increment = increment } };
+            return .{ .state = .complete, .error_code = .none, .event_count = 1 };
+        }
         return .{ .state = .complete, .error_code = .none, .event_count = 0 };
     }
 
@@ -1199,6 +1209,27 @@ pub const Stack = struct {
             }
         }
         return null;
+    }
+
+    /// Returns how many bytes of DATA the sender is allowed to emit for
+    /// `stream_id` right now, capped at `want`. Returns 0 when either
+    /// the connection or stream send window is exhausted.
+    pub fn canSend(self: *Stack, stream_id: u32, want: usize) usize {
+        if (self.conn_send_window <= 0) return 0;
+        const stream = self.findStream(stream_id) orelse return 0;
+        if (stream.send_window <= 0) return 0;
+        const conn_avail: usize = @intCast(self.conn_send_window);
+        const stream_avail: usize = @intCast(stream.send_window);
+        return @min(want, @min(conn_avail, stream_avail));
+    }
+
+    /// Debit both the connection and per-stream send windows after
+    /// successfully enqueuing `len` bytes of DATA for `stream_id`.
+    pub fn consumeSendWindow(self: *Stack, stream_id: u32, len: usize) void {
+        self.conn_send_window -= @intCast(len);
+        if (self.findStream(stream_id)) |stream| {
+            stream.send_window -= @intCast(len);
+        }
     }
 
     /// Mark a stream as closed after sending a complete response (END_STREAM on our side).

@@ -38,6 +38,7 @@ const http3 = @import("../protocol/http3.zig");
 const middleware = @import("../middleware/middleware.zig");
 const quic_handler = @import("../quic/handler.zig");
 const quic_connection = @import("../quic/connection.zig");
+const clock = @import("../runtime/clock.zig");
 const preencoded = @import("preencoded.zig");
 const write_queue = @import("write_queue.zig");
 
@@ -224,6 +225,14 @@ fn handleHttp3Request(
         }
     }
 
+    // --- Static file serving ---
+    if (server.cfg.static_root.len > 0 and std.mem.startsWith(u8, req_view.path, "/static/")) {
+        const file_path = req_view.path[8..];
+        const content_type = Server.guessContentType(file_path);
+        serveStaticFileH3(server, udp_fd, conn, req.stream_id, peer_addr, file_path, content_type);
+        return;
+    }
+
     // --- Cold path: full router dispatch ---
     var mw_ctx = middleware.Context{
         .protocol = .http3,
@@ -254,6 +263,66 @@ fn handleHttp3Request(
     defer if (managed_handle) |handle| server.io.releaseBuffer(handle);
 
     sendHttp3ResponseFromResponse(server, udp_fd, conn, req.stream_id, peer_addr, result.resp);
+}
+
+fn serveStaticFileH3(
+    server: *Server,
+    udp_fd: std.posix.fd_t,
+    conn: *quic_connection.Connection,
+    stream_id: u64,
+    peer_addr: net.SockAddrStorage,
+    file_path: []const u8,
+    content_type: []const u8,
+) void {
+    if (std.mem.indexOfScalar(u8, file_path, '%') != null) return sendNotFoundH3(server, udp_fd, conn, stream_id, peer_addr);
+    if (std.mem.indexOf(u8, file_path, "..") != null) return sendNotFoundH3(server, udp_fd, conn, stream_id, peer_addr);
+    if (std.mem.indexOfScalar(u8, file_path, 0) != null) return sendNotFoundH3(server, udp_fd, conn, stream_id, peer_addr);
+    if (file_path.len > 0 and file_path[0] == '/') return sendNotFoundH3(server, udp_fd, conn, stream_id, peer_addr);
+
+    const root_fd = server.static_root_fd orelse return sendNotFoundH3(server, udp_fd, conn, stream_id, peer_addr);
+
+    var path_buf: [4096]u8 = undefined;
+    if (file_path.len >= path_buf.len) return sendNotFoundH3(server, udp_fd, conn, stream_id, peer_addr);
+    @memcpy(path_buf[0..file_path.len], file_path);
+    path_buf[file_path.len] = 0;
+    const path_z: [*:0]const u8 = @ptrCast(&path_buf);
+
+    var o_flags: std.posix.O = .{ .ACCMODE = .RDONLY };
+    if (@hasField(std.posix.O, "NOFOLLOW")) o_flags.NOFOLLOW = true;
+    if (@hasField(std.posix.O, "CLOEXEC")) o_flags.CLOEXEC = true;
+    const file_fd = std.posix.openatZ(root_fd, path_z, o_flags, 0) catch return sendNotFoundH3(server, udp_fd, conn, stream_id, peer_addr);
+    defer clock.closeFd(file_fd);
+
+    const buf_handle = server.io.acquireBuffer() orelse return;
+    var total_read: usize = 0;
+    while (total_read < buf_handle.bytes.len) {
+        const n = std.posix.read(file_fd, buf_handle.bytes[total_read..]) catch {
+            server.io.releaseBuffer(buf_handle);
+            return;
+        };
+        if (n == 0) break;
+        total_read += n;
+    }
+
+    const resp: response_mod.Response = .{
+        .status = 200,
+        .headers = &[_]response_mod.Header{
+            .{ .name = "Content-Type", .value = content_type },
+        },
+        .body = .{ .managed = .{ .handle = buf_handle, .len = total_read } },
+    };
+    sendHttp3ResponseFromResponse(server, udp_fd, conn, stream_id, peer_addr, resp);
+    server.io.releaseBuffer(buf_handle);
+}
+
+fn sendNotFoundH3(
+    server: *Server,
+    udp_fd: std.posix.fd_t,
+    conn: *quic_connection.Connection,
+    stream_id: u64,
+    peer_addr: net.SockAddrStorage,
+) void {
+    sendHttp3ResponseFromResponse(server, udp_fd, conn, stream_id, peer_addr, Server.notFoundResponse());
 }
 
 /// Encode a router Response into h3 bytes and send it over the

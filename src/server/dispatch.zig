@@ -299,7 +299,7 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
                             // Edge-triggered epoll: EPOLLOUT may have been consumed earlier
                             // (e.g., sending h2 SETTINGS). Flush any responses queued by handleRead.
                             const rconn = server.io.getConnection(index) orelse continue;
-                            if (rconn.write_count > 0) {
+                            if (rconn.write_count > 0 or rconn.hasPendingH2Streams()) {
                                 handleWrite(server, index) catch {};
                             }
                             // Re-arm single-shot recv on the native backend
@@ -1302,6 +1302,10 @@ pub fn handleWrite(server: *Server, index: u32) !void {
             if (conn.write_count == 0 and conn.hasPendingFile() and http1_mod.bufferPendingFileWrites(server, conn)) {
                 continue;
             }
+            if (conn.hasPendingH2Streams()) {
+                http2_mod.drainPendingH2Streams(server, conn);
+                if (conn.write_count > 0) continue;
+            }
             if (conn.state == .closed) return;
         } else {
             // Plain TCP path.
@@ -1382,6 +1386,10 @@ pub fn handleWrite(server: *Server, index: u32) !void {
                 }
             }
         }
+        if (conn.hasPendingH2Streams()) {
+            http2_mod.drainPendingH2Streams(server, conn);
+            if (conn.write_count > 0) continue;
+        }
         break;
     }
 
@@ -1412,7 +1420,7 @@ pub fn handleWrite(server: *Server, index: u32) !void {
 
     // Check if all writes are complete
     if (conn.state == .closed) return;
-    if (conn.write_count == 0 and !conn.hasPendingBody() and !conn.hasPendingFile()) {
+    if (conn.write_count == 0 and !conn.hasPendingBody() and !conn.hasPendingFile() and !conn.hasPendingH2Streams()) {
         if (conn.close_after_write) {
             server.closeConnection(conn);
             return;

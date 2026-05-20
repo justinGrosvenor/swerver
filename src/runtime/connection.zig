@@ -118,6 +118,43 @@ pub const PendingH2Body = struct {
 
 pub const MAX_PENDING_H2_BODIES = 32;
 
+pub const PendingH2File = struct {
+    active: bool = false,
+    stream_id: u32 = 0,
+    file_fd: std.posix.fd_t = undefined,
+    offset: u64 = 0,
+    remaining: u64 = 0,
+    content_type: [64]u8 = undefined,
+    content_type_len: u8 = 0,
+    headers_sent: bool = false,
+
+    pub fn cleanup(self: *PendingH2File) void {
+        if (self.active) {
+            clock.closeFd(self.file_fd);
+            self.active = false;
+        }
+    }
+};
+
+pub const MAX_PENDING_H2_FILES = 32;
+
+pub const PendingH2Response = struct {
+    active: bool = false,
+    stream_id: u32 = 0,
+    handle: buffer_pool.BufferHandle = undefined,
+    offset: usize = 0,
+    len: usize = 0,
+
+    pub fn cleanup(self: *PendingH2Response, io: anytype) void {
+        if (self.active) {
+            io.releaseBuffer(self.handle);
+            self.active = false;
+        }
+    }
+};
+
+pub const MAX_PENDING_H2_RESPONSES = 32;
+
 pub const Connection = struct {
     index: u32,
     id: u64,
@@ -158,6 +195,12 @@ pub const Connection = struct {
     /// Pending H2 body-bearing requests (HEADERS received, waiting for DATA).
     /// Heap-allocated lazily on HTTP/2 upgrade to avoid ~112KB per connection.
     h2_pending: ?*[MAX_PENDING_H2_BODIES]PendingH2Body = null,
+    /// Pending H2 file responses for lazy streaming (pread on demand).
+    /// Heap-allocated lazily on first H2 static file response.
+    h2_pending_files: ?*[MAX_PENDING_H2_FILES]PendingH2File = null,
+    /// Pending H2 in-memory response bodies for deferred drain (fair scheduling).
+    /// Heap-allocated lazily on first large-body H2 response.
+    h2_pending_responses: ?*[MAX_PENDING_H2_RESPONSES]PendingH2Response = null,
     /// Pending response body for streaming large responses
     pending_body: []const u8,
     /// File descriptor for sendfile-based response (null = no file pending)
@@ -277,8 +320,10 @@ pub const Connection = struct {
         self.is_head_request = false;
         // body_accum is cleaned up by the server before reset
         self.body_accum = null;
-        // h2_pending is freed by closeConnection before reset
+        // h2_pending, h2_pending_files, h2_pending_responses freed by closeConnection before reset
         self.h2_pending = null;
+        self.h2_pending_files = null;
+        self.h2_pending_responses = null;
         self.pending_body = &[_]u8{};
         self.cleanupPendingFile();
         self.cached_peer_ip = null;
@@ -465,6 +510,26 @@ pub const Connection = struct {
         return self.pending_body.len > 0;
     }
 
+    pub fn hasPendingH2Files(self: *Connection) bool {
+        const files = self.h2_pending_files orelse return false;
+        for (files) |*f| {
+            if (f.active) return true;
+        }
+        return false;
+    }
+
+    pub fn hasPendingH2Responses(self: *Connection) bool {
+        const resps = self.h2_pending_responses orelse return false;
+        for (resps) |*r| {
+            if (r.active) return true;
+        }
+        return false;
+    }
+
+    pub fn hasPendingH2Streams(self: *Connection) bool {
+        return self.hasPendingH2Files() or self.hasPendingH2Responses();
+    }
+
     fn updateReadBackpressure(self: *Connection, backpressure: config.Backpressure) void {
         if (self.read_paused) {
             if (self.read_buffered_bytes <= backpressure.read_low_water) self.read_paused = false;
@@ -587,8 +652,9 @@ fn isValidTransition(from: State, to: State) bool {
 /// Per-connection write queue capacity. Response coalescing packs ~200
 /// pre-encoded responses per 64KB buffer, so 32 entries handles 6000+
 /// pipelined responses. HTTP/2 multiplexing needs at most ~2 entries
-/// per concurrent stream (HEADERS + DATA).
-const write_queue_capacity: u16 = 32;
+/// per concurrent stream (HEADERS + DATA). 64 reduces starvation
+/// pressure under multiplexing — each entry is 16 bytes (1KB total).
+const write_queue_capacity: u16 = 64;
 /// Max iovec entries per async writev SQE on the native io_uring backend.
 /// Mirrors the gather cap in the sync writev path so the two branches
 /// submit the same-sized batches.

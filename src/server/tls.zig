@@ -114,7 +114,7 @@ pub fn handleTlsHandshake(server: *Server, conn: *connection.Connection) !void {
         };
         // Flush any response queued by handleRead (the event loop also does
         // this after read events, but we need it here for the initial handshake)
-        if (conn.write_count > 0) {
+        if (conn.write_count > 0 or conn.hasPendingH2Streams()) {
             server.handleWrite(conn.index) catch {};
         }
     }

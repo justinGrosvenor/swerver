@@ -37,6 +37,7 @@ const http2 = @import("../protocol/http2.zig");
 const middleware = @import("../middleware/middleware.zig");
 const router = @import("../router/router.zig");
 const clock = @import("../runtime/clock.zig");
+const buffer_pool = @import("../runtime/buffer_pool.zig");
 const preencoded = @import("preencoded.zig");
 const write_queue = @import("write_queue.zig");
 
@@ -75,8 +76,18 @@ pub fn sendHttp2ServerPreface(server: *Server, conn: *connection.Connection) !vo
     server.io.onWriteBuffered(conn, len);
 }
 
-/// Send an HTTP/2 control frame (SETTINGS ACK, PING ACK, WINDOW_UPDATE, GOAWAY)
+/// Send an HTTP/2 control frame (SETTINGS ACK, PING ACK, WINDOW_UPDATE, GOAWAY).
+/// Tries to append to the last write-queue entry to avoid acquiring a new
+/// 64KB pool buffer for ~100 bytes of control data.
 fn sendHttp2ControlFrame(server: *Server, conn: *connection.Connection, frame_data: []const u8) void {
+    if (conn.peekLastWrite()) |last| {
+        if (last.len + frame_data.len <= last.handle.bytes.len) {
+            @memcpy(last.handle.bytes[last.len..][0..frame_data.len], frame_data);
+            last.len += frame_data.len;
+            server.io.onWriteBuffered(conn, frame_data.len);
+            return;
+        }
+    }
     const buf = server.io.acquireBuffer() orelse return;
     if (frame_data.len > buf.bytes.len) {
         server.io.releaseBuffer(buf);
@@ -283,6 +294,9 @@ pub fn handleHttp2Read(server: *Server, conn: *connection.Connection) !void {
                     const n = http2.writeWindowUpdate(ctrl_buf[ctrl_len..], wu.stream_id, wu.increment) catch 0;
                     ctrl_len += n;
                 },
+                .window_opened => {
+                    drainPendingH2Streams(server, conn);
+                },
                 .err => {},
             }
         }
@@ -293,10 +307,10 @@ pub fn handleHttp2Read(server: *Server, conn: *connection.Connection) !void {
     }
 }
 
-/// Serve a static file over HTTP/2. Opens the file, reads into a
-/// managed buffer, and queues the response via queueHttp2Response.
-/// Less efficient than the h1 sendfile path but correct for h2
-/// multiplexed streams.
+/// Lazy-streaming static file serving for HTTP/2.
+/// Sends HEADERS + first DATA chunk immediately. If the file is larger
+/// than one frame, the fd is kept open in a PendingH2File slot and
+/// subsequent chunks are pumped by drainPendingH2Streams from the write handler.
 fn queueFileResponseH2(
     server: *Server,
     conn: *connection.Connection,
@@ -306,7 +320,6 @@ fn queueFileResponseH2(
     content_type: []const u8,
 ) !void {
     _ = static_root;
-    // Path validation (same as h1)
     if (std.mem.indexOfScalar(u8, file_path, '%') != null) return error.NotFound;
     if (std.mem.indexOf(u8, file_path, "..") != null) return error.NotFound;
     if (std.mem.indexOfScalar(u8, file_path, 0) != null) return error.NotFound;
@@ -324,41 +337,265 @@ fn queueFileResponseH2(
     if (@hasField(std.posix.O, "NOFOLLOW")) o_flags.NOFOLLOW = true;
     if (@hasField(std.posix.O, "CLOEXEC")) o_flags.CLOEXEC = true;
     const file_fd = std.posix.openatZ(root_fd, path_z, o_flags, 0) catch return error.NotFound;
-    defer clock.closeFd(file_fd);
 
-    // Read file into a managed buffer (loop to handle short reads)
-    const buf_handle = server.io.acquireBuffer() orelse return error.NotFound;
-    var total_read: usize = 0;
-    while (total_read < buf_handle.bytes.len) {
-        const n = std.posix.read(file_fd, buf_handle.bytes[total_read..]) catch {
-            server.io.releaseBuffer(buf_handle);
-            return error.NotFound;
-        };
-        if (n == 0) break;
-        total_read += n;
+    const end_pos = std.c.lseek(file_fd, 0, std.posix.SEEK.END);
+    if (end_pos < 0) {
+        clock.closeFd(file_fd);
+        return error.NotFound;
     }
-    const n = total_read;
+    _ = std.c.lseek(file_fd, 0, std.posix.SEEK.SET);
+    const file_size: u64 = @intCast(end_pos);
 
-    const resp: response_mod.Response = .{
-        .status = 200,
-        .headers = &[_]response_mod.Header{
-            .{ .name = "Content-Type", .value = content_type },
-        },
-        .body = .{ .managed = .{ .handle = buf_handle, .len = n } },
+    const buf = server.io.acquireBuffer() orelse {
+        clock.closeFd(file_fd);
+        sendRstStream(server, conn, stream_id, 0x7);
+        return;
     };
-    try queueHttp2Response(server, conn, stream_id, resp, false);
+    const max_frame_size: usize = if (conn.http2_stack) |stack| @intCast(stack.max_frame_size) else 16384;
+
+    // Encode HEADERS frame
+    const hpack_start: usize = 9;
+    const date_str = server.getCachedDate();
+    const hdrs = [_]response_mod.Header{
+        .{ .name = "Content-Type", .value = content_type },
+    };
+    const header_block_len = http2.encodeResponseHeaders(buf.bytes[hpack_start..], 200, &hdrs, file_size, date_str) catch {
+        server.io.releaseBuffer(buf);
+        clock.closeFd(file_fd);
+        sendRstStream(server, conn, stream_id, 0x2);
+        return;
+    };
+    const headers_flags: u8 = if (file_size == 0) 0x5 else 0x4; // END_HEADERS + maybe END_STREAM
+    http2.writeFrameHeader(buf.bytes, .headers, headers_flags, stream_id, header_block_len) catch {
+        server.io.releaseBuffer(buf);
+        clock.closeFd(file_fd);
+        return;
+    };
+    var total_len: usize = 9 + header_block_len;
+
+    if (file_size == 0) {
+        clock.closeFd(file_fd);
+        if (!conn.enqueueWrite(buf, total_len)) {
+            server.io.releaseBuffer(buf);
+            return;
+        }
+        server.io.onWriteBuffered(conn, total_len);
+        server.io.setTimeoutPhase(conn, .write);
+        if (conn.http2_stack) |stack| stack.closeStream(stream_id);
+        return;
+    }
+
+    // Read first chunk and pack into same buffer after HEADERS
+    const data_space = buf.bytes.len - total_len - 9; // room for DATA frame header + payload
+    const first_chunk_max = @min(data_space, max_frame_size);
+    const first_chunk_max_capped = @min(first_chunk_max, file_size);
+    const data_frame_offset = total_len;
+    const payload_start = data_frame_offset + 9;
+
+    var first_read: usize = 0;
+    while (first_read < first_chunk_max_capped) {
+        const max_read = first_chunk_max_capped - first_read;
+        const result = std.c.pread(file_fd, buf.bytes[payload_start + first_read ..].ptr, max_read, @intCast(first_read));
+        if (result < 0) {
+            switch (std.posix.errno(result)) {
+                .INTR => continue,
+                else => {
+                    server.io.releaseBuffer(buf);
+                    clock.closeFd(file_fd);
+                    sendRstStream(server, conn, stream_id, 0x2);
+                    return;
+                },
+            }
+        }
+        const n: usize = @intCast(result);
+        if (n == 0) break;
+        first_read += n;
+    }
+
+    const file_remaining = file_size - first_read;
+    const data_flags: u8 = if (file_remaining == 0) 0x1 else 0x0; // END_STREAM if complete
+    http2.writeFrameHeader(buf.bytes[data_frame_offset..], .data, data_flags, stream_id, first_read) catch {
+        server.io.releaseBuffer(buf);
+        clock.closeFd(file_fd);
+        return;
+    };
+    total_len += 9 + first_read;
+
+    if (!conn.enqueueWrite(buf, total_len)) {
+        server.io.releaseBuffer(buf);
+        clock.closeFd(file_fd);
+        return;
+    }
+    server.io.onWriteBuffered(conn, total_len);
+    server.io.setTimeoutPhase(conn, .write);
+
+    if (conn.http2_stack) |stack| stack.consumeSendWindow(stream_id, first_read);
+
+    if (file_remaining == 0) {
+        clock.closeFd(file_fd);
+        if (conn.http2_stack) |stack| stack.closeStream(stream_id);
+        return;
+    }
+
+    // File too large for one frame — stash fd for lazy draining
+    const files = conn.h2_pending_files orelse blk: {
+        const alloc = server.allocator.create([connection.MAX_PENDING_H2_FILES]connection.PendingH2File) catch {
+            clock.closeFd(file_fd);
+            sendRstStream(server, conn, stream_id, 0x7);
+            return;
+        };
+        alloc.* = [_]connection.PendingH2File{.{}} ** connection.MAX_PENDING_H2_FILES;
+        conn.h2_pending_files = alloc;
+        break :blk alloc;
+    };
+
+    for (files) |*slot| {
+        if (!slot.active) {
+            slot.* = .{
+                .active = true,
+                .stream_id = stream_id,
+                .file_fd = file_fd,
+                .offset = first_read,
+                .remaining = file_remaining,
+                .headers_sent = true,
+            };
+            const ct_len = @min(content_type.len, slot.content_type.len);
+            @memcpy(slot.content_type[0..ct_len], content_type[0..ct_len]);
+            slot.content_type_len = @intCast(ct_len);
+            return;
+        }
+    }
+    // No free slot — RST this stream
+    clock.closeFd(file_fd);
+    sendRstStream(server, conn, stream_id, 0x7);
+}
+
+/// Pump pending H2 file responses: for each active slot with write-queue
+/// space, pread the next chunk, frame as DATA, and enqueue. Called from
+/// the write handler after buffers drain.
+fn drainPendingH2Files(server: *Server, conn: *connection.Connection) void {
+    const files = conn.h2_pending_files orelse return;
+    const stack = conn.http2_stack orelse return;
+    const max_frame_size: usize = @intCast(stack.max_frame_size);
+
+    for (files) |*slot| {
+        if (!slot.active) continue;
+        if (conn.writeQueueAvailable() < 2) return;
+
+        const max_payload = @min(server.io.cfg.buffer_pool.buffer_size - 9, max_frame_size);
+        const file_want: usize = @intCast(@min(slot.remaining, @as(u64, max_payload)));
+        const allowed = stack.canSend(slot.stream_id, file_want);
+        if (allowed == 0) continue;
+
+        const data_buf = server.io.acquireBuffer() orelse return;
+
+        var chunk_read: usize = 0;
+        while (chunk_read < allowed) {
+            const result = std.c.pread(slot.file_fd, data_buf.bytes[9 + chunk_read ..].ptr, allowed - chunk_read, @intCast(slot.offset + chunk_read));
+            if (result < 0) {
+                switch (std.posix.errno(result)) {
+                    .INTR => continue,
+                    else => {
+                        server.io.releaseBuffer(data_buf);
+                        slot.cleanup();
+                        sendRstStream(server, conn, slot.stream_id, 0x2);
+                        break;
+                    },
+                }
+            }
+            const n: usize = @intCast(result);
+            if (n == 0) break;
+            chunk_read += n;
+        }
+        if (!slot.active) continue;
+
+        slot.offset += chunk_read;
+        slot.remaining -= chunk_read;
+        const is_last = slot.remaining == 0 or chunk_read == 0;
+        const flags: u8 = if (is_last) 0x1 else 0x0;
+        http2.writeFrameHeader(data_buf.bytes, .data, flags, slot.stream_id, chunk_read) catch {
+            server.io.releaseBuffer(data_buf);
+            slot.cleanup();
+            sendRstStream(server, conn, slot.stream_id, 0x2);
+            continue;
+        };
+        const frame_len = 9 + chunk_read;
+        if (!conn.enqueueWrite(data_buf, frame_len)) {
+            server.io.releaseBuffer(data_buf);
+            slot.cleanup();
+            sendRstStream(server, conn, slot.stream_id, 0x7);
+            continue;
+        }
+        server.io.onWriteBuffered(conn, frame_len);
+        stack.consumeSendWindow(slot.stream_id, chunk_read);
+
+        if (is_last) {
+            slot.cleanup();
+            stack.closeStream(slot.stream_id);
+        }
+    }
+}
+
+fn drainPendingH2Responses(server: *Server, conn: *connection.Connection) void {
+    const resps = conn.h2_pending_responses orelse return;
+    const stack = conn.http2_stack orelse return;
+    const max_frame_size: usize = @intCast(stack.max_frame_size);
+
+    for (resps) |*slot| {
+        if (!slot.active) continue;
+        if (conn.writeQueueAvailable() < 2) return;
+
+        const remaining = slot.len - slot.offset;
+        const max_payload = @min(server.io.cfg.buffer_pool.buffer_size - 9, max_frame_size);
+        const want = @min(remaining, max_payload);
+        const allowed = stack.canSend(slot.stream_id, want);
+        if (allowed == 0) continue;
+
+        const data_buf = server.io.acquireBuffer() orelse return;
+        const chunk_len = @min(allowed, max_payload);
+        @memcpy(data_buf.bytes[9 .. 9 + chunk_len], slot.handle.bytes[slot.offset..][0..chunk_len]);
+        slot.offset += chunk_len;
+
+        const is_last = slot.offset >= slot.len;
+        const flags: u8 = if (is_last) 0x1 else 0x0;
+        http2.writeFrameHeader(data_buf.bytes, .data, flags, slot.stream_id, chunk_len) catch {
+            server.io.releaseBuffer(data_buf);
+            slot.cleanup(&server.io);
+            sendRstStream(server, conn, slot.stream_id, 0x2);
+            continue;
+        };
+        const frame_len = 9 + chunk_len;
+        if (!conn.enqueueWrite(data_buf, frame_len)) {
+            server.io.releaseBuffer(data_buf);
+            slot.cleanup(&server.io);
+            sendRstStream(server, conn, slot.stream_id, 0x7);
+            continue;
+        }
+        server.io.onWriteBuffered(conn, frame_len);
+        stack.consumeSendWindow(slot.stream_id, chunk_len);
+
+        if (is_last) {
+            slot.cleanup(&server.io);
+            stack.closeStream(slot.stream_id);
+        }
+    }
+}
+
+pub fn drainPendingH2Streams(server: *Server, conn: *connection.Connection) void {
+    drainPendingH2Files(server, conn);
+    drainPendingH2Responses(server, conn);
 }
 
 pub fn queueHttp2Response(server: *Server, conn: *connection.Connection, stream_id: u32, resp: response_mod.Response, is_head: bool) !void {
     const body_len = resp.bodyLen();
     const body_bytes = resp.bodyBytes();
-    const managed_body = switch (resp.body) {
+    var managed_body: ?response_mod.ManagedBody = switch (resp.body) {
         .managed => |managed| managed,
         else => null,
     };
     defer if (managed_body) |managed| server.io.releaseBuffer(managed.handle);
     const buf = server.io.acquireBuffer() orelse {
-        server.closeConnection(conn);
+        sendRstStream(server, conn, stream_id, 0x7);
         return;
     };
     const max_frame_size: usize = if (conn.http2_stack) |stack| @intCast(stack.max_frame_size) else 16384;
@@ -433,12 +670,21 @@ pub fn queueHttp2Response(server: *Server, conn: *connection.Connection, stream_
         }
         server.io.onWriteBuffered(conn, total_len);
         server.io.setTimeoutPhase(conn, .write);
-        if (conn.http2_stack) |stack| stack.closeStream(stream_id);
+        if (conn.http2_stack) |stack| {
+            stack.consumeSendWindow(stream_id, body_len);
+            stack.closeStream(stream_id);
+        }
         return;
     }
 
-    // Large body: enqueue HEADERS first, then chunk DATA frames into
-    // separate buffers (each up to max_frame_size).
+    const stack = conn.http2_stack orelse {
+        server.io.releaseBuffer(buf);
+        server.closeConnection(conn);
+        return;
+    };
+
+    // Large body: enqueue HEADERS + one DATA frame for fair scheduling,
+    // stash remainder as PendingH2Response for the drain pump.
     if (!conn.enqueueWrite(buf, total_len)) {
         server.io.releaseBuffer(buf);
         server.closeConnection(conn);
@@ -447,30 +693,97 @@ pub fn queueHttp2Response(server: *Server, conn: *connection.Connection, stream_
     server.io.onWriteBuffered(conn, total_len);
     server.io.setTimeoutPhase(conn, .write);
 
-    var remaining = body_bytes;
-    while (remaining.len > 0) {
+    const allowed = stack.canSend(stream_id, body_len);
+    var sent: usize = 0;
+    if (allowed > 0) {
         const data_buf = server.io.acquireBuffer() orelse {
-            server.closeConnection(conn);
+            sendRstStream(server, conn, stream_id, 0x7);
             return;
         };
         const max_payload = @min(data_buf.bytes.len - 9, max_frame_size);
-        const chunk_len = @min(remaining.len, max_payload);
-        @memcpy(data_buf.bytes[9 .. 9 + chunk_len], remaining[0..chunk_len]);
-        const flags: u8 = if (remaining.len == chunk_len) 0x1 else 0x0;
+        const chunk_len = @min(allowed, max_payload);
+        @memcpy(data_buf.bytes[9 .. 9 + chunk_len], body_bytes[0..chunk_len]);
+        const is_last = chunk_len == body_len;
+        const flags: u8 = if (is_last) 0x1 else 0x0;
         http2.writeFrameHeader(data_buf.bytes, .data, flags, stream_id, chunk_len) catch {
             server.io.releaseBuffer(data_buf);
-            server.closeConnection(conn);
+            sendRstStream(server, conn, stream_id, 0x2);
             return;
         };
         const frame_len = 9 + chunk_len;
         if (!conn.enqueueWrite(data_buf, frame_len)) {
             server.io.releaseBuffer(data_buf);
-            server.closeConnection(conn);
+            sendRstStream(server, conn, stream_id, 0x7);
             return;
         }
         server.io.onWriteBuffered(conn, frame_len);
-        remaining = remaining[chunk_len..];
+        stack.consumeSendWindow(stream_id, chunk_len);
+        if (is_last) {
+            stack.closeStream(stream_id);
+            return;
+        }
+        sent = chunk_len;
     }
+
+    // Stash remaining body for the drain pump (fair round-robin with files).
+    const remaining_len = body_len - sent;
+    var stash_handle: buffer_pool.BufferHandle = undefined;
+    var stash_offset: usize = undefined;
+    var stash_len: usize = undefined;
+    if (managed_body) |managed| {
+        stash_handle = managed.handle;
+        stash_offset = sent;
+        stash_len = body_len;
+        managed_body = null;
+    } else {
+        const h = server.io.acquireBuffer() orelse {
+            sendRstStream(server, conn, stream_id, 0x7);
+            return;
+        };
+        if (h.bytes.len < remaining_len) {
+            server.io.releaseBuffer(h);
+            sendRstStream(server, conn, stream_id, 0x7);
+            return;
+        }
+        @memcpy(h.bytes[0..remaining_len], body_bytes[sent..][0..remaining_len]);
+        stash_handle = h;
+        stash_offset = 0;
+        stash_len = remaining_len;
+    }
+
+    const resps = conn.h2_pending_responses orelse blk: {
+        const alloc = server.allocator.create([connection.MAX_PENDING_H2_RESPONSES]connection.PendingH2Response) catch {
+            server.io.releaseBuffer(stash_handle);
+            sendRstStream(server, conn, stream_id, 0x7);
+            return;
+        };
+        alloc.* = [_]connection.PendingH2Response{.{}} ** connection.MAX_PENDING_H2_RESPONSES;
+        conn.h2_pending_responses = alloc;
+        break :blk alloc;
+    };
+
+    for (resps) |*slot| {
+        if (!slot.active) {
+            slot.* = .{
+                .active = true,
+                .stream_id = stream_id,
+                .handle = stash_handle,
+                .offset = stash_offset,
+                .len = stash_len,
+            };
+            return;
+        }
+    }
+    server.io.releaseBuffer(stash_handle);
+    sendRstStream(server, conn, stream_id, 0x7);
+}
+
+/// Send RST_STREAM for a single stream without killing the connection.
+/// Used when buffer exhaustion prevents serving a particular stream.
+fn sendRstStream(server: *Server, conn: *connection.Connection, stream_id: u32, error_code: u32) void {
+    var rst_buf: [13]u8 = undefined;
+    const rst_len = http2.writeRstStream(&rst_buf, stream_id, error_code) catch return;
+    sendHttp2ControlFrame(server, conn, rst_buf[0..rst_len]);
     if (conn.http2_stack) |stack| stack.closeStream(stream_id);
 }
 
