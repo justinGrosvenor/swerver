@@ -51,7 +51,7 @@ jobs:
 
       - name: Build ReleaseFast for ${{ matrix.target }}
         run: |
-          zig build -Dtarget=${{ matrix.target }} -Denable-tls=false -Doptimize=ReleaseFast --summary all
+          zig build -Dtarget=${{ matrix.target }} -Denable-tls=false -Denable-compression=false -Doptimize=ReleaseFast --summary all
 
       - name: Smoke test (native targets only)
         # Cross-compiled binaries can't run on the build host (e.g. a

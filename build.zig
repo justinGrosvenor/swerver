@@ -16,6 +16,7 @@ pub fn build(b: *std.Build) void {
     const effective_enable_tls = enable_tls and is_native;
     const effective_enable_http3 = enable_http3 and effective_enable_tls;
     const effective_enable_x402_crypto = enable_x402_crypto and is_native;
+    const enable_compression = b.option(bool, "enable-compression", "Enable response compression (requires zlib)") orelse is_native;
 
     const options = b.addOptions();
     options.addOption(bool, "enable_tls", effective_enable_tls);
@@ -24,7 +25,7 @@ pub fn build(b: *std.Build) void {
     options.addOption(bool, "enable_proxy", enable_proxy);
     options.addOption(bool, "enable_io_uring", enable_io_uring);
     options.addOption(bool, "enable_x402_crypto", effective_enable_x402_crypto);
-    options.addOption(bool, "enable_compression", is_native);
+    options.addOption(bool, "enable_compression", enable_compression);
 
     const swerver_module = b.addModule("swerver", .{
         .root_source_file = b.path("src/lib.zig"),
@@ -33,7 +34,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     swerver_module.addOptions("build_options", options);
-    if (is_native) {
+    if (enable_compression) {
         swerver_module.linkSystemLibrary("z", .{});
     }
     // Only link OpenSSL when TLS/HTTP3 is enabled and the target matches the host.
