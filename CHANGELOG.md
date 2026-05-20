@@ -1,5 +1,144 @@
 # Changelog
 
+## 0.1.0-alpha.7 — 2026-05-19
+
+API gateway feature set, identity-aware proxy, 15 hot-path performance
+optimizations, and critical H2 upload flow control fix. Zig 0.16.0 stable.
+
+### API Gateway
+
+- **feat: WebSocket proxy** — bidirectional tunnel relay with HTTP Upgrade
+  negotiation. Proxies WebSocket connections through configured upstreams.
+- **feat: SNI multi-certificate TLS** — serve different certificates per
+  hostname. Up to `MAX_SNI_ENTRIES` certificates selected at handshake time
+  based on the SNI extension.
+- **feat: admin API** — runtime route and upstream management on a separate
+  port (default 9180) with API key authentication. Add, remove, and inspect
+  routes and upstreams without restart.
+- **feat: mTLS client certificate verification** — `client_ca_path` and
+  `client_cert_required` config fields. Client certificate DN forwarded to
+  upstream via headers.
+- **feat: traffic splitting** — canary and blue-green deployments via
+  weighted `traffic_split` targets on proxy routes. Percentage-based routing
+  to multiple upstreams.
+- **feat: response caching** — LRU response cache for proxy routes with
+  configurable `max_entries`. Cache-Control aware with TTL expiry.
+- **feat: gRPC-aware proxy** — HTTP/2 gRPC status code mapping and metadata
+  passthrough. Content-type detection for gRPC frames.
+- **feat: response compression** — gzip and deflate compression for proxy
+  responses via zlib. Accept-Encoding negotiation.
+- **feat: traffic mirroring** — shadow traffic to a mirror upstream for
+  testing. Fire-and-forget copy of requests without affecting the primary
+  response path.
+- **feat: Consul service discovery** — automatic upstream resolution from
+  Consul's service catalog with health-aware filtering.
+- **feat: DNS service discovery** — resolve upstream servers from DNS A
+  records with periodic refresh. Configurable TTL and resolver.
+- **feat: OpenTelemetry trace export** — W3C trace context propagation and
+  span export. Configurable via `otel` config section.
+- **feat: request body validation** — JSON Schema subset validation via
+  `body_schema` on routes. Type, required fields, min/max constraints.
+- **feat: SIGHUP hot reload for routes and upstreams** — reload the full
+  route table and upstream config from the JSON config file on SIGHUP.
+  Previously only timeouts and limits were reloadable.
+- **feat: per-consumer rate limiting** — rate limit buckets keyed by
+  consumer identity (from auth headers) in addition to client IP.
+
+### Identity & Authentication
+
+- **feat: identity-aware proxy** — pluggable auth chain with API key and
+  JWT authentication. Header mutation injects verified identity into upstream
+  requests. Forward-auth support delegates to an external auth service.
+- **feat: body discard mode** — per-route opt-in to consume request bodies
+  without buffering. Handler receives `.len()` but body content is
+  unavailable. Eliminates memory pressure on upload-heavy endpoints.
+- **security: fix use-after-free, header injection, and timing leaks in
+  auth** — constant-time comparison for API keys, header value sanitization,
+  and lifetime fixes in the auth middleware.
+
+### Performance
+
+- **perf: quick-line fast path** — extract method + path from the request
+  line without full header parsing. On pre-encoded cache hit, skip the
+  router, middleware, and response encoding entirely.
+- **perf: shrink Connection struct by ~130KB** — lazy allocation of
+  per-connection H2 state and pending body slots.
+- **perf: cache nowMs per event-loop tick** — single `clock_gettime` per
+  event batch instead of per-event.
+- **perf: eliminate clock_gettime from pre-encoded cache hits** — response
+  coalescing reuses the tick-cached timestamp.
+- **perf: pin forked workers to CPU cores (Linux)** — `sched_setaffinity`
+  after fork for cache-local processing.
+- **perf: fast-path exact match for literal-only routes** — O(1) hash
+  lookup before trie traversal for routes with no parameters.
+- **perf: lazy arena acquire for HTTP/2 GET dispatch** — skip buffer pool
+  acquisition for bodyless request methods.
+- **perf: skip getpeername on accept** — defer `getpeername` until the peer
+  IP is actually needed.
+- **perf: HPACK length-switch** — replace linear static table scan with a
+  switch on header name length.
+- **perf: refresh date cache per tick** — `Date` header string updated once
+  per event-loop tick, not per response.
+- **perf: cached date in H2 HPACK encoder** — pass pre-formatted date
+  string to avoid repeated formatting.
+- **perf: inline write drain during H1 pipelining** — flush enqueued
+  responses to the kernel mid-batch so the client can overlap its next send
+  with our remaining processing.
+- **perf: skip realtimeNanos when OTel not configured** — avoid the
+  syscall on the hot path when tracing is disabled.
+
+### HTTP/2
+
+- **fix: upload flow control deadlock** — the H2 stack conflated send and
+  receive flow control windows. Client `WINDOW_UPDATE` frames and
+  `SETTINGS_INITIAL_WINDOW_SIZE` were applied to the server's receive
+  window instead of the send window, inflating it so `WINDOW_UPDATE`
+  emission thresholds were never reached. Uploads >1MB stalled as the
+  client exhausted its send window waiting for updates that never came.
+  Fixed by adding separate `conn_send_window` / `initial_peer_window`
+  tracking for the send direction.
+- **fix: read buffer compaction for H2** — DATA frames left unconsumed
+  partial frames at high buffer offsets with no room for new data. Added
+  H2-specific buffer compaction that slides partial data to offset 0.
+- **fix: TLS drain loop** — added inline write flushing and buffer
+  compaction inside the SSL drain loop so `WINDOW_UPDATE`s reach the
+  peer while we keep reading.
+- **fix: body buffer upgraded to 1MB pool** — H2 body accumulation now
+  uses the 1MB body buffer pool instead of 64KB regular buffers, with
+  correct pool type tracking for release.
+- **fix: ingest loop unreachable** — `min_write_slots` exceeded write
+  queue capacity, making the H2 processing loop unreachable.
+- **fix: guard ALPN h2 selection** — only advertise `h2` in ALPN when
+  the `enable_http2` build flag is set.
+
+### io_uring / TLS
+
+- **fix: rearm recv after TLS handshake on native backend** — native
+  io_uring backend wasn't rearming the receive SQE after TLS handshake
+  completion, causing connections to stall.
+- **fix: arm writable event on native backend when TLS write stalls** —
+  when `SSL_write` returns `WANT_WRITE`, properly arm a writable event
+  instead of dropping the write.
+
+### HTTP/1.1
+
+- **fix: extractQuickLine Connection header fallthrough** — the quick-line
+  parser fell through on requests with a `Connection` header, missing the
+  fast path.
+- **fix: Route.pattern slice after copy** — pattern slices were
+  invalidated when routes were copied into the routes array.
+- **fix: body_schema validation on fast-path dispatch** — small POST
+  bodies dispatched via the fast path now run body schema validation.
+
+### Toolchain
+
+- **chore: upgrade to Zig 0.16.0 stable** — pinned to the stable release,
+  fixed release workflow timeout.
+- **chore: remove httparena directory** — HttpArena handlers live in their
+  own repository now.
+
+---
+
 ## 0.1.0-alpha.2 — 2026-05-15
 
 Full-codebase correctness audit: 41 findings across 24 files, 35 fixed.

@@ -44,6 +44,7 @@ pub fn main() !void {
 - `ServerBuilder.middleware(MiddlewareChain)`
 - `ServerBuilder.withState(*AppState)`
 - `ServerBuilder.withServices(*Services)`
+- `ServerBuilder.withProxy()` to enable the reverse proxy (used with JSON config routes/upstreams)
 - `ServerBuilder.build(allocator)` -> `Server`
 - `Server.run(run_for_ms: ?u64)`
 
