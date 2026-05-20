@@ -254,7 +254,9 @@ pub fn handleHttp2Read(server: *Server, conn: *connection.Connection) !void {
                                         const final_body = if (data_ev.data.len > 0) data_ev.data else body;
                                         try dispatchHttp2Request(server, conn, slot.stream_id, slot.toRequestView(final_body), final_body);
                                     }
-                                    if (slot.body_handle) |bh| server.io.releaseBuffer(bh);
+                                    if (slot.body_handle) |bh| {
+                                        if (slot.body_is_body_pool) server.io.releaseBodyBuffer(bh) else server.io.releaseBuffer(bh);
+                                    }
                                     slot.clear();
                                 } else {
                                     accumulateH2Body(server, conn, data_ev);
@@ -264,7 +266,6 @@ pub fn handleHttp2Read(server: *Server, conn: *connection.Connection) !void {
                         }
                         if (!found_persistent) {
                             // Orphaned DATA frame — stream will time out on the client side.
-                            // Nothing we can do without headers.
                         }
                     }
                 },
@@ -478,8 +479,9 @@ fn accumulateH2Body(server: *Server, conn: *connection.Connection, data_ev: http
     for (pending) |*slot| {
         if (slot.active and slot.stream_id == data_ev.stream_id) {
             if (slot.body_handle == null) {
-                slot.body_handle = server.io.acquireBuffer() orelse return;
+                slot.body_handle = server.io.acquireBodyBuffer() orelse return;
                 slot.body_len = 0;
+                slot.body_is_body_pool = true;
             }
             const buf = slot.body_handle.?.bytes;
             const avail = buf.len - slot.body_len;

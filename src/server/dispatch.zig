@@ -463,49 +463,66 @@ pub fn handleRead(server: *Server, index: u32) !void {
         }
     }
 
-    const offset = conn.read_offset + conn.read_buffered_bytes;
-    if (offset >= buffer_handle.bytes.len) {
-        // Buffer full — try header-only parse to see if we can start body accumulation
-        if (conn.canEnqueueWrite()) {
-            const start = conn.read_offset;
-            const end = start + conn.read_buffered_bytes;
-            const hparse = http1.parseHeaders(buffer_handle.bytes[start..end], .{
-                .max_header_bytes = server.cfg.limits.max_header_bytes,
-                .max_body_bytes = server.cfg.limits.max_body_bytes,
-                .max_header_count = server.cfg.limits.max_header_count,
-                .headers_storage = conn.headers[0..],
-            });
-            if (hparse.state == .err) {
-                conn.close_after_write = true;
-                server.io.onReadConsumed(conn, conn.read_buffered_bytes);
-                try http1_mod.queueResponse(server, conn, http1_mod.errorResponseFor(hparse.error_code));
-            } else if (hparse.state == .complete) {
-                // Headers valid, body too big for buffer → init body accumulation
-                const needs_body = hparse.is_chunked or hparse.content_length > 0;
-                if (needs_body) {
-                    http1_mod.initBodyAccumulation(server, conn, hparse, buffer_handle) catch {
+    var read_start = conn.read_offset + conn.read_buffered_bytes;
+    if (read_start >= buffer_handle.bytes.len) {
+        if (build_options.enable_http2 and conn.protocol == .http2) {
+            // H2 read buffer fragmented: unconsumed partial frame sits at
+            // a high read_offset leaving no room to append new data.
+            // Compact the buffer by sliding the partial data to the front.
+            if (conn.read_offset > 0) {
+                const start = conn.read_offset;
+                const len = conn.read_buffered_bytes;
+                std.mem.copyForwards(u8, buffer_handle.bytes[0..len], buffer_handle.bytes[start .. start + len]);
+                conn.read_offset = 0;
+                read_start = len;
+            } else {
+                // read_offset already 0 — buffer genuinely full, process what we have
+                try http2_mod.handleHttp2Read(server, conn);
+                return;
+            }
+        } else {
+            // Buffer full — try header-only parse to see if we can start body accumulation
+            if (conn.canEnqueueWrite()) {
+                const start = conn.read_offset;
+                const end = start + conn.read_buffered_bytes;
+                const hparse = http1.parseHeaders(buffer_handle.bytes[start..end], .{
+                    .max_header_bytes = server.cfg.limits.max_header_bytes,
+                    .max_body_bytes = server.cfg.limits.max_body_bytes,
+                    .max_header_count = server.cfg.limits.max_header_count,
+                    .headers_storage = conn.headers[0..],
+                });
+                if (hparse.state == .err) {
+                    conn.close_after_write = true;
+                    server.io.onReadConsumed(conn, conn.read_buffered_bytes);
+                    try http1_mod.queueResponse(server, conn, http1_mod.errorResponseFor(hparse.error_code));
+                } else if (hparse.state == .complete) {
+                    // Headers valid, body too big for buffer → init body accumulation
+                    const needs_body = hparse.is_chunked or hparse.content_length > 0;
+                    if (needs_body) {
+                        http1_mod.initBodyAccumulation(server, conn, hparse, buffer_handle) catch {
+                            conn.close_after_write = true;
+                            server.io.onReadConsumed(conn, conn.read_buffered_bytes);
+                            try http1_mod.queueResponse(server, conn, http1_mod.errorResponseFor(.body_too_large));
+                            return;
+                        };
+                        // Body accumulation started — re-enter handleRead to drain socket
+                        // (edge-triggered epoll won't fire again for data already buffered)
+                        return handleRead(server, index);
+                    } else {
+                        // No body but buffer full → shouldn't happen (parse() would've completed)
                         conn.close_after_write = true;
                         server.io.onReadConsumed(conn, conn.read_buffered_bytes);
                         try http1_mod.queueResponse(server, conn, http1_mod.errorResponseFor(.body_too_large));
-                        return;
-                    };
-                    // Body accumulation started — re-enter handleRead to drain socket
-                    // (edge-triggered epoll won't fire again for data already buffered)
-                    return handleRead(server, index);
+                    }
                 } else {
-                    // No body but buffer full → shouldn't happen (parse() would've completed)
+                    // .partial — headers not even complete yet → 431 (header too large)
                     conn.close_after_write = true;
                     server.io.onReadConsumed(conn, conn.read_buffered_bytes);
-                    try http1_mod.queueResponse(server, conn, http1_mod.errorResponseFor(.body_too_large));
+                    try http1_mod.queueResponse(server, conn, http1_mod.errorResponseFor(.header_too_large));
                 }
-            } else {
-                // .partial — headers not even complete yet → 431 (header too large)
-                conn.close_after_write = true;
-                server.io.onReadConsumed(conn, conn.read_buffered_bytes);
-                try http1_mod.queueResponse(server, conn, http1_mod.errorResponseFor(.header_too_large));
             }
+            return;
         }
-        return;
     }
     // With completion-model backends (io_uring native), the event
     // dispatcher has already seeded read_buffered_bytes from the
@@ -514,7 +531,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
     // kernel-delivered bytes are ciphertext living in rbio; we still
     // need to call connRead (SSL_read) to pull plaintext out.
     if (!server.io.capabilities().delivers_read_data or conn.is_tls) {
-        const slice = buffer_handle.bytes[offset..];
+        const slice = buffer_handle.bytes[read_start..];
         const count = switch (connRead(server, conn, slice)) {
             .bytes => |n| n,
             .eof => {
@@ -574,9 +591,29 @@ pub fn handleRead(server: *Server, index: u32) !void {
         // EPOLLIN for data that's already in SSL's buffer.
         if (conn.is_tls) {
             while (true) {
+                // Flush queued control frames (WINDOW_UPDATE, SETTINGS
+                // ACK) between read rounds so the peer can open its
+                // send window while we keep draining. Without this,
+                // WINDOW_UPDATEs sit in the write queue until
+                // handleRead returns, and the peer stalls.
+                if (conn.write_count > 0) {
+                    drainTlsWriteQueue(server, conn);
+                    if (conn.state == .closed) return;
+                }
                 const drain_buf = conn.read_buffer orelse break;
-                const drain_offset = conn.read_offset + conn.read_buffered_bytes;
-                if (drain_offset >= drain_buf.bytes.len) break;
+                var drain_offset = conn.read_offset + conn.read_buffered_bytes;
+                if (drain_offset >= drain_buf.bytes.len) {
+                    if (conn.read_offset > 0) {
+                        const start = conn.read_offset;
+                        const len = conn.read_buffered_bytes;
+                        std.mem.copyForwards(u8, drain_buf.bytes[0..len], drain_buf.bytes[start .. start + len]);
+                        conn.read_offset = 0;
+                        drain_offset = len;
+                    } else {
+                        try http2_mod.handleHttp2Read(server, conn);
+                        break;
+                    }
+                }
                 const drain_slice = drain_buf.bytes[drain_offset..];
                 switch (connRead(server, conn, drain_slice)) {
                     .bytes => |n| {
@@ -588,7 +625,9 @@ pub fn handleRead(server: *Server, index: u32) !void {
                         server.closeConnection(conn);
                         return;
                     },
-                    .again, .err => break,
+                    .again, .err => {
+                        break;
+                    },
                 }
             }
         }
@@ -1429,6 +1468,58 @@ fn drainWritesInline(server: *Server, conn: *connection.Connection) void {
                 server.io.onWriteCompleted(conn, written);
                 written = 0;
             }
+        }
+    }
+}
+
+/// Flush the write queue through TLS during the H2 drain loop.
+/// Sends queued WINDOW_UPDATE / SETTINGS ACK frames to the peer so it
+/// can open its send window while we keep reading. Unlike handleWrite,
+/// this never calls handleRead, avoiding mutual recursion.
+fn drainTlsWriteQueue(server: *Server, conn: *connection.Connection) void {
+    const socket_fd = conn.fd orelse return;
+    while (conn.write_count > 0) {
+        switch (server_tls.tlsDrainCarry(server, conn)) {
+            .done => {},
+            .again => {
+                server.io.armWritable(conn.index, socket_fd) catch {};
+                return;
+            },
+            .err => {
+                server.closeConnection(conn);
+                return;
+            },
+        }
+        const entry = conn.peekWrite() orelse break;
+        const data = entry.handle.bytes[entry.offset..entry.len];
+        if (data.len == 0) {
+            server.io.releaseBuffer(entry.handle);
+            conn.popWrite();
+            continue;
+        }
+        switch (connWrite(server, conn, data)) {
+            .bytes => |n| {
+                if (n >= data.len) {
+                    server.io.onWriteCompleted(conn, data.len);
+                    server.io.releaseBuffer(entry.handle);
+                    conn.popWrite();
+                } else {
+                    entry.offset += n;
+                    server.io.onWriteCompleted(conn, n);
+                }
+                if (conn.tls_cipher_carry_handle != null) {
+                    server.io.armWritable(conn.index, socket_fd) catch {};
+                    return;
+                }
+            },
+            .again => {
+                server.io.armWritable(conn.index, socket_fd) catch {};
+                return;
+            },
+            .err => {
+                server.closeConnection(conn);
+                return;
+            },
         }
     }
 }

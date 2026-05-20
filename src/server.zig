@@ -680,7 +680,9 @@ pub const Server = struct {
         }
         if (conn.h2_pending) |pending| {
             for (pending) |*slot| {
-                if (slot.body_handle) |bh| self.io.releaseBuffer(bh);
+                if (slot.body_handle) |bh| {
+                    if (slot.body_is_body_pool) self.io.releaseBodyBuffer(bh) else self.io.releaseBuffer(bh);
+                }
             }
             self.allocator.destroy(pending);
             conn.h2_pending = null;

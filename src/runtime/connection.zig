@@ -60,6 +60,7 @@ pub const PendingH2Body = struct {
     header_entries: [32]request.Header = undefined,
     body_handle: ?buffer_pool.BufferHandle = null,
     body_len: usize = 0,
+    body_is_body_pool: bool = false,
     active: bool = false,
 
     pub fn stash(self: *PendingH2Body, stream_id: u32, req: request.RequestView) bool {
@@ -89,6 +90,7 @@ pub const PendingH2Body = struct {
         self.header_storage_len = off;
         self.body_handle = null;
         self.body_len = 0;
+        self.body_is_body_pool = false;
         self.active = true;
         return true;
     }
@@ -110,6 +112,7 @@ pub const PendingH2Body = struct {
         self.active = false;
         self.body_handle = null;
         self.body_len = 0;
+        self.body_is_body_pool = false;
     }
 };
 

@@ -266,6 +266,7 @@ const Stream = struct {
     id: u32,
     state: StreamState,
     recv_window: i32,
+    send_window: i32,
     header_block_len: usize,
     header_block_in_progress: bool,
     /// END_STREAM flag from HEADERS, deferred until header block completes via CONTINUATION
@@ -274,10 +275,11 @@ const Stream = struct {
     saw_data: bool,
     continuation_count: u16,
 
-    fn reset(self: *Stream, id: u32, initial_window: i32) void {
+    fn reset(self: *Stream, id: u32, initial_recv_window: i32) void {
         self.id = id;
         self.state = .idle;
-        self.recv_window = initial_window;
+        self.recv_window = initial_recv_window;
+        self.send_window = DefaultInitialWindow;
         self.header_block_len = 0;
         self.header_block_in_progress = false;
         self.end_stream_pending = false;
@@ -709,6 +711,8 @@ pub const Stack = struct {
     last_stream_id: u32,
     conn_recv_window: i32,
     initial_stream_window: i32,
+    conn_send_window: i32,
+    initial_peer_window: i32,
     max_frame_size: u32,
     max_header_list_size: usize,
     header_block: [HeaderBlockBytes]u8,
@@ -739,6 +743,8 @@ pub const Stack = struct {
             .last_stream_id = 0,
             .conn_recv_window = initial_window,
             .initial_stream_window = initial_window,
+            .conn_send_window = @intCast(DefaultInitialWindow),
+            .initial_peer_window = @intCast(DefaultInitialWindow),
             .max_frame_size = cfg.max_frame_size,
             .max_header_list_size = cfg.max_header_list_size,
             .header_block = undefined,
@@ -1021,21 +1027,19 @@ pub const Stack = struct {
         const increment = parseWindowIncrement(frame.payload) orelse return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
         const max_window: i32 = 0x7FFF_FFFF; // 2^31-1 per RFC 7540
         if (frame.header.stream_id == 0) {
-            // RFC 7540 Section 6.9.1: window must not exceed 2^31-1
-            const new_window = @as(i64, self.conn_recv_window) + @as(i64, increment);
+            const new_window = @as(i64, self.conn_send_window) + @as(i64, increment);
             if (new_window > max_window) {
                 return .{ .state = .err, .error_code = .flow_control_error, .event_count = 0 };
             }
-            self.conn_recv_window = @intCast(new_window);
+            self.conn_send_window = @intCast(new_window);
             return .{ .state = .complete, .error_code = .none, .event_count = 0 };
         }
         const stream = self.findStream(frame.header.stream_id) orelse return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
-        // RFC 7540 Section 6.9.1: window must not exceed 2^31-1
-        const new_stream_window = @as(i64, stream.recv_window) + @as(i64, increment);
+        const new_stream_window = @as(i64, stream.send_window) + @as(i64, increment);
         if (new_stream_window > max_window) {
             return .{ .state = .err, .error_code = .flow_control_error, .event_count = 0 };
         }
-        stream.recv_window = @intCast(new_stream_window);
+        stream.send_window = @intCast(new_stream_window);
         return .{ .state = .complete, .error_code = .none, .event_count = 0 };
     }
 
@@ -1118,16 +1122,14 @@ pub const Stack = struct {
             0x4 => {
                 if (value > 0x7fff_ffff) return error.InvalidSetting;
                 const new_window: i32 = @intCast(value);
-                const delta: i64 = @as(i64, new_window) - @as(i64, self.initial_stream_window);
-                // RFC 9113 §6.5.2: Adjust existing stream windows by the delta
+                const delta: i64 = @as(i64, new_window) - @as(i64, self.initial_peer_window);
                 for (self.streams[0..self.stream_count]) |*stream| {
                     if (stream.state == .closed) continue;
-                    const adjusted = @as(i64, stream.recv_window) + delta;
-                    // RFC 9113 §6.5.2: flow-control error if window exceeds 2^31-1
+                    const adjusted = @as(i64, stream.send_window) + delta;
                     if (adjusted > 0x7fff_ffff) return error.InvalidSetting;
-                    stream.recv_window = @intCast(adjusted);
+                    stream.send_window = @intCast(adjusted);
                 }
-                self.initial_stream_window = new_window;
+                self.initial_peer_window = new_window;
             },
             // SETTINGS_MAX_FRAME_SIZE (0x5) - must be between 2^14 and 2^24-1
             0x5 => {
@@ -1158,6 +1160,7 @@ pub const Stack = struct {
             if (stream.state == .closed) {
                 self.last_stream_id = stream_id;
                 stream.reset(stream_id, self.initial_stream_window);
+                stream.send_window = self.initial_peer_window;
                 stream.state = .idle;
                 // Update cache
                 self.cached_stream_id = stream_id;
@@ -1171,6 +1174,7 @@ pub const Stack = struct {
         const idx = self.stream_count;
         var stream = &self.streams[idx];
         stream.reset(stream_id, self.initial_stream_window);
+        stream.send_window = self.initial_peer_window;
         stream.state = .idle;
         self.stream_count += 1;
         // Update cache
