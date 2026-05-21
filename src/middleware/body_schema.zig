@@ -98,13 +98,14 @@ pub const ValidationResult = struct {
     }
 };
 
+threadlocal var validate_buf: [65536]u8 = undefined;
+
 pub fn validate(schema: *const Schema, body: []const u8) ValidationResult {
     var result = ValidationResult{};
 
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
+    var fba = std.heap.FixedBufferAllocator.init(&validate_buf);
 
-    const value = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), body, .{}) catch {
+    const value = std.json.parseFromSliceLeaky(std.json.Value, fba.allocator(), body, .{}) catch {
         result.addError(&.{}, "invalid JSON");
         return result;
     };

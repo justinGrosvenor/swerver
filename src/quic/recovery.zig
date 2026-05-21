@@ -64,7 +64,7 @@ pub const RttEstimator = struct {
 
         // Adjust for ACK delay (only for application data)
         var adjusted_rtt = rtt_sample;
-        if (!is_handshake and ack_delay < self.max_ack_delay) {
+        if (!is_handshake and ack_delay <= self.max_ack_delay) {
             if (rtt_sample > self.min_rtt + ack_delay) {
                 adjusted_rtt = rtt_sample - ack_delay;
             }

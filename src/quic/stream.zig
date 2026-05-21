@@ -364,7 +364,22 @@ pub const StreamManager = struct {
             return stream;
         }
 
-        // Create new stream
+        // Enforce stream limits for peer-initiated streams
+        const is_server_initiated = (id & 0x1) != 0;
+        const is_peer = if (self.is_server) !is_server_initiated else is_server_initiated;
+        if (is_peer) {
+            const is_bidi = (id & 0x2) == 0;
+            if (is_bidi) {
+                if (self.open_streams_bidi >= self.max_streams_bidi_remote)
+                    return Error.StreamLimitExceeded;
+                self.open_streams_bidi += 1;
+            } else {
+                if (self.open_streams_uni >= self.max_streams_uni_remote)
+                    return Error.StreamLimitExceeded;
+                self.open_streams_uni += 1;
+            }
+        }
+
         return try self.createStream(id);
     }
 

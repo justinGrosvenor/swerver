@@ -1100,6 +1100,7 @@ pub const Connection = struct {
                 self.peer_params.decode(blob) catch return Error.ProtocolViolation;
                 // Hook the negotiated send window into flow control.
                 self.flow_control.max_data_send = self.peer_params.initial_max_data;
+                self.recovery.rtt.max_ack_delay = self.peer_params.max_ack_delay * std.time.ns_per_ms;
             }
         }
 
@@ -1320,7 +1321,7 @@ pub const Connection = struct {
         if (ack_result.largest_sent_time) |sent_time| {
             // Update RTT estimator (RFC 9002 §5)
             if (now_ns > sent_time) {
-                const ack_delay_ns = self.application_space.calculateAckDelay() * 1000;
+                const ack_delay_ns = if (space == .application) self.application_space.calculateAckDelay() * 1000 else 0;
                 self.recovery.rtt.update(
                     now_ns - sent_time,
                     ack_delay_ns,
