@@ -116,7 +116,7 @@ pub const PendingH2Body = struct {
     }
 };
 
-pub const MAX_PENDING_H2_BODIES = 32;
+pub const MAX_PENDING_H2_BODIES = 128;
 
 pub const PendingH2File = struct {
     active: bool = false,

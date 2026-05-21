@@ -91,6 +91,7 @@ pub const IoRuntime = struct {
                 // overlap. Sync is strictly faster for this server's
                 // shape.
                 .async_writes = false,
+                .recv_buffer_size = io_uring_native_backend.RECV_BUF_SIZE,
             },
             .windows_iocp, .unknown => .{},
         };
@@ -454,6 +455,10 @@ pub const Capabilities = struct {
     /// True if writes are submitted asynchronously and completion is
     /// signaled via a later .write event (vs sync writev in handleWrite).
     async_writes: bool = false,
+    /// Size of kernel-delivered recv buffers (0 = not applicable).
+    /// Used to trigger body accumulation before the read buffer
+    /// overflows, preventing data loss from seedReadBuffer truncation.
+    recv_buffer_size: usize = 0,
 };
 
 /// Magic identifier for UDP socket events to distinguish from TCP listener (0) and connections

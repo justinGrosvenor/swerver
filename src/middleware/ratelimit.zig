@@ -427,6 +427,16 @@ pub const RateLimitResponse = struct {
     pause_ms: u64,
 };
 
+// Stable storage for per-route 429 headers — avoids dangling pointer
+// from returning &[_]Header{runtime_vals} on the stack.
+var route_rl_headers: [5]response.Header = .{
+    .{ .name = "Retry-After", .value = "0" },
+    .{ .name = "X-RateLimit-Limit", .value = "0" },
+    .{ .name = "X-RateLimit-Remaining", .value = "0" },
+    .{ .name = "Content-Type", .value = "application/json" },
+    .{ .name = "Content-Length", .value = "29" },
+};
+
 pub fn evaluateRoute(
     consumer_name: []const u8,
     client_ip: ?IpKey,
@@ -448,16 +458,12 @@ pub fn evaluateRoute(
     const result = consumer_limiter.checkAndGetInfo(key, cfg.requests_per_second, cfg.burst_size);
     if (result.allowed) return null;
 
+    route_rl_headers[0].value = retryStr(result.retry_after_ms);
+    route_rl_headers[1].value = numStr(result.limit);
     return .{
         .resp = .{
             .status = 429,
-            .headers = &[_]response.Header{
-                .{ .name = "Retry-After", .value = retryStr(result.retry_after_ms) },
-                .{ .name = "X-RateLimit-Limit", .value = numStr(result.limit) },
-                .{ .name = "X-RateLimit-Remaining", .value = "0" },
-                .{ .name = "Content-Type", .value = "application/json" },
-                .{ .name = "Content-Length", .value = "29" },
-            },
+            .headers = &route_rl_headers,
             .body = .{ .bytes = "{\"error\":\"too many requests\"}" },
         },
         .pause_ms = result.retry_after_ms,
@@ -484,20 +490,20 @@ const retry_after_strings = blk: {
     break :blk strs;
 };
 
-/// 429 response with Retry-After header
+var global_rl_headers: [2]response.Header = .{
+    .{ .name = "Retry-After", .value = "0" },
+    .{ .name = "Content-Length", .value = "0" },
+};
+
 fn tooManyRequests(retry_after: u64) response.Response {
-    // Use pre-computed string table for common values (0-60s)
-    const retry_str = if (retry_after < retry_after_strings.len)
+    global_rl_headers[0].value = if (retry_after < retry_after_strings.len)
         retry_after_strings[retry_after]
     else
         "60";
 
     return .{
         .status = 429,
-        .headers = &[_]response.Header{
-            .{ .name = "Retry-After", .value = retry_str },
-            .{ .name = "Content-Length", .value = "0" },
-        },
+        .headers = &global_rl_headers,
         .body = .none,
     };
 }

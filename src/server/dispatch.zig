@@ -690,11 +690,17 @@ pub fn handleRead(server: *Server, index: u32) !void {
                 conn.sent_continue = true;
                 try http1_mod.queueResponse(server, conn, http1_mod.continueResponse());
             }
-            // If buffer is full with a partial request, attempt body accumulation now.
-            // With edge-triggered epoll, we may not get another read event to trigger
-            // the buffer-full handler at the top of handleRead.
+            // If buffer is full (or nearly full on completion-model
+            // backends), attempt body accumulation now. On io_uring
+            // native, recv buffers are fixed-size and seedReadBuffer
+            // truncates silently if the read buffer overflows. Trigger
+            // body accumulation before the next recv chunk would
+            // overflow, so no data is lost.
             const parse_end = conn.read_offset + conn.read_buffered_bytes;
-            if (parse_end >= buffer_handle.bytes.len) {
+            const recv_margin = server.io.capabilities().recv_buffer_size;
+            const buffer_full = parse_end >= buffer_handle.bytes.len;
+            const near_full = recv_margin > 0 and parse_end + recv_margin > buffer_handle.bytes.len;
+            if (buffer_full or near_full) {
                 const hparse = http1.parseHeaders(buffer_handle.bytes[conn.read_offset..parse_end], .{
                     .max_header_bytes = server.cfg.limits.max_header_bytes,
                     .max_body_bytes = server.cfg.limits.max_body_bytes,
@@ -710,13 +716,12 @@ pub fn handleRead(server: *Server, index: u32) !void {
                     };
                     // Re-enter to drain remaining socket data
                     return handleRead(server, index);
-                } else if (hparse.state == .partial) {
-                    // Headers not complete → 431
+                } else if (hparse.state == .partial and buffer_full) {
+                    // Headers not complete and buffer truly full → 431
                     conn.close_after_write = true;
                     server.io.onReadConsumed(conn, conn.read_buffered_bytes);
                     try http1_mod.queueResponse(server, conn, http1_mod.errorResponseFor(.header_too_large));
                 }
-                // else: hparse.state == .err handled by returning (let next event handle it)
             }
             return;
         }
