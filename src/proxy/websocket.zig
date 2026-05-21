@@ -52,7 +52,6 @@ pub fn performUpgrade(
     ) catch {
         return .{ .err = errorResp(502) };
     };
-    errdefer clock.closeFd(fd);
 
     net.setSocketTimeouts(fd, route.timeouts.send_ms, route.timeouts.read_ms);
 

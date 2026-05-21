@@ -206,6 +206,11 @@ pub const Provider = struct {
     /// Initialize a TLS provider for client connections (no certificates needed).
     pub fn initClient(allocator: std.mem.Allocator) Error!Provider {
         const ctx = ffi.createContext(false) catch return error.ContextCreationFailed;
+        ffi.loadDefaultVerifyPaths(ctx) catch {
+            ffi.freeContext(ctx);
+            return error.ContextCreationFailed;
+        };
+        ffi.setVerifyPeer(ctx, false);
 
         return .{
             .ctx = ctx,

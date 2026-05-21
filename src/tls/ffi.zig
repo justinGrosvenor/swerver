@@ -118,6 +118,7 @@ pub const X509_NAME = opaque {};
 
 extern fn SSL_CTX_set_verify(ctx: *SSL_CTX, mode: c_int, callback: ?*const anyopaque) void;
 extern fn SSL_CTX_load_verify_locations(ctx: *SSL_CTX, ca_file: ?[*:0]const u8, ca_path: ?[*:0]const u8) c_int;
+extern fn SSL_CTX_set_default_verify_paths(ctx: *SSL_CTX) c_int;
 extern fn SSL_get1_peer_certificate(ssl: *const SSL) ?*X509;
 extern fn X509_get_subject_name(x: *const X509) ?*X509_NAME;
 extern fn X509_NAME_oneline(name: *const X509_NAME, buf: ?[*]u8, size: c_int) ?[*:0]const u8;
@@ -127,6 +128,11 @@ pub fn setVerifyPeer(ctx: *SSL_CTX, require: bool) void {
     if (!tls_enabled) return;
     const mode = if (require) SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT else SSL_VERIFY_PEER;
     SSL_CTX_set_verify(ctx, mode, null);
+}
+
+pub fn loadDefaultVerifyPaths(ctx: *SSL_CTX) !void {
+    if (!tls_enabled) return error.TlsNotAvailable;
+    if (SSL_CTX_set_default_verify_paths(ctx) != 1) return error.CaCertLoadFailed;
 }
 
 pub fn loadCaCert(ctx: *SSL_CTX, ca_path: [:0]const u8) !void {

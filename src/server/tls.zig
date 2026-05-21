@@ -109,9 +109,10 @@ pub fn handleTlsHandshake(server: *Server, conn: *connection.Connection) !void {
         }
         // Try to read immediately (data may already be buffered by TLS/kernel)
         server.handleRead(conn.index) catch {
-            server.closeConnection(conn);
+            if (conn.state != .closed) server.closeConnection(conn);
             return;
         };
+        if (conn.state == .closed) return;
         // Flush any response queued by handleRead (the event loop also does
         // this after read events, but we need it here for the initial handshake)
         if (conn.write_count > 0 or conn.hasPendingH2Streams()) {

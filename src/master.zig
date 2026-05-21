@@ -164,10 +164,6 @@ pub const Master = struct {
                 std.log.err("[w{d}] failed to build server: {}", .{ worker_id, err });
                 std.process.exit(1);
             };
-            defer {
-                srv.deinit();
-                self.allocator.destroy(srv);
-            }
 
             srv.run(null) catch |err| {
                 std.log.err("[w{d}] server error: {}", .{ worker_id, err });

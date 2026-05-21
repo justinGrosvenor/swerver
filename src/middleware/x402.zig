@@ -456,6 +456,8 @@ fn facilitatorRoundTripTls(fd: std.posix.fd_t, req_bytes: []const u8, resp_buf: 
 
     const ctx = ffi.SSL_CTX_new(ffi.TLS_client_method()) orelse return error.TlsInitFailed;
     defer ffi.SSL_CTX_free(ctx);
+    ffi.loadDefaultVerifyPaths(ctx) catch return error.TlsInitFailed;
+    ffi.setVerifyPeer(ctx, false);
 
     const ssl = ffi.SSL_new(ctx) orelse return error.TlsInitFailed;
     defer ffi.SSL_free(ssl);

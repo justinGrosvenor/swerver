@@ -590,7 +590,8 @@ pub fn handleRead(server: *Server, index: u32) !void {
         // epoll is edge-triggered on the kernel socket and won't fire
         // EPOLLIN for data that's already in SSL's buffer.
         if (conn.is_tls) {
-            while (true) {
+            var tls_drain_rounds: u8 = 0;
+            while (tls_drain_rounds < 64) : (tls_drain_rounds += 1) {
                 // Flush queued control frames (WINDOW_UPDATE, SETTINGS
                 // ACK) between read rounds so the peer can open its
                 // send window while we keep draining. Without this,
