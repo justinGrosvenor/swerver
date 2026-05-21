@@ -180,13 +180,51 @@ fn evaluateApiKey(req: request.RequestView, cfg: ApiKeyConfig) AuthResult {
         while (it.next()) |pair| {
             if (std.mem.startsWith(u8, pair, cfg.query_param)) {
                 if (pair.len > cfg.query_param.len and pair[cfg.query_param.len] == '=') {
-                    return matchApiKey(pair[cfg.query_param.len + 1 ..], cfg.keys);
+                    const raw = pair[cfg.query_param.len + 1 ..];
+                    if (percentDecodeQueryValue(raw)) |decoded| {
+                        return matchApiKey(decoded, cfg.keys);
+                    }
+                    return matchApiKey(raw, cfg.keys);
                 }
             }
         }
     }
 
     return .{ .reject = UNAUTHORIZED };
+}
+
+threadlocal var query_decode_buf: [512]u8 = undefined;
+
+fn percentDecodeQueryValue(input: []const u8) ?[]const u8 {
+    if (std.mem.indexOfScalar(u8, input, '%') == null and std.mem.indexOfScalar(u8, input, '+') == null) return null;
+    var src: usize = 0;
+    var dst: usize = 0;
+    while (src < input.len) {
+        if (dst >= query_decode_buf.len) return null;
+        if (input[src] == '%' and src + 2 < input.len) {
+            const hi = hexVal(input[src + 1]) orelse return null;
+            const lo = hexVal(input[src + 2]) orelse return null;
+            query_decode_buf[dst] = (hi << 4) | lo;
+            src += 3;
+        } else if (input[src] == '+') {
+            query_decode_buf[dst] = ' ';
+            src += 1;
+        } else {
+            query_decode_buf[dst] = input[src];
+            src += 1;
+        }
+        dst += 1;
+    }
+    return query_decode_buf[0..dst];
+}
+
+fn hexVal(c: u8) ?u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'A'...'F' => c - 'A' + 10,
+        'a'...'f' => c - 'a' + 10,
+        else => null,
+    };
 }
 
 fn matchApiKey(provided: []const u8, keys: []const ApiKey) AuthResult {

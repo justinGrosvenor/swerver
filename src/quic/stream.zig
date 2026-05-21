@@ -196,7 +196,12 @@ pub const Stream = struct {
                 }
             }
         } else if (offset > self.recv_offset) {
-            // Out-of-order, queue for later (must copy data as caller's buffer may be reused)
+            // Out-of-order, queue for later (must copy data as caller's buffer may be reused).
+            // Skip exact duplicates already queued.
+            for (self.pending_chunks.items) |existing| {
+                if (existing.offset == offset and existing.data.len == data.len) return;
+            }
+
             const data_copy = self.allocator.alloc(u8, data.len) catch return Error.OutOfMemory;
             @memcpy(data_copy, data);
 
@@ -208,12 +213,30 @@ pub const Stream = struct {
                 self.allocator.free(data_copy);
                 return Error.OutOfMemory;
             };
-        } else if (fin and self.recv_fin_offset != null and self.recv_offset >= self.recv_fin_offset.?) {
-            // Duplicate data carrying FIN whose end_offset we already reached.
-            if (self.state == .open) {
-                self.state = .half_closed_remote;
-            } else if (self.state == .half_closed_local) {
-                self.state = .closed;
+        } else {
+            // offset < recv_offset: retransmission or partial overlap
+            if (end_offset > self.recv_offset) {
+                // Partial overlap — trim already-consumed prefix, deliver the rest
+                const skip = self.recv_offset - offset;
+                const useful = data[skip..];
+                self.recv_buffer.appendSlice(self.allocator, useful) catch return Error.OutOfMemory;
+                self.recv_offset = end_offset;
+
+                try self.processPendingChunks();
+
+                if (fin or (self.recv_fin_offset != null and self.recv_offset >= self.recv_fin_offset.?)) {
+                    if (self.state == .open) {
+                        self.state = .half_closed_remote;
+                    } else if (self.state == .half_closed_local) {
+                        self.state = .closed;
+                    }
+                }
+            } else if (fin and self.recv_fin_offset != null and self.recv_offset >= self.recv_fin_offset.?) {
+                if (self.state == .open) {
+                    self.state = .half_closed_remote;
+                } else if (self.state == .half_closed_local) {
+                    self.state = .closed;
+                }
             }
         }
 

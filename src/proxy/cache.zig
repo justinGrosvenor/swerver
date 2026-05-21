@@ -245,24 +245,28 @@ pub const ResponseCache = struct {
     }
 
     pub fn invalidate(self: *ResponseCache, path: []const u8) void {
-        var to_remove: [16]u64 = undefined;
-        var remove_count: usize = 0;
+        while (true) {
+            var to_remove: [16]u64 = undefined;
+            var remove_count: usize = 0;
 
-        var it = self.map.iterator();
-        while (it.next()) |kv| {
-            const entry = &self.entries[kv.value_ptr.*];
-            if (entry.in_use and std.mem.eql(u8, entry.path, path)) {
-                if (remove_count < to_remove.len) {
-                    to_remove[remove_count] = kv.key_ptr.*;
-                    remove_count += 1;
+            var it = self.map.iterator();
+            while (it.next()) |kv| {
+                const entry = &self.entries[kv.value_ptr.*];
+                if (entry.in_use and std.mem.eql(u8, entry.path, path)) {
+                    if (remove_count < to_remove.len) {
+                        to_remove[remove_count] = kv.key_ptr.*;
+                        remove_count += 1;
+                    }
                 }
             }
-        }
 
-        for (to_remove[0..remove_count]) |key| {
-            if (self.map.get(key)) |idx| {
-                self.evictEntry(idx);
+            for (to_remove[0..remove_count]) |key| {
+                if (self.map.get(key)) |idx| {
+                    self.evictEntry(idx);
+                }
             }
+
+            if (remove_count < to_remove.len) break;
         }
     }
 

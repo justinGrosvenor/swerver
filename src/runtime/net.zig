@@ -588,7 +588,7 @@ fn resolveAddress(address: []const u8, port: u16) ConnectError!ResolvedAddr {
     buf[address.len] = 0;
 
     var hints: addrinfo = std.mem.zeroes(addrinfo);
-    hints.family = @intCast(std.posix.AF.INET);
+    hints.family = @intCast(std.posix.AF.UNSPEC);
     hints.socktype = @intCast(std.posix.SOCK.STREAM);
 
     var result: ?*addrinfo = null;
@@ -598,13 +598,21 @@ fn resolveAddress(address: []const u8, port: u16) ConnectError!ResolvedAddr {
 
     const info = result.?;
     const sa = info.addr orelse return error.UnsupportedAddress;
-
-    // Copy sockaddr into our SockAddrIn and set the requested port
     const sa_bytes: [*]const u8 = @ptrCast(sa);
+
+    if (info.family == @as(c_int, @intCast(std.posix.AF.INET6))) {
+        var sa6: SockAddrIn6 = undefined;
+        @memcpy(std.mem.asBytes(&sa6), sa_bytes[0..@sizeOf(SockAddrIn6)]);
+        sa6.port = std.mem.nativeToBig(u16, port);
+        return .{
+            .storage = .{ .ip6 = sa6 },
+            .len = @intCast(@sizeOf(SockAddrIn6)),
+        };
+    }
+
     var sa4: SockAddrIn = undefined;
     @memcpy(std.mem.asBytes(&sa4), sa_bytes[0..@sizeOf(SockAddrIn)]);
     sa4.port = std.mem.nativeToBig(u16, port);
-
     return .{
         .storage = .{ .ip4 = sa4 },
         .len = @intCast(@sizeOf(SockAddrIn)),

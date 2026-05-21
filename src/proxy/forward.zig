@@ -479,6 +479,9 @@ const ResponseParser = struct {
             if (header_count < headers.len) {
                 headers[header_count] = .{ .name = name, .value = value };
                 header_count += 1;
+            } else if (header_count == headers.len) {
+                std.log.warn("upstream response exceeded {d} header limit, excess headers dropped", .{headers.len});
+                header_count += 1;
             }
 
             // Track important headers

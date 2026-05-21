@@ -172,6 +172,7 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
         if (x.enabled) |v| cfg.x402.enabled = v;
         if (x.facilitator_url) |v| cfg.x402.facilitator_url = v;
         if (x.facilitator_timeout_ms) |v| cfg.x402.facilitator_timeout_ms = v;
+        if (x.payment_required_b64) |v| cfg.x402.payment_required_b64 = v;
     }
 
     // OpenTelemetry
@@ -562,6 +563,7 @@ const X402Json = struct {
     enabled: ?bool = null,
     facilitator_url: ?[]const u8 = null,
     facilitator_timeout_ms: ?u32 = null,
+    payment_required_b64: ?[]const u8 = null,
 };
 
 const AdminJson = struct {

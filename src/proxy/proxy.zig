@@ -935,10 +935,9 @@ pub const Proxy = struct {
     }
 
     fn releaseRequestBuffer(self: *Proxy, idx: usize) void {
-        if (self.free_request_count < BUFFER_POOL_SIZE) {
-            self.free_request_stack[self.free_request_count] = idx;
-            self.free_request_count += 1;
-        }
+        std.debug.assert(self.free_request_count < BUFFER_POOL_SIZE);
+        self.free_request_stack[self.free_request_count] = idx;
+        self.free_request_count += 1;
     }
 
     fn acquireResponseBuffer(self: *Proxy) ?usize {
@@ -948,10 +947,9 @@ pub const Proxy = struct {
     }
 
     fn releaseResponseBuffer(self: *Proxy, idx: usize) void {
-        if (self.free_response_count < BUFFER_POOL_SIZE) {
-            self.free_response_stack[self.free_response_count] = idx;
-            self.free_response_count += 1;
-        }
+        std.debug.assert(self.free_response_count < BUFFER_POOL_SIZE);
+        self.free_response_stack[self.free_response_count] = idx;
+        self.free_response_count += 1;
     }
 };
 
