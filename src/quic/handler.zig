@@ -100,7 +100,7 @@ pub const Handler = struct {
         var result = ProcessResult{};
 
         // Parse packet header
-        const parse_result = packet.parseHeader(data, 8); // Assume 8-byte CIDs
+        const parse_result = packet.parseHeader(data, connection.OUR_CID_LEN);
         if (parse_result.state != .complete) {
             return Error.InvalidPacket;
         }
@@ -234,9 +234,12 @@ pub const Handler = struct {
     ) Error!void {
         _ = self;
 
-        // Update peer's connection ID
-        if (header.scid.len > 0) {
+        // Adopt the peer's SCID only from the first client Initial
+        // (RFC 9000 §7.2). Subsequent Initials (retransmissions) must
+        // not overwrite the already-established peer CID.
+        if (header.scid.len > 0 and !conn.peer_cid_set) {
             conn.peer_cid = header.scid;
+            conn.peer_cid_set = true;
         }
 
         // Get Initial keys for decryption

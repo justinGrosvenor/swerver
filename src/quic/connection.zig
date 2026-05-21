@@ -14,6 +14,13 @@ const congestion_mod = @import("congestion.zig");
 const http3 = @import("../protocol/http3.zig");
 const clock = @import("../runtime/clock.zig");
 
+/// Length (in bytes) of the Connection IDs we generate for ourselves.
+/// Peers use this length when sending short-header packets to us, and
+/// the packet parser needs it to extract the DCID from short headers
+/// (which carry no explicit length field). Valid range: 0-20 per
+/// RFC 9000 §17.2.
+pub const OUR_CID_LEN: u8 = 8;
+
 fn fillRandom(buf: []u8) void {
     switch (builtin.os.tag) {
         .macos, .ios, .tvos, .watchos, .freebsd, .netbsd, .openbsd => {
@@ -608,6 +615,10 @@ pub const Connection = struct {
     our_cid: types.ConnectionId,
     /// Peer's connection ID
     peer_cid: types.ConnectionId,
+    /// True once peer_cid has been set from the peer's SCID in the
+    /// first Initial packet. Subsequent Initials (retransmissions)
+    /// must not overwrite the already-adopted value (RFC 9000 §7.2).
+    peer_cid_set: bool = false,
     /// QUIC version in use
     version: u32 = @intFromEnum(types.Version.quic_v1),
     /// Cryptographic context
@@ -724,8 +735,8 @@ pub const Connection = struct {
             .recovery = recovery_mod.Recovery.init(allocator),
         };
 
-        fillRandom(conn.our_cid.bytes[0..8]);
-        conn.our_cid.len = 8;
+        fillRandom(conn.our_cid.bytes[0..OUR_CID_LEN]);
+        conn.our_cid.len = OUR_CID_LEN;
 
         // Derive initial keys from DCID
         conn.crypto_ctx.deriveInitialKeys(dcid.slice(), conn.version);
