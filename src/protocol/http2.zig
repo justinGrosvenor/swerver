@@ -718,6 +718,7 @@ pub const Stack = struct {
     conn_send_window: i32,
     initial_peer_window: i32,
     max_frame_size: u32,
+    peer_max_frame_size: u32,
     max_header_list_size: usize,
     header_block: [HeaderBlockBytes]u8,
     headers_storage: [MaxHeaders]request.Header,
@@ -750,6 +751,7 @@ pub const Stack = struct {
             .conn_send_window = @intCast(DefaultInitialWindow),
             .initial_peer_window = @intCast(DefaultInitialWindow),
             .max_frame_size = cfg.max_frame_size,
+            .peer_max_frame_size = DefaultMaxFrameSize,
             .max_header_list_size = cfg.max_header_list_size,
             .header_block = undefined,
             .headers_storage = undefined,
@@ -999,24 +1001,25 @@ pub const Stack = struct {
         const data = parseDataPayload(frame.payload, frame.header.flags) catch {
             return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
         };
-        // Validate flow control windows before cast — reject if window is non-positive
-        // or if data exceeds remaining window capacity
+        // RFC 9113 §6.9.1: flow control counts the entire DATA frame payload
+        // (including Pad Length and Padding), not just the application data.
+        const flow_len: usize = frame.header.length;
         if (self.conn_recv_window <= 0) {
             return .{ .state = .err, .error_code = .flow_control_error, .event_count = 0 };
         }
         const conn_window: usize = @intCast(self.conn_recv_window);
-        if (data.len > conn_window) {
+        if (flow_len > conn_window) {
             return .{ .state = .err, .error_code = .flow_control_error, .event_count = 0 };
         }
         if (stream.recv_window <= 0) {
             return .{ .state = .err, .error_code = .flow_control_error, .event_count = 0 };
         }
         const stream_window: usize = @intCast(stream.recv_window);
-        if (data.len > stream_window) {
+        if (flow_len > stream_window) {
             return .{ .state = .err, .error_code = .flow_control_error, .event_count = 0 };
         }
-        self.conn_recv_window -= @intCast(data.len);
-        stream.recv_window -= @intCast(data.len);
+        self.conn_recv_window -= @intCast(flow_len);
+        stream.recv_window -= @intCast(flow_len);
         const end_stream = (frame.header.flags & 0x1) != 0;
         stream.saw_data = true;
         if (end_stream) stream.state = .half_closed_remote else stream.state = .open;
@@ -1165,18 +1168,22 @@ pub const Stack = struct {
                 for (self.streams[0..self.stream_count]) |*stream| {
                     if (stream.state == .closed) continue;
                     const adjusted = @as(i64, stream.send_window) + delta;
-                    if (adjusted > 0x7fff_ffff) return error.InvalidSetting;
+                    if (adjusted > 0x7fff_ffff or adjusted < -0x80000000) return error.InvalidSetting;
                     stream.send_window = @intCast(adjusted);
                 }
                 self.initial_peer_window = new_window;
             },
-            // SETTINGS_MAX_FRAME_SIZE (0x5) - must be between 2^14 and 2^24-1
+            // SETTINGS_MAX_FRAME_SIZE (0x5) - must be between 2^14 and 2^24-1.
+            // This is the peer's receive limit — governs our outbound framing,
+            // NOT our inbound parser limit (which stays at our configured value).
             0x5 => {
                 if (value < 16384 or value > 16777215) return error.InvalidSetting;
-                self.max_frame_size = value;
+                self.peer_max_frame_size = value;
             },
-            // SETTINGS_MAX_HEADER_LIST_SIZE (0x6)
-            0x6 => self.max_header_list_size = value,
+            // SETTINGS_MAX_HEADER_LIST_SIZE (0x6) — peer's receive limit for
+            // response headers. We don't currently enforce this on outbound,
+            // and it must NOT change our inbound request header limit.
+            0x6 => {},
             else => {},
         }
     }
@@ -1267,6 +1274,19 @@ pub const Stack = struct {
         if (self.findStream(stream_id)) |stream| {
             stream.state = .closed;
         }
+    }
+
+    pub fn openTestStream(self: *Stack, stream_id: u32) *Stream {
+        const idx = self.stream_count;
+        var stream = &self.streams[idx];
+        stream.reset(stream_id, self.initial_stream_window);
+        stream.send_window = self.initial_peer_window;
+        stream.state = .open;
+        self.stream_count += 1;
+        self.last_stream_id = stream_id;
+        self.cached_stream_id = stream_id;
+        self.cached_stream_index = idx;
+        return stream;
     }
 
     fn decodeHeaders(self: *Stack, stream: *Stream) !HeaderBlockResult {

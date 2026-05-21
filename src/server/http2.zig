@@ -355,7 +355,7 @@ fn queueFileResponseH2(
         sendRstStream(server, conn, stream_id, 0x7);
         return;
     };
-    const max_frame_size: usize = if (conn.http2_stack) |stack| @intCast(stack.max_frame_size) else 16384;
+    const max_frame_size: usize = if (conn.http2_stack) |stack| @intCast(stack.peer_max_frame_size) else 16384;
 
     // Encode HEADERS frame
     const hpack_start: usize = 9;
@@ -398,17 +398,25 @@ fn queueFileResponseH2(
     var total_data_sent: usize = 0;
     var read_error = false;
 
+    const stack_ref = conn.http2_stack orelse {
+        server.io.releaseBuffer(buf);
+        clock.closeFd(file_fd);
+        return;
+    };
+
     while (file_offset < file_size) {
         const space_left = buf.bytes.len - buf_pos;
         if (space_left <= 9) break;
         const payload_space = space_left - 9;
         const payload_max = @min(payload_space, max_frame_size);
         const file_want: usize = @intCast(@min(file_size - file_offset, payload_max));
+        const allowed = stack_ref.canSend(stream_id, file_want);
+        if (allowed == 0) break;
 
         const payload_start = buf_pos + 9;
         var chunk_read: usize = 0;
-        while (chunk_read < file_want) {
-            const result = std.c.pread(file_fd, buf.bytes[payload_start + chunk_read ..].ptr, file_want - chunk_read, @intCast(file_offset + chunk_read));
+        while (chunk_read < allowed) {
+            const result = std.c.pread(file_fd, buf.bytes[payload_start + chunk_read ..].ptr, allowed - chunk_read, @intCast(file_offset + chunk_read));
             if (result < 0) {
                 switch (std.posix.errno(result)) {
                     .INTR => continue,
@@ -430,6 +438,7 @@ fn queueFileResponseH2(
         const data_flags: u8 = if (is_last) 0x1 else 0x0;
         http2.writeFrameHeader(buf.bytes[buf_pos..], .data, data_flags, stream_id, chunk_read) catch break;
         buf_pos += 9 + chunk_read;
+        stack_ref.consumeSendWindow(stream_id, chunk_read);
         if (is_last) break;
     }
     total_len = buf_pos;
@@ -448,8 +457,6 @@ fn queueFileResponseH2(
     }
     server.io.onWriteBuffered(conn, total_len);
     server.io.setTimeoutPhase(conn, .write);
-
-    if (conn.http2_stack) |stack| stack.consumeSendWindow(stream_id, total_data_sent);
 
     if (file_offset >= file_size) {
         clock.closeFd(file_fd);
@@ -496,7 +503,7 @@ fn queueFileResponseH2(
 fn drainPendingH2Files(server: *Server, conn: *connection.Connection) void {
     const files = conn.h2_pending_files orelse return;
     const stack = conn.http2_stack orelse return;
-    const max_frame_size: usize = @intCast(stack.max_frame_size);
+    const max_frame_size: usize = @intCast(stack.peer_max_frame_size);
     const buf_size = server.io.cfg.buffer_pool.buffer_size;
 
     for (files) |*slot| {
@@ -576,7 +583,7 @@ fn drainPendingH2Files(server: *Server, conn: *connection.Connection) void {
 fn drainPendingH2Responses(server: *Server, conn: *connection.Connection) void {
     const resps = conn.h2_pending_responses orelse return;
     const stack = conn.http2_stack orelse return;
-    const max_frame_size: usize = @intCast(stack.max_frame_size);
+    const max_frame_size: usize = @intCast(stack.peer_max_frame_size);
     const buf_size = server.io.cfg.buffer_pool.buffer_size;
 
     for (resps) |*slot| {
@@ -646,7 +653,7 @@ pub fn queueHttp2Response(server: *Server, conn: *connection.Connection, stream_
         sendRstStream(server, conn, stream_id, 0x7);
         return;
     };
-    const max_frame_size: usize = if (conn.http2_stack) |stack| @intCast(stack.max_frame_size) else 16384;
+    const max_frame_size: usize = if (conn.http2_stack) |stack| @intCast(stack.peer_max_frame_size) else 16384;
     const has_body = body_len > 0 and !is_head;
 
     // Build HPACK headers directly into the buffer after the 9-byte
@@ -698,31 +705,35 @@ pub fn queueHttp2Response(server: *Server, conn: *connection.Connection, stream_
         return;
     }
 
-    // Small body: pack HEADERS + DATA into the same buffer. This
-    // halves buffer acquisitions and write-queue slots for the
-    // overwhelmingly common case (bodies < max_frame_size).
+    // Small body: pack HEADERS + DATA into the same buffer when the
+    // send window allows it. This halves buffer acquisitions and
+    // write-queue slots for the common case (bodies < max_frame_size).
     if (body_len <= max_frame_size and total_len + 9 + body_len <= buf.bytes.len) {
-        const data_offset = total_len;
-        http2.writeFrameHeader(buf.bytes[data_offset..], .data, 0x1, stream_id, body_len) catch {
-            server.io.releaseBuffer(buf);
-            server.closeConnection(conn);
-            return;
-        };
-        @memcpy(buf.bytes[data_offset + 9 .. data_offset + 9 + body_len], body_bytes);
-        total_len += 9 + body_len;
+        const send_allowed = if (conn.http2_stack) |stack| stack.canSend(stream_id, body_len) else 0;
+        if (send_allowed >= body_len) {
+            const data_offset = total_len;
+            http2.writeFrameHeader(buf.bytes[data_offset..], .data, 0x1, stream_id, body_len) catch {
+                server.io.releaseBuffer(buf);
+                server.closeConnection(conn);
+                return;
+            };
+            @memcpy(buf.bytes[data_offset + 9 .. data_offset + 9 + body_len], body_bytes);
+            total_len += 9 + body_len;
 
-        if (!conn.enqueueWrite(buf, total_len)) {
-            server.io.releaseBuffer(buf);
-            server.closeConnection(conn);
+            if (!conn.enqueueWrite(buf, total_len)) {
+                server.io.releaseBuffer(buf);
+                server.closeConnection(conn);
+                return;
+            }
+            server.io.onWriteBuffered(conn, total_len);
+            server.io.setTimeoutPhase(conn, .write);
+            if (conn.http2_stack) |stack| {
+                stack.consumeSendWindow(stream_id, body_len);
+                stack.closeStream(stream_id);
+            }
             return;
         }
-        server.io.onWriteBuffered(conn, total_len);
-        server.io.setTimeoutPhase(conn, .write);
-        if (conn.http2_stack) |stack| {
-            stack.consumeSendWindow(stream_id, body_len);
-            stack.closeStream(stream_id);
-        }
-        return;
+        // Window too small — fall through to large-body path
     }
 
     const stack = conn.http2_stack orelse {

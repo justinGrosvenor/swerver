@@ -878,6 +878,9 @@ test "metrics middleware response queued for http2" {
     const conn = server.io.acquireConnection(server.io.nowMs()) orelse return error.OutOfMemory;
     defer if (conn.state != .closed) server.io.releaseConnection(conn);
     conn.protocol = .http2;
+    var stack = http2.Stack.init();
+    _ = stack.openTestStream(1);
+    conn.http2_stack = &stack;
 
     try http2_mod.queueHttp2Response(&server, conn, 1, result.resp, false);
     try std.testing.expect(conn.write_count >= 1);
