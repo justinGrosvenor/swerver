@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.0-alpha.9 — 2026-05-20
+
+### HTTP/1.1 Correctness
+
+- **fix: pipelined uploads broken** — body accumulation consumed trailing
+  bytes belonging to the next pipelined request, and the dispatch loop
+  returned after body completion without re-entering the read path.
+  Together these bugs caused keep-alive connections with multiple POST
+  requests (e.g. upload benchmarks sending 5 requests per connection) to
+  process only the first request and then stall until timeout.
+  `continueBodyAccumulation` now tracks actual bytes consumed via
+  `bytes_received` delta instead of assuming the entire read buffer is
+  body data, and the dispatch loop re-enters `handleRead` after body
+  completion to process any buffered pipelined data.
+
+---
+
 ## 0.1.0-alpha.8 — 2026-05-20
 
 HTTP/2 correctness and performance release. Three architectural improvements

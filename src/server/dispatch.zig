@@ -429,6 +429,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
                 http1_mod.abortBodyAccumulation(server, conn, 400);
                 return;
             };
+            if (!conn.isAccumulatingBody()) return handleRead(server, index);
             return;
         }
         while (true) {
@@ -458,8 +459,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
                 http1_mod.abortBodyAccumulation(server, conn, 400);
                 return;
             };
-            // Body complete — dispatch already happened
-            if (!conn.isAccumulatingBody()) return;
+            if (!conn.isAccumulatingBody()) return handleRead(server, index);
         }
     }
 

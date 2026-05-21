@@ -820,14 +820,17 @@ pub fn initBodyAccumulation(
 
 /// Continue accumulating body data from the read buffer into body buffers.
 pub fn continueBodyAccumulation(server: *Server, conn: *connection.Connection) !void {
+    const accum = conn.body_accum orelse return;
     const buffer_handle = conn.read_buffer orelse return;
     const start = conn.read_offset;
     const end = start + conn.read_buffered_bytes;
     if (end <= start) return;
 
     const data = buffer_handle.bytes[start..end];
+    const received_before = accum.bytes_received;
     try appendBodyData(server, conn, data);
-    server.io.onReadConsumed(conn, data.len);
+    const consumed = accum.bytes_received - received_before;
+    server.io.onReadConsumed(conn, consumed);
 
     if (bodyComplete(conn)) {
         try dispatchWithAccumulatedBody(server, conn);
