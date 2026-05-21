@@ -896,9 +896,22 @@ pub const Stack = struct {
                 }
             }
         }
-        const stream = self.getOrCreateStream(frame.header.stream_id) orelse return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
+        const stream = self.getOrCreateStream(frame.header.stream_id) orelse {
+            if ((frame.header.stream_id & 1) == 0)
+                return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
+            if (events.len > 0) {
+                events[0] = .{ .err = .{ .stream_id = frame.header.stream_id, .code = .refused_stream } };
+                return .{ .state = .stream_err, .error_code = .none, .event_count = 1 };
+            }
+            return .{ .state = .stream_err, .error_code = .none, .event_count = 0 };
+        };
         if (stream.state == .closed or stream.state == .half_closed_remote) {
-            return .{ .state = .err, .error_code = .stream_closed, .event_count = 0 };
+            stream.state = .closed;
+            if (events.len > 0) {
+                events[0] = .{ .err = .{ .stream_id = frame.header.stream_id, .code = .stream_closed } };
+                return .{ .state = .stream_err, .error_code = .none, .event_count = 1 };
+            }
+            return .{ .state = .stream_err, .error_code = .none, .event_count = 0 };
         }
         const header_block = parseHeadersPayload(frame.payload, frame.header.flags) catch {
             return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
@@ -1071,11 +1084,17 @@ pub const Stack = struct {
             }
             return .{ .state = .complete, .error_code = .none, .event_count = 0 };
         }
-        const stream = self.findStream(frame.header.stream_id) orelse return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
+        const stream = self.findStream(frame.header.stream_id) orelse
+            return .{ .state = .complete, .error_code = .none, .event_count = 0 };
         const was_blocked = stream.send_window <= 0;
         const new_stream_window = @as(i64, stream.send_window) + @as(i64, increment);
         if (new_stream_window > max_window) {
-            return .{ .state = .err, .error_code = .flow_control_error, .event_count = 0 };
+            stream.state = .closed;
+            if (events.len > 0) {
+                events[0] = .{ .err = .{ .stream_id = frame.header.stream_id, .code = .flow_control_error } };
+                return .{ .state = .stream_err, .error_code = .none, .event_count = 1 };
+            }
+            return .{ .state = .stream_err, .error_code = .none, .event_count = 0 };
         }
         stream.send_window = @intCast(new_stream_window);
         if (was_blocked and stream.send_window > 0 and events.len > 0) {
@@ -1088,7 +1107,9 @@ pub const Stack = struct {
     fn handleRstStream(self: *Stack, frame: Frame, events: []Event) FrameHandle {
         _ = events;
         if (frame.payload.len != 4) return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
-        const stream = self.findStream(frame.header.stream_id) orelse return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
+        if (frame.header.stream_id == 0) return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
+        const stream = self.findStream(frame.header.stream_id) orelse
+            return .{ .state = .complete, .error_code = .none, .event_count = 0 };
         stream.state = .closed;
         return .{ .state = .complete, .error_code = .none, .event_count = 0 };
     }
