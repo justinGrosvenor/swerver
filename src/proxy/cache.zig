@@ -96,7 +96,7 @@ pub const ResponseCache = struct {
         const entry = &self.entries[idx];
 
         if (!entry.in_use or entry.key_hash != key) return .miss;
-        if (now_ms > entry.created_ms + entry.ttl_ms) {
+        if (now_ms -| entry.created_ms > entry.ttl_ms) {
             self.evictEntry(idx);
             return .miss;
         }

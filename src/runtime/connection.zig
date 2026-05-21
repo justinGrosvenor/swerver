@@ -390,10 +390,10 @@ pub const Connection = struct {
         if (now_ms <= self.last_active_ms) return false;
         const elapsed = now_ms - self.last_active_ms;
         return switch (phase) {
-            .idle => elapsed > timeouts.idle_ms,
-            .header => elapsed > timeouts.header_ms,
-            .body => elapsed > timeouts.body_ms,
-            .write => elapsed > timeouts.write_ms,
+            .idle => elapsed >= timeouts.idle_ms,
+            .header => elapsed >= timeouts.header_ms,
+            .body => elapsed >= timeouts.body_ms,
+            .write => elapsed >= timeouts.write_ms,
         };
     }
 

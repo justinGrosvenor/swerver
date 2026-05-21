@@ -22,7 +22,10 @@ pub const GrpcStatus = enum(u8) {
 
 pub fn isGrpcContentType(content_type: []const u8) bool {
     if (content_type.len < 16) return false;
-    return std.ascii.eqlIgnoreCase(content_type[0..16], "application/grpc");
+    if (!std.ascii.eqlIgnoreCase(content_type[0..16], "application/grpc")) return false;
+    if (content_type.len == 16) return true;
+    const next = content_type[16];
+    return next == '+' or next == ';';
 }
 
 pub fn isGrpcRequest(headers: []const @import("../protocol/request.zig").Header) bool {

@@ -85,6 +85,7 @@ pub const ServerConfig = struct {
             if (self.quic.max_idle_timeout_ms == 0) return error.InvalidQuicConfig;
             if (self.quic.max_streams_bidi == 0 and self.quic.max_streams_uni == 0) return error.InvalidQuicConfig;
         }
+        if (self.admin.enabled and self.admin.api_key.len == 0) return error.InvalidAdminConfig;
         if (self.workers > 256) return error.InvalidWorkerCount;
         if (self.static_root.len > 0) {
             // Reject paths containing null bytes
@@ -220,6 +221,7 @@ pub const ConfigError = error{
     InvalidTlsConfig,
     InvalidX402Config,
     InvalidQuicConfig,
+    InvalidAdminConfig,
     InvalidStaticRoot,
     InvalidWorkerCount,
 };

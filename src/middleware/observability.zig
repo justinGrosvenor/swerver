@@ -531,11 +531,13 @@ pub const RequestIdStorage = struct {
         self.len = copy_len;
     }
 
+    threadlocal var counter: u64 = 0;
+
     pub fn generate(self: *RequestIdStorage) void {
-        // Generate simple request ID from timestamp-derived seed.
         const realtime_ns = clock.realtimeNanos() orelse 0;
         const ts: u64 = @intCast(@mod(realtime_ns, std.math.maxInt(u64)));
-        const hash = std.hash.Wyhash.hash(ts, &[_]u8{ 0, 1, 2, 3, 4, 5, 6, 7 });
+        counter +%= 1;
+        const hash = std.hash.Wyhash.hash(ts ^ counter, &std.mem.toBytes(counter));
 
         const result = std.fmt.bufPrint(&self.buf, "{x:0>16}", .{hash}) catch {
             self.len = 0;

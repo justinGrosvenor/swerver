@@ -635,7 +635,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
         return;
     }
 
-    while (conn.read_buffered_bytes > 0 and conn.canEnqueueWrite()) {
+    while (conn.state != .closed and conn.read_buffered_bytes > 0 and conn.canEnqueueWrite()) {
         // Opportunistic inline write drain: push enqueued responses
         // to the kernel while still processing pipelined requests.
         // At low connection counts (e.g. 512 conns / 64 workers =

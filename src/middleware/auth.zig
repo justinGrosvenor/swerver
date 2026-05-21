@@ -342,24 +342,39 @@ fn clock_realtimeNanos() i128 {
 }
 
 pub fn extractClaim(json: []const u8, key: []const u8) ?[]const u8 {
-    var search_buf: [128]u8 = undefined;
-    const needle = std.fmt.bufPrint(&search_buf, "\"{s}\":\"", .{key}) catch return null;
-    const start = (std.mem.indexOf(u8, json, needle) orelse return null) + needle.len;
-    const end = std.mem.indexOfScalar(u8, json[start..], '"') orelse return null;
-    return json[start .. start + end];
+    const parsed = parseJsonValue(json) orelse return null;
+    const obj = switch (parsed) {
+        .object => |o| o,
+        else => return null,
+    };
+    const val = obj.get(key) orelse return null;
+    return switch (val) {
+        .string => |s| s,
+        else => null,
+    };
 }
 
 fn extractNumericClaim(json: []const u8, key: []const u8) ?i64 {
-    var search_buf: [128]u8 = undefined;
-    const needle = std.fmt.bufPrint(&search_buf, "\"{s}\":", .{key}) catch return null;
-    const after = (std.mem.indexOf(u8, json, needle) orelse return null) + needle.len;
-    var pos = after;
-    while (pos < json.len and (json[pos] == ' ' or json[pos] == '\t')) : (pos += 1) {}
-    const num_start = pos;
-    if (pos < json.len and json[pos] == '-') pos += 1;
-    while (pos < json.len and json[pos] >= '0' and json[pos] <= '9') : (pos += 1) {}
-    if (pos == num_start) return null;
-    return std.fmt.parseInt(i64, json[num_start..pos], 10) catch null;
+    const parsed = parseJsonValue(json) orelse return null;
+    const obj = switch (parsed) {
+        .object => |o| o,
+        else => return null,
+    };
+    const val = obj.get(key) orelse return null;
+    return switch (val) {
+        .integer => |n| n,
+        .float => |f| if (f >= -9.2e18 and f <= 9.2e18) @as(i64, @intFromFloat(f)) else null,
+        else => null,
+    };
+}
+
+/// Shared JSON parse helper — uses a stack-backed arena so that no heap
+/// allocation occurs on the hot path. The returned Value contains string
+/// slices that point directly into `json`.
+fn parseJsonValue(json: []const u8) ?std.json.Value {
+    var fba_buf: [8192]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
+    return std.json.parseFromSliceLeaky(std.json.Value, fba.allocator(), json, .{}) catch null;
 }
 
 // ── Forward Auth ───────────────────────────────────────────────
@@ -775,6 +790,15 @@ test "extract claim from json" {
     try std.testing.expectEqualStrings("test-issuer", extractClaim(json, "iss").?);
     try std.testing.expectEqualStrings("my-app", extractClaim(json, "aud").?);
     try std.testing.expect(extractClaim(json, "nope") == null);
+}
+
+test "extract claim: immune to substring injection" {
+    // Audit issue #27: a crafted payload with an embedded key in a prior
+    // value must not trick the parser into returning the wrong claim.
+    const json =
+        \\{"fake":"\"sub\":\"admin\"","sub":"user"}
+    ;
+    try std.testing.expectEqualStrings("user", extractClaim(json, "sub").?);
 }
 
 test "extract numeric claim from json" {

@@ -411,7 +411,8 @@ pub fn createContext(is_server: bool) !*SSL_CTX {
     const ctx = SSL_CTX_new(method) orelse return error.ContextCreationFailed;
     errdefer SSL_CTX_free(ctx);
 
-    if (SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, TLS1_3_VERSION, null) == 0)
+    const min_ver: c_int = if (is_server) TLS1_3_VERSION else TLS1_2_VERSION;
+    if (SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, min_ver, null) == 0)
         return error.ContextCreationFailed;
     if (SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MAX_PROTO_VERSION, TLS1_3_VERSION, null) == 0)
         return error.ContextCreationFailed;
@@ -731,6 +732,7 @@ pub fn doHandshake(ssl: *SSL) HandshakeResult {
                 ret, err, buf[0..msg_len],
             });
         }
+        while (ERR_get_error() != 0) {}
     }
     return switch (err) {
         SSL_ERROR_WANT_READ => .want_read,
@@ -806,5 +808,6 @@ pub fn getLastError() [256]u8 {
     } else {
         @memset(&buf, 0);
     }
+    while (ERR_get_error() != 0) {}
     return buf;
 }
