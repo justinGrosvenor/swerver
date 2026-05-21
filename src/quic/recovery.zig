@@ -331,7 +331,7 @@ pub const Recovery = struct {
         }
 
         // Calculate PTO
-        const pto = self.rtt.getPto() * (@as(u64, 1) << @intCast(self.pto_count));
+        const pto = self.rtt.getPto() *| (@as(u64, 1) << @intCast(@min(self.pto_count, 62)));
 
         // Find latest time of ACK-eliciting packet
         var latest_time: u64 = 0;

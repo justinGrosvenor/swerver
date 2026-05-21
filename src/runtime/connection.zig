@@ -599,9 +599,11 @@ pub const ConnectionPool = struct {
     }
 
     pub fn release(self: *ConnectionPool, conn: *Connection) void {
+        if (conn.state == .closed) return;
         // Remove from active list using swap-remove for O(1)
         if (self.active_count > 0) {
             const pos = conn.active_list_pos;
+            std.debug.assert(pos < self.active_count);
             const last_pos = self.active_count - 1;
             if (pos < last_pos) {
                 // Swap with last element

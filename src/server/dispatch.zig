@@ -1194,6 +1194,7 @@ fn setupWebSocketTunnel(
             // Acquire a connection slot for the upstream side of the tunnel
             const upstream_conn = server.io.acquireConnection(server.now_ms) orelse {
                 clock.closeFd(upstream_fd);
+                conn.close_after_write = true;
                 return;
             };
             upstream_conn.fd = upstream_fd;
@@ -1206,6 +1207,7 @@ fn setupWebSocketTunnel(
             const upstream_read_buf = server.io.acquireBuffer() orelse {
                 server.io.releaseConnection(upstream_conn);
                 clock.closeFd(upstream_fd);
+                conn.close_after_write = true;
                 return;
             };
             upstream_conn.read_buffer = upstream_read_buf;
@@ -1216,6 +1218,7 @@ fn setupWebSocketTunnel(
                 upstream_conn.read_buffer = null;
                 server.io.releaseConnection(upstream_conn);
                 clock.closeFd(upstream_fd);
+                conn.close_after_write = true;
                 return;
             };
 
@@ -1226,6 +1229,7 @@ fn setupWebSocketTunnel(
                 upstream_conn.fd = null;
                 server.io.releaseConnection(upstream_conn);
                 clock.closeFd(upstream_fd);
+                conn.close_after_write = true;
                 return;
             };
 
