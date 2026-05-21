@@ -389,41 +389,57 @@ fn queueFileResponseH2(
         return;
     }
 
-    // Read first chunk and pack into same buffer after HEADERS
-    const data_space = buf.bytes.len - total_len - 9; // room for DATA frame header + payload
-    const first_chunk_max = @min(data_space, max_frame_size);
-    const first_chunk_max_capped = @min(first_chunk_max, file_size);
-    const data_frame_offset = total_len;
-    const payload_start = data_frame_offset + 9;
+    // Pack as many DATA frames as fit into the buffer after HEADERS.
+    // Each frame carries its own 9-byte header + up to max_frame_size
+    // payload, so a 64KB buffer holds ~3-4 frames at the default 16KB
+    // max_frame_size — cutting buffer-pool pressure proportionally.
+    var file_offset: u64 = 0;
+    var buf_pos = total_len;
+    var total_data_sent: usize = 0;
+    var read_error = false;
 
-    var first_read: usize = 0;
-    while (first_read < first_chunk_max_capped) {
-        const max_read = first_chunk_max_capped - first_read;
-        const result = std.c.pread(file_fd, buf.bytes[payload_start + first_read ..].ptr, max_read, @intCast(first_read));
-        if (result < 0) {
-            switch (std.posix.errno(result)) {
-                .INTR => continue,
-                else => {
-                    server.io.releaseBuffer(buf);
-                    clock.closeFd(file_fd);
-                    sendRstStream(server, conn, stream_id, 0x2);
-                    return;
-                },
+    while (file_offset < file_size) {
+        const space_left = buf.bytes.len - buf_pos;
+        if (space_left <= 9) break;
+        const payload_space = space_left - 9;
+        const payload_max = @min(payload_space, max_frame_size);
+        const file_want: usize = @intCast(@min(file_size - file_offset, payload_max));
+
+        const payload_start = buf_pos + 9;
+        var chunk_read: usize = 0;
+        while (chunk_read < file_want) {
+            const result = std.c.pread(file_fd, buf.bytes[payload_start + chunk_read ..].ptr, file_want - chunk_read, @intCast(file_offset + chunk_read));
+            if (result < 0) {
+                switch (std.posix.errno(result)) {
+                    .INTR => continue,
+                    else => {
+                        read_error = true;
+                        break;
+                    },
+                }
             }
+            const n: usize = @intCast(result);
+            if (n == 0) break;
+            chunk_read += n;
         }
-        const n: usize = @intCast(result);
-        if (n == 0) break;
-        first_read += n;
-    }
+        if (read_error or chunk_read == 0) break;
 
-    const file_remaining = file_size - first_read;
-    const data_flags: u8 = if (file_remaining == 0) 0x1 else 0x0; // END_STREAM if complete
-    http2.writeFrameHeader(buf.bytes[data_frame_offset..], .data, data_flags, stream_id, first_read) catch {
+        file_offset += chunk_read;
+        total_data_sent += chunk_read;
+        const is_last = file_offset >= file_size;
+        const data_flags: u8 = if (is_last) 0x1 else 0x0;
+        http2.writeFrameHeader(buf.bytes[buf_pos..], .data, data_flags, stream_id, chunk_read) catch break;
+        buf_pos += 9 + chunk_read;
+        if (is_last) break;
+    }
+    total_len = buf_pos;
+
+    if (read_error and total_data_sent == 0) {
         server.io.releaseBuffer(buf);
         clock.closeFd(file_fd);
+        sendRstStream(server, conn, stream_id, 0x2);
         return;
-    };
-    total_len += 9 + first_read;
+    }
 
     if (!conn.enqueueWrite(buf, total_len)) {
         server.io.releaseBuffer(buf);
@@ -433,15 +449,15 @@ fn queueFileResponseH2(
     server.io.onWriteBuffered(conn, total_len);
     server.io.setTimeoutPhase(conn, .write);
 
-    if (conn.http2_stack) |stack| stack.consumeSendWindow(stream_id, first_read);
+    if (conn.http2_stack) |stack| stack.consumeSendWindow(stream_id, total_data_sent);
 
-    if (file_remaining == 0) {
+    if (file_offset >= file_size) {
         clock.closeFd(file_fd);
         if (conn.http2_stack) |stack| stack.closeStream(stream_id);
         return;
     }
 
-    // File too large for one frame — stash fd for lazy draining
+    // File too large for one buffer — stash fd for lazy draining
     const files = conn.h2_pending_files orelse blk: {
         const alloc = server.allocator.create([connection.MAX_PENDING_H2_FILES]connection.PendingH2File) catch {
             clock.closeFd(file_fd);
@@ -459,8 +475,8 @@ fn queueFileResponseH2(
                 .active = true,
                 .stream_id = stream_id,
                 .file_fd = file_fd,
-                .offset = first_read,
-                .remaining = file_remaining,
+                .offset = file_offset,
+                .remaining = file_size - file_offset,
                 .headers_sent = true,
             };
             const ct_len = @min(content_type.len, slot.content_type.len);
@@ -481,59 +497,76 @@ fn drainPendingH2Files(server: *Server, conn: *connection.Connection) void {
     const files = conn.h2_pending_files orelse return;
     const stack = conn.http2_stack orelse return;
     const max_frame_size: usize = @intCast(stack.max_frame_size);
+    const buf_size = server.io.cfg.buffer_pool.buffer_size;
 
     for (files) |*slot| {
         if (!slot.active) continue;
         if (conn.writeQueueAvailable() < 2) return;
 
-        const max_payload = @min(server.io.cfg.buffer_pool.buffer_size - 9, max_frame_size);
-        const file_want: usize = @intCast(@min(slot.remaining, @as(u64, max_payload)));
-        const allowed = stack.canSend(slot.stream_id, file_want);
-        if (allowed == 0) continue;
-
         const data_buf = server.io.acquireBuffer() orelse return;
+        var buf_pos: usize = 0;
+        var total_sent: usize = 0;
+        var read_error = false;
 
-        var chunk_read: usize = 0;
-        while (chunk_read < allowed) {
-            const result = std.c.pread(slot.file_fd, data_buf.bytes[9 + chunk_read ..].ptr, allowed - chunk_read, @intCast(slot.offset + chunk_read));
-            if (result < 0) {
-                switch (std.posix.errno(result)) {
-                    .INTR => continue,
-                    else => {
-                        server.io.releaseBuffer(data_buf);
-                        slot.cleanup();
-                        sendRstStream(server, conn, slot.stream_id, 0x2);
-                        break;
-                    },
+        while (slot.remaining > 0) {
+            const space_left = buf_size - buf_pos;
+            if (space_left <= 9) break;
+            const payload_max = @min(space_left - 9, max_frame_size);
+            const file_want: usize = @intCast(@min(slot.remaining, @as(u64, payload_max)));
+            const allowed = stack.canSend(slot.stream_id, file_want);
+            if (allowed == 0) break;
+
+            const payload_start = buf_pos + 9;
+            var chunk_read: usize = 0;
+            while (chunk_read < allowed) {
+                const result = std.c.pread(slot.file_fd, data_buf.bytes[payload_start + chunk_read ..].ptr, allowed - chunk_read, @intCast(slot.offset + chunk_read));
+                if (result < 0) {
+                    switch (std.posix.errno(result)) {
+                        .INTR => continue,
+                        else => {
+                            read_error = true;
+                            break;
+                        },
+                    }
                 }
+                const n: usize = @intCast(result);
+                if (n == 0) break;
+                chunk_read += n;
             }
-            const n: usize = @intCast(result);
-            if (n == 0) break;
-            chunk_read += n;
-        }
-        if (!slot.active) continue;
+            if (read_error or chunk_read == 0) break;
 
-        slot.offset += chunk_read;
-        slot.remaining -= chunk_read;
-        const is_last = slot.remaining == 0 or chunk_read == 0;
-        const flags: u8 = if (is_last) 0x1 else 0x0;
-        http2.writeFrameHeader(data_buf.bytes, .data, flags, slot.stream_id, chunk_read) catch {
+            slot.offset += chunk_read;
+            slot.remaining -= chunk_read;
+            total_sent += chunk_read;
+            const is_last = slot.remaining == 0;
+            const flags: u8 = if (is_last) 0x1 else 0x0;
+            http2.writeFrameHeader(data_buf.bytes[buf_pos..], .data, flags, slot.stream_id, chunk_read) catch {
+                read_error = true;
+                break;
+            };
+            buf_pos += 9 + chunk_read;
+            stack.consumeSendWindow(slot.stream_id, chunk_read);
+            if (is_last) break;
+        }
+
+        if (total_sent == 0) {
             server.io.releaseBuffer(data_buf);
-            slot.cleanup();
-            sendRstStream(server, conn, slot.stream_id, 0x2);
+            if (read_error) {
+                slot.cleanup();
+                sendRstStream(server, conn, slot.stream_id, 0x2);
+            }
             continue;
-        };
-        const frame_len = 9 + chunk_read;
-        if (!conn.enqueueWrite(data_buf, frame_len)) {
+        }
+
+        if (!conn.enqueueWrite(data_buf, buf_pos)) {
             server.io.releaseBuffer(data_buf);
             slot.cleanup();
             sendRstStream(server, conn, slot.stream_id, 0x7);
             continue;
         }
-        server.io.onWriteBuffered(conn, frame_len);
-        stack.consumeSendWindow(slot.stream_id, chunk_read);
+        server.io.onWriteBuffered(conn, buf_pos);
 
-        if (is_last) {
+        if (slot.remaining == 0) {
             slot.cleanup();
             stack.closeStream(slot.stream_id);
         }
@@ -544,41 +577,52 @@ fn drainPendingH2Responses(server: *Server, conn: *connection.Connection) void {
     const resps = conn.h2_pending_responses orelse return;
     const stack = conn.http2_stack orelse return;
     const max_frame_size: usize = @intCast(stack.max_frame_size);
+    const buf_size = server.io.cfg.buffer_pool.buffer_size;
 
     for (resps) |*slot| {
         if (!slot.active) continue;
         if (conn.writeQueueAvailable() < 2) return;
 
-        const remaining = slot.len - slot.offset;
-        const max_payload = @min(server.io.cfg.buffer_pool.buffer_size - 9, max_frame_size);
-        const want = @min(remaining, max_payload);
-        const allowed = stack.canSend(slot.stream_id, want);
-        if (allowed == 0) continue;
-
         const data_buf = server.io.acquireBuffer() orelse return;
-        const chunk_len = @min(allowed, max_payload);
-        @memcpy(data_buf.bytes[9 .. 9 + chunk_len], slot.handle.bytes[slot.offset..][0..chunk_len]);
-        slot.offset += chunk_len;
+        var buf_pos: usize = 0;
+        var total_sent: usize = 0;
 
-        const is_last = slot.offset >= slot.len;
-        const flags: u8 = if (is_last) 0x1 else 0x0;
-        http2.writeFrameHeader(data_buf.bytes, .data, flags, slot.stream_id, chunk_len) catch {
+        while (slot.offset < slot.len) {
+            const space_left = buf_size - buf_pos;
+            if (space_left <= 9) break;
+            const remaining = slot.len - slot.offset;
+            const payload_max = @min(space_left - 9, max_frame_size);
+            const want = @min(remaining, payload_max);
+            const allowed = stack.canSend(slot.stream_id, want);
+            if (allowed == 0) break;
+
+            const chunk_len = @min(allowed, payload_max);
+            @memcpy(data_buf.bytes[buf_pos + 9 ..][0..chunk_len], slot.handle.bytes[slot.offset..][0..chunk_len]);
+            slot.offset += chunk_len;
+            total_sent += chunk_len;
+
+            const is_last = slot.offset >= slot.len;
+            const flags: u8 = if (is_last) 0x1 else 0x0;
+            http2.writeFrameHeader(data_buf.bytes[buf_pos..], .data, flags, slot.stream_id, chunk_len) catch break;
+            buf_pos += 9 + chunk_len;
+            stack.consumeSendWindow(slot.stream_id, chunk_len);
+            if (is_last) break;
+        }
+
+        if (total_sent == 0) {
             server.io.releaseBuffer(data_buf);
-            slot.cleanup(&server.io);
-            sendRstStream(server, conn, slot.stream_id, 0x2);
             continue;
-        };
-        const frame_len = 9 + chunk_len;
-        if (!conn.enqueueWrite(data_buf, frame_len)) {
+        }
+
+        if (!conn.enqueueWrite(data_buf, buf_pos)) {
             server.io.releaseBuffer(data_buf);
             slot.cleanup(&server.io);
             sendRstStream(server, conn, slot.stream_id, 0x7);
             continue;
         }
-        server.io.onWriteBuffered(conn, frame_len);
-        stack.consumeSendWindow(slot.stream_id, chunk_len);
+        server.io.onWriteBuffered(conn, buf_pos);
 
-        if (is_last) {
+        if (slot.offset >= slot.len) {
             slot.cleanup(&server.io);
             stack.closeStream(slot.stream_id);
         }
