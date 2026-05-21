@@ -367,7 +367,6 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
             }
         }
         if (!found) {
-            std.log.warn("config: route references unknown upstream '{s}'", .{route.upstream});
             return error.ConfigParseError;
         }
 
@@ -381,7 +380,6 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
                     }
                 }
                 if (!t_found) {
-                    std.log.warn("config: traffic_split references unknown upstream '{s}'", .{t.upstream});
                     return error.ConfigParseError;
                 }
             }
@@ -396,7 +394,6 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
                 }
             }
             if (!m_found) {
-                std.log.warn("config: mirror references unknown upstream '{s}'", .{mirror_name});
                 return error.ConfigParseError;
             }
         }
@@ -411,6 +408,11 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
 }
 
 fn parseAuthMethod(alloc: std.mem.Allocator, a: RouteAuthJson) !auth_mod.AuthMethod {
+    return parseAuthMethodDepth(alloc, a, 0);
+}
+
+fn parseAuthMethodDepth(alloc: std.mem.Allocator, a: RouteAuthJson, depth: u8) !auth_mod.AuthMethod {
+    if (depth > 3) return error.ConfigParseError;
     if (std.mem.eql(u8, a.type, "api_key")) {
         const json_keys = a.keys orelse return error.ConfigParseError;
         const keys_out = try alloc.alloc(auth_mod.ApiKey, json_keys.len);
@@ -452,7 +454,7 @@ fn parseAuthMethod(alloc: std.mem.Allocator, a: RouteAuthJson) !auth_mod.AuthMet
         const json_methods = a.methods orelse return error.ConfigParseError;
         const methods = try alloc.alloc(auth_mod.AuthMethod, json_methods.len);
         for (json_methods, 0..) |m, mi| {
-            methods[mi] = try parseAuthMethod(alloc, m);
+            methods[mi] = try parseAuthMethodDepth(alloc, m, depth + 1);
         }
         return .{ .chain = .{ .methods = methods } };
     } else {

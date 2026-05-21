@@ -792,10 +792,10 @@ pub fn exportKeyingMaterial(
 
 pub fn getSelectedAlpn(ssl: *const SSL) ?[]const u8 {
     if (!tls_enabled) return null;
-    var data: [*]const u8 = undefined;
+    var data: [*]const u8 = @ptrFromInt(0);
     var len: c_uint = 0;
     SSL_get0_alpn_selected(ssl, &data, &len);
-    if (len == 0) return null;
+    if (len == 0 or @intFromPtr(data) == 0) return null;
     return data[0..len];
 }
 

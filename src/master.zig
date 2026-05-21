@@ -264,19 +264,6 @@ pub const Master = struct {
         self.forkWorker(worker_id);
     }
 
-    fn rollingRestart(self: *Master) void {
-        for (0..self.worker_count) |i| {
-            const wid: u16 = @intCast(i);
-            if (self.worker_pids[wid] > 0) {
-                std.posix.kill(self.worker_pids[wid], std.posix.SIG.TERM) catch {};
-                _ = std.c.waitpid(self.worker_pids[wid], null, 0);
-                self.worker_pids[wid] = 0;
-            }
-            self.forkWorker(wid);
-        }
-        std.log.info("[master] rolling restart complete", .{});
-    }
-
     fn findWorkerByPid(self: *Master, pid: std.c.pid_t) ?u16 {
         for (self.worker_pids, 0..) |p, i| {
             if (p == pid) return @intCast(i);

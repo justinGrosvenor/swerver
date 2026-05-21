@@ -854,15 +854,16 @@ fn translateIoUringNativeEvents(
 }
 
 fn sleepMs(timeout_ms: u32) void {
-    const ts = std.posix.timespec{
+    var ts = std.posix.timespec{
         .sec = @intCast(timeout_ms / 1000),
         .nsec = @intCast((timeout_ms % 1000) * std.time.ns_per_ms),
     };
+    var rem: std.posix.timespec = .{ .sec = 0, .nsec = 0 };
     while (true) {
-        const rc = std.posix.system.nanosleep(&ts, null);
+        const rc = std.posix.system.nanosleep(&ts, &rem);
         if (rc == 0) return;
         switch (std.posix.errno(rc)) {
-            .INTR => continue,
+            .INTR => ts = rem,
             else => return,
         }
     }
