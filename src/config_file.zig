@@ -70,7 +70,7 @@ pub fn loadConfigFile(allocator: std.mem.Allocator, path: []const u8) !LoadedCon
     return parseJsonFromBytes(allocator, buf[0..total]);
 }
 
-fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !LoadedConfig {
+pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !LoadedConfig {
     var arena = std.heap.ArenaAllocator.init(parent_alloc);
     errdefer arena.deinit();
     const alloc = arena.allocator();

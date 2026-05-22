@@ -1,5 +1,6 @@
 const std = @import("std");
 const config = @import("config.zig");
+const config_fetch = @import("config_fetch.zig");
 const ServerBuilder = @import("server_builder.zig").ServerBuilder;
 const router = @import("router/router.zig");
 const clock = @import("runtime/clock.zig");
@@ -63,6 +64,8 @@ pub const Master = struct {
     last_crash_ms: []u64,
     /// Consecutive crash count per worker slot
     crash_count: []u8,
+    /// Config source for worker hot reload (propagated to each worker)
+    config_source: ?config_fetch.ConfigSource = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -164,6 +167,7 @@ pub const Master = struct {
                 std.log.err("[w{d}] failed to build server: {}", .{ worker_id, err });
                 std.process.exit(1);
             };
+            srv.config_source = self.config_source;
 
             srv.run(null) catch |err| {
                 std.log.err("[w{d}] server error: {}", .{ worker_id, err });

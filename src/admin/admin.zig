@@ -6,9 +6,26 @@ const proxy_mod = @import("../proxy/proxy.zig");
 const json_write = @import("../runtime/json_write.zig");
 
 const Server = @import("../server.zig").Server;
+const config_fetch = @import("../config_fetch.zig");
 
 const MAX_REQUEST = 65536;
 const MAX_RESPONSE = 65536;
+
+const NO_CONFIG = DispatchResult{ .status = 400, .body = "{\"error\":\"no config file\"}" };
+const URL_MANAGED = DispatchResult{ .status = 409, .body = "{\"error\":\"config managed by remote URL, local mutations disabled\"}" };
+
+const FilePathResult = union(enum) {
+    path: []const u8,
+    err: DispatchResult,
+};
+
+fn requireFilePath(server: *Server) FilePathResult {
+    const source = server.config_source orelse return .{ .err = NO_CONFIG };
+    return switch (source) {
+        .file => |p| .{ .path = p },
+        .url => .{ .err = URL_MANAGED },
+    };
+}
 
 fn jsonObjPut(obj: *std.json.ObjectMap, alloc: std.mem.Allocator, key: []const u8, value: std.json.Value) !void {
     if (comptime @typeInfo(@TypeOf(std.json.ObjectMap.put)).@"fn".params.len == 4) {
@@ -152,7 +169,10 @@ fn listRoutes(server: *Server, buf: []u8) DispatchResult {
 }
 
 fn addRoute(server: *Server, body: []const u8, buf: []u8) DispatchResult {
-    const config_path = server.config_path orelse return .{ .status = 400, .body = "{\"error\":\"no config file\"}" };
+    const config_path = switch (requireFilePath(server)) {
+        .path => |p| p,
+        .err => |e| return e,
+    };
     if (body.len == 0) return .{ .status = 400, .body = "{\"error\":\"empty body\"}" };
 
     const config_file = @import("../config_file.zig");
@@ -194,7 +214,10 @@ fn addRoute(server: *Server, body: []const u8, buf: []u8) DispatchResult {
 }
 
 fn deleteRoute(server: *Server, path: []const u8, buf: []u8) DispatchResult {
-    const config_path = server.config_path orelse return .{ .status = 400, .body = "{\"error\":\"no config file\"}" };
+    const config_path = switch (requireFilePath(server)) {
+        .path => |p| p,
+        .err => |e| return e,
+    };
     const prefix = queryParam(path, "prefix") orelse
         return .{ .status = 400, .body = "{\"error\":\"?prefix= required\"}" };
 
@@ -246,7 +269,10 @@ fn listUpstreams(server: *Server, buf: []u8) DispatchResult {
 }
 
 fn addUpstream(server: *Server, body: []const u8, buf: []u8) DispatchResult {
-    const config_path = server.config_path orelse return .{ .status = 400, .body = "{\"error\":\"no config file\"}" };
+    const config_path = switch (requireFilePath(server)) {
+        .path => |p| p,
+        .err => |e| return e,
+    };
     if (body.len == 0) return .{ .status = 400, .body = "{\"error\":\"empty body\"}" };
 
     const config_file = @import("../config_file.zig");
@@ -286,7 +312,10 @@ fn addUpstream(server: *Server, body: []const u8, buf: []u8) DispatchResult {
 }
 
 fn deleteUpstream(server: *Server, path: []const u8, buf: []u8) DispatchResult {
-    const config_path = server.config_path orelse return .{ .status = 400, .body = "{\"error\":\"no config file\"}" };
+    const config_path = switch (requireFilePath(server)) {
+        .path => |p| p,
+        .err => |e| return e,
+    };
     const name = queryParam(path, "name") orelse
         return .{ .status = 400, .body = "{\"error\":\"?name= required\"}" };
 
@@ -336,7 +365,10 @@ fn getStatus(server: *Server, buf: []u8) DispatchResult {
 
 fn persistConfig(server: *Server, buf: []u8) DispatchResult {
     _ = buf;
-    const config_path = server.config_path orelse return .{ .status = 400, .body = "{\"error\":\"no config file\"}" };
+    const config_path = switch (requireFilePath(server)) {
+        .path => |p| p,
+        .err => |e| return e,
+    };
     _ = config_path;
     return .{ .status = 200, .body = "{\"ok\":true,\"persisted\":true}" };
 }

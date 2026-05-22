@@ -261,14 +261,20 @@ fn findContentLength(response: []const u8) ?usize {
 }
 
 pub fn writeCacheFile(path: []const u8, data: []const u8) !void {
-    // Atomic write: write to .tmp suffix, then rename
-    var tmp_path_buf: [4096]u8 = undefined;
-    const tmp_path = std.fmt.bufPrint(&tmp_path_buf, "{s}.tmp", .{path}) catch return error.NameTooLong;
+    if (path.len == 0 or path.len >= 4090) return error.NameTooLong;
 
-    const tmp_z: [:0]const u8 = @ptrCast(tmp_path_buf[0..tmp_path.len :0]);
-    const path_z: [:0]const u8 = @ptrCast(@as([*]const u8, @ptrCast(path.ptr))[0..path.len :0]);
+    // Build null-terminated path + .tmp variant
+    var path_buf: [4096:0]u8 = undefined;
+    @memcpy(path_buf[0..path.len], path);
+    path_buf[path.len] = 0;
+    const path_z: [:0]const u8 = path_buf[0..path.len :0];
 
-    // Write to temp file
+    var tmp_buf: [4096:0]u8 = undefined;
+    @memcpy(tmp_buf[0..path.len], path);
+    @memcpy(tmp_buf[path.len .. path.len + 4], ".tmp");
+    tmp_buf[path.len + 4] = 0;
+    const tmp_z: [:0]const u8 = tmp_buf[0 .. path.len + 4 :0];
+
     const fd = std.posix.openat(std.posix.AT.FDCWD, tmp_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch
         return error.WriteFailed;
     defer clock.closeFd(fd);
@@ -282,7 +288,6 @@ pub fn writeCacheFile(path: []const u8, data: []const u8) !void {
         written += @intCast(signed);
     }
 
-    // Rename atomically
     _ = std.c.rename(tmp_z.ptr, path_z.ptr);
 }
 
