@@ -98,14 +98,17 @@ pub fn main(init: std.process.Init) !void {
         swerver.benchmark.registerPostHooks(&app_router);
     }
 
-    // Build proxy from config file if upstreams/routes defined
-    var proxy_instance: ?swerver.proxy.handler.Proxy = null;
+    // Build proxy from config file if upstreams/routes defined.
+    // Heap-allocate so applyReload() can destroy()/replace it uniformly.
+    var proxy_ptr: ?*swerver.proxy.handler.Proxy = null;
     if (loaded_config) |lc| {
         if (lc.upstreams.len > 0 and lc.routes.len > 0) {
-            proxy_instance = try swerver.proxy.handler.Proxy.init(allocator, .{
+            const p = try allocator.create(swerver.proxy.handler.Proxy);
+            p.* = try swerver.proxy.handler.Proxy.init(allocator, .{
                 .upstreams = lc.upstreams,
                 .routes = lc.routes,
             });
+            proxy_ptr = p;
         }
     }
 
@@ -118,7 +121,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (cfg.workers != 1) {
         // Multi-process mode
-        var master = try swerver.Master.init(allocator, cfg, app_router, if (proxy_instance) |*p| p else null);
+        var master = try swerver.Master.init(allocator, cfg, app_router, proxy_ptr);
         master.config_source = config_source;
         defer master.deinit();
         try master.run(args.run_for_ms);
@@ -127,7 +130,7 @@ pub fn main(init: std.process.Init) !void {
         var builder = swerver.ServerBuilder
             .config(cfg)
             .router(app_router);
-        if (proxy_instance) |*p| {
+        if (proxy_ptr) |p| {
             builder = builder.withProxy(p);
         }
         const srv = try builder.build(allocator);
