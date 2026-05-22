@@ -1351,7 +1351,7 @@ pub const Connection = struct {
 
         // Feed lost packets into the congestion controller.
         for (lost_buf[0..lost_count]) |lost_pkt| {
-            self.congestion.onPacketLost(lost_pkt.size, lost_pkt.packet_number);
+            self.congestion.onPacketLost(lost_pkt.packet_number);
         }
 
         // Feed ACK into congestion window growth using the exact byte

@@ -123,11 +123,7 @@ pub const CongestionController = struct {
         self.bytes_acked = 0;
     }
 
-    /// Called when a packet is lost. Note: bytes_in_flight accounting
-    /// is handled by `SentRing` (the single source of truth); this
-    /// method only triggers the congestion response.
-    pub fn onPacketLost(self: *CongestionController, bytes: usize, packet_number: u64) void {
-        _ = bytes;
+    pub fn onPacketLost(self: *CongestionController, packet_number: u64) void {
         self.onCongestionEvent(packet_number);
     }
 
@@ -282,7 +278,7 @@ test "loss reduces window" {
     const cwnd_before = cc.congestion_window;
 
     // Lose a packet (bytes_in_flight tracked by SentRing, not here)
-    cc.onPacketLost(1200, 0);
+    cc.onPacketLost(0);
 
     // Window should be halved (but not below minimum)
     try std.testing.expect(cc.congestion_window < cwnd_before);
@@ -294,7 +290,7 @@ test "recovery exit" {
     var cc = CongestionController.init();
 
     // Enter recovery
-    cc.onPacketLost(1200, 5);
+    cc.onPacketLost(5);
     try std.testing.expectEqual(CongestionState.recovery, cc.state);
 
     // ACK a packet sent after recovery started

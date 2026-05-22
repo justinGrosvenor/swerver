@@ -158,7 +158,7 @@ extern fn SSL_get_error(ssl: *const SSL, ret: c_int) c_int;
 extern fn SSL_is_init_finished(ssl: *const SSL) c_int;
 pub extern fn SSL_read(ssl: *SSL, buf: [*]u8, num: c_int) c_int;
 pub extern fn SSL_write(ssl: *SSL, buf: [*]const u8, num: c_int) c_int;
-extern fn SSL_get0_alpn_selected(ssl: *const SSL, data: *[*]const u8, len: *c_uint) void;
+extern fn SSL_get0_alpn_selected(ssl: *const SSL, data: *?[*]const u8, len: *c_uint) void;
 extern fn SSL_export_keying_material(
     ssl: *SSL,
     out: [*]u8,
@@ -792,11 +792,12 @@ pub fn exportKeyingMaterial(
 
 pub fn getSelectedAlpn(ssl: *const SSL) ?[]const u8 {
     if (!tls_enabled) return null;
-    var data: [*]const u8 = @ptrFromInt(0);
+    var data: ?[*]const u8 = null;
     var len: c_uint = 0;
     SSL_get0_alpn_selected(ssl, &data, &len);
-    if (len == 0 or @intFromPtr(data) == 0) return null;
-    return data[0..len];
+    const ptr = data orelse return null;
+    if (len == 0) return null;
+    return ptr[0..len];
 }
 
 pub fn getLastError() [256]u8 {

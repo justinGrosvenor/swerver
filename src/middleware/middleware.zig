@@ -155,6 +155,8 @@ pub const BufferOps = struct {
     release: *const fn (*anyopaque, buffer_pool.BufferHandle) void,
 };
 
+threadlocal var managed_ct_header: [1]response.Header = undefined;
+
 pub fn respondManaged(ctx: *Context, status: u16, content_type: []const u8, body: []const u8) ?response.Response {
     const ops = ctx.buffer_ops orelse return null;
     const handle = ops.acquire(ops.ctx) orelse return null;
@@ -163,11 +165,10 @@ pub fn respondManaged(ctx: *Context, status: u16, content_type: []const u8, body
         return null;
     }
     @memcpy(handle.bytes[0..body.len], body);
+    managed_ct_header[0] = .{ .name = "Content-Type", .value = content_type };
     return response.Response{
         .status = status,
-        .headers = &[_]response.Header{
-            .{ .name = "Content-Type", .value = content_type },
-        },
+        .headers = &managed_ct_header,
         .body = .{ .managed = .{ .handle = handle, .len = body.len } },
     };
 }

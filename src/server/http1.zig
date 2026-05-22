@@ -1257,7 +1257,7 @@ fn validateBodyAgainstSchema(schema: *const body_schema.Schema, bv: *const forwa
             var flat: [65536]u8 = undefined;
             if (b.total_len > flat.len) {
                 var r = body_schema.ValidationResult{};
-                r.valid = true;
+                r.addError(&.{}, "body too large to validate");
                 return r;
             }
             var pos: usize = 0;

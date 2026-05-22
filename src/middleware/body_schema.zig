@@ -85,7 +85,7 @@ pub const ValidationResult = struct {
     error_count: u8 = 0,
     valid: bool = true,
 
-    fn addError(self: *ValidationResult, path: []const ValidationError.PathSegment, message: []const u8) void {
+    pub fn addError(self: *ValidationResult, path: []const ValidationError.PathSegment, message: []const u8) void {
         if (self.error_count >= MAX_ERRORS) return;
         self.valid = false;
         var err = &self.errors[self.error_count];

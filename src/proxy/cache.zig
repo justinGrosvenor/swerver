@@ -245,7 +245,7 @@ pub const ResponseCache = struct {
     }
 
     pub fn invalidate(self: *ResponseCache, path: []const u8) void {
-        while (true) {
+        for (0..256) |_| {
             var to_remove: [16]u64 = undefined;
             var remove_count: usize = 0;
 
