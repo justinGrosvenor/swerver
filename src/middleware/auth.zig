@@ -27,7 +27,8 @@ pub const ApiKeyConfig = struct {
 };
 
 pub const ApiKey = struct {
-    key: []const u8,
+    key: []const u8 = "",
+    key_hash: []const u8 = "",
     name: []const u8,
 };
 
@@ -195,6 +196,7 @@ fn evaluateApiKey(req: request.RequestView, cfg: ApiKeyConfig) AuthResult {
 
 threadlocal var query_decode_buf: [512]u8 = undefined;
 
+// Returned slice aliases query_decode_buf — consume before the next call.
 fn percentDecodeQueryValue(input: []const u8) ?[]const u8 {
     if (std.mem.indexOfScalar(u8, input, '%') == null and std.mem.indexOfScalar(u8, input, '+') == null) return null;
     var src: usize = 0;
@@ -228,15 +230,43 @@ fn hexVal(c: u8) ?u8 {
 }
 
 fn matchApiKey(provided: []const u8, keys: []const ApiKey) AuthResult {
+    const provided_hash = hashKeyHex(provided);
     for (keys) |entry| {
-        if (constantTimeEqual(provided, entry.key)) {
-            var info = AuthInfo{};
-            info.setConsumer(entry.name);
-            info.addHeader("X-Consumer-Name", entry.name);
-            return .{ .allow = info };
+        if (entry.key_hash.len > 0) {
+            if (constantTimeEqualFixed(&provided_hash, entry.key_hash)) {
+                return allowKey(entry);
+            }
+        } else if (entry.key.len > 0) {
+            if (constantTimeEqual(provided, entry.key)) {
+                return allowKey(entry);
+            }
         }
     }
     return .{ .reject = FORBIDDEN };
+}
+
+fn allowKey(entry: ApiKey) AuthResult {
+    var info = AuthInfo{};
+    info.setConsumer(entry.name);
+    info.addHeader("X-Consumer-Name", entry.name);
+    return .{ .allow = info };
+}
+
+const Sha256 = std.crypto.hash.sha2.Sha256;
+
+fn hashKeyHex(key: []const u8) [64]u8 {
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(key, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+fn constantTimeEqualFixed(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    var diff: u8 = 0;
+    for (a, b) |x, y| {
+        diff |= x ^ y;
+    }
+    return diff == 0;
 }
 
 fn constantTimeEqual(a: []const u8, b: []const u8) bool {
@@ -1040,4 +1070,81 @@ test "jwt: validateJwtHeader requires alg field" {
     try std.testing.expect(!validateJwtHeader("{\"alg\":\"none\",\"note\":\"HS256\"}"));
     try std.testing.expect(!validateJwtHeader("{\"alg\":\"RS256\"}"));
     try std.testing.expect(!validateJwtHeader("{\"typ\":\"JWT\"}"));
+}
+
+test "api_key: hash-based auth" {
+    const hash = hashKeyHex("secret-key-123");
+    const keys = [_]ApiKey{
+        .{ .key_hash = &hash, .name = "hash-consumer" },
+    };
+    const cfg = ApiKeyConfig{ .keys = &keys };
+    const hdrs = [_]request.Header{
+        .{ .name = "X-API-Key", .value = "secret-key-123" },
+    };
+    const req = request.RequestView{
+        .method = .GET,
+        .path = "/api/test",
+        .headers = &hdrs,
+    };
+    const result = evaluate(req, .{ .api_key = cfg });
+    switch (result) {
+        .allow => |*info| try std.testing.expectEqualStrings("hash-consumer", info.consumerName()),
+        .reject => return error.TestUnexpectedResult,
+    }
+}
+
+test "api_key: hash-based auth rejects wrong key" {
+    const hash = hashKeyHex("secret-key-123");
+    const keys = [_]ApiKey{
+        .{ .key_hash = &hash, .name = "hash-consumer" },
+    };
+    const cfg = ApiKeyConfig{ .keys = &keys };
+    const hdrs = [_]request.Header{
+        .{ .name = "X-API-Key", .value = "wrong-key" },
+    };
+    const req = request.RequestView{
+        .method = .GET,
+        .path = "/api/test",
+        .headers = &hdrs,
+    };
+    const result = evaluate(req, .{ .api_key = cfg });
+    switch (result) {
+        .allow => return error.TestUnexpectedResult,
+        .reject => |resp| try std.testing.expectEqual(@as(u16, 403), resp.status),
+    }
+}
+
+test "api_key: mixed plaintext and hash keys" {
+    const hash = hashKeyHex("hash-key-456");
+    const keys = [_]ApiKey{
+        .{ .key = "plain-key-123", .name = "plain-consumer" },
+        .{ .key_hash = &hash, .name = "hash-consumer" },
+    };
+    const cfg = ApiKeyConfig{ .keys = &keys };
+
+    // plaintext key works
+    const hdrs1 = [_]request.Header{
+        .{ .name = "X-API-Key", .value = "plain-key-123" },
+    };
+    const req1 = request.RequestView{ .method = .GET, .path = "/test", .headers = &hdrs1 };
+    switch (evaluate(req1, .{ .api_key = cfg })) {
+        .allow => |*info| try std.testing.expectEqualStrings("plain-consumer", info.consumerName()),
+        .reject => return error.TestUnexpectedResult,
+    }
+
+    // hash key works
+    const hdrs2 = [_]request.Header{
+        .{ .name = "X-API-Key", .value = "hash-key-456" },
+    };
+    const req2 = request.RequestView{ .method = .GET, .path = "/test", .headers = &hdrs2 };
+    switch (evaluate(req2, .{ .api_key = cfg })) {
+        .allow => |*info| try std.testing.expectEqualStrings("hash-consumer", info.consumerName()),
+        .reject => return error.TestUnexpectedResult,
+    }
+}
+
+test "hashKeyHex produces consistent SHA-256 hex" {
+    const hash = hashKeyHex("test");
+    // SHA-256("test") = 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+    try std.testing.expectEqualStrings("9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", &hash);
 }

@@ -418,7 +418,12 @@ fn parseAuthMethodDepth(alloc: std.mem.Allocator, a: RouteAuthJson, depth: u8) !
         const json_keys = a.keys orelse return error.ConfigParseError;
         const keys_out = try alloc.alloc(auth_mod.ApiKey, json_keys.len);
         for (json_keys, 0..) |k, ki| {
-            keys_out[ki] = .{ .key = k.key, .name = k.name };
+            if (k.key == null and k.key_hash == null) return error.ConfigParseError;
+            keys_out[ki] = .{
+                .key = k.key orelse "",
+                .key_hash = k.key_hash orelse "",
+                .name = k.name,
+            };
         }
         return .{ .api_key = .{
             .keys = keys_out,
@@ -687,7 +692,8 @@ const RouteAuthJson = struct {
 };
 
 const ApiKeyJson = struct {
-    key: []const u8,
+    key: ?[]const u8 = null,
+    key_hash: ?[]const u8 = null,
     name: []const u8,
 };
 
