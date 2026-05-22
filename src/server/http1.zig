@@ -42,6 +42,7 @@ const router = @import("../router/router.zig");
 const middleware = @import("../middleware/middleware.zig");
 const auth_mod = @import("../middleware/auth.zig");
 const ratelimit_mod = @import("../middleware/ratelimit.zig");
+const usage_mod = @import("../middleware/usage.zig");
 const forward_mod = @import("../proxy/forward.zig");
 const clock = @import("../runtime/clock.zig");
 const preencoded = @import("preencoded.zig");
@@ -963,6 +964,10 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
                 .allow => |*info| info,
                 .reject => null,
             };
+            if (auth_info_ptr) |ai| {
+                const name = ai.consumerName();
+                if (name.len > 0) usage_mod.record(name, server.now_ms);
+            }
             if (matched_route.rate_limit) |rl_cfg| {
                 const consumer = if (auth_info_ptr) |ai| ai.consumerName() else "";
                 const client_key: ?ratelimit_mod.IpKey = if (conn.cached_peer_ip) |ip4|

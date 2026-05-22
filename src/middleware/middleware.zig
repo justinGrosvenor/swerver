@@ -318,6 +318,7 @@ pub const access_log = @import("access_log.zig");
 pub const ratelimit = @import("ratelimit.zig");
 pub const security = @import("security.zig");
 pub const observability = @import("observability.zig");
+pub const usage = @import("usage.zig");
 pub const x402 = @import("x402.zig");
 pub const x402_crypto = @import("x402_crypto.zig");
 

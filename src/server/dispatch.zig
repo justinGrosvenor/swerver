@@ -38,6 +38,7 @@ const middleware = @import("../middleware/middleware.zig");
 const x402_mod = @import("../middleware/x402.zig");
 const auth_mod = @import("../middleware/auth.zig");
 const ratelimit_mod = @import("../middleware/ratelimit.zig");
+const usage_mod = @import("../middleware/usage.zig");
 const ws_mod = @import("../proxy/websocket.zig");
 const accept_mod = @import("accept.zig");
 const http1_mod = @import("http1.zig");
@@ -811,6 +812,10 @@ pub fn handleRead(server: *Server, index: u32) !void {
                     .allow => |*info| info,
                     .reject => null,
                 };
+                if (auth_info_ptr) |ai| {
+                    const name = ai.consumerName();
+                    if (name.len > 0) usage_mod.record(name, server.now_ms);
+                }
                 if (matched_route.rate_limit) |rl_cfg| {
                     const consumer = if (auth_info_ptr) |ai| ai.consumerName() else "";
                     const client_key = if (conn.cached_peer_ip) |ip4|

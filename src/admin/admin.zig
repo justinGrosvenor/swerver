@@ -7,6 +7,7 @@ const json_write = @import("../runtime/json_write.zig");
 
 const Server = @import("../server.zig").Server;
 const config_fetch = @import("../config_fetch.zig");
+const usage = @import("../middleware/usage.zig");
 
 const MAX_REQUEST = 65536;
 const MAX_RESPONSE = 65536;
@@ -146,6 +147,13 @@ fn dispatch(server: *Server, method: Method, path: []const u8, body: []const u8,
     }
     if (startsWith(path, "/v1/status")) {
         return getStatus(server, buf);
+    }
+    if (startsWith(path, "/v1/usage")) {
+        return switch (method) {
+            .GET => getUsage(buf, queryParam(path, "reset") != null),
+            .DELETE => getUsage(buf, true),
+            else => .{ .status = 405, .body = "{\"error\":\"method not allowed\"}" },
+        };
     }
     if (startsWith(path, "/v1/config/persist")) {
         if (method != .POST) return .{ .status = 405, .body = "{\"error\":\"method not allowed\"}" };
@@ -361,6 +369,11 @@ fn getStatus(server: *Server, buf: []u8) DispatchResult {
         route_count, upstream_count, server.cfg.port, server.cfg.workers,
     }) catch return .{ .status = 200, .body = "{\"status\":\"ok\"}" };
     return .{ .status = 200, .body = n };
+}
+
+fn getUsage(buf: []u8, reset: bool) DispatchResult {
+    const body = if (reset) usage.snapshotAndReset(buf) else usage.snapshot(buf);
+    return .{ .status = 200, .body = body };
 }
 
 fn persistConfig(server: *Server, buf: []u8) DispatchResult {
