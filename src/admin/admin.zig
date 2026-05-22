@@ -413,21 +413,23 @@ fn writeConfigAndReload(server: *Server, alloc: std.mem.Allocator, tree: std.jso
             return error.ProxyBuildFailed;
         };
 
-        if (server.proxy) |old| {
-            old.deinit();
-            server.allocator.destroy(old);
-        }
-
         const proxy_ptr = server.allocator.create(proxy_mod.Proxy) catch {
             new_proxy.deinit();
             loaded.deinit();
             return error.AllocFailed;
         };
         proxy_ptr.* = new_proxy;
-        server.proxy = proxy_ptr;
 
-        if (server.reload_arena) |*old_arena| old_arena.deinit();
+        const old_proxy = server.proxy;
+        const old_arena = server.reload_arena;
+        server.proxy = proxy_ptr;
         server.reload_arena = loaded.arena;
+
+        if (old_proxy) |old| {
+            old.deinit();
+            server.allocator.destroy(old);
+        }
+        if (old_arena) |*oa| oa.deinit();
     } else if (loaded.upstreams.len == 0 and loaded.routes.len == 0) {
         if (server.proxy) |old| {
             old.deinit();
@@ -655,20 +657,39 @@ fn readFileAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
 }
 
 fn writeFileContents(path: []const u8, data: []const u8) !void {
-    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .TRUNC = true }, 0) catch
-        return error.OpenFailed;
-    defer clock.closeFd(fd);
+    var tmp_path: [4096:0]u8 = undefined;
+    if (path.len >= 4090) return error.PathTooLong;
+    @memcpy(tmp_path[0..path.len], path);
+    @memcpy(tmp_path[path.len .. path.len + 4], ".tmp");
+    tmp_path[path.len + 4] = 0;
+
+    const fd = std.posix.openat(std.posix.AT.FDCWD, tmp_path[0 .. path.len + 4 :0], .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .TRUNC = true,
+    }, 0o644) catch return error.OpenFailed;
 
     var written: usize = 0;
     while (written < data.len) {
         const rc = std.posix.system.write(fd, data[written..].ptr, data[written..].len);
         if (rc < 0) {
             if (std.posix.errno(rc) == .INTR) continue;
+            clock.closeFd(fd);
             return error.WriteFailed;
         }
-        if (rc == 0) return error.WriteFailed;
+        if (rc == 0) {
+            clock.closeFd(fd);
+            return error.WriteFailed;
+        }
         written += @intCast(rc);
     }
+    clock.closeFd(fd);
+
+    var path_z: [4096:0]u8 = undefined;
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
+    if (std.c.rename(tmp_path[0 .. path.len + 4 :0].ptr, path_z[0..path.len :0].ptr) != 0)
+        return error.WriteFailed;
 }
 
 fn startsWith(haystack: []const u8, prefix: []const u8) bool {

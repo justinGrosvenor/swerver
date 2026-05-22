@@ -406,21 +406,23 @@ pub const Server = struct {
                 return;
             };
 
-            if (self.proxy) |old| {
-                old.deinit();
-                self.allocator.destroy(old);
-            }
-
             const proxy_ptr = self.allocator.create(proxy_mod.Proxy) catch {
                 new_proxy.deinit();
                 loaded.deinit();
                 return;
             };
             proxy_ptr.* = new_proxy;
-            self.proxy = proxy_ptr;
 
-            if (self.reload_arena) |*old_arena| old_arena.deinit();
+            const old_proxy = self.proxy;
+            const old_arena = self.reload_arena;
+            self.proxy = proxy_ptr;
             self.reload_arena = loaded.arena;
+
+            if (old_proxy) |old| {
+                old.deinit();
+                self.allocator.destroy(old);
+            }
+            if (old_arena) |*oa| oa.deinit();
             self.needs_peer_ip = true;
             const src_label: []const u8 = switch (source) {
                 .file => |p| p,

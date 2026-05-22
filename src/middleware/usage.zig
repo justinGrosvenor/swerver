@@ -1,4 +1,5 @@
 const std = @import("std");
+const json_write = @import("../runtime/json_write.zig");
 
 const MAX_CONSUMERS = 1024;
 const MAX_NAME_LEN = 128;
@@ -60,8 +61,11 @@ pub fn snapshot(buf: []u8) []const u8 {
         if (!e.active or e.requests == 0) continue;
         if (!first) off += copyInto(buf[off..], ",");
         first = false;
-        const n = std.fmt.bufPrint(buf[off..], "{{\"name\":\"{s}\",\"requests\":{d},\"last_seen_ms\":{d}}}", .{
-            e.nameSlice(), e.requests, e.last_seen_ms,
+        off += copyInto(buf[off..], "{\"name\":\"");
+        const escaped = json_write.writeEscaped(buf[off..], e.nameSlice()) catch break;
+        off += escaped.len;
+        const n = std.fmt.bufPrint(buf[off..], "\",\"requests\":{d},\"last_seen_ms\":{d}}}", .{
+            e.requests, e.last_seen_ms,
         }) catch break;
         off += n.len;
     }
@@ -123,6 +127,23 @@ test "empty consumer ignored" {
     var buf: [4096]u8 = undefined;
     const json = snapshot(&buf);
     try std.testing.expectEqualStrings("{\"consumers\":[]}", json);
+}
+
+test "consumer name with special chars is JSON-escaped" {
+    @memset(std.mem.asBytes(&entries), 0);
+
+    record("tenant-\"evil\"\\bad", 100);
+
+    var buf: [4096]u8 = undefined;
+    const json = snapshot(&buf);
+    // Must not contain unescaped quotes
+    try std.testing.expect(std.mem.indexOf(u8, json, "tenant-\\\"evil\\\"\\\\bad") != null);
+    // Verify it parses as valid JSON
+    var fba_buf: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, fba.allocator(), json, .{}) catch
+        return error.InvalidJson;
+    try std.testing.expect(parsed == .object);
 }
 
 test "LRU eviction" {
