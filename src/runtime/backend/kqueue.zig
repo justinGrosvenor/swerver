@@ -34,6 +34,7 @@ pub const KqueueBackend = struct {
         if (!is_supported) return error.Unsupported;
         const kq = std.posix.system.kqueue();
         if (kq < 0) return error.KqueueFailed;
+        _ = std.c.fcntl(kq, std.posix.F.SETFD, @as(c_int, std.posix.FD_CLOEXEC));
         const events = try allocator.alloc(Kevent, max_events);
         return .{
             .kq = kq,

@@ -479,6 +479,9 @@ const ResponseParser = struct {
             if (header_count < headers.len) {
                 headers[header_count] = .{ .name = name, .value = value };
                 header_count += 1;
+            } else if (header_count == headers.len) {
+                std.log.warn("upstream response exceeded {d} header limit, excess headers dropped", .{headers.len});
+                header_count += 1;
             }
 
             // Track important headers
@@ -759,11 +762,7 @@ pub fn buildClientResponse(
             @memcpy(buf[pos .. pos + written], decode_buf[0..written]);
             pos += written;
         } else {
-            // Decode failed — send raw body with matching Content-Length
-            pos += (std.fmt.bufPrint(buf[pos..], "Content-Length: {d}\r\n\r\n", .{raw_body.len}) catch return error.BufferFull).len;
-            if (pos + raw_body.len > buf.len) return error.BufferFull;
-            @memcpy(buf[pos .. pos + raw_body.len], raw_body);
-            pos += raw_body.len;
+            return error.ChunkedDecodeFailed;
         }
     } else {
         // Non-chunked: add Content-Length and copy body directly

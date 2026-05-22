@@ -14,6 +14,13 @@ const congestion_mod = @import("congestion.zig");
 const http3 = @import("../protocol/http3.zig");
 const clock = @import("../runtime/clock.zig");
 
+/// Length (in bytes) of the Connection IDs we generate for ourselves.
+/// Peers use this length when sending short-header packets to us, and
+/// the packet parser needs it to extract the DCID from short headers
+/// (which carry no explicit length field). Valid range: 0-20 per
+/// RFC 9000 §17.2.
+pub const OUR_CID_LEN: u8 = 8;
+
 fn fillRandom(buf: []u8) void {
     switch (builtin.os.tag) {
         .macos, .ios, .tvos, .watchos, .freebsd, .netbsd, .openbsd => {
@@ -608,6 +615,10 @@ pub const Connection = struct {
     our_cid: types.ConnectionId,
     /// Peer's connection ID
     peer_cid: types.ConnectionId,
+    /// True once peer_cid has been set from the peer's SCID in the
+    /// first Initial packet. Subsequent Initials (retransmissions)
+    /// must not overwrite the already-adopted value (RFC 9000 §7.2).
+    peer_cid_set: bool = false,
     /// QUIC version in use
     version: u32 = @intFromEnum(types.Version.quic_v1),
     /// Cryptographic context
@@ -724,8 +735,8 @@ pub const Connection = struct {
             .recovery = recovery_mod.Recovery.init(allocator),
         };
 
-        fillRandom(conn.our_cid.bytes[0..8]);
-        conn.our_cid.len = 8;
+        fillRandom(conn.our_cid.bytes[0..OUR_CID_LEN]);
+        conn.our_cid.len = OUR_CID_LEN;
 
         // Derive initial keys from DCID
         conn.crypto_ctx.deriveInitialKeys(dcid.slice(), conn.version);
@@ -1089,6 +1100,7 @@ pub const Connection = struct {
                 self.peer_params.decode(blob) catch return Error.ProtocolViolation;
                 // Hook the negotiated send window into flow control.
                 self.flow_control.max_data_send = self.peer_params.initial_max_data;
+                self.recovery.rtt.max_ack_delay = self.peer_params.max_ack_delay * std.time.ns_per_ms;
             }
         }
 
@@ -1309,7 +1321,7 @@ pub const Connection = struct {
         if (ack_result.largest_sent_time) |sent_time| {
             // Update RTT estimator (RFC 9002 §5)
             if (now_ns > sent_time) {
-                const ack_delay_ns = self.application_space.calculateAckDelay() * 1000;
+                const ack_delay_ns = if (space == .application) self.application_space.calculateAckDelay() * 1000 else 0;
                 self.recovery.rtt.update(
                     now_ns - sent_time,
                     ack_delay_ns,
@@ -1339,7 +1351,7 @@ pub const Connection = struct {
 
         // Feed lost packets into the congestion controller.
         for (lost_buf[0..lost_count]) |lost_pkt| {
-            self.congestion.onPacketLost(lost_pkt.size, lost_pkt.packet_number);
+            self.congestion.onPacketLost(lost_pkt.packet_number);
         }
 
         // Feed ACK into congestion window growth using the exact byte

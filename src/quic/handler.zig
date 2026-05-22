@@ -100,7 +100,7 @@ pub const Handler = struct {
         var result = ProcessResult{};
 
         // Parse packet header
-        const parse_result = packet.parseHeader(data, 8); // Assume 8-byte CIDs
+        const parse_result = packet.parseHeader(data, connection.OUR_CID_LEN);
         if (parse_result.state != .complete) {
             return Error.InvalidPacket;
         }
@@ -234,9 +234,12 @@ pub const Handler = struct {
     ) Error!void {
         _ = self;
 
-        // Update peer's connection ID
-        if (header.scid.len > 0) {
+        // Adopt the peer's SCID only from the first client Initial
+        // (RFC 9000 §7.2). Subsequent Initials (retransmissions) must
+        // not overwrite the already-established peer CID.
+        if (header.scid.len > 0 and !conn.peer_cid_set) {
             conn.peer_cid = header.scid;
+            conn.peer_cid_set = true;
         }
 
         // Get Initial keys for decryption
@@ -1087,6 +1090,13 @@ pub fn buildShortPacket(out: []u8, opts: BuildShortPacketOptions) Error!BuildPac
 
     // ---- Plaintext payload ----
 
+    // Capture ack-eliciting signals BEFORE writing frames, because the
+    // write path clears pending state (needsMaxData, hasPendingPathResponse,
+    // etc.) as a side effect.
+    const had_pending_uni = conn_ref.has1RttPayloadPending();
+    const had_max_data = conn_ref.needsMaxData();
+    const had_path_response = conn_ref.hasPendingPathResponse();
+
     // ACK frame (per-application-space). Walk the receive bitmap to
     // collect multi-range acknowledgements so lossy paths don't force
     // the peer to retransmit everything below the first gap.
@@ -1196,11 +1206,12 @@ pub fn buildShortPacket(out: []u8, opts: BuildShortPacketOptions) Error!BuildPac
 
     // Record the sent packet for loss detection (RFC 9002). A packet
     // is ACK-eliciting if it contains anything other than just an ACK.
+    // Uses pre-capture flags since frame writing clears pending state.
     const ack_eliciting = opts.send_handshake_done or
         (opts.stream_data != null) or
-        conn_ref.has1RttPayloadPending() or
-        conn_ref.needsMaxData() or
-        conn_ref.hasPendingPathResponse();
+        had_pending_uni or
+        had_max_data or
+        had_path_response;
     conn_ref.recordPacketSent(pn, .application, protected_len, ack_eliciting);
 
     return .{ .bytes_written = protected_len, .packet_number = pn };

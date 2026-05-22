@@ -118,6 +118,7 @@ pub const X509_NAME = opaque {};
 
 extern fn SSL_CTX_set_verify(ctx: *SSL_CTX, mode: c_int, callback: ?*const anyopaque) void;
 extern fn SSL_CTX_load_verify_locations(ctx: *SSL_CTX, ca_file: ?[*:0]const u8, ca_path: ?[*:0]const u8) c_int;
+extern fn SSL_CTX_set_default_verify_paths(ctx: *SSL_CTX) c_int;
 extern fn SSL_get1_peer_certificate(ssl: *const SSL) ?*X509;
 extern fn X509_get_subject_name(x: *const X509) ?*X509_NAME;
 extern fn X509_NAME_oneline(name: *const X509_NAME, buf: ?[*]u8, size: c_int) ?[*:0]const u8;
@@ -127,6 +128,11 @@ pub fn setVerifyPeer(ctx: *SSL_CTX, require: bool) void {
     if (!tls_enabled) return;
     const mode = if (require) SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT else SSL_VERIFY_PEER;
     SSL_CTX_set_verify(ctx, mode, null);
+}
+
+pub fn loadDefaultVerifyPaths(ctx: *SSL_CTX) !void {
+    if (!tls_enabled) return error.TlsNotAvailable;
+    if (SSL_CTX_set_default_verify_paths(ctx) != 1) return error.CaCertLoadFailed;
 }
 
 pub fn loadCaCert(ctx: *SSL_CTX, ca_path: [:0]const u8) !void {
@@ -152,7 +158,7 @@ extern fn SSL_get_error(ssl: *const SSL, ret: c_int) c_int;
 extern fn SSL_is_init_finished(ssl: *const SSL) c_int;
 pub extern fn SSL_read(ssl: *SSL, buf: [*]u8, num: c_int) c_int;
 pub extern fn SSL_write(ssl: *SSL, buf: [*]const u8, num: c_int) c_int;
-extern fn SSL_get0_alpn_selected(ssl: *const SSL, data: *[*]const u8, len: *c_uint) void;
+extern fn SSL_get0_alpn_selected(ssl: *const SSL, data: *?[*]const u8, len: *c_uint) void;
 extern fn SSL_export_keying_material(
     ssl: *SSL,
     out: [*]u8,
@@ -405,7 +411,8 @@ pub fn createContext(is_server: bool) !*SSL_CTX {
     const ctx = SSL_CTX_new(method) orelse return error.ContextCreationFailed;
     errdefer SSL_CTX_free(ctx);
 
-    if (SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, TLS1_3_VERSION, null) == 0)
+    const min_ver: c_int = if (is_server) TLS1_3_VERSION else TLS1_2_VERSION;
+    if (SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, min_ver, null) == 0)
         return error.ContextCreationFailed;
     if (SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MAX_PROTO_VERSION, TLS1_3_VERSION, null) == 0)
         return error.ContextCreationFailed;
@@ -725,6 +732,7 @@ pub fn doHandshake(ssl: *SSL) HandshakeResult {
                 ret, err, buf[0..msg_len],
             });
         }
+        while (ERR_get_error() != 0) {}
     }
     return switch (err) {
         SSL_ERROR_WANT_READ => .want_read,
@@ -784,11 +792,12 @@ pub fn exportKeyingMaterial(
 
 pub fn getSelectedAlpn(ssl: *const SSL) ?[]const u8 {
     if (!tls_enabled) return null;
-    var data: [*]const u8 = undefined;
+    var data: ?[*]const u8 = null;
     var len: c_uint = 0;
     SSL_get0_alpn_selected(ssl, &data, &len);
+    const ptr = data orelse return null;
     if (len == 0) return null;
-    return data[0..len];
+    return ptr[0..len];
 }
 
 pub fn getLastError() [256]u8 {
@@ -800,5 +809,6 @@ pub fn getLastError() [256]u8 {
     } else {
         @memset(&buf, 0);
     }
+    while (ERR_get_error() != 0) {}
     return buf;
 }

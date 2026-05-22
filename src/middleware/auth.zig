@@ -27,7 +27,8 @@ pub const ApiKeyConfig = struct {
 };
 
 pub const ApiKey = struct {
-    key: []const u8,
+    key: []const u8 = "",
+    key_hash: []const u8 = "",
     name: []const u8,
 };
 
@@ -180,7 +181,11 @@ fn evaluateApiKey(req: request.RequestView, cfg: ApiKeyConfig) AuthResult {
         while (it.next()) |pair| {
             if (std.mem.startsWith(u8, pair, cfg.query_param)) {
                 if (pair.len > cfg.query_param.len and pair[cfg.query_param.len] == '=') {
-                    return matchApiKey(pair[cfg.query_param.len + 1 ..], cfg.keys);
+                    const raw = pair[cfg.query_param.len + 1 ..];
+                    if (percentDecodeQueryValue(raw)) |decoded| {
+                        return matchApiKey(decoded, cfg.keys);
+                    }
+                    return matchApiKey(raw, cfg.keys);
                 }
             }
         }
@@ -189,16 +194,79 @@ fn evaluateApiKey(req: request.RequestView, cfg: ApiKeyConfig) AuthResult {
     return .{ .reject = UNAUTHORIZED };
 }
 
+threadlocal var query_decode_buf: [512]u8 = undefined;
+
+// Returned slice aliases query_decode_buf — consume before the next call.
+fn percentDecodeQueryValue(input: []const u8) ?[]const u8 {
+    if (std.mem.indexOfScalar(u8, input, '%') == null and std.mem.indexOfScalar(u8, input, '+') == null) return null;
+    var src: usize = 0;
+    var dst: usize = 0;
+    while (src < input.len) {
+        if (dst >= query_decode_buf.len) return null;
+        if (input[src] == '%' and src + 2 < input.len) {
+            const hi = hexVal(input[src + 1]) orelse return null;
+            const lo = hexVal(input[src + 2]) orelse return null;
+            query_decode_buf[dst] = (hi << 4) | lo;
+            src += 3;
+        } else if (input[src] == '+') {
+            query_decode_buf[dst] = ' ';
+            src += 1;
+        } else {
+            query_decode_buf[dst] = input[src];
+            src += 1;
+        }
+        dst += 1;
+    }
+    return query_decode_buf[0..dst];
+}
+
+fn hexVal(c: u8) ?u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'A'...'F' => c - 'A' + 10,
+        'a'...'f' => c - 'a' + 10,
+        else => null,
+    };
+}
+
 fn matchApiKey(provided: []const u8, keys: []const ApiKey) AuthResult {
+    const provided_hash = hashKeyHex(provided);
     for (keys) |entry| {
-        if (constantTimeEqual(provided, entry.key)) {
-            var info = AuthInfo{};
-            info.setConsumer(entry.name);
-            info.addHeader("X-Consumer-Name", entry.name);
-            return .{ .allow = info };
+        if (entry.key_hash.len > 0) {
+            if (constantTimeEqualFixed(&provided_hash, entry.key_hash)) {
+                return allowKey(entry);
+            }
+        } else if (entry.key.len > 0) {
+            if (constantTimeEqual(provided, entry.key)) {
+                return allowKey(entry);
+            }
         }
     }
     return .{ .reject = FORBIDDEN };
+}
+
+fn allowKey(entry: ApiKey) AuthResult {
+    var info = AuthInfo{};
+    info.setConsumer(entry.name);
+    info.addHeader("X-Consumer-Name", entry.name);
+    return .{ .allow = info };
+}
+
+const Sha256 = std.crypto.hash.sha2.Sha256;
+
+fn hashKeyHex(key: []const u8) [64]u8 {
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(key, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+fn constantTimeEqualFixed(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    var diff: u8 = 0;
+    for (a, b) |x, y| {
+        diff |= x ^ y;
+    }
+    return diff == 0;
 }
 
 fn constantTimeEqual(a: []const u8, b: []const u8) bool {
@@ -342,24 +410,39 @@ fn clock_realtimeNanos() i128 {
 }
 
 pub fn extractClaim(json: []const u8, key: []const u8) ?[]const u8 {
-    var search_buf: [128]u8 = undefined;
-    const needle = std.fmt.bufPrint(&search_buf, "\"{s}\":\"", .{key}) catch return null;
-    const start = (std.mem.indexOf(u8, json, needle) orelse return null) + needle.len;
-    const end = std.mem.indexOfScalar(u8, json[start..], '"') orelse return null;
-    return json[start .. start + end];
+    const parsed = parseJsonValue(json) orelse return null;
+    const obj = switch (parsed) {
+        .object => |o| o,
+        else => return null,
+    };
+    const val = obj.get(key) orelse return null;
+    return switch (val) {
+        .string => |s| s,
+        else => null,
+    };
 }
 
 fn extractNumericClaim(json: []const u8, key: []const u8) ?i64 {
-    var search_buf: [128]u8 = undefined;
-    const needle = std.fmt.bufPrint(&search_buf, "\"{s}\":", .{key}) catch return null;
-    const after = (std.mem.indexOf(u8, json, needle) orelse return null) + needle.len;
-    var pos = after;
-    while (pos < json.len and (json[pos] == ' ' or json[pos] == '\t')) : (pos += 1) {}
-    const num_start = pos;
-    if (pos < json.len and json[pos] == '-') pos += 1;
-    while (pos < json.len and json[pos] >= '0' and json[pos] <= '9') : (pos += 1) {}
-    if (pos == num_start) return null;
-    return std.fmt.parseInt(i64, json[num_start..pos], 10) catch null;
+    const parsed = parseJsonValue(json) orelse return null;
+    const obj = switch (parsed) {
+        .object => |o| o,
+        else => return null,
+    };
+    const val = obj.get(key) orelse return null;
+    return switch (val) {
+        .integer => |n| n,
+        .float => |f| if (f >= -9.2e18 and f <= 9.2e18) @as(i64, @intFromFloat(f)) else null,
+        else => null,
+    };
+}
+
+/// Shared JSON parse helper — uses a stack-backed arena so that no heap
+/// allocation occurs on the hot path. The returned Value contains string
+/// slices that point directly into `json`.
+fn parseJsonValue(json: []const u8) ?std.json.Value {
+    var fba_buf: [8192]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
+    return std.json.parseFromSliceLeaky(std.json.Value, fba.allocator(), json, .{}) catch null;
 }
 
 // ── Forward Auth ───────────────────────────────────────────────
@@ -777,6 +860,15 @@ test "extract claim from json" {
     try std.testing.expect(extractClaim(json, "nope") == null);
 }
 
+test "extract claim: immune to substring injection" {
+    // Audit issue #27: a crafted payload with an embedded key in a prior
+    // value must not trick the parser into returning the wrong claim.
+    const json =
+        \\{"fake":"\"sub\":\"admin\"","sub":"user"}
+    ;
+    try std.testing.expectEqualStrings("user", extractClaim(json, "sub").?);
+}
+
 test "extract numeric claim from json" {
     const json = "{\"exp\":1700000000,\"nbf\":1699000000}";
     try std.testing.expectEqual(@as(i64, 1700000000), extractNumericClaim(json, "exp").?);
@@ -978,4 +1070,81 @@ test "jwt: validateJwtHeader requires alg field" {
     try std.testing.expect(!validateJwtHeader("{\"alg\":\"none\",\"note\":\"HS256\"}"));
     try std.testing.expect(!validateJwtHeader("{\"alg\":\"RS256\"}"));
     try std.testing.expect(!validateJwtHeader("{\"typ\":\"JWT\"}"));
+}
+
+test "api_key: hash-based auth" {
+    const hash = hashKeyHex("secret-key-123");
+    const keys = [_]ApiKey{
+        .{ .key_hash = &hash, .name = "hash-consumer" },
+    };
+    const cfg = ApiKeyConfig{ .keys = &keys };
+    const hdrs = [_]request.Header{
+        .{ .name = "X-API-Key", .value = "secret-key-123" },
+    };
+    const req = request.RequestView{
+        .method = .GET,
+        .path = "/api/test",
+        .headers = &hdrs,
+    };
+    const result = evaluate(req, .{ .api_key = cfg });
+    switch (result) {
+        .allow => |*info| try std.testing.expectEqualStrings("hash-consumer", info.consumerName()),
+        .reject => return error.TestUnexpectedResult,
+    }
+}
+
+test "api_key: hash-based auth rejects wrong key" {
+    const hash = hashKeyHex("secret-key-123");
+    const keys = [_]ApiKey{
+        .{ .key_hash = &hash, .name = "hash-consumer" },
+    };
+    const cfg = ApiKeyConfig{ .keys = &keys };
+    const hdrs = [_]request.Header{
+        .{ .name = "X-API-Key", .value = "wrong-key" },
+    };
+    const req = request.RequestView{
+        .method = .GET,
+        .path = "/api/test",
+        .headers = &hdrs,
+    };
+    const result = evaluate(req, .{ .api_key = cfg });
+    switch (result) {
+        .allow => return error.TestUnexpectedResult,
+        .reject => |resp| try std.testing.expectEqual(@as(u16, 403), resp.status),
+    }
+}
+
+test "api_key: mixed plaintext and hash keys" {
+    const hash = hashKeyHex("hash-key-456");
+    const keys = [_]ApiKey{
+        .{ .key = "plain-key-123", .name = "plain-consumer" },
+        .{ .key_hash = &hash, .name = "hash-consumer" },
+    };
+    const cfg = ApiKeyConfig{ .keys = &keys };
+
+    // plaintext key works
+    const hdrs1 = [_]request.Header{
+        .{ .name = "X-API-Key", .value = "plain-key-123" },
+    };
+    const req1 = request.RequestView{ .method = .GET, .path = "/test", .headers = &hdrs1 };
+    switch (evaluate(req1, .{ .api_key = cfg })) {
+        .allow => |*info| try std.testing.expectEqualStrings("plain-consumer", info.consumerName()),
+        .reject => return error.TestUnexpectedResult,
+    }
+
+    // hash key works
+    const hdrs2 = [_]request.Header{
+        .{ .name = "X-API-Key", .value = "hash-key-456" },
+    };
+    const req2 = request.RequestView{ .method = .GET, .path = "/test", .headers = &hdrs2 };
+    switch (evaluate(req2, .{ .api_key = cfg })) {
+        .allow => |*info| try std.testing.expectEqualStrings("hash-consumer", info.consumerName()),
+        .reject => return error.TestUnexpectedResult,
+    }
+}
+
+test "hashKeyHex produces consistent SHA-256 hex" {
+    const hash = hashKeyHex("test");
+    // SHA-256("test") = 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+    try std.testing.expectEqualStrings("9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", &hash);
 }

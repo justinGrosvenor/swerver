@@ -172,6 +172,7 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
         if (x.enabled) |v| cfg.x402.enabled = v;
         if (x.facilitator_url) |v| cfg.x402.facilitator_url = v;
         if (x.facilitator_timeout_ms) |v| cfg.x402.facilitator_timeout_ms = v;
+        if (x.payment_required_b64) |v| cfg.x402.payment_required_b64 = v;
     }
 
     // OpenTelemetry
@@ -367,7 +368,6 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
             }
         }
         if (!found) {
-            std.log.warn("config: route references unknown upstream '{s}'", .{route.upstream});
             return error.ConfigParseError;
         }
 
@@ -381,7 +381,6 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
                     }
                 }
                 if (!t_found) {
-                    std.log.warn("config: traffic_split references unknown upstream '{s}'", .{t.upstream});
                     return error.ConfigParseError;
                 }
             }
@@ -396,7 +395,6 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
                 }
             }
             if (!m_found) {
-                std.log.warn("config: mirror references unknown upstream '{s}'", .{mirror_name});
                 return error.ConfigParseError;
             }
         }
@@ -411,11 +409,21 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
 }
 
 fn parseAuthMethod(alloc: std.mem.Allocator, a: RouteAuthJson) !auth_mod.AuthMethod {
+    return parseAuthMethodDepth(alloc, a, 0);
+}
+
+fn parseAuthMethodDepth(alloc: std.mem.Allocator, a: RouteAuthJson, depth: u8) !auth_mod.AuthMethod {
+    if (depth > 3) return error.ConfigParseError;
     if (std.mem.eql(u8, a.type, "api_key")) {
         const json_keys = a.keys orelse return error.ConfigParseError;
         const keys_out = try alloc.alloc(auth_mod.ApiKey, json_keys.len);
         for (json_keys, 0..) |k, ki| {
-            keys_out[ki] = .{ .key = k.key, .name = k.name };
+            if (k.key == null and k.key_hash == null) return error.ConfigParseError;
+            keys_out[ki] = .{
+                .key = k.key orelse "",
+                .key_hash = k.key_hash orelse "",
+                .name = k.name,
+            };
         }
         return .{ .api_key = .{
             .keys = keys_out,
@@ -452,7 +460,7 @@ fn parseAuthMethod(alloc: std.mem.Allocator, a: RouteAuthJson) !auth_mod.AuthMet
         const json_methods = a.methods orelse return error.ConfigParseError;
         const methods = try alloc.alloc(auth_mod.AuthMethod, json_methods.len);
         for (json_methods, 0..) |m, mi| {
-            methods[mi] = try parseAuthMethod(alloc, m);
+            methods[mi] = try parseAuthMethodDepth(alloc, m, depth + 1);
         }
         return .{ .chain = .{ .methods = methods } };
     } else {
@@ -560,6 +568,7 @@ const X402Json = struct {
     enabled: ?bool = null,
     facilitator_url: ?[]const u8 = null,
     facilitator_timeout_ms: ?u32 = null,
+    payment_required_b64: ?[]const u8 = null,
 };
 
 const AdminJson = struct {
@@ -683,7 +692,8 @@ const RouteAuthJson = struct {
 };
 
 const ApiKeyJson = struct {
-    key: []const u8,
+    key: ?[]const u8 = null,
+    key_hash: ?[]const u8 = null,
     name: []const u8,
 };
 

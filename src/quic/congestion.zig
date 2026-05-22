@@ -37,8 +37,6 @@ pub const CongestionState = enum {
 pub const CongestionController = struct {
     /// Current congestion window (bytes)
     congestion_window: usize = Constants.initial_window,
-    /// Bytes in flight
-    bytes_in_flight: usize = 0,
     /// Slow start threshold
     ssthresh: usize = std.math.maxInt(usize),
     /// Current state
@@ -54,27 +52,24 @@ pub const CongestionController = struct {
         return .{};
     }
 
-    /// Check if we can send more data
-    pub fn canSend(self: *const CongestionController, bytes: usize) bool {
-        return self.bytes_in_flight + bytes <= self.congestion_window;
+    /// Check if we can send more data. `bytes_in_flight` is provided
+    /// by the caller (from `SentRing.bytes_in_flight`, the single
+    /// source of truth for in-flight byte accounting).
+    pub fn canSend(self: *const CongestionController, bytes_in_flight: usize, bytes: usize) bool {
+        return bytes_in_flight + bytes <= self.congestion_window;
     }
 
-    /// Get available window (bytes we can send)
-    pub fn availableWindow(self: *const CongestionController) usize {
-        if (self.bytes_in_flight >= self.congestion_window) {
+    /// Get available window (bytes we can send). `bytes_in_flight` is
+    /// provided by the caller from `SentRing.bytes_in_flight`.
+    pub fn availableWindow(self: *const CongestionController, bytes_in_flight: usize) usize {
+        if (bytes_in_flight >= self.congestion_window) {
             return 0;
         }
-        return self.congestion_window - self.bytes_in_flight;
-    }
-
-    /// Called when a packet is sent
-    pub fn onPacketSent(self: *CongestionController, bytes: usize) void {
-        self.bytes_in_flight += bytes;
+        return self.congestion_window - bytes_in_flight;
     }
 
     /// Called when a packet is acknowledged
     pub fn onPacketAcked(self: *CongestionController, bytes: usize, packet_number: u64) void {
-        self.bytes_in_flight -|= bytes;
 
         // Don't increase window during recovery for packets sent before recovery
         if (self.recovery_start_pn) |recovery_pn| {
@@ -128,9 +123,7 @@ pub const CongestionController = struct {
         self.bytes_acked = 0;
     }
 
-    /// Called when a packet is lost
-    pub fn onPacketLost(self: *CongestionController, bytes: usize, packet_number: u64) void {
-        self.bytes_in_flight -|= bytes;
+    pub fn onPacketLost(self: *CongestionController, packet_number: u64) void {
         self.onCongestionEvent(packet_number);
     }
 
@@ -150,11 +143,11 @@ pub const CongestionController = struct {
         }
     }
 
-    /// Reset for a new path
+    /// Reset for a new path. Note: bytes_in_flight is tracked by
+    /// `SentRing` and does not need to be reset here.
     pub fn onPathChange(self: *CongestionController) void {
         self.congestion_window = Constants.initial_window;
         self.ssthresh = std.math.maxInt(usize);
-        self.bytes_in_flight = 0;
         self.bytes_acked = 0;
         self.state = .slow_start;
         self.recovery_start_pn = null;
@@ -248,19 +241,14 @@ test "congestion controller initialization" {
 
     try std.testing.expectEqual(Constants.initial_window, cc.congestion_window);
     try std.testing.expectEqual(CongestionState.slow_start, cc.state);
-    try std.testing.expect(cc.canSend(1200));
+    try std.testing.expect(cc.canSend(0, 1200));
 }
 
 test "slow start growth" {
     var cc = CongestionController.init();
 
-    // Send a packet
-    cc.onPacketSent(1200);
-    try std.testing.expectEqual(@as(usize, 1200), cc.bytes_in_flight);
-
-    // ACK the packet - window should grow
+    // ACK a packet - window should grow
     cc.onPacketAcked(1200, 0);
-    try std.testing.expectEqual(@as(usize, 0), cc.bytes_in_flight);
     try std.testing.expectEqual(Constants.initial_window + 1200, cc.congestion_window);
 }
 
@@ -287,14 +275,10 @@ test "congestion avoidance" {
 test "loss reduces window" {
     var cc = CongestionController.init();
 
-    // Send some packets
-    cc.onPacketSent(1200);
-    cc.onPacketSent(1200);
-
     const cwnd_before = cc.congestion_window;
 
-    // Lose a packet
-    cc.onPacketLost(1200, 0);
+    // Lose a packet (bytes_in_flight tracked by SentRing, not here)
+    cc.onPacketLost(0);
 
     // Window should be halved (but not below minimum)
     try std.testing.expect(cc.congestion_window < cwnd_before);
@@ -306,7 +290,7 @@ test "recovery exit" {
     var cc = CongestionController.init();
 
     // Enter recovery
-    cc.onPacketLost(1200, 5);
+    cc.onPacketLost(5);
     try std.testing.expectEqual(CongestionState.recovery, cc.state);
 
     // ACK a packet sent after recovery started
@@ -333,13 +317,12 @@ test "persistent congestion" {
 test "available window calculation" {
     var cc = CongestionController.init();
 
-    try std.testing.expectEqual(Constants.initial_window, cc.availableWindow());
+    // bytes_in_flight is now passed in from SentRing
+    try std.testing.expectEqual(Constants.initial_window, cc.availableWindow(0));
 
-    cc.onPacketSent(5000);
-    try std.testing.expectEqual(Constants.initial_window - 5000, cc.availableWindow());
+    try std.testing.expectEqual(Constants.initial_window - 5000, cc.availableWindow(5000));
 
-    // Fill window
-    cc.onPacketSent(Constants.initial_window - 5000);
-    try std.testing.expectEqual(@as(usize, 0), cc.availableWindow());
-    try std.testing.expect(!cc.canSend(1));
+    // Full window
+    try std.testing.expectEqual(@as(usize, 0), cc.availableWindow(Constants.initial_window));
+    try std.testing.expect(!cc.canSend(Constants.initial_window, 1));
 }

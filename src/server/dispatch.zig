@@ -590,7 +590,8 @@ pub fn handleRead(server: *Server, index: u32) !void {
         // epoll is edge-triggered on the kernel socket and won't fire
         // EPOLLIN for data that's already in SSL's buffer.
         if (conn.is_tls) {
-            while (true) {
+            var tls_drain_rounds: u8 = 0;
+            while (tls_drain_rounds < 64) : (tls_drain_rounds += 1) {
                 // Flush queued control frames (WINDOW_UPDATE, SETTINGS
                 // ACK) between read rounds so the peer can open its
                 // send window while we keep draining. Without this,
@@ -634,7 +635,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
         return;
     }
 
-    while (conn.read_buffered_bytes > 0 and conn.canEnqueueWrite()) {
+    while (conn.state != .closed and conn.read_buffered_bytes > 0 and conn.canEnqueueWrite()) {
         // Opportunistic inline write drain: push enqueued responses
         // to the kernel while still processing pipelined requests.
         // At low connection counts (e.g. 512 conns / 64 workers =
@@ -1193,6 +1194,7 @@ fn setupWebSocketTunnel(
             // Acquire a connection slot for the upstream side of the tunnel
             const upstream_conn = server.io.acquireConnection(server.now_ms) orelse {
                 clock.closeFd(upstream_fd);
+                conn.close_after_write = true;
                 return;
             };
             upstream_conn.fd = upstream_fd;
@@ -1205,6 +1207,7 @@ fn setupWebSocketTunnel(
             const upstream_read_buf = server.io.acquireBuffer() orelse {
                 server.io.releaseConnection(upstream_conn);
                 clock.closeFd(upstream_fd);
+                conn.close_after_write = true;
                 return;
             };
             upstream_conn.read_buffer = upstream_read_buf;
@@ -1215,6 +1218,7 @@ fn setupWebSocketTunnel(
                 upstream_conn.read_buffer = null;
                 server.io.releaseConnection(upstream_conn);
                 clock.closeFd(upstream_fd);
+                conn.close_after_write = true;
                 return;
             };
 
@@ -1225,6 +1229,7 @@ fn setupWebSocketTunnel(
                 upstream_conn.fd = null;
                 server.io.releaseConnection(upstream_conn);
                 clock.closeFd(upstream_fd);
+                conn.close_after_write = true;
                 return;
             };
 

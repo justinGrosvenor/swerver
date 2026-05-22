@@ -57,10 +57,19 @@ pub fn parseAcceptEncoding(header_value: []const u8) Encoding {
     var has_deflate = false;
     while (it.next()) |token| {
         const trimmed = std.mem.trim(u8, token, " \t");
-        const name = if (std.mem.indexOfScalar(u8, trimmed, ';')) |semi|
-            std.mem.trim(u8, trimmed[0..semi], " \t")
+        const semi = std.mem.indexOfScalar(u8, trimmed, ';');
+        const name = if (semi) |s|
+            std.mem.trim(u8, trimmed[0..s], " \t")
         else
             trimmed;
+        if (semi) |s| {
+            const params = std.mem.trim(u8, trimmed[s + 1 ..], " \t");
+            if (std.ascii.startsWithIgnoreCase(params, "q=")) {
+                const qval = std.mem.trim(u8, params[2..], " \t");
+                if (std.mem.eql(u8, qval, "0") or std.mem.eql(u8, qval, "0.0") or
+                    std.mem.eql(u8, qval, "0.00") or std.mem.eql(u8, qval, "0.000")) continue;
+            }
+        }
         if (std.ascii.eqlIgnoreCase(name, "gzip")) has_gzip = true;
         if (std.ascii.eqlIgnoreCase(name, "deflate")) has_deflate = true;
     }

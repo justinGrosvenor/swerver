@@ -206,6 +206,11 @@ pub const Provider = struct {
     /// Initialize a TLS provider for client connections (no certificates needed).
     pub fn initClient(allocator: std.mem.Allocator) Error!Provider {
         const ctx = ffi.createContext(false) catch return error.ContextCreationFailed;
+        ffi.loadDefaultVerifyPaths(ctx) catch {
+            ffi.freeContext(ctx);
+            return error.ContextCreationFailed;
+        };
+        ffi.setVerifyPeer(ctx, false);
 
         return .{
             .ctx = ctx,
@@ -215,8 +220,21 @@ pub const Provider = struct {
 
     pub fn deinit(self: *Provider) void {
         if (self.cert_store) |store| {
+            var freed: [MAX_SNI_ENTRIES]*ffi.SSL_CTX = undefined;
+            var freed_count: usize = 0;
             for (store.entries[0..store.count]) |entry| {
-                if (entry.ctx != self.ctx) ffi.freeContext(entry.ctx);
+                if (entry.ctx == self.ctx) continue;
+                var already_freed = false;
+                for (freed[0..freed_count]) |f| {
+                    if (f == entry.ctx) { already_freed = true; break; }
+                }
+                if (!already_freed) {
+                    ffi.freeContext(entry.ctx);
+                    if (freed_count < freed.len) {
+                        freed[freed_count] = entry.ctx;
+                        freed_count += 1;
+                    }
+                }
             }
             self.allocator.destroy(store);
             self.cert_store = null;

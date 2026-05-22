@@ -1254,10 +1254,10 @@ fn validateBodyAgainstSchema(schema: *const body_schema.Schema, bv: *const forwa
             if (b.handles.len == 1) {
                 return body_schema.validate(schema, b.handles[0].bytes[0..b.last_buf_len]);
             }
-            var flat: [1024 * 1024]u8 = undefined;
+            var flat: [65536]u8 = undefined;
             if (b.total_len > flat.len) {
                 var r = body_schema.ValidationResult{};
-                r.valid = true;
+                r.addError(&.{}, "body too large to validate");
                 return r;
             }
             var pos: usize = 0;

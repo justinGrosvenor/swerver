@@ -85,7 +85,7 @@ pub const ValidationResult = struct {
     error_count: u8 = 0,
     valid: bool = true,
 
-    fn addError(self: *ValidationResult, path: []const ValidationError.PathSegment, message: []const u8) void {
+    pub fn addError(self: *ValidationResult, path: []const ValidationError.PathSegment, message: []const u8) void {
         if (self.error_count >= MAX_ERRORS) return;
         self.valid = false;
         var err = &self.errors[self.error_count];
@@ -98,13 +98,14 @@ pub const ValidationResult = struct {
     }
 };
 
+threadlocal var validate_buf: [65536]u8 = undefined;
+
 pub fn validate(schema: *const Schema, body: []const u8) ValidationResult {
     var result = ValidationResult{};
 
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
+    var fba = std.heap.FixedBufferAllocator.init(&validate_buf);
 
-    const value = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), body, .{}) catch {
+    const value = std.json.parseFromSliceLeaky(std.json.Value, fba.allocator(), body, .{}) catch {
         result.addError(&.{}, "invalid JSON");
         return result;
     };

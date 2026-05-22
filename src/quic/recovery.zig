@@ -64,7 +64,7 @@ pub const RttEstimator = struct {
 
         // Adjust for ACK delay (only for application data)
         var adjusted_rtt = rtt_sample;
-        if (!is_handshake and ack_delay < self.max_ack_delay) {
+        if (!is_handshake and ack_delay <= self.max_ack_delay) {
             if (rtt_sample > self.min_rtt + ack_delay) {
                 adjusted_rtt = rtt_sample - ack_delay;
             }
@@ -331,7 +331,7 @@ pub const Recovery = struct {
         }
 
         // Calculate PTO
-        const pto = self.rtt.getPto() * (@as(u64, 1) << @intCast(self.pto_count));
+        const pto = self.rtt.getPto() *| (@as(u64, 1) << @intCast(@min(self.pto_count, 62)));
 
         // Find latest time of ACK-eliciting packet
         var latest_time: u64 = 0;
