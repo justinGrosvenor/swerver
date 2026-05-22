@@ -1,0 +1,83 @@
+{
+  "server": {
+    "port": 8080,
+    "static_root": "examples/gateway/static"
+  },
+
+  "timeouts": {
+    "idle_ms": 30000,
+    "header_ms": 5000,
+    "body_ms": 10000
+  },
+
+  "upstreams": [
+    {
+      "name": "api-v1",
+      "servers": [
+        { "address": "127.0.0.1", "port": 9001 },
+        { "address": "127.0.0.1", "port": 9002 }
+      ],
+      "load_balancer": "round_robin",
+      "health_check": {
+        "path": "/health",
+        "interval_ms": 5000,
+        "timeout_ms": 2000,
+        "expected_status": 200
+      }
+    },
+    {
+      "name": "api-v2",
+      "servers": [
+        { "address": "127.0.0.1", "port": 9003 }
+      ],
+      "load_balancer": "round_robin"
+    }
+  ],
+
+  "routes": [
+    {
+      "path_prefix": "/api/v1/",
+      "upstream": "api-v1",
+      "rewrite_pattern": "/api/v1/",
+      "rewrite_replacement": "/",
+      "rate_limit": {
+        "requests_per_second": 50,
+        "burst_size": 100
+      },
+      "auth": {
+        "type": "api_key",
+        "keys": [
+          { "key": "demo-key-1", "name": "dev-user" },
+          { "key": "demo-key-2", "name": "test-user" }
+        ],
+        "header_name": "X-API-Key"
+      }
+    },
+    {
+      "path_prefix": "/api/v2/",
+      "upstream": "api-v2",
+      "rewrite_pattern": "/api/v2/",
+      "rewrite_replacement": "/",
+      "auth": {
+        "type": "api_key",
+        "keys": [
+          { "key": "demo-key-1", "name": "dev-user" }
+        ]
+      },
+      "cache": {
+        "ttl_s": 30,
+        "max_entries": 256
+      }
+    },
+    {
+      "path_prefix": "/canary/",
+      "upstream": "api-v1",
+      "rewrite_pattern": "/canary/",
+      "rewrite_replacement": "/",
+      "traffic_split": [
+        { "upstream": "api-v1", "weight": 90 },
+        { "upstream": "api-v2", "weight": 10 }
+      ]
+    }
+  ]
+}

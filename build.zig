@@ -172,6 +172,24 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| example_run.addArgs(args);
     const example_step = b.step("example", "Run embedded API example");
     example_step.dependOn(&example_run.step);
+
+    const gateway_module = b.createModule(.{
+        .root_source_file = b.path("examples/gateway/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    gateway_module.addImport("swerver", swerver_module);
+    gateway_module.addOptions("build_options", options);
+    const gateway_exe = b.addExecutable(.{
+        .name = "swerver-gateway-example",
+        .root_module = gateway_module,
+    });
+    b.installArtifact(gateway_exe);
+    const gateway_run = b.addRunArtifact(gateway_exe);
+    if (b.args) |args| gateway_run.addArgs(args);
+    const gateway_step = b.step("gateway", "Run gateway example");
+    gateway_step.dependOn(&gateway_run.step);
 }
 
 const FeatureFlags = struct {
