@@ -164,6 +164,7 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
     if (file_cfg.admin) |a| {
         if (a.enabled) |v| cfg.admin.enabled = v;
         if (a.port) |v| cfg.admin.port = v;
+        if (a.address) |v| cfg.admin.address = v;
         if (a.api_key) |v| cfg.admin.api_key = v;
     }
 
@@ -574,6 +575,7 @@ const X402Json = struct {
 const AdminJson = struct {
     enabled: ?bool = null,
     port: ?u16 = null,
+    address: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
 };
 

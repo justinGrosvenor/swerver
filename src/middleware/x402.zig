@@ -451,7 +451,7 @@ fn facilitatorRoundTrip(config: FacilitatorConfig, req_bytes: []const u8, resp_b
     net.setSocketTimeouts(fd, config.timeout_ms, config.timeout_ms);
 
     if (config.use_tls and build_options.enable_tls) {
-        return facilitatorRoundTripTls(fd, req_bytes, resp_buf);
+        return facilitatorRoundTripTls(fd, config.host, req_bytes, resp_buf);
     }
 
     net.sendAll(fd, req_bytes) catch return error.SendFailed;
@@ -472,16 +472,24 @@ fn facilitatorRoundTrip(config: FacilitatorConfig, req_bytes: []const u8, resp_b
     return total;
 }
 
-fn facilitatorRoundTripTls(fd: std.posix.fd_t, req_bytes: []const u8, resp_buf: []u8) !usize {
+fn facilitatorRoundTripTls(fd: std.posix.fd_t, host: []const u8, req_bytes: []const u8, resp_buf: []u8) !usize {
     if (!build_options.enable_tls) return error.TlsNotEnabled;
 
     const ctx = ffi.SSL_CTX_new(ffi.TLS_client_method()) orelse return error.TlsInitFailed;
     defer ffi.SSL_CTX_free(ctx);
     ffi.loadDefaultVerifyPaths(ctx) catch return error.TlsInitFailed;
-    ffi.setVerifyPeer(ctx, false);
+    ffi.setVerifyPeer(ctx, true);
 
     const ssl = ffi.SSL_new(ctx) orelse return error.TlsInitFailed;
     defer ffi.SSL_free(ssl);
+
+    var host_z: [253:0]u8 = undefined;
+    if (host.len >= host_z.len) return error.TlsInitFailed;
+    @memcpy(host_z[0..host.len], host);
+    host_z[host.len] = 0;
+    const host_sentinel: [:0]const u8 = host_z[0..host.len :0];
+    if (!ffi.setHostnameVerification(ssl, host_sentinel)) return error.TlsInitFailed;
+    if (!ffi.setSniHostname(ssl, host_sentinel)) return error.TlsInitFailed;
 
     if (ffi.SSL_set_fd(ssl, @intCast(fd)) != 1) return error.TlsInitFailed;
     if (ffi.SSL_connect(ssl) != 1) return error.TlsHandshakeFailed;

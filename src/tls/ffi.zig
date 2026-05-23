@@ -136,6 +136,14 @@ pub fn setHostnameVerification(ssl: *SSL, hostname: [:0]const u8) bool {
     return SSL_set1_host(ssl, hostname.ptr) == 1;
 }
 
+extern fn SSL_ctrl(ssl: *SSL, cmd: c_int, larg: c_long, parg: ?*anyopaque) c_long;
+const SSL_CTRL_SET_TLSEXT_HOSTNAME: c_int = 55;
+
+pub fn setSniHostname(ssl: *SSL, hostname: [:0]const u8) bool {
+    if (!tls_enabled) return false;
+    return SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, @constCast(@ptrCast(hostname.ptr))) != 0;
+}
+
 pub fn loadDefaultVerifyPaths(ctx: *SSL_CTX) !void {
     if (!tls_enabled) return error.TlsNotAvailable;
     if (SSL_CTX_set_default_verify_paths(ctx) != 1) return error.CaCertLoadFailed;

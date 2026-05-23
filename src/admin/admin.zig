@@ -534,7 +534,10 @@ fn checkApiKey(headers_start: usize, headers_end: usize, raw: []const u8, expect
         const name = std.mem.trim(u8, header_line[0..colon], " ");
         if (std.ascii.eqlIgnoreCase(name, "x-api-key")) {
             const value = std.mem.trim(u8, header_line[colon + 1 ..], " ");
-            return std.mem.eql(u8, value, expected);
+            if (value.len != expected.len) return false;
+            var diff: u8 = 0;
+            for (value, expected) |a, b| diff |= a ^ b;
+            return diff == 0;
         }
     }
     return false;

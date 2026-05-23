@@ -200,6 +200,7 @@ pub const QuicConfig = struct {
 pub const AdminConfig = struct {
     enabled: bool = false,
     port: u16 = 9180,
+    address: []const u8 = "127.0.0.1",
     api_key: []const u8 = "",
 };
 

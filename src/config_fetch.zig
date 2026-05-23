@@ -125,6 +125,7 @@ fn fetchTls(allocator: std.mem.Allocator, fd: std.posix.fd_t, url_config: UrlCon
     host_z[url_config.host.len] = 0;
     const host_sentinel: [:0]const u8 = host_z[0..url_config.host.len :0];
     if (!ffi.setHostnameVerification(ssl, host_sentinel)) return error.TlsInitFailed;
+    if (!ffi.setSniHostname(ssl, host_sentinel)) return error.TlsInitFailed;
 
     if (ffi.SSL_set_fd(ssl, @intCast(fd)) != 1) return error.TlsInitFailed;
     if (ffi.SSL_connect(ssl) != 1) return error.TlsHandshakeFailed;

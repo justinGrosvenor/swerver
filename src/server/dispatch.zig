@@ -125,7 +125,7 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
     }
     // Bind admin API listener if enabled
     if (server.cfg.admin.enabled and server.admin_listener_fd == null) {
-        if (admin_mod.bindAdminSocket(server.cfg.address, server.cfg.admin.port)) |fd| {
+        if (admin_mod.bindAdminSocket(server.cfg.admin.address, server.cfg.admin.port)) |fd| {
             server.admin_listener_fd = fd;
             std.log.info("Admin API listening on :{d}", .{server.cfg.admin.port});
         } else |err| {
