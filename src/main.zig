@@ -64,13 +64,17 @@ pub fn main(init: std.process.Init) !void {
         break :blk swerver.config.ServerConfig.default();
     };
 
-    var x402_payload: ?[]const u8 = null;
-    defer if (x402_payload) |p| allocator.free(p);
+    var x402_b64: ?[]const u8 = null;
+    var x402_json: ?[]const u8 = null;
+    defer if (x402_b64) |p| allocator.free(p);
+    defer if (x402_json) |p| allocator.free(p);
 
     if (cfg.x402.enabled and cfg.x402.payment_required_b64.len == 0) {
-        const payload = try swerver.middleware.x402.demoPaymentRequiredB64(allocator, "http://localhost:8080/");
-        x402_payload = payload;
-        cfg.x402.payment_required_b64 = payload;
+        const encoded = try swerver.middleware.x402.demoPaymentRequiredB64(allocator, "http://localhost:8080/");
+        x402_b64 = encoded.b64;
+        x402_json = encoded.json;
+        cfg.x402.payment_required_b64 = encoded.b64;
+        cfg.x402.payment_required_json = encoded.json;
     }
 
     // CLI args override config file
@@ -83,6 +87,7 @@ pub fn main(init: std.process.Init) !void {
     var app_router = swerver.router.Router.init(.{
         .require_payment = cfg.x402.enabled,
         .payment_required_b64 = cfg.x402.payment_required_b64,
+        .payment_required_json = cfg.x402.payment_required_json,
     });
     if (cfg.x402.facilitator_url.len > 0) {
         if (swerver.middleware.x402.parseFacilitatorUrl(cfg.x402.facilitator_url)) |fac| {

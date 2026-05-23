@@ -191,6 +191,7 @@ pub const Server = struct {
         var app_router = router.Router.init(.{
             .require_payment = cfg.x402.enabled,
             .payment_required_b64 = cfg.x402.payment_required_b64,
+            .payment_required_json = cfg.x402.payment_required_json,
         });
         try benchmark_routes.registerRoutes(&app_router);
         middleware.security.buildCache();

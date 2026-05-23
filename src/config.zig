@@ -132,6 +132,7 @@ pub const BufferPoolConfig = struct {
 pub const X402Config = struct {
     enabled: bool = false,
     payment_required_b64: []const u8 = "",
+    payment_required_json: []const u8 = "",
     facilitator_url: []const u8 = "",
     facilitator_timeout_ms: u32 = 5_000,
 };

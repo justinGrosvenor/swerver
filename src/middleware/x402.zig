@@ -15,6 +15,7 @@ pub const Decision = union(enum) {
 pub const RoutePaymentConfig = struct {
     require_payment: bool = false,
     payment_required_b64: []const u8 = "",
+    payment_required_json: []const u8 = "",
     price: []const u8 = "",
     asset: []const u8 = "",
     network: []const u8 = "",
@@ -80,7 +81,7 @@ pub fn evaluate(req: request.RequestView, policy: Policy) Decision {
         }
     }
 
-    return .{ .reject = rejectWith(.missing_header, policy.payment_required_b64).resp };
+    return .{ .reject = rejectWith(.missing_header, policy).resp };
 }
 
 /// Validate payment header structure: must be valid base64 containing JSON
@@ -124,20 +125,28 @@ fn validatePaymentHeader(header_value: []const u8) bool {
     return true;
 }
 
-pub fn buildPaymentRequired(allocator: std.mem.Allocator, required: PaymentRequired) ![]u8 {
+pub const PaymentRequiredEncoded = struct {
+    b64: []u8,
+    json: []u8,
+};
+
+pub fn buildPaymentRequired(allocator: std.mem.Allocator, required: PaymentRequired) !PaymentRequiredEncoded {
     var json_list = std.ArrayList(u8).empty;
     var writer = std.Io.Writer.Allocating.fromArrayList(allocator, &json_list);
     defer writer.deinit();
     try std.json.Stringify.value(required, .{}, &writer.writer);
     json_list = writer.toArrayList();
 
+    const json_copy = try allocator.alloc(u8, json_list.items.len);
+    @memcpy(json_copy, json_list.items);
+
     const encoded_len = std.base64.standard.Encoder.calcSize(json_list.items.len);
-    const out = try allocator.alloc(u8, encoded_len);
-    _ = std.base64.standard.Encoder.encode(out, json_list.items);
-    return out;
+    const b64 = try allocator.alloc(u8, encoded_len);
+    _ = std.base64.standard.Encoder.encode(b64, json_list.items);
+    return .{ .b64 = b64, .json = json_copy };
 }
 
-pub fn demoPaymentRequiredB64(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
+pub fn demoPaymentRequiredB64(allocator: std.mem.Allocator, url: []const u8) !PaymentRequiredEncoded {
     const payload = PaymentRequired{
         .@"error" = "PAYMENT-SIGNATURE header is required",
         .resource = .{
@@ -176,10 +185,11 @@ pub fn configFromProxyRoute(proxy_x402: anytype, allocator: std.mem.Allocator, u
             .maxTimeoutSeconds = proxy_x402.max_timeout_seconds,
         }},
     };
-    const b64 = try buildPaymentRequired(allocator, payload);
+    const encoded = try buildPaymentRequired(allocator, payload);
     return .{
         .require_payment = true,
-        .payment_required_b64 = b64,
+        .payment_required_b64 = encoded.b64,
+        .payment_required_json = encoded.json,
         .price = proxy_x402.price,
         .asset = proxy_x402.asset,
         .network = proxy_x402.network,
@@ -189,12 +199,26 @@ pub fn configFromProxyRoute(proxy_x402: anytype, allocator: std.mem.Allocator, u
     };
 }
 
-fn rejectWith(reason: RejectReason, payload_b64: []const u8) RejectInfo {
+var reject_402_headers: [2]response.Header = undefined;
+
+fn rejectWith(reason: RejectReason, policy: RoutePaymentConfig) RejectInfo {
     const status: u16 = switch (reason) {
         .missing_header, .facilitator_rejected => 402,
         .malformed_header, .invalid_signature => 400,
         .facilitator_error => 500,
     };
+    if (status == 402 and policy.payment_required_json.len > 0) {
+        reject_402_headers[0] = .{ .name = "Content-Type", .value = "application/json" };
+        reject_402_headers[1] = .{ .name = "X-Payment-Required", .value = policy.payment_required_b64 };
+        return .{
+            .reason = reason,
+            .resp = .{
+                .status = 402,
+                .headers = &reject_402_headers,
+                .body = .{ .bytes = policy.payment_required_json },
+            },
+        };
+    }
     const body: []const u8 = switch (reason) {
         .missing_header => "Payment required",
         .malformed_header => "Invalid payment header",
@@ -206,10 +230,7 @@ fn rejectWith(reason: RejectReason, payload_b64: []const u8) RejectInfo {
         .reason = reason,
         .resp = .{
             .status = status,
-            .headers = if (status == 402)
-                &[_]response.Header{.{ .name = "PAYMENT-REQUIRED", .value = payload_b64 }}
-            else
-                &.{},
+            .headers = &.{},
             .body = .{ .bytes = body },
         },
     };
@@ -315,7 +336,7 @@ pub fn evaluateWithFacilitator(
         return .{
             .reject = rejectWith(
                 if (has_any) .malformed_header else .missing_header,
-                policy.payment_required_b64,
+                policy,
             ),
         };
     };
@@ -324,16 +345,16 @@ pub fn evaluateWithFacilitator(
     // hitting the facilitator.
     if (build_options.enable_x402_crypto and policy.pay_to.len > 0) {
         const decoded = decodePaymentHeader(payment_header) orelse
-            return .{ .reject = rejectWith(.malformed_header, policy.payment_required_b64) };
+            return .{ .reject = rejectWith(.malformed_header, policy) };
         if (!x402_crypto.verifyPaymentSignature(decoded, policy.pay_to)) {
-            return .{ .reject = rejectWith(.invalid_signature, policy.payment_required_b64) };
+            return .{ .reject = rejectWith(.invalid_signature, policy) };
         }
     }
 
     if (facilitator) |fac| {
         const result = facilitatorVerify(fac, payment_header, &policy);
         if (!result.is_valid) {
-            return .{ .reject = rejectWith(.facilitator_rejected, policy.payment_required_b64) };
+            return .{ .reject = rejectWith(.facilitator_rejected, policy) };
         }
         return .{ .allow = .{ .payment_header = payment_header, .needs_settlement = true } };
     }
@@ -1044,32 +1065,49 @@ test "x402: buildReceiptB64 encodes settlement" {
     try std.testing.expect(std.mem.indexOf(u8, decoded, "\"payer\":\"0xabc\"") != null);
 }
 
-test "x402: error differentiation - missing header = 402" {
-    const info = rejectWith(.missing_header, "dGVzdA==");
+test "x402: error differentiation - missing header = 402 with JSON body" {
+    const policy = RoutePaymentConfig{
+        .require_payment = true,
+        .payment_required_b64 = "dGVzdA==",
+        .payment_required_json = "{\"test\":true}",
+    };
+    const info = rejectWith(.missing_header, policy);
     try std.testing.expectEqual(@as(u16, 402), info.resp.status);
-    try std.testing.expect(info.resp.headers.len > 0);
-    try std.testing.expectEqualStrings("PAYMENT-REQUIRED", info.resp.headers[0].name);
+    try std.testing.expectEqual(@as(usize, 2), info.resp.headers.len);
+    try std.testing.expectEqualStrings("Content-Type", info.resp.headers[0].name);
+    try std.testing.expectEqualStrings("application/json", info.resp.headers[0].value);
+    try std.testing.expectEqualStrings("X-Payment-Required", info.resp.headers[1].name);
+    try std.testing.expectEqualStrings("dGVzdA==", info.resp.headers[1].value);
+    try std.testing.expectEqualStrings("{\"test\":true}", info.resp.bodyBytes());
 }
 
 test "x402: error differentiation - malformed header = 400" {
-    const info = rejectWith(.malformed_header, "dGVzdA==");
+    const policy = RoutePaymentConfig{ .require_payment = true, .payment_required_b64 = "dGVzdA==" };
+    const info = rejectWith(.malformed_header, policy);
     try std.testing.expectEqual(@as(u16, 400), info.resp.status);
     try std.testing.expectEqual(@as(usize, 0), info.resp.headers.len);
 }
 
 test "x402: error differentiation - invalid signature = 400" {
-    const info = rejectWith(.invalid_signature, "dGVzdA==");
+    const policy = RoutePaymentConfig{ .require_payment = true, .payment_required_b64 = "dGVzdA==" };
+    const info = rejectWith(.invalid_signature, policy);
     try std.testing.expectEqual(@as(u16, 400), info.resp.status);
 }
 
 test "x402: error differentiation - facilitator rejected = 402" {
-    const info = rejectWith(.facilitator_rejected, "dGVzdA==");
+    const policy = RoutePaymentConfig{
+        .require_payment = true,
+        .payment_required_b64 = "dGVzdA==",
+        .payment_required_json = "{\"test\":true}",
+    };
+    const info = rejectWith(.facilitator_rejected, policy);
     try std.testing.expectEqual(@as(u16, 402), info.resp.status);
     try std.testing.expect(info.resp.headers.len > 0);
 }
 
 test "x402: error differentiation - facilitator error = 500" {
-    const info = rejectWith(.facilitator_error, "dGVzdA==");
+    const policy = RoutePaymentConfig{ .require_payment = true, .payment_required_b64 = "dGVzdA==" };
+    const info = rejectWith(.facilitator_error, policy);
     try std.testing.expectEqual(@as(u16, 500), info.resp.status);
 }
 
