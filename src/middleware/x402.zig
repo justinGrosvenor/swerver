@@ -25,6 +25,8 @@ pub const RoutePaymentConfig = struct {
     max_timeout_seconds: u32 = 60,
     settlement_url: []const u8 = "",
     gateway_id: []const u8 = "",
+    extra_name: []const u8 = "",
+    extra_version: []const u8 = "",
 };
 
 pub const Policy = RoutePaymentConfig;
@@ -103,29 +105,24 @@ fn validatePaymentHeader(header_value: []const u8) bool {
     std.base64.standard.Decoder.decode(decode_buf[0..max_decoded], header_value) catch return false;
     const decoded = decode_buf[0..actual_len];
 
-    // Parse into a minimal typed shape. `ignore_unknown_fields = true` lets
-    // the payload carry scheme/network/chainId/etc. without us having to
-    // mirror every x402 field here — we only care that the two mandatory
-    // fields are present and syntactically well-formed JSON.
-    const MinimalPayment = struct {
-        signature: []const u8,
-        payload: std.json.Value,
-    };
-
-    // Stack-backed fixed buffer allocator. No `ArenaAllocator` wrapper
-    // because the FBA already owns all the memory and `parseFromSliceLeaky`
-    // is fine leaking into it — the whole buffer goes out of scope on return.
     var arena_buf: [16 * 1024]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&arena_buf);
 
-    _ = std.json.parseFromSliceLeaky(
-        MinimalPayment,
-        fba.allocator(),
-        decoded,
-        .{ .ignore_unknown_fields = true },
-    ) catch return false;
+    // v1: top-level { signature, payload }
+    const V1 = struct { signature: []const u8, payload: std.json.Value };
+    if (std.json.parseFromSliceLeaky(V1, fba.allocator(), decoded, .{ .ignore_unknown_fields = true })) |_| {
+        return true;
+    } else |_| {}
 
-    return true;
+    // v2: { x402Version, payload: { signature, ... } }
+    fba.reset();
+    const V2Payload = struct { signature: []const u8 };
+    const V2 = struct { x402Version: u32, payload: V2Payload };
+    if (std.json.parseFromSliceLeaky(V2, fba.allocator(), decoded, .{ .ignore_unknown_fields = true })) |_| {
+        return true;
+    } else |_| {}
+
+    return false;
 }
 
 pub const PaymentRequiredEncoded = struct {
@@ -186,6 +183,10 @@ pub fn configFromProxyRoute(proxy_x402: anytype, allocator: std.mem.Allocator, u
             .asset = proxy_x402.asset,
             .payTo = proxy_x402.pay_to,
             .maxTimeoutSeconds = proxy_x402.max_timeout_seconds,
+            .extra = if (proxy_x402.extra_name.len > 0) .{
+                .name = proxy_x402.extra_name,
+                .version = proxy_x402.extra_version,
+            } else null,
         }},
     };
     const encoded = try buildPaymentRequired(allocator, payload);
@@ -201,6 +202,8 @@ pub fn configFromProxyRoute(proxy_x402: anytype, allocator: std.mem.Allocator, u
         .max_timeout_seconds = proxy_x402.max_timeout_seconds,
         .settlement_url = proxy_x402.settlement_url,
         .gateway_id = proxy_x402.gateway_id,
+        .extra_name = proxy_x402.extra_name,
+        .extra_version = proxy_x402.extra_version,
     };
 }
 
@@ -214,7 +217,7 @@ fn rejectWith(reason: RejectReason, policy: RoutePaymentConfig) RejectInfo {
     };
     if (status == 402 and policy.payment_required_json.len > 0) {
         reject_402_headers[0] = .{ .name = "Content-Type", .value = "application/json" };
-        reject_402_headers[1] = .{ .name = "X-Payment-Required", .value = policy.payment_required_b64 };
+        reject_402_headers[1] = .{ .name = "Payment-Required", .value = policy.payment_required_b64 };
         return .{
             .reason = reason,
             .resp = .{
@@ -346,13 +349,16 @@ pub fn evaluateWithFacilitator(
         };
     };
 
-    // Local signature verification: fast-reject invalid signatures before
-    // hitting the facilitator.
+    // Local signature verification: fast-reject invalid v1 signatures
+    // before hitting the facilitator. v2 payloads use EIP-3009/Permit2
+    // typed data which requires on-chain verification via the facilitator.
     if (build_options.enable_x402_crypto and policy.pay_to.len > 0) {
         const decoded = decodePaymentHeader(payment_header) orelse
             return .{ .reject = rejectWith(.malformed_header, policy) };
-        if (!x402_crypto.verifyPaymentSignature(decoded, policy.pay_to)) {
-            return .{ .reject = rejectWith(.invalid_signature, policy) };
+        if (!isV2Payload(decoded)) {
+            if (!x402_crypto.verifyPaymentSignature(decoded, policy.pay_to)) {
+                return .{ .reject = rejectWith(.invalid_signature, policy) };
+            }
         }
     }
 
@@ -365,6 +371,10 @@ pub fn evaluateWithFacilitator(
     }
 
     return .{ .allow = .{ .payment_header = payment_header, .needs_settlement = false } };
+}
+
+fn isV2Payload(decoded: []const u8) bool {
+    return std.mem.indexOf(u8, decoded, "\"x402Version\"") != null;
 }
 
 fn findValidPaymentHeader(req: request.RequestView) ?[]const u8 {
@@ -466,13 +476,7 @@ fn facilitatorRoundTrip(config: FacilitatorConfig, req_bytes: []const u8, resp_b
         const n = net.recvBlocking(fd, resp_buf[total..]) catch break;
         if (n == 0) break;
         total += n;
-        if (std.mem.indexOf(u8, resp_buf[0..total], "\r\n\r\n") != null) {
-            if (findContentLength(resp_buf[0..total])) |expected| {
-                const header_end = std.mem.indexOf(u8, resp_buf[0..total], "\r\n\r\n").? + 4;
-                const body_received = total - header_end;
-                if (body_received >= expected) break;
-            } else break;
-        }
+        if (isHttpResponseComplete(resp_buf[0..total])) break;
     }
     return total;
 }
@@ -512,13 +516,7 @@ fn facilitatorRoundTripTls(fd: std.posix.fd_t, host: []const u8, req_bytes: []co
         const n = ffi.SSL_read(ssl, resp_buf[total..].ptr, @intCast(resp_buf.len - total));
         if (n <= 0) break;
         total += @intCast(n);
-        if (std.mem.indexOf(u8, resp_buf[0..total], "\r\n\r\n") != null) {
-            if (findContentLength(resp_buf[0..total])) |expected| {
-                const header_end = std.mem.indexOf(u8, resp_buf[0..total], "\r\n\r\n").? + 4;
-                const body_received = total - header_end;
-                if (body_received >= expected) break;
-            } else break;
-        }
+        if (isHttpResponseComplete(resp_buf[0..total])) break;
     }
     return total;
 }
@@ -535,54 +533,93 @@ fn findContentLength(http_response: []const u8) ?usize {
     return null;
 }
 
-fn buildSettleRequestJson(buf: []u8, payment_header: []const u8, policy: *const RoutePaymentConfig, charge_amount: []const u8) !usize {
-    const amount = if (std.mem.eql(u8, policy.scheme, "upto") and charge_amount.len > 0)
-        charge_amount
-    else
-        policy.price;
-    if (std.mem.eql(u8, policy.scheme, "upto") and charge_amount.len > 0) {
-        if (parseU64(charge_amount)) |charge| {
-            if (parseU64(policy.price)) |max| {
-                if (charge > max) return error.ChargeExceedsMax;
-            }
+fn isChunkedEncoding(http_response: []const u8) bool {
+    const header_end = std.mem.indexOf(u8, http_response, "\r\n\r\n") orelse return false;
+    const headers = http_response[0..header_end];
+    var it = std.mem.splitSequence(u8, headers, "\r\n");
+    while (it.next()) |line| {
+        if (line.len >= 26 and std.ascii.eqlIgnoreCase(line[0..19], "transfer-encoding: ")) {
+            return std.mem.indexOf(u8, line[19..], "chunked") != null;
         }
     }
+    return false;
+}
+
+fn isHttpResponseComplete(data: []const u8) bool {
+    const header_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse return false;
+    if (findContentLength(data)) |expected| {
+        const body_start = header_end + 4;
+        return data.len - body_start >= expected;
+    }
+    if (isChunkedEncoding(data)) {
+        return std.mem.indexOf(u8, data[header_end + 4 ..], "\r\n0\r\n") != null;
+    }
+    return true;
+}
+
+fn buildSettleRequestJson(buf: []u8, payment_header: []const u8, policy: *const RoutePaymentConfig, charge_amount: []const u8) !usize {
+    _ = charge_amount;
+    // Decode base64 payment header to get the raw JSON payload object
+    var decode_buf: [8192]u8 = undefined;
+    const max_decoded = std.base64.standard.Decoder.calcSizeUpperBound(payment_header.len) catch return error.BufferTooSmall;
+    if (max_decoded > decode_buf.len) return error.BufferTooSmall;
+    const actual_len = std.base64.standard.Decoder.calcSizeForSlice(payment_header) catch return error.BufferTooSmall;
+    std.base64.standard.Decoder.decode(decode_buf[0..max_decoded], payment_header) catch return error.BufferTooSmall;
+    const decoded_payload = decode_buf[0..actual_len];
+
     var off: usize = 0;
-    off += copyInto(buf[off..], "{\"x402Version\":2,\"paymentPayload\":\"");
-    off += jsonEscape(buf[off..], payment_header);
-    off += copyInto(buf[off..], "\",\"paymentRequirements\":{\"scheme\":\"");
+    off += copyInto(buf[off..], "{\"x402Version\":2,\"paymentPayload\":");
+    off += copyInto(buf[off..], decoded_payload);
+    off += copyInto(buf[off..], ",\"paymentRequirements\":{\"scheme\":\"");
     off += jsonEscape(buf[off..], policy.scheme);
     off += copyInto(buf[off..], "\",\"network\":\"");
     off += jsonEscape(buf[off..], policy.network);
-    off += copyInto(buf[off..], "\",\"maxAmountRequired\":\"");
+    off += copyInto(buf[off..], "\",\"amount\":\"");
     off += jsonEscape(buf[off..], policy.price);
-    off += copyInto(buf[off..], "\",\"resource\":{\"url\":\"\",\"description\":\"\",\"mimeType\":\"\"},\"asset\":\"");
+    off += copyInto(buf[off..], "\",\"asset\":\"");
     off += jsonEscape(buf[off..], policy.asset);
     off += copyInto(buf[off..], "\",\"payTo\":\"");
     off += jsonEscape(buf[off..], policy.pay_to);
-    const timeout = std.fmt.bufPrint(buf[off..], "\",\"maxTimeoutSeconds\":{d}}},\"settleAmount\":\"", .{policy.max_timeout_seconds}) catch return error.BufferTooSmall;
-    off += timeout.len;
-    off += jsonEscape(buf[off..], amount);
-    off += copyInto(buf[off..], "\"}");
+    if (policy.extra_name.len > 0) {
+        const tail = std.fmt.bufPrint(buf[off..], "\",\"maxTimeoutSeconds\":{d},\"extra\":{{\"name\":\"{s}\",\"version\":\"{s}\"}}}}}}", .{ policy.max_timeout_seconds, policy.extra_name, policy.extra_version }) catch return error.BufferTooSmall;
+        off += tail.len;
+    } else {
+        const tail = std.fmt.bufPrint(buf[off..], "\",\"maxTimeoutSeconds\":{d}}}}}", .{policy.max_timeout_seconds}) catch return error.BufferTooSmall;
+        off += tail.len;
+    }
     return off;
 }
 
 fn buildVerifyRequestJson(buf: []u8, payment_header: []const u8, policy: *const RoutePaymentConfig) !usize {
+    // Decode base64 payment header to get the raw JSON payload object.
+    // The facilitator expects paymentPayload as a JSON object, not a base64 string.
+    var decode_buf: [8192]u8 = undefined;
+    const max_decoded = std.base64.standard.Decoder.calcSizeUpperBound(payment_header.len) catch return error.BufferTooSmall;
+    if (max_decoded > decode_buf.len) return error.BufferTooSmall;
+    const actual_len = std.base64.standard.Decoder.calcSizeForSlice(payment_header) catch return error.BufferTooSmall;
+    std.base64.standard.Decoder.decode(decode_buf[0..max_decoded], payment_header) catch return error.BufferTooSmall;
+    const decoded_payload = decode_buf[0..actual_len];
+
     var off: usize = 0;
-    off += copyInto(buf[off..], "{\"x402Version\":2,\"paymentPayload\":\"");
-    off += jsonEscape(buf[off..], payment_header);
-    off += copyInto(buf[off..], "\",\"paymentRequirements\":{\"scheme\":\"");
+    off += copyInto(buf[off..], "{\"x402Version\":2,\"paymentPayload\":");
+    off += copyInto(buf[off..], decoded_payload);
+    off += copyInto(buf[off..], ",\"paymentRequirements\":{\"scheme\":\"");
     off += jsonEscape(buf[off..], policy.scheme);
     off += copyInto(buf[off..], "\",\"network\":\"");
     off += jsonEscape(buf[off..], policy.network);
-    off += copyInto(buf[off..], "\",\"maxAmountRequired\":\"");
+    off += copyInto(buf[off..], "\",\"amount\":\"");
     off += jsonEscape(buf[off..], policy.price);
-    off += copyInto(buf[off..], "\",\"resource\":{\"url\":\"\",\"description\":\"\",\"mimeType\":\"\"},\"asset\":\"");
+    off += copyInto(buf[off..], "\",\"asset\":\"");
     off += jsonEscape(buf[off..], policy.asset);
     off += copyInto(buf[off..], "\",\"payTo\":\"");
     off += jsonEscape(buf[off..], policy.pay_to);
-    const timeout = std.fmt.bufPrint(buf[off..], "\",\"maxTimeoutSeconds\":{d}}}}}", .{policy.max_timeout_seconds}) catch return error.BufferTooSmall;
-    off += timeout.len;
+    if (policy.extra_name.len > 0) {
+        const tail = std.fmt.bufPrint(buf[off..], "\",\"maxTimeoutSeconds\":{d},\"extra\":{{\"name\":\"{s}\",\"version\":\"{s}\"}}}}}}", .{ policy.max_timeout_seconds, policy.extra_name, policy.extra_version }) catch return error.BufferTooSmall;
+        off += tail.len;
+    } else {
+        const tail = std.fmt.bufPrint(buf[off..], "\",\"maxTimeoutSeconds\":{d}}}}}", .{policy.max_timeout_seconds}) catch return error.BufferTooSmall;
+        off += tail.len;
+    }
     return off;
 }
 
@@ -640,7 +677,20 @@ fn parseSettleResponse(http_response: []const u8) SettleResult {
 
 fn extractResponseBody(http_response: []const u8) ?[]const u8 {
     const sep = std.mem.indexOf(u8, http_response, "\r\n\r\n") orelse return null;
-    return http_response[sep + 4 ..];
+    const raw_body = http_response[sep + 4 ..];
+    if (isChunkedEncoding(http_response)) {
+        return decodeFirstChunk(raw_body);
+    }
+    return raw_body;
+}
+
+fn decodeFirstChunk(body: []const u8) ?[]const u8 {
+    const size_end = std.mem.indexOf(u8, body, "\r\n") orelse return null;
+    const chunk_size = std.fmt.parseInt(usize, body[0..size_end], 16) catch return null;
+    if (chunk_size == 0) return null;
+    const data_start = size_end + 2;
+    if (data_start + chunk_size > body.len) return null;
+    return body[data_start .. data_start + chunk_size];
 }
 
 fn extractStatusCode(http_response: []const u8) ?u16 {

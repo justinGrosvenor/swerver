@@ -159,6 +159,8 @@ pub const ProxyRouteX402 = struct {
     max_timeout_seconds: u32 = 60,
     settlement_url: []const u8 = "",
     gateway_id: []const u8 = "",
+    extra_name: []const u8 = "",
+    extra_version: []const u8 = "",
 };
 
 /// Path rewrite rule

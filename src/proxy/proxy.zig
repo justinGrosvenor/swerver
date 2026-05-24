@@ -121,7 +121,7 @@ pub const Proxy = struct {
 
         compress_ce_header = .{ .name = "Content-Encoding", .value = compress_mod.encodingName(encoding) };
         if (resp.headers.len < header_buf.len) {
-            @memcpy(header_buf[0..resp.headers.len], resp.headers);
+            std.mem.copyForwards(response.Header, header_buf[0..resp.headers.len], resp.headers);
             header_buf[resp.headers.len] = compress_ce_header;
             resp.headers = header_buf[0 .. resp.headers.len + 1];
         }

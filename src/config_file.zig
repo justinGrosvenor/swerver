@@ -286,6 +286,8 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
                 .max_timeout_seconds = x.max_timeout_seconds orelse 60,
                 .settlement_url = x.settlement_url orelse "",
                 .gateway_id = x.gateway_id orelse "",
+                .extra_name = x.extra_name orelse "",
+                .extra_version = x.extra_version orelse "",
             };
         }
 
@@ -599,6 +601,8 @@ const RouteX402Json = struct {
     max_timeout_seconds: ?u32 = null,
     settlement_url: ?[]const u8 = null,
     gateway_id: ?[]const u8 = null,
+    extra_name: ?[]const u8 = null,
+    extra_version: ?[]const u8 = null,
 };
 
 const UpstreamJson = struct {
