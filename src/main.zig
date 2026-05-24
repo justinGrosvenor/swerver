@@ -22,9 +22,21 @@ pub fn main(init: std.process.Init) !void {
                 std.log.err("invalid config URL: {s}", .{url});
                 return error.InvalidArgs;
             };
-            // Read auth token from environment — never passed on CLI
             if (std.c.getenv("SWERVER_CONFIG_TOKEN")) |t| uc.token = std.mem.sliceTo(t, 0);
             if (args.config_cache) |cp| uc.cache_path = cp;
+            for (args.config_headers[0..args.config_header_count]) |hdr| {
+                _ = uc.addHeader(hdr);
+            }
+            if (std.c.getenv("SWERVER_CONFIG_HEADERS")) |env_hdrs| {
+                const env_str: []const u8 = std.mem.sliceTo(env_hdrs, 0);
+                var pos: usize = 0;
+                while (pos < env_str.len) {
+                    const sep = std.mem.indexOfAnyPos(u8, env_str, pos, ",\n") orelse env_str.len;
+                    const hdr = std.mem.trim(u8, env_str[pos..sep], " \t\r");
+                    if (hdr.len > 0) _ = uc.addHeader(hdr);
+                    pos = sep + 1;
+                }
+            }
             url_config = uc;
 
             const bytes = swerver.config_fetch.fetchConfigBytes(allocator, uc) catch |err| {
@@ -155,6 +167,8 @@ const Args = struct {
     config_path: ?[]const u8,
     config_url: ?[]const u8,
     config_cache: ?[]const u8,
+    config_headers: [swerver.config_fetch.MAX_EXTRA_HEADERS][]const u8,
+    config_header_count: u8,
     cert_path: ?[:0]const u8,
     key_path: ?[:0]const u8,
 };
@@ -167,6 +181,8 @@ fn parseArgs(args: std.process.Args, allocator: std.mem.Allocator) !Args {
         .config_path = null,
         .config_url = null,
         .config_cache = null,
+        .config_headers = .{""} ** swerver.config_fetch.MAX_EXTRA_HEADERS,
+        .config_header_count = 0,
         .cert_path = null,
         .key_path = null,
     };
@@ -207,6 +223,17 @@ fn parseArgs(args: std.process.Args, allocator: std.mem.Allocator) !Args {
             result.config_cache = std.mem.sliceTo(value, 0);
         } else if (std.mem.startsWith(u8, arg, "--config-cache=")) {
             result.config_cache = arg["--config-cache=".len..];
+        } else if (std.mem.eql(u8, arg, "--config-header")) {
+            const value = it.next() orelse return error.InvalidArgs;
+            if (result.config_header_count < swerver.config_fetch.MAX_EXTRA_HEADERS) {
+                result.config_headers[result.config_header_count] = std.mem.sliceTo(value, 0);
+                result.config_header_count += 1;
+            }
+        } else if (std.mem.startsWith(u8, arg, "--config-header=")) {
+            if (result.config_header_count < swerver.config_fetch.MAX_EXTRA_HEADERS) {
+                result.config_headers[result.config_header_count] = arg["--config-header=".len..];
+                result.config_header_count += 1;
+            }
         } else if (std.mem.eql(u8, arg, "--cert")) {
             const value = it.next() orelse return error.InvalidCertPath;
             result.cert_path = std.mem.sliceTo(value, 0);

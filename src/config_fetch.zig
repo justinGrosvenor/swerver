@@ -4,6 +4,8 @@ const clock = @import("runtime/clock.zig");
 const ffi = @import("tls/ffi.zig");
 const build_options = @import("build_options");
 
+pub const MAX_EXTRA_HEADERS = 8;
+
 pub const UrlConfig = struct {
     url: []const u8 = "",
     host: []const u8 = "",
@@ -13,6 +15,15 @@ pub const UrlConfig = struct {
     token: []const u8 = "",
     timeout_ms: u32 = 10_000,
     cache_path: ?[]const u8 = null,
+    extra_headers: [MAX_EXTRA_HEADERS][]const u8 = .{""} ** MAX_EXTRA_HEADERS,
+    extra_header_count: u8 = 0,
+
+    pub fn addHeader(self: *UrlConfig, header: []const u8) bool {
+        if (self.extra_header_count >= MAX_EXTRA_HEADERS) return false;
+        self.extra_headers[self.extra_header_count] = header;
+        self.extra_header_count += 1;
+        return true;
+    }
 };
 
 pub const ConfigSource = union(enum) {
@@ -227,18 +238,25 @@ fn receiveAndExtractBody(allocator: std.mem.Allocator, fd: std.posix.fd_t, sourc
 }
 
 fn buildGetRequest(buf: []u8, config: UrlConfig) ![]const u8 {
+    var off: usize = 0;
+    const preamble = std.fmt.bufPrint(buf, "GET {s} HTTP/1.1\r\nHost: {s}\r\n", .{ config.path, config.host }) catch return error.BufferTooSmall;
+    off += preamble.len;
     if (config.token.len > 0) {
-        const result = std.fmt.bufPrint(buf,
-            "GET {s} HTTP/1.1\r\nHost: {s}\r\nAuthorization: Bearer {s}\r\nUser-Agent: swerver/1.0\r\nConnection: close\r\n\r\n",
-            .{ config.path, config.host, config.token },
-        ) catch return error.BufferTooSmall;
-        return result;
+        const auth = std.fmt.bufPrint(buf[off..], "Authorization: Bearer {s}\r\n", .{config.token}) catch return error.BufferTooSmall;
+        off += auth.len;
     }
-    const result = std.fmt.bufPrint(buf,
-        "GET {s} HTTP/1.1\r\nHost: {s}\r\nUser-Agent: swerver/1.0\r\nConnection: close\r\n\r\n",
-        .{ config.path, config.host },
-    ) catch return error.BufferTooSmall;
-    return result;
+    for (config.extra_headers[0..config.extra_header_count]) |hdr| {
+        if (hdr.len == 0) continue;
+        if (off + hdr.len + 2 > buf.len) return error.BufferTooSmall;
+        @memcpy(buf[off..][0..hdr.len], hdr);
+        off += hdr.len;
+        buf[off] = '\r';
+        buf[off + 1] = '\n';
+        off += 2;
+    }
+    const suffix = std.fmt.bufPrint(buf[off..], "User-Agent: swerver/1.0\r\nConnection: close\r\n\r\n", .{}) catch return error.BufferTooSmall;
+    off += suffix.len;
+    return buf[0..off];
 }
 
 fn extractStatusCode(response: []const u8) ?u16 {
