@@ -1,8 +1,10 @@
 const std = @import("std");
 const net = @import("runtime/net.zig");
 const clock = @import("runtime/clock.zig");
-const ffi = @import("tls/ffi.zig");
 const build_options = @import("build_options");
+const ffi = if (build_options.enable_tls) @import("tls/ffi.zig") else struct {
+    pub const SSL = opaque {};
+};
 
 pub const MAX_EXTRA_HEADERS = 8;
 
@@ -155,19 +157,23 @@ fn fetchTls(allocator: std.mem.Allocator, fd: std.posix.fd_t, url_config: UrlCon
     return receiveAndExtractBody(allocator, fd, .{ .tls = ssl });
 }
 
-const ReadSource = union(enum) {
-    plain: void,
-    tls: *ffi.SSL,
-};
+const ReadSource = if (build_options.enable_tls)
+    union(enum) { plain: void, tls: *ffi.SSL }
+else
+    union(enum) { plain: void };
 
 fn readOnce(source: ReadSource, fd: std.posix.fd_t, buf: []u8) !usize {
-    switch (source) {
-        .plain => return net.recvBlocking(fd, buf) catch return error.RecvFailed,
-        .tls => |ssl| {
-            const n = ffi.SSL_read(ssl, buf.ptr, @intCast(buf.len));
-            if (n <= 0) return 0;
-            return @intCast(n);
-        },
+    if (build_options.enable_tls) {
+        switch (source) {
+            .plain => return net.recvBlocking(fd, buf) catch return error.RecvFailed,
+            .tls => |ssl| {
+                const n = ffi.SSL_read(ssl, buf.ptr, @intCast(buf.len));
+                if (n <= 0) return 0;
+                return @intCast(n);
+            },
+        }
+    } else {
+        return net.recvBlocking(fd, buf) catch return error.RecvFailed;
     }
 }
 
