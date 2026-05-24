@@ -453,7 +453,7 @@ fn evaluateForwardAuth(req: request.RequestView, cfg: ForwardAuthConfig) AuthRes
 
     const parsed = parseUrl(cfg.url, &host_buf, &url_buf) orelse return .{ .reject = UNAUTHORIZED };
 
-    const fd = net.connectBlocking(parsed.host, parsed.port, cfg.timeout_ms) catch {
+    const fd = net.connectBlockingValidated(parsed.host, parsed.port, cfg.timeout_ms) catch {
         return .{ .reject = UNAUTHORIZED };
     };
     defer clock.closeFd(fd);

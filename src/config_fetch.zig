@@ -88,7 +88,7 @@ pub fn fetchConfigBytes(allocator: std.mem.Allocator, url_config: UrlConfig) Fet
         std.log.warn("fetching config over plaintext HTTP — this is insecure", .{});
     }
 
-    const fd = net.connectBlocking(url_config.host, url_config.port, url_config.timeout_ms) catch
+    const fd = net.connectBlockingValidated(url_config.host, url_config.port, url_config.timeout_ms) catch
         return error.ConnectFailed;
     defer clock.closeFd(fd);
 

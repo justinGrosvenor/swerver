@@ -445,7 +445,7 @@ fn buildReceiptB64(settle: *const SettleResult) ?[]const u8 {
 }
 
 fn facilitatorRoundTrip(config: FacilitatorConfig, req_bytes: []const u8, resp_buf: []u8) !usize {
-    const fd = net.connectBlocking(config.host, config.port, config.timeout_ms) catch
+    const fd = net.connectBlockingValidated(config.host, config.port, config.timeout_ms) catch
         return error.ConnectFailed;
     defer clock.closeFd(fd);
 

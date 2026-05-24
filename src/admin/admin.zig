@@ -698,6 +698,7 @@ fn writeFileContents(path: []const u8, data: []const u8) !void {
         }
         written += @intCast(rc);
     }
+    _ = std.c.fsync(fd);
     clock.closeFd(fd);
 
     var path_z: [4096:0]u8 = undefined;

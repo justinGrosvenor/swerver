@@ -125,6 +125,8 @@ pub const Server = struct {
     proxy: ?*proxy_mod.Proxy = null,
     /// Admin API listener (null if admin API not enabled)
     admin_listener_fd: ?std.posix.fd_t = null,
+    /// Spare FD for EMFILE recovery — closed temporarily to accept+close one connection
+    spare_fd: ?std.posix.fd_t = null,
     /// OpenTelemetry trace exporter (null if otel not enabled)
     otel: ?*otel_mod.TraceExporter = null,
     /// Config source for hot reload (null if not using external config)
@@ -693,7 +695,10 @@ pub const Server = struct {
     }
 
     pub fn closeConnection(self: *Server, conn: *connection.Connection) void {
-        // Clean up TLS session before closing the socket
+        if (conn.ip_hash != 0) {
+            accept_mod.ip_tracker.decrement(conn.ip_hash);
+            conn.ip_hash = 0;
+        }
         conn.cleanupTls();
         if (conn.fd) |fd| {
             _ = self.io.unregister(fd) catch {};

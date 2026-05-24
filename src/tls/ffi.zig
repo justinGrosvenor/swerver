@@ -98,6 +98,7 @@ extern fn SSL_CTX_check_private_key(ctx: *SSL_CTX) c_int;
 extern fn SSL_CTX_set_alpn_select_cb(ctx: *SSL_CTX, cb: AlpnSelectCallback, arg: ?*anyopaque) void;
 extern fn SSL_CTX_ctrl(ctx: *SSL_CTX, cmd: c_int, larg: c_long, parg: ?*anyopaque) c_long;
 extern fn SSL_CTX_set_ciphersuites(ctx: *SSL_CTX, str: [*:0]const u8) c_int;
+extern fn SSL_CTX_set_cipher_list(ctx: *SSL_CTX, str: [*:0]const u8) c_int;
 extern fn SSL_CTX_set_alpn_protos(ctx: *SSL_CTX, protos: [*]const u8, protos_len: c_uint) c_int;
 
 // SNI (Server Name Indication)
@@ -500,6 +501,10 @@ pub fn createTcpContext(is_server: bool) !*SSL_CTX {
 
     _ = SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, TLS1_2_VERSION, null);
     _ = SSL_CTX_ctrl(ctx, SSL_CTRL_OPTIONS, SSL_OP_NO_COMPRESSION | SSL_OP_NO_RENEGOTIATION, null);
+
+    try setCiphersuites(ctx, "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256");
+    if (SSL_CTX_set_cipher_list(ctx, "ECDHE+AESGCM:ECDHE+CHACHA20:!aNULL:!MD5:!RC4") != 1)
+        return error.CipherConfigFailed;
 
     if (is_server) {
         SSL_CTX_set_alpn_select_cb(ctx, tcpAlpnSelectCallback, null);

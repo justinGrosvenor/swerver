@@ -21,6 +21,10 @@ pub const ServerConfig = struct {
     allowed_hosts: []const []const u8 = &.{},
     /// Number of worker processes. 1 = single-process (no fork). 0 = auto-detect CPU count.
     workers: u16 = 1,
+    /// Max connections per IP address. 0 = unlimited.
+    per_ip_limit: u16 = 0,
+    /// Graceful shutdown drain timeout in milliseconds.
+    drain_timeout_ms: u32 = 30_000,
     /// Disable security headers, metrics, and access logging middleware.
     /// Use for pure benchmark mode where middleware overhead matters.
     disable_middleware: bool = false,
