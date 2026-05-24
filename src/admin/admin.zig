@@ -216,9 +216,11 @@ fn addRoute(server: *Server, body: []const u8, buf: []u8) DispatchResult {
     writeConfigAndReload(server, alloc, tree, config_path, config_file) catch
         return .{ .status = 500, .body = "{\"error\":\"failed to write config\"}" };
 
-    const n = std.fmt.bufPrint(buf, "{{\"ok\":true,\"route\":\"{s}\"}}", .{prefix}) catch
-        return .{ .status = 201, .body = "{\"ok\":true}" };
-    return .{ .status = 201, .body = n };
+    var off: usize = 0;
+    off += copyInto(buf[off..], "{\"ok\":true,\"route\":\"");
+    off += copyEscaped(buf[off..], prefix);
+    off += copyInto(buf[off..], "\"}");
+    return .{ .status = 201, .body = buf[0..off] };
 }
 
 fn deleteRoute(server: *Server, path: []const u8, buf: []u8) DispatchResult {
@@ -259,9 +261,11 @@ fn deleteRoute(server: *Server, path: []const u8, buf: []u8) DispatchResult {
     writeConfigAndReload(server, alloc, tree, config_path, config_file) catch
         return .{ .status = 500, .body = "{\"error\":\"failed to write config\"}" };
 
-    const n = std.fmt.bufPrint(buf, "{{\"ok\":true,\"deleted\":\"{s}\"}}", .{prefix}) catch
-        return .{ .status = 200, .body = "{\"ok\":true}" };
-    return .{ .status = 200, .body = n };
+    var off: usize = 0;
+    off += copyInto(buf[off..], "{\"ok\":true,\"deleted\":\"");
+    off += copyEscaped(buf[off..], prefix);
+    off += copyInto(buf[off..], "\"}");
+    return .{ .status = 200, .body = buf[0..off] };
 }
 
 fn listUpstreams(server: *Server, buf: []u8) DispatchResult {
@@ -314,9 +318,11 @@ fn addUpstream(server: *Server, body: []const u8, buf: []u8) DispatchResult {
     writeConfigAndReload(server, alloc, tree, config_path, config_file) catch
         return .{ .status = 500, .body = "{\"error\":\"failed to write config\"}" };
 
-    const n = std.fmt.bufPrint(buf, "{{\"ok\":true,\"upstream\":\"{s}\"}}", .{name}) catch
-        return .{ .status = 201, .body = "{\"ok\":true}" };
-    return .{ .status = 201, .body = n };
+    var off: usize = 0;
+    off += copyInto(buf[off..], "{\"ok\":true,\"upstream\":\"");
+    off += copyEscaped(buf[off..], name);
+    off += copyInto(buf[off..], "\"}");
+    return .{ .status = 201, .body = buf[0..off] };
 }
 
 fn deleteUpstream(server: *Server, path: []const u8, buf: []u8) DispatchResult {
@@ -357,9 +363,11 @@ fn deleteUpstream(server: *Server, path: []const u8, buf: []u8) DispatchResult {
     writeConfigAndReload(server, alloc, tree, config_path, config_file) catch
         return .{ .status = 500, .body = "{\"error\":\"failed to write config\"}" };
 
-    const n = std.fmt.bufPrint(buf, "{{\"ok\":true,\"deleted\":\"{s}\"}}", .{name}) catch
-        return .{ .status = 200, .body = "{\"ok\":true}" };
-    return .{ .status = 200, .body = n };
+    var off: usize = 0;
+    off += copyInto(buf[off..], "{\"ok\":true,\"deleted\":\"");
+    off += copyEscaped(buf[off..], name);
+    off += copyInto(buf[off..], "\"}");
+    return .{ .status = 200, .body = buf[0..off] };
 }
 
 fn getStatus(server: *Server, buf: []u8) DispatchResult {
@@ -579,8 +587,10 @@ fn writeRouteJson(buf: []u8, route: upstream_mod.ProxyRoute) usize {
         off += copyInto(buf[off..], ",\"traffic_split\":[");
         for (ts, 0..) |t, i| {
             if (i > 0) off += copyInto(buf[off..], ",");
-            const n = std.fmt.bufPrint(buf[off..], "{{\"upstream\":\"{s}\",\"weight\":{d}}}", .{ t.upstream, t.weight }) catch break;
-            off += n.len;
+            off += copyInto(buf[off..], "{\"upstream\":\"");
+            off += copyEscaped(buf[off..], t.upstream);
+            const w = std.fmt.bufPrint(buf[off..], "\",\"weight\":{d}}}", .{t.weight}) catch break;
+            off += w.len;
         }
         off += copyInto(buf[off..], "]");
     }
@@ -613,8 +623,10 @@ fn writeUpstreamJson(buf: []u8, u: upstream_mod.Upstream) usize {
     off += copyInto(buf[off..], "\",\"servers\":[");
     for (u.servers, 0..) |s, i| {
         if (i > 0) off += copyInto(buf[off..], ",");
-        const n = std.fmt.bufPrint(buf[off..], "{{\"address\":\"{s}\",\"port\":{d},\"weight\":{d}}}", .{ s.address, s.port, s.weight }) catch break;
-        off += n.len;
+        off += copyInto(buf[off..], "{\"address\":\"");
+        off += copyEscaped(buf[off..], s.address);
+        const sv = std.fmt.bufPrint(buf[off..], "\",\"port\":{d},\"weight\":{d}}}", .{ s.port, s.weight }) catch break;
+        off += sv.len;
     }
     off += copyInto(buf[off..], "]");
     const lb_name: []const u8 = switch (u.load_balancer) {

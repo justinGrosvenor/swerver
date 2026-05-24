@@ -487,7 +487,7 @@ pub fn setNonBlocking(fd: std.posix.fd_t) NonBlockingError!void {
 /// (avoids 40 ms delayed-ACK on multi-frame writes) because HEADERS +
 /// DATA go out without Nagle batching. Failure is swallowed: TCP_NODELAY
 /// is an optimization, not a correctness requirement.
-fn setNoDelay(fd: std.posix.fd_t) void {
+pub fn setNoDelay(fd: std.posix.fd_t) void {
     const opt: c_int = 1;
     std.posix.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&opt)) catch {};
 }

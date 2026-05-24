@@ -4,6 +4,7 @@ const response = @import("../response/response.zig");
 const request = @import("../protocol/request.zig");
 const net = @import("../runtime/net.zig");
 const clock = @import("../runtime/clock.zig");
+const json_write = @import("../runtime/json_write.zig");
 const ffi = if (build_options.enable_tls) @import("../tls/ffi.zig") else struct {};
 const x402_crypto = if (build_options.enable_x402_crypto) @import("x402_crypto.zig") else struct {};
 
@@ -535,17 +536,50 @@ fn buildSettleRequestJson(buf: []u8, payment_header: []const u8, policy: *const 
         charge_amount
     else
         policy.price;
-    const result = std.fmt.bufPrint(buf,
-        \\{{"x402Version":2,"paymentPayload":"{s}","paymentRequirements":{{"scheme":"{s}","network":"{s}","maxAmountRequired":"{s}","resource":{{"url":"","description":"","mimeType":""}},"asset":"{s}","payTo":"{s}","maxTimeoutSeconds":{d}}},"settleAmount":"{s}"}}
-    , .{ payment_header, policy.scheme, policy.network, policy.price, policy.asset, policy.pay_to, policy.max_timeout_seconds, amount }) catch return error.BufferTooSmall;
-    return result.len;
+    if (std.mem.eql(u8, policy.scheme, "upto") and charge_amount.len > 0) {
+        if (parseU64(charge_amount)) |charge| {
+            if (parseU64(policy.price)) |max| {
+                if (charge > max) return error.ChargeExceedsMax;
+            }
+        }
+    }
+    var off: usize = 0;
+    off += copyInto(buf[off..], "{\"x402Version\":2,\"paymentPayload\":\"");
+    off += jsonEscape(buf[off..], payment_header);
+    off += copyInto(buf[off..], "\",\"paymentRequirements\":{\"scheme\":\"");
+    off += jsonEscape(buf[off..], policy.scheme);
+    off += copyInto(buf[off..], "\",\"network\":\"");
+    off += jsonEscape(buf[off..], policy.network);
+    off += copyInto(buf[off..], "\",\"maxAmountRequired\":\"");
+    off += jsonEscape(buf[off..], policy.price);
+    off += copyInto(buf[off..], "\",\"resource\":{\"url\":\"\",\"description\":\"\",\"mimeType\":\"\"},\"asset\":\"");
+    off += jsonEscape(buf[off..], policy.asset);
+    off += copyInto(buf[off..], "\",\"payTo\":\"");
+    off += jsonEscape(buf[off..], policy.pay_to);
+    const timeout = std.fmt.bufPrint(buf[off..], "\",\"maxTimeoutSeconds\":{d}}},\"settleAmount\":\"", .{policy.max_timeout_seconds}) catch return error.BufferTooSmall;
+    off += timeout.len;
+    off += jsonEscape(buf[off..], amount);
+    off += copyInto(buf[off..], "\"}");
+    return off;
 }
 
 fn buildVerifyRequestJson(buf: []u8, payment_header: []const u8, policy: *const RoutePaymentConfig) !usize {
-    const result = std.fmt.bufPrint(buf,
-        \\{{"x402Version":2,"paymentPayload":"{s}","paymentRequirements":{{"scheme":"{s}","network":"{s}","maxAmountRequired":"{s}","resource":{{"url":"","description":"","mimeType":""}},"asset":"{s}","payTo":"{s}","maxTimeoutSeconds":{d}}}}}
-    , .{ payment_header, policy.scheme, policy.network, policy.price, policy.asset, policy.pay_to, policy.max_timeout_seconds }) catch return error.BufferTooSmall;
-    return result.len;
+    var off: usize = 0;
+    off += copyInto(buf[off..], "{\"x402Version\":2,\"paymentPayload\":\"");
+    off += jsonEscape(buf[off..], payment_header);
+    off += copyInto(buf[off..], "\",\"paymentRequirements\":{\"scheme\":\"");
+    off += jsonEscape(buf[off..], policy.scheme);
+    off += copyInto(buf[off..], "\",\"network\":\"");
+    off += jsonEscape(buf[off..], policy.network);
+    off += copyInto(buf[off..], "\",\"maxAmountRequired\":\"");
+    off += jsonEscape(buf[off..], policy.price);
+    off += copyInto(buf[off..], "\",\"resource\":{\"url\":\"\",\"description\":\"\",\"mimeType\":\"\"},\"asset\":\"");
+    off += jsonEscape(buf[off..], policy.asset);
+    off += copyInto(buf[off..], "\",\"payTo\":\"");
+    off += jsonEscape(buf[off..], policy.pay_to);
+    const timeout = std.fmt.bufPrint(buf[off..], "\",\"maxTimeoutSeconds\":{d}}}}}", .{policy.max_timeout_seconds}) catch return error.BufferTooSmall;
+    off += timeout.len;
+    return off;
 }
 
 fn buildFacilitatorPost(buf: []u8, config: FacilitatorConfig, endpoint: []const u8, body: []const u8) !usize {
@@ -609,6 +643,21 @@ fn extractStatusCode(http_response: []const u8) ?u16 {
     if (http_response.len < 12) return null;
     if (!std.mem.startsWith(u8, http_response, "HTTP/1.")) return null;
     return std.fmt.parseInt(u16, http_response[9..12], 10) catch null;
+}
+
+fn copyInto(dst: []u8, src: []const u8) usize {
+    const n = @min(dst.len, src.len);
+    @memcpy(dst[0..n], src[0..n]);
+    return n;
+}
+
+fn jsonEscape(dst: []u8, src: []const u8) usize {
+    const escaped = json_write.writeEscaped(dst, src) catch return 0;
+    return escaped.len;
+}
+
+fn parseU64(s: []const u8) ?u64 {
+    return std.fmt.parseInt(u64, s, 10) catch null;
 }
 
 // ============================================================
@@ -1166,6 +1215,19 @@ test "x402: buildSettleRequestJson upto with empty charge falls back to price" {
     const json = buf[0..len];
     // No charge_amount provided, falls back to configured price
     try std.testing.expect(std.mem.indexOf(u8, json, "\"settleAmount\":\"100000\"") != null);
+}
+
+test "x402: buildSettleRequestJson rejects charge exceeding max" {
+    const policy = RoutePaymentConfig{
+        .require_payment = true,
+        .price = "100000",
+        .asset = "0xUSDC",
+        .network = "eip155:8453",
+        .pay_to = "0xRecv",
+        .scheme = "upto",
+    };
+    var buf: [4096]u8 = undefined;
+    try std.testing.expectError(error.ChargeExceedsMax, buildSettleRequestJson(&buf, "payment_b64", &policy, "999999"));
 }
 
 fn encodeJson(json: []const u8) []const u8 {
