@@ -4,6 +4,7 @@ const response = @import("../response/response.zig");
 const request = @import("../protocol/request.zig");
 const net = @import("../runtime/net.zig");
 const clock = @import("../runtime/clock.zig");
+const json_write = @import("../runtime/json_write.zig");
 const ffi = if (build_options.enable_tls) @import("../tls/ffi.zig") else struct {};
 const x402_crypto = if (build_options.enable_x402_crypto) @import("x402_crypto.zig") else struct {};
 
@@ -15,6 +16,7 @@ pub const Decision = union(enum) {
 pub const RoutePaymentConfig = struct {
     require_payment: bool = false,
     payment_required_b64: []const u8 = "",
+    payment_required_json: []const u8 = "",
     price: []const u8 = "",
     asset: []const u8 = "",
     network: []const u8 = "",
@@ -80,7 +82,7 @@ pub fn evaluate(req: request.RequestView, policy: Policy) Decision {
         }
     }
 
-    return .{ .reject = rejectWith(.missing_header, policy.payment_required_b64).resp };
+    return .{ .reject = rejectWith(.missing_header, policy).resp };
 }
 
 /// Validate payment header structure: must be valid base64 containing JSON
@@ -124,20 +126,28 @@ fn validatePaymentHeader(header_value: []const u8) bool {
     return true;
 }
 
-pub fn buildPaymentRequired(allocator: std.mem.Allocator, required: PaymentRequired) ![]u8 {
+pub const PaymentRequiredEncoded = struct {
+    b64: []u8,
+    json: []u8,
+};
+
+pub fn buildPaymentRequired(allocator: std.mem.Allocator, required: PaymentRequired) !PaymentRequiredEncoded {
     var json_list = std.ArrayList(u8).empty;
     var writer = std.Io.Writer.Allocating.fromArrayList(allocator, &json_list);
     defer writer.deinit();
     try std.json.Stringify.value(required, .{}, &writer.writer);
     json_list = writer.toArrayList();
 
+    const json_copy = try allocator.alloc(u8, json_list.items.len);
+    @memcpy(json_copy, json_list.items);
+
     const encoded_len = std.base64.standard.Encoder.calcSize(json_list.items.len);
-    const out = try allocator.alloc(u8, encoded_len);
-    _ = std.base64.standard.Encoder.encode(out, json_list.items);
-    return out;
+    const b64 = try allocator.alloc(u8, encoded_len);
+    _ = std.base64.standard.Encoder.encode(b64, json_list.items);
+    return .{ .b64 = b64, .json = json_copy };
 }
 
-pub fn demoPaymentRequiredB64(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
+pub fn demoPaymentRequiredB64(allocator: std.mem.Allocator, url: []const u8) !PaymentRequiredEncoded {
     const payload = PaymentRequired{
         .@"error" = "PAYMENT-SIGNATURE header is required",
         .resource = .{
@@ -176,10 +186,11 @@ pub fn configFromProxyRoute(proxy_x402: anytype, allocator: std.mem.Allocator, u
             .maxTimeoutSeconds = proxy_x402.max_timeout_seconds,
         }},
     };
-    const b64 = try buildPaymentRequired(allocator, payload);
+    const encoded = try buildPaymentRequired(allocator, payload);
     return .{
         .require_payment = true,
-        .payment_required_b64 = b64,
+        .payment_required_b64 = encoded.b64,
+        .payment_required_json = encoded.json,
         .price = proxy_x402.price,
         .asset = proxy_x402.asset,
         .network = proxy_x402.network,
@@ -189,12 +200,26 @@ pub fn configFromProxyRoute(proxy_x402: anytype, allocator: std.mem.Allocator, u
     };
 }
 
-fn rejectWith(reason: RejectReason, payload_b64: []const u8) RejectInfo {
+var reject_402_headers: [2]response.Header = undefined;
+
+fn rejectWith(reason: RejectReason, policy: RoutePaymentConfig) RejectInfo {
     const status: u16 = switch (reason) {
         .missing_header, .facilitator_rejected => 402,
         .malformed_header, .invalid_signature => 400,
         .facilitator_error => 500,
     };
+    if (status == 402 and policy.payment_required_json.len > 0) {
+        reject_402_headers[0] = .{ .name = "Content-Type", .value = "application/json" };
+        reject_402_headers[1] = .{ .name = "X-Payment-Required", .value = policy.payment_required_b64 };
+        return .{
+            .reason = reason,
+            .resp = .{
+                .status = 402,
+                .headers = &reject_402_headers,
+                .body = .{ .bytes = policy.payment_required_json },
+            },
+        };
+    }
     const body: []const u8 = switch (reason) {
         .missing_header => "Payment required",
         .malformed_header => "Invalid payment header",
@@ -206,10 +231,7 @@ fn rejectWith(reason: RejectReason, payload_b64: []const u8) RejectInfo {
         .reason = reason,
         .resp = .{
             .status = status,
-            .headers = if (status == 402)
-                &[_]response.Header{.{ .name = "PAYMENT-REQUIRED", .value = payload_b64 }}
-            else
-                &.{},
+            .headers = &.{},
             .body = .{ .bytes = body },
         },
     };
@@ -315,7 +337,7 @@ pub fn evaluateWithFacilitator(
         return .{
             .reject = rejectWith(
                 if (has_any) .malformed_header else .missing_header,
-                policy.payment_required_b64,
+                policy,
             ),
         };
     };
@@ -324,16 +346,16 @@ pub fn evaluateWithFacilitator(
     // hitting the facilitator.
     if (build_options.enable_x402_crypto and policy.pay_to.len > 0) {
         const decoded = decodePaymentHeader(payment_header) orelse
-            return .{ .reject = rejectWith(.malformed_header, policy.payment_required_b64) };
+            return .{ .reject = rejectWith(.malformed_header, policy) };
         if (!x402_crypto.verifyPaymentSignature(decoded, policy.pay_to)) {
-            return .{ .reject = rejectWith(.invalid_signature, policy.payment_required_b64) };
+            return .{ .reject = rejectWith(.invalid_signature, policy) };
         }
     }
 
     if (facilitator) |fac| {
         const result = facilitatorVerify(fac, payment_header, &policy);
         if (!result.is_valid) {
-            return .{ .reject = rejectWith(.facilitator_rejected, policy.payment_required_b64) };
+            return .{ .reject = rejectWith(.facilitator_rejected, policy) };
         }
         return .{ .allow = .{ .payment_header = payment_header, .needs_settlement = true } };
     }
@@ -423,14 +445,14 @@ fn buildReceiptB64(settle: *const SettleResult) ?[]const u8 {
 }
 
 fn facilitatorRoundTrip(config: FacilitatorConfig, req_bytes: []const u8, resp_buf: []u8) !usize {
-    const fd = net.connectBlocking(config.host, config.port, config.timeout_ms) catch
+    const fd = net.connectBlockingValidated(config.host, config.port, config.timeout_ms) catch
         return error.ConnectFailed;
     defer clock.closeFd(fd);
 
     net.setSocketTimeouts(fd, config.timeout_ms, config.timeout_ms);
 
     if (config.use_tls and build_options.enable_tls) {
-        return facilitatorRoundTripTls(fd, req_bytes, resp_buf);
+        return facilitatorRoundTripTls(fd, config.host, req_bytes, resp_buf);
     }
 
     net.sendAll(fd, req_bytes) catch return error.SendFailed;
@@ -451,16 +473,24 @@ fn facilitatorRoundTrip(config: FacilitatorConfig, req_bytes: []const u8, resp_b
     return total;
 }
 
-fn facilitatorRoundTripTls(fd: std.posix.fd_t, req_bytes: []const u8, resp_buf: []u8) !usize {
+fn facilitatorRoundTripTls(fd: std.posix.fd_t, host: []const u8, req_bytes: []const u8, resp_buf: []u8) !usize {
     if (!build_options.enable_tls) return error.TlsNotEnabled;
 
     const ctx = ffi.SSL_CTX_new(ffi.TLS_client_method()) orelse return error.TlsInitFailed;
     defer ffi.SSL_CTX_free(ctx);
     ffi.loadDefaultVerifyPaths(ctx) catch return error.TlsInitFailed;
-    ffi.setVerifyPeer(ctx, false);
+    ffi.setVerifyPeer(ctx, true);
 
     const ssl = ffi.SSL_new(ctx) orelse return error.TlsInitFailed;
     defer ffi.SSL_free(ssl);
+
+    var host_z: [253:0]u8 = undefined;
+    if (host.len >= host_z.len) return error.TlsInitFailed;
+    @memcpy(host_z[0..host.len], host);
+    host_z[host.len] = 0;
+    const host_sentinel: [:0]const u8 = host_z[0..host.len :0];
+    if (!ffi.setHostnameVerification(ssl, host_sentinel)) return error.TlsInitFailed;
+    if (!ffi.setSniHostname(ssl, host_sentinel)) return error.TlsInitFailed;
 
     if (ffi.SSL_set_fd(ssl, @intCast(fd)) != 1) return error.TlsInitFailed;
     if (ffi.SSL_connect(ssl) != 1) return error.TlsHandshakeFailed;
@@ -506,17 +536,50 @@ fn buildSettleRequestJson(buf: []u8, payment_header: []const u8, policy: *const 
         charge_amount
     else
         policy.price;
-    const result = std.fmt.bufPrint(buf,
-        \\{{"x402Version":2,"paymentPayload":"{s}","paymentRequirements":{{"scheme":"{s}","network":"{s}","maxAmountRequired":"{s}","resource":{{"url":"","description":"","mimeType":""}},"asset":"{s}","payTo":"{s}","maxTimeoutSeconds":{d}}},"settleAmount":"{s}"}}
-    , .{ payment_header, policy.scheme, policy.network, policy.price, policy.asset, policy.pay_to, policy.max_timeout_seconds, amount }) catch return error.BufferTooSmall;
-    return result.len;
+    if (std.mem.eql(u8, policy.scheme, "upto") and charge_amount.len > 0) {
+        if (parseU64(charge_amount)) |charge| {
+            if (parseU64(policy.price)) |max| {
+                if (charge > max) return error.ChargeExceedsMax;
+            }
+        }
+    }
+    var off: usize = 0;
+    off += copyInto(buf[off..], "{\"x402Version\":2,\"paymentPayload\":\"");
+    off += jsonEscape(buf[off..], payment_header);
+    off += copyInto(buf[off..], "\",\"paymentRequirements\":{\"scheme\":\"");
+    off += jsonEscape(buf[off..], policy.scheme);
+    off += copyInto(buf[off..], "\",\"network\":\"");
+    off += jsonEscape(buf[off..], policy.network);
+    off += copyInto(buf[off..], "\",\"maxAmountRequired\":\"");
+    off += jsonEscape(buf[off..], policy.price);
+    off += copyInto(buf[off..], "\",\"resource\":{\"url\":\"\",\"description\":\"\",\"mimeType\":\"\"},\"asset\":\"");
+    off += jsonEscape(buf[off..], policy.asset);
+    off += copyInto(buf[off..], "\",\"payTo\":\"");
+    off += jsonEscape(buf[off..], policy.pay_to);
+    const timeout = std.fmt.bufPrint(buf[off..], "\",\"maxTimeoutSeconds\":{d}}},\"settleAmount\":\"", .{policy.max_timeout_seconds}) catch return error.BufferTooSmall;
+    off += timeout.len;
+    off += jsonEscape(buf[off..], amount);
+    off += copyInto(buf[off..], "\"}");
+    return off;
 }
 
 fn buildVerifyRequestJson(buf: []u8, payment_header: []const u8, policy: *const RoutePaymentConfig) !usize {
-    const result = std.fmt.bufPrint(buf,
-        \\{{"x402Version":2,"paymentPayload":"{s}","paymentRequirements":{{"scheme":"{s}","network":"{s}","maxAmountRequired":"{s}","resource":{{"url":"","description":"","mimeType":""}},"asset":"{s}","payTo":"{s}","maxTimeoutSeconds":{d}}}}}
-    , .{ payment_header, policy.scheme, policy.network, policy.price, policy.asset, policy.pay_to, policy.max_timeout_seconds }) catch return error.BufferTooSmall;
-    return result.len;
+    var off: usize = 0;
+    off += copyInto(buf[off..], "{\"x402Version\":2,\"paymentPayload\":\"");
+    off += jsonEscape(buf[off..], payment_header);
+    off += copyInto(buf[off..], "\",\"paymentRequirements\":{\"scheme\":\"");
+    off += jsonEscape(buf[off..], policy.scheme);
+    off += copyInto(buf[off..], "\",\"network\":\"");
+    off += jsonEscape(buf[off..], policy.network);
+    off += copyInto(buf[off..], "\",\"maxAmountRequired\":\"");
+    off += jsonEscape(buf[off..], policy.price);
+    off += copyInto(buf[off..], "\",\"resource\":{\"url\":\"\",\"description\":\"\",\"mimeType\":\"\"},\"asset\":\"");
+    off += jsonEscape(buf[off..], policy.asset);
+    off += copyInto(buf[off..], "\",\"payTo\":\"");
+    off += jsonEscape(buf[off..], policy.pay_to);
+    const timeout = std.fmt.bufPrint(buf[off..], "\",\"maxTimeoutSeconds\":{d}}}}}", .{policy.max_timeout_seconds}) catch return error.BufferTooSmall;
+    off += timeout.len;
+    return off;
 }
 
 fn buildFacilitatorPost(buf: []u8, config: FacilitatorConfig, endpoint: []const u8, body: []const u8) !usize {
@@ -580,6 +643,21 @@ fn extractStatusCode(http_response: []const u8) ?u16 {
     if (http_response.len < 12) return null;
     if (!std.mem.startsWith(u8, http_response, "HTTP/1.")) return null;
     return std.fmt.parseInt(u16, http_response[9..12], 10) catch null;
+}
+
+fn copyInto(dst: []u8, src: []const u8) usize {
+    const n = @min(dst.len, src.len);
+    @memcpy(dst[0..n], src[0..n]);
+    return n;
+}
+
+fn jsonEscape(dst: []u8, src: []const u8) usize {
+    const escaped = json_write.writeEscaped(dst, src) catch return 0;
+    return escaped.len;
+}
+
+fn parseU64(s: []const u8) ?u64 {
+    return std.fmt.parseInt(u64, s, 10) catch null;
 }
 
 // ============================================================
@@ -1044,32 +1122,49 @@ test "x402: buildReceiptB64 encodes settlement" {
     try std.testing.expect(std.mem.indexOf(u8, decoded, "\"payer\":\"0xabc\"") != null);
 }
 
-test "x402: error differentiation - missing header = 402" {
-    const info = rejectWith(.missing_header, "dGVzdA==");
+test "x402: error differentiation - missing header = 402 with JSON body" {
+    const policy = RoutePaymentConfig{
+        .require_payment = true,
+        .payment_required_b64 = "dGVzdA==",
+        .payment_required_json = "{\"test\":true}",
+    };
+    const info = rejectWith(.missing_header, policy);
     try std.testing.expectEqual(@as(u16, 402), info.resp.status);
-    try std.testing.expect(info.resp.headers.len > 0);
-    try std.testing.expectEqualStrings("PAYMENT-REQUIRED", info.resp.headers[0].name);
+    try std.testing.expectEqual(@as(usize, 2), info.resp.headers.len);
+    try std.testing.expectEqualStrings("Content-Type", info.resp.headers[0].name);
+    try std.testing.expectEqualStrings("application/json", info.resp.headers[0].value);
+    try std.testing.expectEqualStrings("X-Payment-Required", info.resp.headers[1].name);
+    try std.testing.expectEqualStrings("dGVzdA==", info.resp.headers[1].value);
+    try std.testing.expectEqualStrings("{\"test\":true}", info.resp.bodyBytes());
 }
 
 test "x402: error differentiation - malformed header = 400" {
-    const info = rejectWith(.malformed_header, "dGVzdA==");
+    const policy = RoutePaymentConfig{ .require_payment = true, .payment_required_b64 = "dGVzdA==" };
+    const info = rejectWith(.malformed_header, policy);
     try std.testing.expectEqual(@as(u16, 400), info.resp.status);
     try std.testing.expectEqual(@as(usize, 0), info.resp.headers.len);
 }
 
 test "x402: error differentiation - invalid signature = 400" {
-    const info = rejectWith(.invalid_signature, "dGVzdA==");
+    const policy = RoutePaymentConfig{ .require_payment = true, .payment_required_b64 = "dGVzdA==" };
+    const info = rejectWith(.invalid_signature, policy);
     try std.testing.expectEqual(@as(u16, 400), info.resp.status);
 }
 
 test "x402: error differentiation - facilitator rejected = 402" {
-    const info = rejectWith(.facilitator_rejected, "dGVzdA==");
+    const policy = RoutePaymentConfig{
+        .require_payment = true,
+        .payment_required_b64 = "dGVzdA==",
+        .payment_required_json = "{\"test\":true}",
+    };
+    const info = rejectWith(.facilitator_rejected, policy);
     try std.testing.expectEqual(@as(u16, 402), info.resp.status);
     try std.testing.expect(info.resp.headers.len > 0);
 }
 
 test "x402: error differentiation - facilitator error = 500" {
-    const info = rejectWith(.facilitator_error, "dGVzdA==");
+    const policy = RoutePaymentConfig{ .require_payment = true, .payment_required_b64 = "dGVzdA==" };
+    const info = rejectWith(.facilitator_error, policy);
     try std.testing.expectEqual(@as(u16, 500), info.resp.status);
 }
 
@@ -1120,6 +1215,19 @@ test "x402: buildSettleRequestJson upto with empty charge falls back to price" {
     const json = buf[0..len];
     // No charge_amount provided, falls back to configured price
     try std.testing.expect(std.mem.indexOf(u8, json, "\"settleAmount\":\"100000\"") != null);
+}
+
+test "x402: buildSettleRequestJson rejects charge exceeding max" {
+    const policy = RoutePaymentConfig{
+        .require_payment = true,
+        .price = "100000",
+        .asset = "0xUSDC",
+        .network = "eip155:8453",
+        .pay_to = "0xRecv",
+        .scheme = "upto",
+    };
+    var buf: [4096]u8 = undefined;
+    try std.testing.expectError(error.ChargeExceedsMax, buildSettleRequestJson(&buf, "payment_b64", &policy, "999999"));
 }
 
 fn encodeJson(json: []const u8) []const u8 {

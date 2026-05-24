@@ -94,6 +94,7 @@
 
 pub const config = @import("config.zig");
 pub const config_file = @import("config_file.zig");
+pub const config_fetch = @import("config_fetch.zig");
 
 // Core library surface
 const server_mod = @import("server.zig");

@@ -55,6 +55,7 @@ pub const AcceptError = error{
     AcceptFailed,
     WouldBlock,
     NonBlockingFailed,
+    TooManyOpenFiles,
 };
 
 pub const UdpError = error{
@@ -144,7 +145,8 @@ pub fn accept(listener_fd: std.posix.fd_t) AcceptError!std.posix.fd_t {
         const errno = std.posix.errno(fd);
         switch (errno) {
             .AGAIN, .INTR => return error.WouldBlock,
-            .CONNABORTED => return error.WouldBlock, // Connection aborted before accept
+            .CONNABORTED => return error.WouldBlock,
+            .MFILE, .NFILE => return error.TooManyOpenFiles,
             else => {
                 std.log.debug("accept errno: {}", .{errno});
                 return error.AcceptFailed;
@@ -487,7 +489,7 @@ pub fn setNonBlocking(fd: std.posix.fd_t) NonBlockingError!void {
 /// (avoids 40 ms delayed-ACK on multi-frame writes) because HEADERS +
 /// DATA go out without Nagle batching. Failure is swallowed: TCP_NODELAY
 /// is an optimization, not a correctness requirement.
-fn setNoDelay(fd: std.posix.fd_t) void {
+pub fn setNoDelay(fd: std.posix.fd_t) void {
     const opt: c_int = 1;
     std.posix.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&opt)) catch {};
 }
@@ -619,6 +621,51 @@ fn resolveAddress(address: []const u8, port: u16) ConnectError!ResolvedAddr {
     };
 }
 
+pub fn isPrivateAddress(storage: SockAddrStorage) bool {
+    switch (storage) {
+        .ip4 => |sa| {
+            const b: [4]u8 = @bitCast(sa.addr);
+            if (b[0] == 127) return true; // 127.0.0.0/8
+            if (b[0] == 10) return true; // 10.0.0.0/8
+            if (b[0] == 172 and (b[1] & 0xf0) == 16) return true; // 172.16.0.0/12
+            if (b[0] == 192 and b[1] == 168) return true; // 192.168.0.0/16
+            if (b[0] == 169 and b[1] == 254) return true; // 169.254.0.0/16
+            if (sa.addr == 0) return true; // 0.0.0.0
+            return false;
+        },
+        .ip6 => |sa| {
+            const a = sa.addr;
+            // ::1 (loopback)
+            const is_loopback = for (a[0..15]) |byte| {
+                if (byte != 0) break false;
+            } else a[15] == 1;
+            if (is_loopback) return true;
+            if (a[0] == 0xfe and (a[1] & 0xc0) == 0x80) return true; // fe80::/10
+            if (a[0] & 0xfe == 0xfc) return true; // fc00::/7
+            if (a[0] == 0xff) return true; // ff00::/8
+            // ::ffff:0:0/96 mapped IPv4 — check the embedded v4 address
+            const is_v4mapped = for (a[0..10]) |byte| {
+                if (byte != 0) break false;
+            } else a[10] == 0xff and a[11] == 0xff;
+            if (is_v4mapped) {
+                if (a[12] == 127) return true;
+                if (a[12] == 10) return true;
+                if (a[12] == 172 and (a[13] & 0xf0) == 16) return true;
+                if (a[12] == 192 and a[13] == 168) return true;
+                if (a[12] == 169 and a[13] == 254) return true;
+            }
+            return false;
+        },
+    }
+}
+
+pub fn connectBlockingValidated(address: []const u8, port: u16, timeout_ms: u32) ConnectError!std.posix.fd_t {
+    if (!isSupportedPlatform()) return error.UnsupportedPlatform;
+    const resolved = resolveAddress(address, port) catch return error.UnsupportedAddress;
+    if (isPrivateAddress(resolved.storage)) return error.UnsupportedAddress;
+    return connectBlockingResolved(resolved, timeout_ms);
+}
+
 // ============================================================
 // sendfile() - Zero-copy file transfer to socket
 // ============================================================
@@ -741,8 +788,11 @@ pub const ConnectError = error{
 /// Returns a connected, blocking socket fd.
 pub fn connectBlocking(address: []const u8, port: u16, timeout_ms: u32) ConnectError!std.posix.fd_t {
     if (!isSupportedPlatform()) return error.UnsupportedPlatform;
-
     const resolved = resolveAddress(address, port) catch return error.UnsupportedAddress;
+    return connectBlockingResolved(resolved, timeout_ms);
+}
+
+fn connectBlockingResolved(resolved: ResolvedAddr, timeout_ms: u32) ConnectError!std.posix.fd_t {
     const domain: c_uint = switch (resolved.storage) {
         .ip4 => @intCast(std.posix.AF.INET),
         .ip6 => @intCast(std.posix.AF.INET6),
@@ -751,7 +801,6 @@ pub fn connectBlocking(address: []const u8, port: u16, timeout_ms: u32) ConnectE
     if (fd < 0) return error.SocketFailed;
     errdefer clock.closeFd(fd);
 
-    // Set non-blocking for connect with timeout
     setNonBlocking(fd) catch return error.SocketFailed;
 
     var storage = resolved.storage;
@@ -763,7 +812,6 @@ pub fn connectBlocking(address: []const u8, port: u16, timeout_ms: u32) ConnectE
 
     const rc = std.posix.system.connect(fd, sockaddr_ptr, addr_len);
     if (rc == 0) {
-        // Connected immediately — switch back to blocking
         clearNonBlocking(fd) catch return error.SocketFailed;
         return fd;
     }
@@ -771,16 +819,13 @@ pub fn connectBlocking(address: []const u8, port: u16, timeout_ms: u32) ConnectE
     const errno = std.posix.errno(rc);
     if (errno != .INPROGRESS) return error.ConnectFailed;
 
-    // Wait for connect to complete using poll
     if (!pollWriteReady(fd, timeout_ms)) return error.Timeout;
 
-    // Check connect result via SO_ERROR
     var err_val: c_int = 0;
     var err_len: std.posix.socklen_t = @sizeOf(c_int);
     const gso_rc = std.posix.system.getsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.ERROR, @ptrCast(&err_val), &err_len);
     if (gso_rc != 0 or err_val != 0) return error.ConnectFailed;
 
-    // Switch back to blocking for simple send/recv
     clearNonBlocking(fd) catch return error.SocketFailed;
     return fd;
 }

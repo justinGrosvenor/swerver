@@ -38,6 +38,7 @@ const middleware = @import("../middleware/middleware.zig");
 const x402_mod = @import("../middleware/x402.zig");
 const auth_mod = @import("../middleware/auth.zig");
 const ratelimit_mod = @import("../middleware/ratelimit.zig");
+const usage_mod = @import("../middleware/usage.zig");
 const ws_mod = @import("../proxy/websocket.zig");
 const accept_mod = @import("accept.zig");
 const http1_mod = @import("http1.zig");
@@ -53,11 +54,17 @@ const body_schema_mod = @import("../middleware/body_schema.zig");
 
 /// Global shutdown flag set by signal handler (atomic for signal safety)
 var shutdown_requested = std.atomic.Value(bool).init(false);
+/// Graceful drain flag — first SIGTERM sets this, second sets shutdown_requested
+var draining = std.atomic.Value(bool).init(false);
 /// Global reload flag set by SIGHUP handler (atomic for signal safety)
 var reload_requested = std.atomic.Value(bool).init(false);
 
 fn handleShutdownSignal(_: std.posix.SIG) callconv(.c) void {
-    shutdown_requested.store(true, .release);
+    if (draining.load(.acquire)) {
+        shutdown_requested.store(true, .release);
+    } else {
+        draining.store(true, .release);
+    }
 }
 
 fn handleReloadSignal(_: std.posix.SIG) callconv(.c) void {
@@ -72,6 +79,7 @@ pub fn requestShutdown() void {
 
 pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
     shutdown_requested.store(false, .release);
+    draining.store(false, .release);
     reload_requested.store(false, .release);
 
     const sa = std.posix.Sigaction{
@@ -103,6 +111,9 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
         server.listener_fd = fd;
     }
     try server.io.registerListener(server.listener_fd.?);
+    if (server.spare_fd == null) {
+        server.spare_fd = std.posix.openat(std.posix.AT.FDCWD, "/dev/null", .{}, 0) catch null;
+    }
     // Initialize UDP listener for QUIC if enabled
     if (server.quic != null) {
         if (server.udp_fd == null) {
@@ -124,7 +135,7 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
     }
     // Bind admin API listener if enabled
     if (server.cfg.admin.enabled and server.admin_listener_fd == null) {
-        if (admin_mod.bindAdminSocket(server.cfg.address, server.cfg.admin.port)) |fd| {
+        if (admin_mod.bindAdminSocket(server.cfg.admin.address, server.cfg.admin.port)) |fd| {
             server.admin_listener_fd = fd;
             std.log.info("Admin API listening on :{d}", .{server.cfg.admin.port});
         } else |err| {
@@ -134,8 +145,34 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
 
     const deadline = if (run_for_ms) |ms| server.io.nowMs() + ms else null;
     var last_housekeeping_ms: u64 = server.io.nowMs();
+    var drain_deadline_ms: u64 = 0;
+    var is_draining = false;
     while (true) {
         if (shutdown_requested.load(.acquire)) return;
+        if (!is_draining and draining.load(.acquire)) {
+            is_draining = true;
+            drain_deadline_ms = server.io.nowMs() + server.cfg.drain_timeout_ms;
+            std.log.info("graceful shutdown: draining connections ({d}ms timeout)", .{server.cfg.drain_timeout_ms});
+            if (server.listener_fd) |lfd| {
+                _ = server.io.unregister(lfd) catch {};
+                clock.closeFd(lfd);
+                server.listener_fd = null;
+            }
+            if (server.admin_listener_fd) |afd| {
+                clock.closeFd(afd);
+                server.admin_listener_fd = null;
+            }
+        }
+        if (is_draining) {
+            if (server.io.connections.active_count == 0) {
+                std.log.info("graceful shutdown: all connections drained", .{});
+                return;
+            }
+            if (server.io.nowMs() >= drain_deadline_ms) {
+                std.log.info("graceful shutdown: drain timeout, closing {d} remaining connections", .{server.io.connections.active_count});
+                return;
+            }
+        }
         if (reload_requested.swap(false, .acq_rel)) {
             server.applyReload();
         }
@@ -811,6 +848,10 @@ pub fn handleRead(server: *Server, index: u32) !void {
                     .allow => |*info| info,
                     .reject => null,
                 };
+                if (auth_info_ptr) |ai| {
+                    const name = ai.consumerName();
+                    if (name.len > 0) usage_mod.record(name, server.now_ms);
+                }
                 if (matched_route.rate_limit) |rl_cfg| {
                     const consumer = if (auth_info_ptr) |ai| ai.consumerName() else "";
                     const client_key = if (conn.cached_peer_ip) |ip4|

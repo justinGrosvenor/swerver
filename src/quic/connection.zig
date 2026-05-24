@@ -18,7 +18,10 @@ const clock = @import("../runtime/clock.zig");
 /// Peers use this length when sending short-header packets to us, and
 /// the packet parser needs it to extract the DCID from short headers
 /// (which carry no explicit length field). Valid range: 0-20 per
-/// RFC 9000 §17.2.
+/// RFC 9000 §17.2. Fixed at 8: sufficient entropy for connection
+/// lookup (2^64 space), matches common implementations (quiche, ngtcp2).
+/// Not configurable because the short-header parser must know this
+/// value at compile time — the wire format carries no length field.
 pub const OUR_CID_LEN: u8 = 8;
 
 fn fillRandom(buf: []u8) void {
@@ -1294,8 +1297,11 @@ pub const Connection = struct {
         var current_largest = ack.largest_acked;
         var current_smallest = ack.largest_acked -| ack.first_ack_range;
 
+        // Peer's ACK delay: encoded value << ack_delay_exponent, in microseconds (RFC 9000 §19.3)
+        const peer_ack_delay_us: u64 = ack.ack_delay << @intCast(self.peer_params.ack_delay_exponent);
+
         // Mark packets in first range as acknowledged
-        self.markPacketsAcked(space, current_smallest, current_largest);
+        self.markPacketsAcked(space, current_smallest, current_largest, peer_ack_delay_us);
 
         // Process additional ACK ranges
         for (ack.ranges) |range| {
@@ -1305,13 +1311,13 @@ pub const Connection = struct {
             current_largest = current_smallest - range.gap - 2;
             current_smallest = current_largest -| range.length;
 
-            self.markPacketsAcked(space, current_smallest, current_largest);
+            self.markPacketsAcked(space, current_smallest, current_largest, 0);
         }
     }
 
     /// Mark a range of packets as acknowledged, feeding into the
     /// sent-packet ring buffer for RTT estimation and loss detection.
-    fn markPacketsAcked(self: *Connection, space: types.PacketNumberSpace, smallest: u64, largest: u64) void {
+    fn markPacketsAcked(self: *Connection, space: types.PacketNumberSpace, smallest: u64, largest: u64, peer_ack_delay_us: u64) void {
         const now_ns: u64 = if (clock.Instant.now()) |inst| inst.ns else 0;
 
         // Mark the range as ACKed in the ring buffer. Returns the sent
@@ -1319,9 +1325,9 @@ pub const Connection = struct {
         // packets removed (for congestion window growth).
         const ack_result = self.sent_ring.markAckedRange(space, smallest, largest);
         if (ack_result.largest_sent_time) |sent_time| {
-            // Update RTT estimator (RFC 9002 §5)
+            // Update RTT estimator (RFC 9002 §5) using peer's ACK delay
             if (now_ns > sent_time) {
-                const ack_delay_ns = if (space == .application) self.application_space.calculateAckDelay() * 1000 else 0;
+                const ack_delay_ns = if (space == .application) peer_ack_delay_us * 1000 else 0;
                 self.recovery.rtt.update(
                     now_ns - sent_time,
                     ack_delay_ns,

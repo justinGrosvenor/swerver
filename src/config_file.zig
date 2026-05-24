@@ -70,7 +70,7 @@ pub fn loadConfigFile(allocator: std.mem.Allocator, path: []const u8) !LoadedCon
     return parseJsonFromBytes(allocator, buf[0..total]);
 }
 
-fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !LoadedConfig {
+pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !LoadedConfig {
     var arena = std.heap.ArenaAllocator.init(parent_alloc);
     errdefer arena.deinit();
     const alloc = arena.allocator();
@@ -164,6 +164,7 @@ fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !Loade
     if (file_cfg.admin) |a| {
         if (a.enabled) |v| cfg.admin.enabled = v;
         if (a.port) |v| cfg.admin.port = v;
+        if (a.address) |v| cfg.admin.address = v;
         if (a.api_key) |v| cfg.admin.api_key = v;
     }
 
@@ -574,6 +575,7 @@ const X402Json = struct {
 const AdminJson = struct {
     enabled: ?bool = null,
     port: ?u16 = null,
+    address: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
 };
 

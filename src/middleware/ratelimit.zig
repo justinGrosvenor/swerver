@@ -427,9 +427,7 @@ pub const RateLimitResponse = struct {
     pause_ms: u64,
 };
 
-// Stable storage for per-route 429 headers — avoids dangling pointer
-// from returning &[_]Header{runtime_vals} on the stack.
-var route_rl_headers: [5]response.Header = .{
+threadlocal var route_rl_headers: [5]response.Header = .{
     .{ .name = "Retry-After", .value = "0" },
     .{ .name = "X-RateLimit-Limit", .value = "0" },
     .{ .name = "X-RateLimit-Remaining", .value = "0" },
@@ -490,7 +488,7 @@ const retry_after_strings = blk: {
     break :blk strs;
 };
 
-var global_rl_headers: [2]response.Header = .{
+threadlocal var global_rl_headers: [2]response.Header = .{
     .{ .name = "Retry-After", .value = "0" },
     .{ .name = "Content-Length", .value = "0" },
 };

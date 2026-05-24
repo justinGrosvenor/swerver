@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const config = @import("config.zig");
+const config_fetch = @import("config_fetch.zig");
 const runtime = @import("runtime/io.zig");
 const connection = @import("runtime/connection.zig");
 const buffer_pool = @import("runtime/buffer_pool.zig");
@@ -124,10 +125,12 @@ pub const Server = struct {
     proxy: ?*proxy_mod.Proxy = null,
     /// Admin API listener (null if admin API not enabled)
     admin_listener_fd: ?std.posix.fd_t = null,
+    /// Spare FD for EMFILE recovery — closed temporarily to accept+close one connection
+    spare_fd: ?std.posix.fd_t = null,
     /// OpenTelemetry trace exporter (null if otel not enabled)
     otel: ?*otel_mod.TraceExporter = null,
-    /// Config file path for hot reload (null if not using config file)
-    config_path: ?[]const u8 = null,
+    /// Config source for hot reload (null if not using external config)
+    config_source: ?config_fetch.ConfigSource = null,
     /// Arena owning the route/upstream string data from the last config reload.
     /// Freed on next reload or on server deinit. Null when proxy was set up
     /// via ServerBuilder (strings owned by the caller's arena instead).
@@ -190,6 +193,7 @@ pub const Server = struct {
         var app_router = router.Router.init(.{
             .require_payment = cfg.x402.enabled,
             .payment_required_b64 = cfg.x402.payment_required_b64,
+            .payment_required_json = cfg.x402.payment_required_json,
         });
         try benchmark_routes.registerRoutes(&app_router);
         middleware.security.buildCache();
@@ -353,18 +357,36 @@ pub const Server = struct {
         dispatch.requestShutdown();
     }
 
-    /// Apply hot reload from config file.
+    /// Apply hot reload from config source (file or URL).
     /// Reloads timeouts, limits, and (if present) routes + upstreams.
     /// Requires restart: address, port, max_connections, buffer pool, TLS certs.
     pub fn applyReload(self: *Server) void {
-        const path = self.config_path orelse {
-            std.log.info("SIGHUP received but no config file path set, ignoring", .{});
+        const source = self.config_source orelse {
+            std.log.info("SIGHUP received but no config source set, ignoring", .{});
             return;
         };
         const config_file = @import("config_file.zig");
-        var loaded = config_file.loadConfigFile(self.allocator, path) catch |err| {
-            std.log.err("Config reload failed: {}", .{err});
-            return;
+        var loaded = switch (source) {
+            .file => |path| config_file.loadConfigFile(self.allocator, path) catch |err| {
+                std.log.err("Config reload failed: {}", .{err});
+                return;
+            },
+            .url => |url_config| blk: {
+                const bytes = config_fetch.fetchConfigBytes(self.allocator, url_config) catch |err| {
+                    std.log.err("Config reload from URL failed: {}", .{err});
+                    return;
+                };
+                defer self.allocator.free(bytes);
+                if (url_config.cache_path) |cache_path| {
+                    config_fetch.writeCacheFile(cache_path, bytes) catch |err| {
+                        std.log.warn("failed to update config cache: {}", .{err});
+                    };
+                }
+                break :blk config_file.parseJsonFromBytes(self.allocator, bytes) catch |err| {
+                    std.log.err("Config reload parse failed: {}", .{err});
+                    return;
+                };
+            },
         };
 
         loaded.server_config.validate() catch |err| {
@@ -387,24 +409,30 @@ pub const Server = struct {
                 return;
             };
 
-            if (self.proxy) |old| {
-                old.deinit();
-                self.allocator.destroy(old);
-            }
-
             const proxy_ptr = self.allocator.create(proxy_mod.Proxy) catch {
                 new_proxy.deinit();
                 loaded.deinit();
                 return;
             };
             proxy_ptr.* = new_proxy;
-            self.proxy = proxy_ptr;
 
-            if (self.reload_arena) |*old_arena| old_arena.deinit();
+            const old_proxy = self.proxy;
+            const old_arena = self.reload_arena;
+            self.proxy = proxy_ptr;
             self.reload_arena = loaded.arena;
+
+            if (old_proxy) |old| {
+                old.deinit();
+                self.allocator.destroy(old);
+            }
+            if (old_arena) |*oa| oa.deinit();
             self.needs_peer_ip = true;
+            const src_label: []const u8 = switch (source) {
+                .file => |p| p,
+                .url => |u| u.url,
+            };
             std.log.info("Config reloaded from {s} (routes: {d}, upstreams: {d})", .{
-                path, loaded.routes.len, loaded.upstreams.len,
+                src_label, loaded.routes.len, loaded.upstreams.len,
             });
         } else {
             if (self.proxy != null and loaded.upstreams.len == 0 and loaded.routes.len == 0) {
@@ -416,10 +444,10 @@ pub const Server = struct {
                 if (self.reload_arena) |*old_arena| old_arena.deinit();
                 self.reload_arena = loaded.arena;
                 self.needs_peer_ip = self.app_router.middleware_chain.post.len > 0;
-                std.log.info("Config reloaded from {s} (proxy removed)", .{path});
+                std.log.info("Config reloaded (proxy removed)", .{});
             } else {
                 loaded.deinit();
-                std.log.info("Config reloaded from {s}", .{path});
+                std.log.info("Config reloaded", .{});
             }
         }
     }
@@ -667,7 +695,10 @@ pub const Server = struct {
     }
 
     pub fn closeConnection(self: *Server, conn: *connection.Connection) void {
-        // Clean up TLS session before closing the socket
+        if (conn.ip_hash != 0) {
+            accept_mod.ip_tracker.decrement(conn.ip_hash);
+            conn.ip_hash = 0;
+        }
         conn.cleanupTls();
         if (conn.fd) |fd| {
             _ = self.io.unregister(fd) catch {};

@@ -21,6 +21,10 @@ pub const ServerConfig = struct {
     allowed_hosts: []const []const u8 = &.{},
     /// Number of worker processes. 1 = single-process (no fork). 0 = auto-detect CPU count.
     workers: u16 = 1,
+    /// Max connections per IP address. 0 = unlimited.
+    per_ip_limit: u16 = 0,
+    /// Graceful shutdown drain timeout in milliseconds.
+    drain_timeout_ms: u32 = 30_000,
     /// Disable security headers, metrics, and access logging middleware.
     /// Use for pure benchmark mode where middleware overhead matters.
     disable_middleware: bool = false,
@@ -132,6 +136,7 @@ pub const BufferPoolConfig = struct {
 pub const X402Config = struct {
     enabled: bool = false,
     payment_required_b64: []const u8 = "",
+    payment_required_json: []const u8 = "",
     facilitator_url: []const u8 = "",
     facilitator_timeout_ms: u32 = 5_000,
 };
@@ -199,6 +204,7 @@ pub const QuicConfig = struct {
 pub const AdminConfig = struct {
     enabled: bool = false,
     port: u16 = 9180,
+    address: []const u8 = "127.0.0.1",
     api_key: []const u8 = "",
 };
 

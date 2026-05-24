@@ -213,6 +213,7 @@ pub const Connection = struct {
     cached_peer_ip: ?[4]u8,
     /// Cached peer IPv6 address (populated once at accept time)
     cached_peer_ip6: ?[16]u8,
+    ip_hash: u64,
     /// Carryover ciphertext buffer for TLS connections using memory BIOs.
     /// Populated when a TLS writev gets partial/EAGAIN mid-drain: the remaining
     /// ciphertext (from the in-flight record plus anything still pending in wbio)
@@ -282,6 +283,7 @@ pub const Connection = struct {
             .pending_file_remaining = 0,
             .cached_peer_ip = null,
             .cached_peer_ip6 = null,
+            .ip_hash = 0,
             .tls_cipher_carry_handle = null,
             .tls_cipher_carry_offset = 0,
             .tls_cipher_carry_len = 0,
@@ -328,6 +330,7 @@ pub const Connection = struct {
         self.cleanupPendingFile();
         self.cached_peer_ip = null;
         self.cached_peer_ip6 = null;
+        self.ip_hash = 0;
         // tls_cipher_carry_handle is cleaned up by the server before reset
         self.tls_cipher_carry_handle = null;
         self.tls_cipher_carry_offset = 0;

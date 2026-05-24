@@ -380,14 +380,14 @@ fn validateJwtHeader(json: []const u8) bool {
 
 fn validateJwtPayload(json: []const u8, cfg: JwtConfig) bool {
     const skew = cfg.clock_skew_seconds;
+    const now_ns = clock_realtimeNanos();
+    if (now_ns == 0) return false;
+    const now: i64 = @intCast(@divTrunc(now_ns, 1_000_000_000));
 
-    if (extractNumericClaim(json, "exp")) |exp| {
-        const now: i64 = @intCast(@divTrunc(clock_realtimeNanos(), 1_000_000_000));
-        if (now > exp + skew) return false;
-    }
+    const exp = extractNumericClaim(json, "exp") orelse return false;
+    if (now > exp + skew) return false;
 
     if (extractNumericClaim(json, "nbf")) |nbf| {
-        const now: i64 = @intCast(@divTrunc(clock_realtimeNanos(), 1_000_000_000));
         if (now < nbf - skew) return false;
     }
 
@@ -453,7 +453,7 @@ fn evaluateForwardAuth(req: request.RequestView, cfg: ForwardAuthConfig) AuthRes
 
     const parsed = parseUrl(cfg.url, &host_buf, &url_buf) orelse return .{ .reject = UNAUTHORIZED };
 
-    const fd = net.connectBlocking(parsed.host, parsed.port, cfg.timeout_ms) catch {
+    const fd = net.connectBlockingValidated(parsed.host, parsed.port, cfg.timeout_ms) catch {
         return .{ .reject = UNAUTHORIZED };
     };
     defer clock.closeFd(fd);

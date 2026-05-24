@@ -6,9 +6,27 @@ const proxy_mod = @import("../proxy/proxy.zig");
 const json_write = @import("../runtime/json_write.zig");
 
 const Server = @import("../server.zig").Server;
+const config_fetch = @import("../config_fetch.zig");
+const usage = @import("../middleware/usage.zig");
 
 const MAX_REQUEST = 65536;
 const MAX_RESPONSE = 65536;
+
+const NO_CONFIG = DispatchResult{ .status = 400, .body = "{\"error\":\"no config file\"}" };
+const URL_MANAGED = DispatchResult{ .status = 409, .body = "{\"error\":\"config managed by remote URL, local mutations disabled\"}" };
+
+const FilePathResult = union(enum) {
+    path: []const u8,
+    err: DispatchResult,
+};
+
+fn requireFilePath(server: *Server) FilePathResult {
+    const source = server.config_source orelse return .{ .err = NO_CONFIG };
+    return switch (source) {
+        .file => |p| .{ .path = p },
+        .url => .{ .err = URL_MANAGED },
+    };
+}
 
 fn jsonObjPut(obj: *std.json.ObjectMap, alloc: std.mem.Allocator, key: []const u8, value: std.json.Value) !void {
     if (comptime @typeInfo(@TypeOf(std.json.ObjectMap.put)).@"fn".params.len == 4) {
@@ -130,6 +148,13 @@ fn dispatch(server: *Server, method: Method, path: []const u8, body: []const u8,
     if (startsWith(path, "/v1/status")) {
         return getStatus(server, buf);
     }
+    if (startsWith(path, "/v1/usage")) {
+        return switch (method) {
+            .GET => getUsage(buf, queryParam(path, "reset") != null),
+            .DELETE => getUsage(buf, true),
+            else => .{ .status = 405, .body = "{\"error\":\"method not allowed\"}" },
+        };
+    }
     if (startsWith(path, "/v1/config/persist")) {
         if (method != .POST) return .{ .status = 405, .body = "{\"error\":\"method not allowed\"}" };
         return persistConfig(server, buf);
@@ -152,7 +177,10 @@ fn listRoutes(server: *Server, buf: []u8) DispatchResult {
 }
 
 fn addRoute(server: *Server, body: []const u8, buf: []u8) DispatchResult {
-    const config_path = server.config_path orelse return .{ .status = 400, .body = "{\"error\":\"no config file\"}" };
+    const config_path = switch (requireFilePath(server)) {
+        .path => |p| p,
+        .err => |e| return e,
+    };
     if (body.len == 0) return .{ .status = 400, .body = "{\"error\":\"empty body\"}" };
 
     const config_file = @import("../config_file.zig");
@@ -188,13 +216,18 @@ fn addRoute(server: *Server, body: []const u8, buf: []u8) DispatchResult {
     writeConfigAndReload(server, alloc, tree, config_path, config_file) catch
         return .{ .status = 500, .body = "{\"error\":\"failed to write config\"}" };
 
-    const n = std.fmt.bufPrint(buf, "{{\"ok\":true,\"route\":\"{s}\"}}", .{prefix}) catch
-        return .{ .status = 201, .body = "{\"ok\":true}" };
-    return .{ .status = 201, .body = n };
+    var off: usize = 0;
+    off += copyInto(buf[off..], "{\"ok\":true,\"route\":\"");
+    off += copyEscaped(buf[off..], prefix);
+    off += copyInto(buf[off..], "\"}");
+    return .{ .status = 201, .body = buf[0..off] };
 }
 
 fn deleteRoute(server: *Server, path: []const u8, buf: []u8) DispatchResult {
-    const config_path = server.config_path orelse return .{ .status = 400, .body = "{\"error\":\"no config file\"}" };
+    const config_path = switch (requireFilePath(server)) {
+        .path => |p| p,
+        .err => |e| return e,
+    };
     const prefix = queryParam(path, "prefix") orelse
         return .{ .status = 400, .body = "{\"error\":\"?prefix= required\"}" };
 
@@ -228,9 +261,11 @@ fn deleteRoute(server: *Server, path: []const u8, buf: []u8) DispatchResult {
     writeConfigAndReload(server, alloc, tree, config_path, config_file) catch
         return .{ .status = 500, .body = "{\"error\":\"failed to write config\"}" };
 
-    const n = std.fmt.bufPrint(buf, "{{\"ok\":true,\"deleted\":\"{s}\"}}", .{prefix}) catch
-        return .{ .status = 200, .body = "{\"ok\":true}" };
-    return .{ .status = 200, .body = n };
+    var off: usize = 0;
+    off += copyInto(buf[off..], "{\"ok\":true,\"deleted\":\"");
+    off += copyEscaped(buf[off..], prefix);
+    off += copyInto(buf[off..], "\"}");
+    return .{ .status = 200, .body = buf[0..off] };
 }
 
 fn listUpstreams(server: *Server, buf: []u8) DispatchResult {
@@ -246,7 +281,10 @@ fn listUpstreams(server: *Server, buf: []u8) DispatchResult {
 }
 
 fn addUpstream(server: *Server, body: []const u8, buf: []u8) DispatchResult {
-    const config_path = server.config_path orelse return .{ .status = 400, .body = "{\"error\":\"no config file\"}" };
+    const config_path = switch (requireFilePath(server)) {
+        .path => |p| p,
+        .err => |e| return e,
+    };
     if (body.len == 0) return .{ .status = 400, .body = "{\"error\":\"empty body\"}" };
 
     const config_file = @import("../config_file.zig");
@@ -280,13 +318,18 @@ fn addUpstream(server: *Server, body: []const u8, buf: []u8) DispatchResult {
     writeConfigAndReload(server, alloc, tree, config_path, config_file) catch
         return .{ .status = 500, .body = "{\"error\":\"failed to write config\"}" };
 
-    const n = std.fmt.bufPrint(buf, "{{\"ok\":true,\"upstream\":\"{s}\"}}", .{name}) catch
-        return .{ .status = 201, .body = "{\"ok\":true}" };
-    return .{ .status = 201, .body = n };
+    var off: usize = 0;
+    off += copyInto(buf[off..], "{\"ok\":true,\"upstream\":\"");
+    off += copyEscaped(buf[off..], name);
+    off += copyInto(buf[off..], "\"}");
+    return .{ .status = 201, .body = buf[0..off] };
 }
 
 fn deleteUpstream(server: *Server, path: []const u8, buf: []u8) DispatchResult {
-    const config_path = server.config_path orelse return .{ .status = 400, .body = "{\"error\":\"no config file\"}" };
+    const config_path = switch (requireFilePath(server)) {
+        .path => |p| p,
+        .err => |e| return e,
+    };
     const name = queryParam(path, "name") orelse
         return .{ .status = 400, .body = "{\"error\":\"?name= required\"}" };
 
@@ -320,9 +363,11 @@ fn deleteUpstream(server: *Server, path: []const u8, buf: []u8) DispatchResult {
     writeConfigAndReload(server, alloc, tree, config_path, config_file) catch
         return .{ .status = 500, .body = "{\"error\":\"failed to write config\"}" };
 
-    const n = std.fmt.bufPrint(buf, "{{\"ok\":true,\"deleted\":\"{s}\"}}", .{name}) catch
-        return .{ .status = 200, .body = "{\"ok\":true}" };
-    return .{ .status = 200, .body = n };
+    var off: usize = 0;
+    off += copyInto(buf[off..], "{\"ok\":true,\"deleted\":\"");
+    off += copyEscaped(buf[off..], name);
+    off += copyInto(buf[off..], "\"}");
+    return .{ .status = 200, .body = buf[0..off] };
 }
 
 fn getStatus(server: *Server, buf: []u8) DispatchResult {
@@ -334,9 +379,17 @@ fn getStatus(server: *Server, buf: []u8) DispatchResult {
     return .{ .status = 200, .body = n };
 }
 
+fn getUsage(buf: []u8, reset: bool) DispatchResult {
+    const body = if (reset) usage.snapshotAndReset(buf) else usage.snapshot(buf);
+    return .{ .status = 200, .body = body };
+}
+
 fn persistConfig(server: *Server, buf: []u8) DispatchResult {
     _ = buf;
-    const config_path = server.config_path orelse return .{ .status = 400, .body = "{\"error\":\"no config file\"}" };
+    const config_path = switch (requireFilePath(server)) {
+        .path => |p| p,
+        .err => |e| return e,
+    };
     _ = config_path;
     return .{ .status = 200, .body = "{\"ok\":true,\"persisted\":true}" };
 }
@@ -368,21 +421,23 @@ fn writeConfigAndReload(server: *Server, alloc: std.mem.Allocator, tree: std.jso
             return error.ProxyBuildFailed;
         };
 
-        if (server.proxy) |old| {
-            old.deinit();
-            server.allocator.destroy(old);
-        }
-
         const proxy_ptr = server.allocator.create(proxy_mod.Proxy) catch {
             new_proxy.deinit();
             loaded.deinit();
             return error.AllocFailed;
         };
         proxy_ptr.* = new_proxy;
-        server.proxy = proxy_ptr;
 
-        if (server.reload_arena) |*old_arena| old_arena.deinit();
+        const old_proxy = server.proxy;
+        const old_arena = server.reload_arena;
+        server.proxy = proxy_ptr;
         server.reload_arena = loaded.arena;
+
+        if (old_proxy) |old| {
+            old.deinit();
+            server.allocator.destroy(old);
+        }
+        if (old_arena) |*oa| oa.deinit();
     } else if (loaded.upstreams.len == 0 and loaded.routes.len == 0) {
         if (server.proxy) |old| {
             old.deinit();
@@ -487,7 +542,10 @@ fn checkApiKey(headers_start: usize, headers_end: usize, raw: []const u8, expect
         const name = std.mem.trim(u8, header_line[0..colon], " ");
         if (std.ascii.eqlIgnoreCase(name, "x-api-key")) {
             const value = std.mem.trim(u8, header_line[colon + 1 ..], " ");
-            return std.mem.eql(u8, value, expected);
+            if (value.len != expected.len) return false;
+            var diff: u8 = 0;
+            for (value, expected) |a, b| diff |= a ^ b;
+            return diff == 0;
         }
     }
     return false;
@@ -529,8 +587,10 @@ fn writeRouteJson(buf: []u8, route: upstream_mod.ProxyRoute) usize {
         off += copyInto(buf[off..], ",\"traffic_split\":[");
         for (ts, 0..) |t, i| {
             if (i > 0) off += copyInto(buf[off..], ",");
-            const n = std.fmt.bufPrint(buf[off..], "{{\"upstream\":\"{s}\",\"weight\":{d}}}", .{ t.upstream, t.weight }) catch break;
-            off += n.len;
+            off += copyInto(buf[off..], "{\"upstream\":\"");
+            off += copyEscaped(buf[off..], t.upstream);
+            const w = std.fmt.bufPrint(buf[off..], "\",\"weight\":{d}}}", .{t.weight}) catch break;
+            off += w.len;
         }
         off += copyInto(buf[off..], "]");
     }
@@ -563,8 +623,10 @@ fn writeUpstreamJson(buf: []u8, u: upstream_mod.Upstream) usize {
     off += copyInto(buf[off..], "\",\"servers\":[");
     for (u.servers, 0..) |s, i| {
         if (i > 0) off += copyInto(buf[off..], ",");
-        const n = std.fmt.bufPrint(buf[off..], "{{\"address\":\"{s}\",\"port\":{d},\"weight\":{d}}}", .{ s.address, s.port, s.weight }) catch break;
-        off += n.len;
+        off += copyInto(buf[off..], "{\"address\":\"");
+        off += copyEscaped(buf[off..], s.address);
+        const sv = std.fmt.bufPrint(buf[off..], "\",\"port\":{d},\"weight\":{d}}}", .{ s.port, s.weight }) catch break;
+        off += sv.len;
     }
     off += copyInto(buf[off..], "]");
     const lb_name: []const u8 = switch (u.load_balancer) {
@@ -610,20 +672,40 @@ fn readFileAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
 }
 
 fn writeFileContents(path: []const u8, data: []const u8) !void {
-    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .TRUNC = true }, 0) catch
-        return error.OpenFailed;
-    defer clock.closeFd(fd);
+    var tmp_path: [4096:0]u8 = undefined;
+    if (path.len >= 4090) return error.PathTooLong;
+    @memcpy(tmp_path[0..path.len], path);
+    @memcpy(tmp_path[path.len .. path.len + 4], ".tmp");
+    tmp_path[path.len + 4] = 0;
+
+    const fd = std.posix.openat(std.posix.AT.FDCWD, tmp_path[0 .. path.len + 4 :0], .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .TRUNC = true,
+    }, 0o644) catch return error.OpenFailed;
 
     var written: usize = 0;
     while (written < data.len) {
         const rc = std.posix.system.write(fd, data[written..].ptr, data[written..].len);
         if (rc < 0) {
             if (std.posix.errno(rc) == .INTR) continue;
+            clock.closeFd(fd);
             return error.WriteFailed;
         }
-        if (rc == 0) return error.WriteFailed;
+        if (rc == 0) {
+            clock.closeFd(fd);
+            return error.WriteFailed;
+        }
         written += @intCast(rc);
     }
+    _ = std.c.fsync(fd);
+    clock.closeFd(fd);
+
+    var path_z: [4096:0]u8 = undefined;
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
+    if (std.c.rename(tmp_path[0 .. path.len + 4 :0].ptr, path_z[0..path.len :0].ptr) != 0)
+        return error.WriteFailed;
 }
 
 fn startsWith(haystack: []const u8, prefix: []const u8) bool {

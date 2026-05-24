@@ -42,6 +42,8 @@ const router = @import("../router/router.zig");
 const middleware = @import("../middleware/middleware.zig");
 const auth_mod = @import("../middleware/auth.zig");
 const ratelimit_mod = @import("../middleware/ratelimit.zig");
+const x402_mod = @import("../middleware/x402.zig");
+const usage_mod = @import("../middleware/usage.zig");
 const forward_mod = @import("../proxy/forward.zig");
 const clock = @import("../runtime/clock.zig");
 const preencoded = @import("preencoded.zig");
@@ -950,6 +952,21 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
     // Check proxy routes first
     if (server.proxy) |proxy| {
         if (proxy.matchRoute(&hparse.view)) |matched_route| {
+            const route_idx = proxy.routeIndex(matched_route);
+            const x402_policy = proxy.route_x402_policies[route_idx];
+            const x402_result = x402_mod.evaluateWithFacilitator(
+                hparse.view,
+                x402_policy,
+                server.app_router.facilitator,
+            );
+            switch (x402_result) {
+                .allow => {},
+                .reject => |info| {
+                    cleanupBodyAccumulation(server, conn);
+                    queueResponse(server, conn, info.resp) catch {};
+                    return;
+                },
+            }
             const auth_result = auth_mod.evaluate(hparse.view, matched_route.auth);
             switch (auth_result) {
                 .allow => {},
@@ -963,6 +980,10 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
                 .allow => |*info| info,
                 .reject => null,
             };
+            if (auth_info_ptr) |ai| {
+                const name = ai.consumerName();
+                if (name.len > 0) usage_mod.record(name, server.now_ms);
+            }
             if (matched_route.rate_limit) |rl_cfg| {
                 const consumer = if (auth_info_ptr) |ai| ai.consumerName() else "";
                 const client_key: ?ratelimit_mod.IpKey = if (conn.cached_peer_ip) |ip4|
@@ -1028,7 +1049,6 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
 
             // Invalidate cache on mutating methods (body-accumulated requests are typically POST/PUT)
             if (matched_route.cache != null) {
-                const route_idx = proxy.routeIndex(matched_route);
                 if (proxy.route_caches[route_idx]) |*rc| {
                     rc.invalidate(hparse.view.path);
                 }

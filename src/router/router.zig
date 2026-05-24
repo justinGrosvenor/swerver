@@ -866,6 +866,7 @@ pub const Router = struct {
                             x402_has_receipt = true;
                         } else if (!settle.success) {
                             std.log.warn("x402 settlement failed: {s}", .{settle.error_reason});
+                            result_resp = .{ .status = 502, .headers = &.{}, .body = .{ .bytes = "{\"error\":\"payment settlement failed\"}" } };
                         }
                     }
                 }

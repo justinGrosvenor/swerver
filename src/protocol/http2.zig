@@ -325,11 +325,11 @@ pub const HpackDecoder = struct {
             .entry_count = 0,
             .dynamic_size = 0,
             .max_dynamic_size = MaxDynamicBytes,
-            .storage = undefined,
+            .storage = std.mem.zeroes([MaxDynamicBytes]u8),
             .storage_head = 0,
             .storage_tail = 0,
             .storage_used = 0,
-            .scratch = undefined,
+            .scratch = std.mem.zeroes([HeaderScratchBytes]u8),
             .scratch_used = 0,
         };
     }
@@ -714,6 +714,7 @@ pub const Stack = struct {
     stream_count: usize,
     last_stream_id: u32,
     conn_recv_window: i32,
+    initial_conn_window: i32,
     initial_stream_window: i32,
     conn_send_window: i32,
     initial_peer_window: i32,
@@ -747,6 +748,7 @@ pub const Stack = struct {
             .stream_count = 0,
             .last_stream_id = 0,
             .conn_recv_window = initial_window,
+            .initial_conn_window = initial_window,
             .initial_stream_window = initial_window,
             .conn_send_window = @intCast(DefaultInitialWindow),
             .initial_peer_window = @intCast(DefaultInitialWindow),
@@ -1044,18 +1046,19 @@ pub const Stack = struct {
             .end_stream = end_stream,
         } };
         event_count += 1;
-        // RFC 9113 §5.2.1: Send WINDOW_UPDATE when half the initial window is consumed
-        const half_window = @divTrunc(self.initial_stream_window, 2);
-        if (self.conn_recv_window < half_window and event_count < events.len) {
-            const increment: u32 = @intCast(self.initial_stream_window - self.conn_recv_window);
-            self.conn_recv_window = self.initial_stream_window;
+        // RFC 9113 §6.5.2: connection window is independent of per-stream SETTINGS
+        const half_conn_window = @divTrunc(self.initial_conn_window, 2);
+        if (self.conn_recv_window < half_conn_window and event_count < events.len) {
+            const increment: u32 = @intCast(self.initial_conn_window - self.conn_recv_window);
+            self.conn_recv_window = self.initial_conn_window;
             events[event_count] = .{ .window_update_needed = .{
                 .stream_id = 0,
                 .increment = increment,
             } };
             event_count += 1;
         }
-        if (!end_stream and stream.recv_window < half_window and event_count < events.len) {
+        const half_stream_window = @divTrunc(self.initial_stream_window, 2);
+        if (!end_stream and stream.recv_window < half_stream_window and event_count < events.len) {
             const s_increment: u32 = @intCast(self.initial_stream_window - stream.recv_window);
             stream.recv_window = self.initial_stream_window;
             events[event_count] = .{ .window_update_needed = .{

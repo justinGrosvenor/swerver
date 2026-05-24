@@ -98,6 +98,7 @@ extern fn SSL_CTX_check_private_key(ctx: *SSL_CTX) c_int;
 extern fn SSL_CTX_set_alpn_select_cb(ctx: *SSL_CTX, cb: AlpnSelectCallback, arg: ?*anyopaque) void;
 extern fn SSL_CTX_ctrl(ctx: *SSL_CTX, cmd: c_int, larg: c_long, parg: ?*anyopaque) c_long;
 extern fn SSL_CTX_set_ciphersuites(ctx: *SSL_CTX, str: [*:0]const u8) c_int;
+extern fn SSL_CTX_set_cipher_list(ctx: *SSL_CTX, str: [*:0]const u8) c_int;
 extern fn SSL_CTX_set_alpn_protos(ctx: *SSL_CTX, protos: [*]const u8, protos_len: c_uint) c_int;
 
 // SNI (Server Name Indication)
@@ -119,6 +120,7 @@ pub const X509_NAME = opaque {};
 extern fn SSL_CTX_set_verify(ctx: *SSL_CTX, mode: c_int, callback: ?*const anyopaque) void;
 extern fn SSL_CTX_load_verify_locations(ctx: *SSL_CTX, ca_file: ?[*:0]const u8, ca_path: ?[*:0]const u8) c_int;
 extern fn SSL_CTX_set_default_verify_paths(ctx: *SSL_CTX) c_int;
+extern fn SSL_set1_host(ssl: *SSL, hostname: [*:0]const u8) c_int;
 extern fn SSL_get1_peer_certificate(ssl: *const SSL) ?*X509;
 extern fn X509_get_subject_name(x: *const X509) ?*X509_NAME;
 extern fn X509_NAME_oneline(name: *const X509_NAME, buf: ?[*]u8, size: c_int) ?[*:0]const u8;
@@ -128,6 +130,19 @@ pub fn setVerifyPeer(ctx: *SSL_CTX, require: bool) void {
     if (!tls_enabled) return;
     const mode = if (require) SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT else SSL_VERIFY_PEER;
     SSL_CTX_set_verify(ctx, mode, null);
+}
+
+pub fn setHostnameVerification(ssl: *SSL, hostname: [:0]const u8) bool {
+    if (!tls_enabled) return false;
+    return SSL_set1_host(ssl, hostname.ptr) == 1;
+}
+
+extern fn SSL_ctrl(ssl: *SSL, cmd: c_int, larg: c_long, parg: ?*anyopaque) c_long;
+const SSL_CTRL_SET_TLSEXT_HOSTNAME: c_int = 55;
+
+pub fn setSniHostname(ssl: *SSL, hostname: [:0]const u8) bool {
+    if (!tls_enabled) return false;
+    return SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, @constCast(@ptrCast(hostname.ptr))) != 0;
 }
 
 pub fn loadDefaultVerifyPaths(ctx: *SSL_CTX) !void {
@@ -486,6 +501,10 @@ pub fn createTcpContext(is_server: bool) !*SSL_CTX {
 
     _ = SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, TLS1_2_VERSION, null);
     _ = SSL_CTX_ctrl(ctx, SSL_CTRL_OPTIONS, SSL_OP_NO_COMPRESSION | SSL_OP_NO_RENEGOTIATION, null);
+
+    try setCiphersuites(ctx, "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256");
+    if (SSL_CTX_set_cipher_list(ctx, "ECDHE+AESGCM:ECDHE+CHACHA20:!aNULL:!MD5:!RC4") != 1)
+        return error.CipherConfigFailed;
 
     if (is_server) {
         SSL_CTX_set_alpn_select_cb(ctx, tcpAlpnSelectCallback, null);

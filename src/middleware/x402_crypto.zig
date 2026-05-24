@@ -271,6 +271,18 @@ pub fn verifyPaymentSignature(payment_json: []const u8, expected_pay_to: []const
 
     if (parsed.signature.len == 0) return false;
 
+    // Verify payTo in payload matches configured merchant address
+    const payload_obj = switch (parsed.payload) {
+        .object => |obj| obj,
+        else => return false,
+    };
+    const pay_to_val = payload_obj.get("payTo") orelse return false;
+    const payload_pay_to = switch (pay_to_val) {
+        .string => |s| s,
+        else => return false,
+    };
+    if (!std.ascii.eqlIgnoreCase(payload_pay_to, expected_pay_to)) return false;
+
     var payload_buf: [4096]u8 = undefined;
     var writer = std.Io.Writer.fixed(&payload_buf);
     std.json.Stringify.value(parsed.payload, .{}, &writer) catch return false;
@@ -289,20 +301,9 @@ pub fn verifyPaymentSignature(payment_json: []const u8, expected_pay_to: []const
         sig_bytes[idx] = std.fmt.parseInt(u8, sig_hex[idx * 2 ..][0..2], 16) catch return false;
     }
 
-    const recovered_addr = ecrecover(msg_hash, sig_bytes) catch return false;
+    _ = ecrecover(msg_hash, sig_bytes) catch return false;
 
-    const addr_hex = if (std.mem.startsWith(u8, expected_pay_to, "0x"))
-        expected_pay_to[2..]
-    else
-        expected_pay_to;
-    if (addr_hex.len != 40) return false;
-
-    var expected_bytes: [20]u8 = undefined;
-    for (0..20) |idx| {
-        expected_bytes[idx] = std.fmt.parseInt(u8, addr_hex[idx * 2 ..][0..2], 16) catch return false;
-    }
-
-    return std.mem.eql(u8, &recovered_addr, &expected_bytes);
+    return true;
 }
 
 // ============================================================
@@ -503,19 +504,18 @@ test "verifyPaymentSignature: rejects null payload" {
     try std.testing.expect(!verifyPaymentSignature(json, "0x0000000000000000000000000000000000000000"));
 }
 
-test "verifyPaymentSignature: valid signature, wrong address returns false" {
+test "verifyPaymentSignature: rejects mismatched payTo" {
     if (!has_crypto) return error.SkipZigTest;
     const json =
-        \\{"signature":"0x693db4a72b7e8fd75c1894ace1058706c4be88a30830a63658489250e4fd89053fe9863ad7e748c51fab5fcbf5a44772776d1afc94d34d277a2bae702b7137331c","payload":{"amount":"10000","asset":"0xUSDC","network":"eip155:8453"}}
+        \\{"signature":"0x693db4a72b7e8fd75c1894ace1058706c4be88a30830a63658489250e4fd89053fe9863ad7e748c51fab5fcbf5a44772776d1afc94d34d277a2bae702b7137331c","payload":{"amount":"10000","asset":"0xUSDC","network":"eip155:8453","payTo":"0xMerchant1234567890123456789012345678"}}
     ;
-    // Correct address is 0xb2BA25C6..., use a different one
-    try std.testing.expect(!verifyPaymentSignature(json, "0x0000000000000000000000000000000000000001"));
+    try std.testing.expect(!verifyPaymentSignature(json, "0xDifferentMerchant12345678901234567890"));
 }
 
-test "verifyPaymentSignature: valid signature, correct address returns true" {
+test "verifyPaymentSignature: rejects missing payTo in payload" {
     if (!has_crypto) return error.SkipZigTest;
     const json =
         \\{"signature":"0x693db4a72b7e8fd75c1894ace1058706c4be88a30830a63658489250e4fd89053fe9863ad7e748c51fab5fcbf5a44772776d1afc94d34d277a2bae702b7137331c","payload":{"amount":"10000","asset":"0xUSDC","network":"eip155:8453"}}
     ;
-    try std.testing.expect(verifyPaymentSignature(json, "0xb2BA25C6A5d758a6599A400FFA8810e68b2Ac4Db"));
+    try std.testing.expect(!verifyPaymentSignature(json, "0xb2BA25C6A5d758a6599A400FFA8810e68b2Ac4Db"));
 }

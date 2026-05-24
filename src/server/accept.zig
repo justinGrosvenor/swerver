@@ -30,6 +30,66 @@ const net = @import("../runtime/net.zig");
 const clock = @import("../runtime/clock.zig");
 const server_tls = @import("tls.zig");
 
+const IP_TRACKER_SLOTS = 4096;
+const DEFAULT_PER_IP_LIMIT: u16 = 256;
+
+pub const IpConnTracker = struct {
+    keys: [IP_TRACKER_SLOTS]u64 = [_]u64{0} ** IP_TRACKER_SLOTS,
+    counts: [IP_TRACKER_SLOTS]u16 = [_]u16{0} ** IP_TRACKER_SLOTS,
+
+    fn slot(self: *IpConnTracker, hash: u64) ?usize {
+        if (hash == 0) return null;
+        var idx = hash % IP_TRACKER_SLOTS;
+        var probes: usize = 0;
+        while (probes < 16) : (probes += 1) {
+            if (self.keys[idx] == hash or self.keys[idx] == 0) return idx;
+            idx = (idx + 1) % IP_TRACKER_SLOTS;
+        }
+        return null;
+    }
+
+    pub fn increment(self: *IpConnTracker, hash: u64, limit: u16) bool {
+        const idx = self.slot(hash) orelse return true;
+        if (self.keys[idx] == 0) {
+            self.keys[idx] = hash;
+            self.counts[idx] = 1;
+            return true;
+        }
+        if (self.counts[idx] >= limit) return false;
+        self.counts[idx] += 1;
+        return true;
+    }
+
+    pub fn decrement(self: *IpConnTracker, hash: u64) void {
+        const idx = self.slot(hash) orelse return;
+        if (self.keys[idx] != hash) return;
+        if (self.counts[idx] > 0) self.counts[idx] -= 1;
+        if (self.counts[idx] == 0) self.keys[idx] = 0;
+    }
+};
+
+pub var ip_tracker: IpConnTracker = .{};
+
+fn hashIp(ip4: ?[4]u8, ip6: ?[16]u8) u64 {
+    if (ip4) |bytes| {
+        var h: u64 = 0xcbf29ce484222325;
+        for (bytes) |b| {
+            h ^= b;
+            h *%= 0x100000001b3;
+        }
+        return h | 1;
+    }
+    if (ip6) |bytes| {
+        var h: u64 = 0xcbf29ce484222325;
+        for (bytes) |b| {
+            h ^= b;
+            h *%= 0x100000001b3;
+        }
+        return h | 1;
+    }
+    return 0;
+}
+
 pub fn handleAccept(server: *Server, listener_fd: std.posix.fd_t) !void {
     // Edge-triggered epoll: must drain the accept queue in a loop or
     // pending connections will be stranded until the next "transition".
@@ -53,6 +113,18 @@ pub fn handlePreAccepted(server: *Server, client_fd: std.posix.fd_t) !void {
 fn acceptOne(server: *Server, listener_fd: std.posix.fd_t) !void {
     const client_fd = net.accept(listener_fd) catch |err| switch (err) {
         error.WouldBlock => return error.WouldBlock,
+        error.TooManyOpenFiles => {
+            if (server.spare_fd) |spare| {
+                clock.closeFd(spare);
+                server.spare_fd = null;
+            }
+            if (net.accept(listener_fd)) |doomed_fd| {
+                clock.closeFd(doomed_fd);
+            } else |_| {}
+            server.spare_fd = std.posix.openat(std.posix.AT.FDCWD, "/dev/null", .{}, 0) catch null;
+            std.log.warn("EMFILE: fd limit reached, dropped incoming connection", .{});
+            return;
+        },
         else => return err,
     };
     try setupAcceptedConnection(server, client_fd);
@@ -84,7 +156,7 @@ fn setupAcceptedConnection(server: *Server, client_fd: std.posix.fd_t) !void {
         return;
     }
     conn.fd = client_fd;
-    if (server.needs_peer_ip) {
+    if (server.needs_peer_ip or server.cfg.per_ip_limit > 0) {
         if (net.getPeerAddress(client_fd)) |peer| {
             if (peer.getIp4Bytes()) |ip4| {
                 conn.cached_peer_ip = ip4;
@@ -92,6 +164,16 @@ fn setupAcceptedConnection(server: *Server, client_fd: std.posix.fd_t) !void {
                 conn.cached_peer_ip6 = ip6;
             }
         }
+    }
+    if (server.cfg.per_ip_limit > 0) {
+        const h = hashIp(conn.cached_peer_ip, conn.cached_peer_ip6);
+        if (h != 0 and !ip_tracker.increment(h, server.cfg.per_ip_limit)) {
+            if (conn.read_buffer) |buf| server.io.releaseBuffer(buf);
+            server.io.releaseConnection(conn);
+            clock.closeFd(client_fd);
+            return;
+        }
+        conn.ip_hash = h;
     }
     // If TLS is configured, start handshake before going active
     if (server.tcp_tls_provider) |*provider| {
