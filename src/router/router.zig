@@ -2,6 +2,7 @@ const std = @import("std");
 const request = @import("../protocol/request.zig");
 const response = @import("../response/response.zig");
 const x402 = @import("../middleware/x402.zig");
+const settlement = @import("../middleware/settlement.zig");
 const middleware = @import("../middleware/middleware.zig");
 const buffer_pool = @import("../runtime/buffer_pool.zig");
 const clock = @import("../runtime/clock.zig");
@@ -861,10 +862,16 @@ pub const Router = struct {
                 if (x402_result == .allow and x402_result.allow.needs_settlement) {
                     if (self.facilitator) |fac| {
                         const settle = x402.facilitatorSettle(fac, x402_result.allow.payment_header, &effective_policy, ctx.charge_amount);
-                        if (settle.success and settle.receipt_b64.len > 0) {
-                            x402_receipt_tls = .{ .name = "PAYMENT-RESPONSE", .value = settle.receipt_b64 };
-                            x402_has_receipt = true;
-                        } else if (!settle.success) {
+                        if (settle.success) {
+                            if (settle.receipt_b64.len > 0) {
+                                x402_receipt_tls = .{ .name = "PAYMENT-RESPONSE", .value = settle.receipt_b64 };
+                                x402_has_receipt = true;
+                            }
+                            if (effective_policy.settlement_url.len > 0) {
+                                const amount = if (ctx.charge_amount.len > 0) ctx.charge_amount else effective_policy.price;
+                                settlement.enqueue(effective_policy.gateway_id, settle.transaction, effective_policy.network, effective_policy.asset, amount);
+                            }
+                        } else {
                             std.log.warn("x402 settlement failed: {s}", .{settle.error_reason});
                             result_resp = .{ .status = 502, .headers = &.{}, .body = .{ .bytes = "{\"error\":\"payment settlement failed\"}" } };
                         }

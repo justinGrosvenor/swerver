@@ -23,6 +23,8 @@ pub const RoutePaymentConfig = struct {
     pay_to: []const u8 = "",
     scheme: []const u8 = "exact",
     max_timeout_seconds: u32 = 60,
+    settlement_url: []const u8 = "",
+    gateway_id: []const u8 = "",
 };
 
 pub const Policy = RoutePaymentConfig;
@@ -197,6 +199,8 @@ pub fn configFromProxyRoute(proxy_x402: anytype, allocator: std.mem.Allocator, u
         .pay_to = proxy_x402.pay_to,
         .scheme = proxy_x402.scheme,
         .max_timeout_seconds = proxy_x402.max_timeout_seconds,
+        .settlement_url = proxy_x402.settlement_url,
+        .gateway_id = proxy_x402.gateway_id,
     };
 }
 

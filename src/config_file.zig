@@ -284,6 +284,8 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
                 .pay_to = x.pay_to orelse return error.ConfigParseError,
                 .scheme = x.scheme orelse "exact",
                 .max_timeout_seconds = x.max_timeout_seconds orelse 60,
+                .settlement_url = x.settlement_url orelse "",
+                .gateway_id = x.gateway_id orelse "",
             };
         }
 
@@ -595,6 +597,8 @@ const RouteX402Json = struct {
     pay_to: ?[]const u8 = null,
     scheme: ?[]const u8 = null,
     max_timeout_seconds: ?u32 = null,
+    settlement_url: ?[]const u8 = null,
+    gateway_id: ?[]const u8 = null,
 };
 
 const UpstreamJson = struct {

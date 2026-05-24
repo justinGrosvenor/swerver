@@ -157,6 +157,8 @@ pub const ProxyRouteX402 = struct {
     pay_to: []const u8,
     scheme: []const u8 = "exact",
     max_timeout_seconds: u32 = 60,
+    settlement_url: []const u8 = "",
+    gateway_id: []const u8 = "",
 };
 
 /// Path rewrite rule

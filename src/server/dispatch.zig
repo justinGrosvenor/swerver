@@ -51,6 +51,7 @@ const admin_mod = @import("../admin/admin.zig");
 const cache_mod = @import("../proxy/cache.zig");
 const otel_mod = @import("../middleware/otel.zig");
 const body_schema_mod = @import("../middleware/body_schema.zig");
+const settlement_mod = @import("../middleware/settlement.zig");
 
 /// Global shutdown flag set by signal handler (atomic for signal safety)
 var shutdown_requested = std.atomic.Value(bool).init(false);
@@ -143,6 +144,9 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
         }
     }
 
+    // Initialize settlement reporting from proxy route config + auth token
+    initSettlement(server);
+
     const deadline = if (run_for_ms) |ms| server.io.nowMs() + ms else null;
     var last_housekeeping_ms: u64 = server.io.nowMs();
     var drain_deadline_ms: u64 = 0;
@@ -220,6 +224,8 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
             }
             // Poll admin API (non-blocking accept + handle)
             admin_mod.pollAdmin(server);
+            // Flush settlement reports (non-blocking batch POST)
+            settlement_mod.flush();
         }
         if (events.len == 0) continue;
         for (events) |event| {
@@ -992,7 +998,12 @@ pub fn handleRead(server: *Server, index: u32) !void {
                                 if (std.ascii.eqlIgnoreCase(hdr.name, "x-charge-amount")) break hdr.value;
                             } else "";
                             const settle = x402_mod.facilitatorSettle(fac, x402_result.allow.payment_header, &x402_policy, charge);
-                            if (!settle.success) {
+                            if (settle.success) {
+                                if (x402_policy.settlement_url.len > 0) {
+                                    const amount = if (charge.len > 0) charge else x402_policy.price;
+                                    settlement_mod.enqueue(x402_policy.gateway_id, settle.transaction, x402_policy.network, x402_policy.asset, amount);
+                                }
+                            } else {
                                 std.log.warn("x402 proxy settlement failed: {s}", .{settle.error_reason});
                             }
                         }
@@ -1664,4 +1675,19 @@ pub fn connWrite(server: *Server, conn: *connection.Connection, data: []const u8
         };
     }
     return .{ .bytes = @intCast(raw) };
+}
+
+fn initSettlement(server: *Server) void {
+    const token = if (server.config_source) |cs| switch (cs) {
+        .url => |uc| uc.token,
+        .file => "",
+    } else "";
+    if (server.proxy) |proxy| {
+        for (proxy.route_x402_policies) |policy| {
+            if (policy.settlement_url.len > 0) {
+                settlement_mod.configure(policy.settlement_url, token);
+                return;
+            }
+        }
+    }
 }
