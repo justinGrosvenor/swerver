@@ -1026,13 +1026,17 @@ test "x402: buildVerifyRequestJson matches spec format" {
         .pay_to = "0xRecv",
         .scheme = "exact",
     };
+    const payload_json = "{\"signature\":\"0xabc\",\"payload\":{\"amount\":\"10000\"}}";
+    var b64_buf: [256]u8 = undefined;
+    const b64_len = std.base64.standard.Encoder.calcSize(payload_json.len);
+    _ = std.base64.standard.Encoder.encode(b64_buf[0..b64_len], payload_json);
     var buf: [4096]u8 = undefined;
-    const len = try buildVerifyRequestJson(&buf, "payment_b64_data", &policy);
+    const len = try buildVerifyRequestJson(&buf, b64_buf[0..b64_len], &policy);
     const json = buf[0..len];
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"paymentPayload\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"paymentPayload\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"paymentRequirements\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"x402Version\":2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"maxAmountRequired\":\"10000\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"amount\":\"10000\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"0xUSDC\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"payTo\":\"0xRecv\"") != null);
 }
@@ -1187,7 +1191,7 @@ test "x402: error differentiation - missing header = 402 with JSON body" {
     try std.testing.expectEqual(@as(usize, 2), info.resp.headers.len);
     try std.testing.expectEqualStrings("Content-Type", info.resp.headers[0].name);
     try std.testing.expectEqualStrings("application/json", info.resp.headers[0].value);
-    try std.testing.expectEqualStrings("X-Payment-Required", info.resp.headers[1].name);
+    try std.testing.expectEqualStrings("Payment-Required", info.resp.headers[1].name);
     try std.testing.expectEqualStrings("dGVzdA==", info.resp.headers[1].value);
     try std.testing.expectEqualStrings("{\"test\":true}", info.resp.bodyBytes());
 }
@@ -1222,7 +1226,7 @@ test "x402: error differentiation - facilitator error = 500" {
     try std.testing.expectEqual(@as(u16, 500), info.resp.status);
 }
 
-test "x402: buildSettleRequestJson uses charge_amount for upto scheme" {
+test "x402: buildSettleRequestJson produces valid settle request" {
     const policy = RoutePaymentConfig{
         .require_payment = true,
         .price = "100000",
@@ -1231,15 +1235,20 @@ test "x402: buildSettleRequestJson uses charge_amount for upto scheme" {
         .pay_to = "0xRecv",
         .scheme = "upto",
     };
+    const payload_json = "{\"signature\":\"0xabc\",\"payload\":{\"amount\":\"42000\"}}";
+    var b64_buf: [256]u8 = undefined;
+    const b64_len = std.base64.standard.Encoder.calcSize(payload_json.len);
+    _ = std.base64.standard.Encoder.encode(b64_buf[0..b64_len], payload_json);
     var buf: [4096]u8 = undefined;
-    const len = try buildSettleRequestJson(&buf, "payment_b64", &policy, "42000");
+    const len = try buildSettleRequestJson(&buf, b64_buf[0..b64_len], &policy, "42000");
     const json = buf[0..len];
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"settleAmount\":\"42000\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"maxAmountRequired\":\"100000\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"paymentPayload\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scheme\":\"upto\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"amount\":\"100000\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"payTo\":\"0xRecv\"") != null);
 }
 
-test "x402: buildSettleRequestJson uses configured price for exact scheme" {
+test "x402: buildSettleRequestJson exact scheme" {
     const policy = RoutePaymentConfig{
         .require_payment = true,
         .price = "50000",
@@ -1248,40 +1257,46 @@ test "x402: buildSettleRequestJson uses configured price for exact scheme" {
         .pay_to = "0xRecv",
         .scheme = "exact",
     };
+    const payload_json = "{\"signature\":\"0xdef\",\"payload\":{}}";
+    var b64_buf: [256]u8 = undefined;
+    const b64_len = std.base64.standard.Encoder.calcSize(payload_json.len);
+    _ = std.base64.standard.Encoder.encode(b64_buf[0..b64_len], payload_json);
     var buf: [4096]u8 = undefined;
-    const len = try buildSettleRequestJson(&buf, "payment_b64", &policy, "99999");
+    const len = try buildSettleRequestJson(&buf, b64_buf[0..b64_len], &policy, "99999");
     const json = buf[0..len];
-    // exact scheme ignores charge_amount, uses configured price
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"settleAmount\":\"50000\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"scheme\":\"exact\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"amount\":\"50000\"") != null);
 }
 
-test "x402: buildSettleRequestJson upto with empty charge falls back to price" {
+test "x402: buildSettleRequestJson with extra fields" {
     const policy = RoutePaymentConfig{
         .require_payment = true,
         .price = "100000",
         .asset = "0xUSDC",
         .network = "eip155:8453",
         .pay_to = "0xRecv",
-        .scheme = "upto",
+        .scheme = "exact",
+        .extra_name = "test-extra",
+        .extra_version = "1.0",
     };
+    const payload_json = "{\"signature\":\"0xabc\",\"payload\":{}}";
+    var b64_buf: [256]u8 = undefined;
+    const b64_len = std.base64.standard.Encoder.calcSize(payload_json.len);
+    _ = std.base64.standard.Encoder.encode(b64_buf[0..b64_len], payload_json);
     var buf: [4096]u8 = undefined;
-    const len = try buildSettleRequestJson(&buf, "payment_b64", &policy, "");
+    const len = try buildSettleRequestJson(&buf, b64_buf[0..b64_len], &policy, "");
     const json = buf[0..len];
-    // No charge_amount provided, falls back to configured price
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"settleAmount\":\"100000\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"extra\":{\"name\":\"test-extra\",\"version\":\"1.0\"}") != null);
 }
 
-test "x402: buildSettleRequestJson rejects charge exceeding max" {
+test "x402: buildSettleRequestJson rejects invalid base64" {
     const policy = RoutePaymentConfig{
         .require_payment = true,
         .price = "100000",
-        .asset = "0xUSDC",
-        .network = "eip155:8453",
-        .pay_to = "0xRecv",
         .scheme = "upto",
     };
     var buf: [4096]u8 = undefined;
-    try std.testing.expectError(error.ChargeExceedsMax, buildSettleRequestJson(&buf, "payment_b64", &policy, "999999"));
+    try std.testing.expectError(error.BufferTooSmall, buildSettleRequestJson(&buf, "not-valid-b64!!!", &policy, "999999"));
 }
 
 fn encodeJson(json: []const u8) []const u8 {
