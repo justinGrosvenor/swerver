@@ -159,6 +159,11 @@ fn dispatch(server: *Server, method: Method, path: []const u8, body: []const u8,
         if (method != .POST) return .{ .status = 405, .body = "{\"error\":\"method not allowed\"}" };
         return persistConfig(server, buf);
     }
+    if (startsWith(path, "/v1/reload")) {
+        if (method != .POST) return .{ .status = 405, .body = "{\"error\":\"method not allowed\"}" };
+        server.applyReload();
+        return .{ .status = 200, .body = "{\"ok\":true}" };
+    }
     return .{ .status = 404, .body = "{\"error\":\"not found\"}" };
 }
 

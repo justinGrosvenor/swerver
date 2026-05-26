@@ -27,6 +27,7 @@ pub const RoutePaymentConfig = struct {
     gateway_id: []const u8 = "",
     extra_name: []const u8 = "",
     extra_version: []const u8 = "",
+    facilitator_url: []const u8 = "",
 };
 
 pub const Policy = RoutePaymentConfig;
@@ -204,6 +205,7 @@ pub fn configFromProxyRoute(proxy_x402: anytype, allocator: std.mem.Allocator, u
         .gateway_id = proxy_x402.gateway_id,
         .extra_name = proxy_x402.extra_name,
         .extra_version = proxy_x402.extra_version,
+        .facilitator_url = proxy_x402.facilitator_url,
     };
 }
 

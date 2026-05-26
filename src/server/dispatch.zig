@@ -828,10 +828,11 @@ pub fn handleRead(server: *Server, index: u32) !void {
             if (proxy.matchRoute(&parse.view)) |matched_route| {
                 const route_idx = proxy.routeIndex(matched_route);
                 const x402_policy = proxy.route_x402_policies[route_idx];
+                const route_fac = proxy.route_facilitators[route_idx] orelse server.app_router.facilitator;
                 const x402_result = x402_mod.evaluateWithFacilitator(
                     parse.view,
                     x402_policy,
-                    server.app_router.facilitator,
+                    route_fac,
                 );
                 switch (x402_result) {
                     .allow => {},
@@ -993,7 +994,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
                 }
                 if (proxy_result.resp.status >= 200 and proxy_result.resp.status < 300) {
                     if (x402_result == .allow and x402_result.allow.needs_settlement) {
-                        if (server.app_router.facilitator) |fac| {
+                        if (route_fac) |fac| {
                             const charge = for (proxy_result.resp.headers) |hdr| {
                                 if (std.ascii.eqlIgnoreCase(hdr.name, "x-charge-amount")) break hdr.value;
                             } else "";

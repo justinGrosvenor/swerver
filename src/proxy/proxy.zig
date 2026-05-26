@@ -64,6 +64,8 @@ pub const Proxy = struct {
     free_response_count: usize,
     /// Pre-computed x402 policies for proxy routes (parallel to config.routes)
     route_x402_policies: []x402.RoutePaymentConfig,
+    /// Per-route facilitator configs (parallel to config.routes, null = use global)
+    route_facilitators: []?x402.FacilitatorConfig,
     /// Per-route response caches (parallel to config.routes, null if route has no cache config)
     route_caches: []?cache_mod.ResponseCache,
     /// DNS service discovery (resolves upstream addresses periodically)
@@ -162,14 +164,23 @@ pub const Proxy = struct {
         // Pre-compute x402 policies for proxy routes
         const route_x402_policies = try allocator.alloc(x402.RoutePaymentConfig, config.routes.len);
         errdefer allocator.free(route_x402_policies);
+        const route_facilitators = try allocator.alloc(?x402.FacilitatorConfig, config.routes.len);
+        errdefer allocator.free(route_facilitators);
         for (config.routes, 0..) |route, i| {
             if (route.x402) |rx| {
                 route_x402_policies[i] = x402.configFromProxyRoute(&rx, allocator, route.path_prefix) catch {
                     route_x402_policies[i] = .{};
+                    route_facilitators[i] = null;
                     continue;
                 };
+                if (rx.facilitator_url.len > 0) {
+                    route_facilitators[i] = x402.parseFacilitatorUrl(rx.facilitator_url);
+                } else {
+                    route_facilitators[i] = null;
+                }
             } else {
                 route_x402_policies[i] = .{};
+                route_facilitators[i] = null;
             }
         }
 
@@ -208,6 +219,7 @@ pub const Proxy = struct {
             .free_request_count = BUFFER_POOL_SIZE,
             .free_response_count = BUFFER_POOL_SIZE,
             .route_x402_policies = route_x402_policies,
+            .route_facilitators = route_facilitators,
             .route_caches = route_caches,
             .dns_discovery = dns_discovery,
             .consul_discovery = consul_discovery,
@@ -267,6 +279,7 @@ pub const Proxy = struct {
         }
         self.allocator.free(self.route_caches);
         self.allocator.free(self.route_x402_policies);
+        self.allocator.free(self.route_facilitators);
         self.allocator.free(self.free_request_stack);
         self.allocator.free(self.free_response_stack);
         self.allocator.free(self.request_bufs);
@@ -1055,6 +1068,7 @@ test "Proxy route matching" {
         .free_request_count = 0,
         .free_response_count = 0,
         .route_x402_policies = &.{},
+        .route_facilitators = &.{},
         .route_caches = &.{},
         .dns_discovery = .{ .allocator = allocator, .entries = &.{}, .entry_count = 0 },
         .consul_discovery = .{ .allocator = allocator, .entries = &.{}, .entry_count = 0 },

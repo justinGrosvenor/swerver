@@ -131,6 +131,8 @@ pub const Server = struct {
     otel: ?*otel_mod.TraceExporter = null,
     /// Config source for hot reload (null if not using external config)
     config_source: ?config_fetch.ConfigSource = null,
+    /// Hash of last fetched config bytes — skip rebuild when unchanged
+    config_content_hash: u64 = 0,
     /// Arena owning the route/upstream string data from the last config reload.
     /// Freed on next reload or on server deinit. Null when proxy was set up
     /// via ServerBuilder (strings owned by the caller's arena instead).
@@ -377,6 +379,10 @@ pub const Server = struct {
                     return;
                 };
                 defer self.allocator.free(bytes);
+                const hash = std.hash.Wyhash.hash(0, bytes);
+                if (hash == self.config_content_hash) return;
+                self.config_content_hash = hash;
+                std.log.info("config changed, reloading", .{});
                 if (url_config.cache_path) |cache_path| {
                     config_fetch.writeCacheFile(cache_path, bytes) catch |err| {
                         std.log.warn("failed to update config cache: {}", .{err});
@@ -388,6 +394,9 @@ pub const Server = struct {
                 };
             },
         };
+
+        // Carry over x402 fields that are only set at startup (not in the JSON config)
+        loaded.server_config.x402 = self.cfg.x402;
 
         loaded.server_config.validate() catch |err| {
             std.log.err("Config reload validation failed: {}", .{err});
