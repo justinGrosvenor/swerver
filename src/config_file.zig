@@ -277,6 +277,17 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
 
         var route_x402: ?upstream_mod.ProxyRouteX402 = null;
         if (r.x402) |x| {
+            var extensions_json: []const u8 = "";
+            if (x.extensions) |ext| {
+                var ext_list = std.ArrayList(u8).empty;
+                var ext_writer = std.Io.Writer.Allocating.fromArrayList(alloc, &ext_list);
+                defer ext_writer.deinit();
+                std.json.Stringify.value(ext, .{}, &ext_writer.writer) catch return error.ConfigParseError;
+                ext_list = ext_writer.toArrayList();
+                const ext_copy = try alloc.alloc(u8, ext_list.items.len);
+                @memcpy(ext_copy, ext_list.items);
+                extensions_json = ext_copy;
+            }
             route_x402 = .{
                 .price = x.price orelse return error.ConfigParseError,
                 .asset = x.asset orelse return error.ConfigParseError,
@@ -289,6 +300,7 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
                 .extra_name = x.extra_name orelse "",
                 .extra_version = x.extra_version orelse "",
                 .facilitator_url = x.facilitator_url orelse "",
+                .extensions_json = extensions_json,
             };
         }
 
@@ -605,6 +617,7 @@ const RouteX402Json = struct {
     extra_name: ?[]const u8 = null,
     extra_version: ?[]const u8 = null,
     facilitator_url: ?[]const u8 = null,
+    extensions: ?std.json.Value = null,
 };
 
 const UpstreamJson = struct {

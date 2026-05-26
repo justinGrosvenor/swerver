@@ -28,6 +28,7 @@ pub const RoutePaymentConfig = struct {
     extra_name: []const u8 = "",
     extra_version: []const u8 = "",
     facilitator_url: []const u8 = "",
+    extensions_json: []const u8 = "",
 };
 
 pub const Policy = RoutePaymentConfig;
@@ -131,19 +132,39 @@ pub const PaymentRequiredEncoded = struct {
     json: []u8,
 };
 
-pub fn buildPaymentRequired(allocator: std.mem.Allocator, required: PaymentRequired) !PaymentRequiredEncoded {
+pub fn buildPaymentRequired(allocator: std.mem.Allocator, required: PaymentRequired, extensions_json: []const u8) !PaymentRequiredEncoded {
     var json_list = std.ArrayList(u8).empty;
     var writer = std.Io.Writer.Allocating.fromArrayList(allocator, &json_list);
     defer writer.deinit();
     try std.json.Stringify.value(required, .{}, &writer.writer);
     json_list = writer.toArrayList();
 
-    const json_copy = try allocator.alloc(u8, json_list.items.len);
-    @memcpy(json_copy, json_list.items);
+    const base = json_list.items;
+    const has_ext = extensions_json.len > 0 and base.len > 0 and base[base.len - 1] == '}';
+    const ext_key = ",\"extensions\":";
 
-    const encoded_len = std.base64.standard.Encoder.calcSize(json_list.items.len);
+    const json_len = if (has_ext)
+        base.len - 1 + ext_key.len + extensions_json.len + 1
+    else
+        base.len;
+
+    const json_copy = try allocator.alloc(u8, json_len);
+    if (has_ext) {
+        var off: usize = 0;
+        @memcpy(json_copy[off..][0 .. base.len - 1], base[0 .. base.len - 1]);
+        off += base.len - 1;
+        @memcpy(json_copy[off..][0..ext_key.len], ext_key);
+        off += ext_key.len;
+        @memcpy(json_copy[off..][0..extensions_json.len], extensions_json);
+        off += extensions_json.len;
+        json_copy[off] = '}';
+    } else {
+        @memcpy(json_copy, base);
+    }
+
+    const encoded_len = std.base64.standard.Encoder.calcSize(json_len);
     const b64 = try allocator.alloc(u8, encoded_len);
-    _ = std.base64.standard.Encoder.encode(b64, json_list.items);
+    _ = std.base64.standard.Encoder.encode(b64, json_copy);
     return .{ .b64 = b64, .json = json_copy };
 }
 
@@ -170,7 +191,7 @@ pub fn demoPaymentRequiredB64(allocator: std.mem.Allocator, url: []const u8) !Pa
             },
         },
     };
-    return buildPaymentRequired(allocator, payload);
+    return buildPaymentRequired(allocator, payload, "");
 }
 
 pub fn configFromProxyRoute(proxy_x402: anytype, allocator: std.mem.Allocator, url: []const u8) !RoutePaymentConfig {
@@ -190,7 +211,7 @@ pub fn configFromProxyRoute(proxy_x402: anytype, allocator: std.mem.Allocator, u
             } else null,
         }},
     };
-    const encoded = try buildPaymentRequired(allocator, payload);
+    const encoded = try buildPaymentRequired(allocator, payload, proxy_x402.extensions_json);
     return .{
         .require_payment = true,
         .payment_required_b64 = encoded.b64,
@@ -206,6 +227,7 @@ pub fn configFromProxyRoute(proxy_x402: anytype, allocator: std.mem.Allocator, u
         .extra_name = proxy_x402.extra_name,
         .extra_version = proxy_x402.extra_version,
         .facilitator_url = proxy_x402.facilitator_url,
+        .extensions_json = proxy_x402.extensions_json,
     };
 }
 
