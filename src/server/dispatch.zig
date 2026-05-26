@@ -177,9 +177,13 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
                 return;
             }
         }
-        if (reload_requested.swap(false, .acq_rel)) {
-            server.applyReload();
+        if (reload_requested.load(.acquire)) {
+            if (!server.reload_in_progress.load(.acquire)) {
+                reload_requested.store(false, .release);
+                server.startBackgroundReload();
+            }
         }
+        server.applyPendingReload();
         if (deadline) |limit| {
             if (server.io.nowMs() >= limit) return;
         }

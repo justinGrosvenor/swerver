@@ -25,6 +25,7 @@ const forward_mod = @import("proxy/forward.zig");
 const preencoded = @import("server/preencoded.zig");
 const server_tls = @import("server/tls.zig");
 const otel_mod = @import("middleware/otel.zig");
+const config_file_mod = @import("config_file.zig");
 const accept_mod = @import("server/accept.zig");
 const http3_mod = @import("server/http3.zig");
 const http2_mod = @import("server/http2.zig");
@@ -105,6 +106,11 @@ const write_queue = @import("server/write_queue.zig");
 /// run until SIGINT / SIGTERM; pass a value to have the loop exit
 /// automatically after that many milliseconds (used by tests and by
 /// the release workflow's smoke step).
+pub const PendingReload = struct {
+    loaded: config_file_mod.LoadedConfig,
+    new_hash: u64,
+};
+
 pub const Server = struct {
     allocator: std.mem.Allocator,
     cfg: config.ServerConfig,
@@ -137,6 +143,10 @@ pub const Server = struct {
     /// Freed on next reload or on server deinit. Null when proxy was set up
     /// via ServerBuilder (strings owned by the caller's arena instead).
     reload_arena: ?std.heap.ArenaAllocator = null,
+    /// Background reload result, set by the fetch thread, consumed by the event loop.
+    pending_reload: std.atomic.Value(?*PendingReload) = std.atomic.Value(?*PendingReload).init(null),
+    /// True while a background reload fetch is in flight.
+    reload_in_progress: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Buffer for receiving UDP datagrams
     udp_recv_buf: [2048]u8 = undefined,
     /// Pre-computed Alt-Svc header value for HTTP/3 advertisement
@@ -349,6 +359,11 @@ pub const Server = struct {
         if (self.admin_listener_fd) |fd| clock.closeFd(fd);
         if (self.quic) |*q| q.deinit();
         if (self.otel) |otel_ptr| self.allocator.destroy(otel_ptr);
+        if (self.pending_reload.swap(null, .acq_rel)) |pr| {
+            var loaded = pr.loaded;
+            loaded.deinit();
+            std.heap.page_allocator.destroy(pr);
+        }
         if (self.reload_arena) |*a| a.deinit();
         self.io.deinit();
     }
@@ -359,50 +374,94 @@ pub const Server = struct {
         dispatch.requestShutdown();
     }
 
-    /// Apply hot reload from config source (file or URL).
-    /// Reloads timeouts, limits, and (if present) routes + upstreams.
-    /// Requires restart: address, port, max_connections, buffer pool, TLS certs.
-    pub fn applyReload(self: *Server) void {
-        const source = self.config_source orelse {
-            std.log.info("SIGHUP received but no config source set, ignoring", .{});
+    /// Kick off a background thread to fetch + parse config.
+    /// The event loop stays unblocked; call applyPendingReload() each
+    /// tick to pick up the result once the fetch completes.
+    pub fn startBackgroundReload(self: *Server) void {
+        if (self.config_source == null) {
+            std.log.info("reload requested but no config source set, ignoring", .{});
+            return;
+        }
+        if (self.reload_in_progress.swap(true, .acq_rel)) return;
+
+        const thread = std.Thread.spawn(.{}, backgroundReloadFetch, .{self}) catch |err| {
+            std.log.err("Failed to spawn reload thread: {}", .{err});
+            self.reload_in_progress.store(false, .release);
             return;
         };
-        const config_file = @import("config_file.zig");
-        var loaded = switch (source) {
-            .file => |path| config_file.loadConfigFile(self.allocator, path) catch |err| {
-                std.log.err("Config reload failed: {}", .{err});
-                return;
+        thread.detach();
+    }
+
+    fn backgroundReloadFetch(server: *Server) void {
+        defer server.reload_in_progress.store(false, .release);
+
+        const source = server.config_source.?;
+        const alloc = std.heap.page_allocator;
+
+        var loaded: config_file_mod.LoadedConfig = undefined;
+        var new_hash: u64 = 0;
+
+        switch (source) {
+            .file => |path| {
+                loaded = config_file_mod.loadConfigFile(alloc, path) catch |err| {
+                    std.log.err("Config reload failed: {}", .{err});
+                    return;
+                };
             },
-            .url => |url_config| blk: {
-                const bytes = config_fetch.fetchConfigBytes(self.allocator, url_config) catch |err| {
+            .url => |url_config| {
+                const bytes = config_fetch.fetchConfigBytes(alloc, url_config) catch |err| {
                     std.log.err("Config reload from URL failed: {}", .{err});
                     return;
                 };
-                defer self.allocator.free(bytes);
-                const hash = std.hash.Wyhash.hash(0, bytes);
-                if (hash == self.config_content_hash) return;
-                self.config_content_hash = hash;
+                defer alloc.free(bytes);
+
+                new_hash = std.hash.Wyhash.hash(0, bytes);
+                if (new_hash == server.config_content_hash) return;
+
                 std.log.info("config changed, reloading", .{});
+
                 if (url_config.cache_path) |cache_path| {
                     config_fetch.writeCacheFile(cache_path, bytes) catch |err| {
                         std.log.warn("failed to update config cache: {}", .{err});
                     };
                 }
-                break :blk config_file.parseJsonFromBytes(self.allocator, bytes) catch |err| {
+
+                loaded = config_file_mod.parseJsonFromBytes(alloc, bytes) catch |err| {
                     std.log.err("Config reload parse failed: {}", .{err});
                     return;
                 };
             },
-        };
+        }
 
-        // Carry over x402 fields that are only set at startup (not in the JSON config)
-        loaded.server_config.x402 = self.cfg.x402;
+        loaded.server_config.x402 = server.cfg.x402;
 
         loaded.server_config.validate() catch |err| {
             std.log.err("Config reload validation failed: {}", .{err});
             loaded.deinit();
             return;
         };
+
+        const result = alloc.create(PendingReload) catch {
+            loaded.deinit();
+            return;
+        };
+        result.* = .{ .loaded = loaded, .new_hash = new_hash };
+
+        if (server.pending_reload.swap(result, .acq_rel)) |old| {
+            var old_loaded = old.loaded;
+            old_loaded.deinit();
+            alloc.destroy(old);
+        }
+    }
+
+    /// Apply a pending reload result produced by the background thread.
+    /// Called from the event loop; only does the fast pointer swap.
+    pub fn applyPendingReload(self: *Server) void {
+        const result = self.pending_reload.swap(null, .acq_rel) orelse return;
+        defer std.heap.page_allocator.destroy(result);
+
+        var loaded = result.loaded;
+        if (result.new_hash != 0) self.config_content_hash = result.new_hash;
 
         const new = loaded.server_config;
         self.cfg.timeouts = new.timeouts;
@@ -436,6 +495,8 @@ pub const Server = struct {
             }
             if (old_arena) |*oa| oa.deinit();
             self.needs_peer_ip = true;
+
+            const source = self.config_source.?;
             const src_label: []const u8 = switch (source) {
                 .file => |p| p,
                 .url => |u| u.url,
@@ -459,6 +520,11 @@ pub const Server = struct {
                 std.log.info("Config reloaded", .{});
             }
         }
+    }
+
+    /// Synchronous reload (legacy path for SIGHUP with file-based config).
+    pub fn applyReload(self: *Server) void {
+        self.startBackgroundReload();
     }
 
     pub fn run(self: *Server, run_for_ms: ?u64) !void {
