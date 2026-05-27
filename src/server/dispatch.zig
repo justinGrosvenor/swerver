@@ -579,20 +579,30 @@ pub fn handleRead(server: *Server, index: u32) !void {
     // need to call connRead (SSL_read) to pull plaintext out.
     if (!server.io.capabilities().delivers_read_data or conn.is_tls) {
         const slice = buffer_handle.bytes[read_start..];
-        const count = switch (connRead(server, conn, slice)) {
-            .bytes => |n| n,
+        switch (connRead(server, conn, slice)) {
+            .bytes => |n| {
+                server.io.onReadBuffered(conn, n);
+                conn.markActive(server.now_ms);
+            },
             .eof => {
                 server.closeConnection(conn);
                 return;
             },
-            .again => return,
+            .again => {
+                // With edge-triggered epoll + TLS, the speculative read
+                // or handleWrite re-entry may call handleRead when
+                // read_buffered_bytes > 0 (data already decrypted from
+                // a prior SSL_read). If SSL_read returns WouldBlock here
+                // (no MORE records), we must still process the existing
+                // buffered data — returning would strand it, since no
+                // EPOLLIN will fire for data already in userspace.
+                if (conn.read_buffered_bytes == 0) return;
+            },
             .err => {
                 server.closeConnection(conn);
                 return;
             },
-        };
-        server.io.onReadBuffered(conn, count);
-        conn.markActive(server.now_ms);
+        }
     } else if (conn.read_buffered_bytes == 0) {
         // Completion backend but no data seeded (shouldn't happen
         // unless the event was spurious). Nothing to do.
@@ -680,6 +690,33 @@ pub fn handleRead(server: *Server, index: u32) !void {
             }
         }
         return;
+    }
+
+    // H1 TLS drain: SSL_read returns one TLS record at a time. If the
+    // kernel delivered a TCP segment spanning multiple TLS records
+    // (e.g. HTTP headers in one record, body in another), seedReadBuffer
+    // fed all ciphertext to rbio but the initial SSL_read above only
+    // decrypted the first record. Drain remaining records now so the
+    // dispatch loop sees the complete request. Without this, a partial
+    // parse (body still encrypted in rbio) strands the connection — no
+    // kernel event will fire for data already in userspace.
+    if (conn.is_tls) {
+        var tls_drain: u8 = 0;
+        while (tls_drain < 64) : (tls_drain += 1) {
+            const drain_start = conn.read_offset + conn.read_buffered_bytes;
+            if (drain_start >= buffer_handle.bytes.len) break;
+            switch (connRead(server, conn, buffer_handle.bytes[drain_start..])) {
+                .bytes => |n| {
+                    server.io.onReadBuffered(conn, n);
+                    conn.markActive(server.now_ms);
+                },
+                .eof => {
+                    server.closeConnection(conn);
+                    return;
+                },
+                .again, .err => break,
+            }
+        }
     }
 
     while (conn.state != .closed and conn.read_buffered_bytes > 0 and conn.canEnqueueWrite()) {
@@ -841,6 +878,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
                 switch (x402_result) {
                     .allow => {},
                     .reject => |info| {
+                        if (parse.view.method == .POST or parse.view.method == .PUT or parse.view.method == .PATCH) conn.close_after_write = true;
                         try http1_mod.queueResponse(server, conn, info.resp);
                         if (conn.read_buffered_bytes == 0) break;
                         continue;
@@ -850,6 +888,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
                 switch (auth_result) {
                     .allow => {},
                     .reject => |resp| {
+                        if (parse.view.method == .POST or parse.view.method == .PUT or parse.view.method == .PATCH) conn.close_after_write = true;
                         try http1_mod.queueResponse(server, conn, resp);
                         if (conn.read_buffered_bytes == 0) break;
                         continue;
@@ -873,6 +912,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
                         null;
                     if (ratelimit_mod.evaluateRoute(consumer, client_key, rl_cfg)) |rl_resp| {
                         conn.setRateLimitPause(server.now_ms, rl_resp.pause_ms);
+                        if (parse.view.method == .POST or parse.view.method == .PUT or parse.view.method == .PATCH) conn.close_after_write = true;
                         try http1_mod.queueResponse(server, conn, rl_resp.resp);
                         if (conn.read_buffered_bytes == 0) break;
                         continue;
