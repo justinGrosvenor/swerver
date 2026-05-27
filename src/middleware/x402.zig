@@ -195,9 +195,10 @@ pub fn demoPaymentRequiredB64(allocator: std.mem.Allocator, url: []const u8) !Pa
 }
 
 pub fn configFromProxyRoute(proxy_x402: anytype, allocator: std.mem.Allocator, url: []const u8) !RoutePaymentConfig {
+    const resource_url = if (proxy_x402.resource_url.len > 0) proxy_x402.resource_url else url;
     const payload = PaymentRequired{
         .@"error" = "Payment required",
-        .resource = .{ .url = url, .description = "Protected resource", .mimeType = "application/json" },
+        .resource = .{ .url = resource_url, .description = "Protected resource", .mimeType = "application/json" },
         .accepts = &[_]Accept{.{
             .scheme = proxy_x402.scheme,
             .network = proxy_x402.network,
