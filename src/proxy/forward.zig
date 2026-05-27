@@ -498,10 +498,16 @@ const ResponseParser = struct {
 
         if (content_length != null and is_chunked) return error.InvalidResponse;
 
+        // RFC 9110 §6.4.1: 1xx, 204, 304 MUST NOT contain a message body
+        const status_no_body = (status >= 100 and status < 200) or
+            status == 204 or status == 304;
+
         // Determine body bounds
         var body_end = self.buf.len;
         var close_delimited = false;
-        if (content_length) |len| {
+        if (status_no_body) {
+            body_end = self.pos;
+        } else if (content_length) |len| {
             if (self.pos + len > self.buf.len) return error.IncompleteResponse;
             body_end = self.pos + len;
         } else if (is_chunked) {
