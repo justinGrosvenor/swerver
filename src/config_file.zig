@@ -356,11 +356,22 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
             route_body_schema = schema_ptr;
         }
 
+        var route_headers: upstream_mod.HeaderRules = .{};
+        if (r.upstream_headers) |uh| {
+            const hdrs = try alloc.alloc(upstream_mod.Header, uh.len);
+            for (uh, 0..) |h, hi| {
+                if (!isSafeHttpValue(h.name) or !isSafeHttpValue(h.value)) return error.ConfigParseError;
+                hdrs[hi] = .{ .name = h.name, .value = h.value };
+            }
+            route_headers.set_request = hdrs;
+        }
+
         routes_out[ri] = .{
             .path_prefix = r.path_prefix,
             .host = r.host,
             .upstream = r.upstream,
             .rewrite = rewrite,
+            .headers = route_headers,
             .timeouts = .{
                 .connect_ms = r.connect_timeout_ms orelse 5_000,
                 .send_ms = r.send_timeout_ms orelse 30_000,
@@ -672,6 +683,11 @@ const PoolConfigJson = struct {
     connect_timeout_ms: ?u32 = null,
 };
 
+const HeaderJson = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
 const RouteJson = struct {
     path_prefix: []const u8,
     host: ?[]const u8 = null,
@@ -689,6 +705,7 @@ const RouteJson = struct {
     cache: ?CacheJson = null,
     body_schema: ?std.json.Value = null,
     mirror: ?[]const u8 = null,
+    upstream_headers: ?[]const HeaderJson = null,
 };
 
 const CacheJson = struct {
