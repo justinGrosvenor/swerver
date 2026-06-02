@@ -241,11 +241,11 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
         // Drain async x402 facilitator results. The 10ms poll timeout
         // bounds delivery latency without needing an eventfd wakeup.
         while (x402_client.pollResult()) |result| {
-            const rconn = server.io.getConnection(result.conn_index) orelse continue;
-            if (rconn.id != result.conn_id) continue;
-            if (rconn.x402 != .pending) continue;
             switch (result.kind) {
                 .verify => {
+                    const rconn = server.io.getConnection(result.conn_index) orelse continue;
+                    if (rconn.id != result.conn_id) continue;
+                    if (rconn.x402 != .pending) continue;
                     rconn.x402 = if (result.is_valid) .resolved_allow else .resolved_reject;
                     if (rconn.isAccumulatingBody()) {
                         http1_mod.dispatchWithAccumulatedBody(server, rconn) catch {};
