@@ -224,6 +224,12 @@ pub const IoRuntime = struct {
         conn.onReadConsumed(bytes, self.cfg.backpressure);
     }
 
+    pub fn unReadConsumed(self: *IoRuntime, conn: *connection.Connection, saved_offset: usize, saved_buffered: usize) void {
+        _ = self;
+        conn.read_offset = saved_offset;
+        conn.read_buffered_bytes = saved_buffered;
+    }
+
     pub fn onWriteBuffered(self: *IoRuntime, conn: *connection.Connection, bytes: usize) void {
         conn.onWriteBuffered(bytes, self.cfg.backpressure);
     }

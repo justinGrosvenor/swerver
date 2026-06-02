@@ -43,6 +43,7 @@ const middleware = @import("../middleware/middleware.zig");
 const auth_mod = @import("../middleware/auth.zig");
 const ratelimit_mod = @import("../middleware/ratelimit.zig");
 const x402_mod = @import("../middleware/x402.zig");
+const x402_client = @import("../middleware/x402_client.zig");
 const usage_mod = @import("../middleware/usage.zig");
 const forward_mod = @import("../proxy/forward.zig");
 const clock = @import("../runtime/clock.zig");
@@ -954,18 +955,62 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
         if (proxy.matchRoute(&hparse.view)) |matched_route| {
             const route_idx = proxy.routeIndex(matched_route);
             const x402_policy = proxy.route_x402_policies[route_idx];
-            const x402_result = x402_mod.evaluateWithFacilitator(
-                hparse.view,
-                x402_policy,
-                server.app_router.facilitator,
-            );
-            switch (x402_result) {
-                .allow => {},
-                .reject => |info| {
-                    cleanupBodyAccumulation(server, conn);
-                    queueResponse(server, conn, info.resp) catch {};
-                    return;
-                },
+            const route_fac = proxy.route_facilitators[route_idx] orelse server.app_router.facilitator;
+            var x402_result: x402_mod.EvaluateResult = undefined;
+            if (conn.x402 == .resolved_allow) {
+                conn.x402 = .none;
+                x402_result = .{ .allow = .{
+                    .payment_header = x402_mod.findValidPaymentHeader(hparse.view) orelse "",
+                    .needs_settlement = true,
+                } };
+            } else if (conn.x402 == .resolved_reject) {
+                conn.x402 = .none;
+                const reject_info = x402_mod.rejectWith(.facilitator_rejected, x402_policy);
+                cleanupBodyAccumulation(server, conn);
+                queueResponse(server, conn, reject_info.resp) catch {};
+                return;
+            } else {
+                x402_result = x402_mod.evaluateWithFacilitator(hparse.view, x402_policy, null);
+                switch (x402_result) {
+                    .reject => |info| {
+                        cleanupBodyAccumulation(server, conn);
+                        queueResponse(server, conn, info.resp) catch {};
+                        return;
+                    },
+                    .allow => |ctx| {
+                        if (route_fac != null and x402_policy.require_payment and ctx.payment_header.len > 0) {
+                            var entry = x402_client.RequestEntry{ .kind = .verify, .conn_index = conn.index, .conn_id = conn.id };
+                            const rf = route_fac.?;
+                            const hl: u8 = @intCast(@min(rf.host.len, entry.host.len));
+                            @memcpy(entry.host[0..hl], rf.host[0..hl]);
+                            entry.host_len = hl;
+                            entry.port = rf.port;
+                            entry.use_tls = rf.use_tls;
+                            entry.timeout_ms = rf.timeout_ms;
+                            var json_buf: [4096]u8 = undefined;
+                            const req_json_len = x402_mod.buildVerifyRequestJson(&json_buf, ctx.payment_header, &x402_policy) catch 0;
+                            if (req_json_len > 0) {
+                                entry.http_len = @intCast(x402_mod.buildFacilitatorPost(&entry.http_buf, rf, "/verify", json_buf[0..req_json_len]) catch 0);
+                            }
+                            if (entry.http_len > 0 and x402_client.submit(entry)) {
+                                conn.x402 = .pending;
+                                conn.markActive(server.now_ms);
+                                return;
+                            }
+                            conn.close_after_write = true;
+                            cleanupBodyAccumulation(server, conn);
+                            queueResponse(server, conn, .{
+                                .status = 503,
+                                .headers = &[_]response_mod.Header{
+                                    .{ .name = "Retry-After", .value = "1" },
+                                    .{ .name = "Content-Length", .value = "0" },
+                                },
+                                .body = .{ .bytes = "" },
+                            }) catch {};
+                            return;
+                        }
+                    },
+                }
             }
             const auth_result = auth_mod.evaluate(hparse.view, matched_route.auth);
             switch (auth_result) {

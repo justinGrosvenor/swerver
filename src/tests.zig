@@ -64,6 +64,7 @@ const access_log = @import("middleware/access_log.zig");
 const observability = @import("middleware/observability.zig");
 const x402 = @import("middleware/x402.zig");
 const x402_crypto = @import("middleware/x402_crypto.zig");
+const x402_client = @import("middleware/x402_client.zig");
 const health = @import("middleware/health.zig");
 const ratelimit = @import("middleware/ratelimit.zig");
 const security = @import("middleware/security.zig");
@@ -163,6 +164,7 @@ comptime {
     _ = observability;
     _ = x402;
     _ = x402_crypto;
+    _ = x402_client;
     _ = health;
     _ = ratelimit;
     _ = security;

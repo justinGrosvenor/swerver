@@ -234,7 +234,7 @@ pub fn configFromProxyRoute(proxy_x402: anytype, allocator: std.mem.Allocator, u
 
 var reject_402_headers: [2]response.Header = undefined;
 
-fn rejectWith(reason: RejectReason, policy: RoutePaymentConfig) RejectInfo {
+pub fn rejectWith(reason: RejectReason, policy: RoutePaymentConfig) RejectInfo {
     const status: u16 = switch (reason) {
         .missing_header, .facilitator_rejected => 402,
         .malformed_header, .invalid_signature => 400,
@@ -402,7 +402,7 @@ fn isV2Payload(decoded: []const u8) bool {
     return std.mem.indexOf(u8, decoded, "\"x402Version\"") != null;
 }
 
-fn findValidPaymentHeader(req: request.RequestView) ?[]const u8 {
+pub fn findValidPaymentHeader(req: request.RequestView) ?[]const u8 {
     for (req.headers) |hdr| {
         if (std.ascii.eqlIgnoreCase(hdr.name, "x-payment") or
             std.ascii.eqlIgnoreCase(hdr.name, "payment-signature"))
@@ -483,9 +483,13 @@ fn buildReceiptB64(settle: *const SettleResult) ?[]const u8 {
     return receipt_b64_buf[0..b64_len];
 }
 
-fn facilitatorRoundTrip(config: FacilitatorConfig, req_bytes: []const u8, resp_buf: []u8) !usize {
-    const fd = net.connectBlockingValidated(config.host, config.port, config.timeout_ms) catch
-        return error.ConnectFailed;
+pub fn facilitatorRoundTrip(config: FacilitatorConfig, req_bytes: []const u8, resp_buf: []u8) !usize {
+    // Use non-validated connect for non-TLS facilitators (local/dev) to allow
+    // loopback/private addresses. TLS facilitators use validated (SSRF-safe) connect.
+    const fd = if (config.use_tls)
+        net.connectBlockingValidated(config.host, config.port, config.timeout_ms) catch return error.ConnectFailed
+    else
+        net.connectBlocking(config.host, config.port, config.timeout_ms) catch return error.ConnectFailed;
     defer clock.closeFd(fd);
 
     net.setSocketTimeouts(fd, config.timeout_ms, config.timeout_ms);
@@ -582,7 +586,7 @@ fn isHttpResponseComplete(data: []const u8) bool {
     return true;
 }
 
-fn buildSettleRequestJson(buf: []u8, payment_header: []const u8, policy: *const RoutePaymentConfig, charge_amount: []const u8) !usize {
+pub fn buildSettleRequestJson(buf: []u8, payment_header: []const u8, policy: *const RoutePaymentConfig, charge_amount: []const u8) !usize {
     _ = charge_amount;
     // Decode base64 payment header to get the raw JSON payload object
     var decode_buf: [8192]u8 = undefined;
@@ -615,7 +619,7 @@ fn buildSettleRequestJson(buf: []u8, payment_header: []const u8, policy: *const 
     return off;
 }
 
-fn buildVerifyRequestJson(buf: []u8, payment_header: []const u8, policy: *const RoutePaymentConfig) !usize {
+pub fn buildVerifyRequestJson(buf: []u8, payment_header: []const u8, policy: *const RoutePaymentConfig) !usize {
     // Decode base64 payment header to get the raw JSON payload object.
     // The facilitator expects paymentPayload as a JSON object, not a base64 string.
     var decode_buf: [8192]u8 = undefined;
@@ -648,7 +652,7 @@ fn buildVerifyRequestJson(buf: []u8, payment_header: []const u8, policy: *const 
     return off;
 }
 
-fn buildFacilitatorPost(buf: []u8, config: FacilitatorConfig, endpoint: []const u8, body: []const u8) !usize {
+pub fn buildFacilitatorPost(buf: []u8, config: FacilitatorConfig, endpoint: []const u8, body: []const u8) !usize {
     const result = std.fmt.bufPrint(buf,
         "POST {s}{s} HTTP/1.1\r\nHost: {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
         .{ config.path_prefix, endpoint, config.host, body.len, body },
@@ -656,7 +660,7 @@ fn buildFacilitatorPost(buf: []u8, config: FacilitatorConfig, endpoint: []const 
     return result.len;
 }
 
-fn parseVerifyResponse(http_response: []const u8) VerifyResult {
+pub fn parseVerifyResponse(http_response: []const u8) VerifyResult {
     const body = extractResponseBody(http_response) orelse
         return .{ .is_valid = false, .invalid_reason = "malformed response" };
     const status = extractStatusCode(http_response) orelse
@@ -672,7 +676,7 @@ fn parseVerifyResponse(http_response: []const u8) VerifyResult {
     return .{ .is_valid = parsed.isValid, .payer = parsed.payer, .invalid_reason = parsed.invalidReason };
 }
 
-fn parseSettleResponse(http_response: []const u8) SettleResult {
+pub fn parseSettleResponse(http_response: []const u8) SettleResult {
     const body = extractResponseBody(http_response) orelse
         return .{ .success = false, .error_reason = "malformed response" };
     const status = extractStatusCode(http_response) orelse

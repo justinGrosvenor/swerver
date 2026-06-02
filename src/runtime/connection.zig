@@ -245,6 +245,10 @@ pub const Connection = struct {
     tunnel_peer_index: ?u32 = null,
     /// True when this connection is in bidirectional tunnel mode (WebSocket).
     is_tunnel: bool = false,
+    /// Async x402 facilitator verify state (H1 only — H2/H3 needs per-stream state).
+    x402: X402State = .none,
+
+    pub const X402State = enum(u8) { none, pending, resolved_allow, resolved_reject };
 
     pub fn init(index: u32) Connection {
         return .{
@@ -344,6 +348,7 @@ pub const Connection = struct {
         self.async_send_total_bytes = 0;
         self.tunnel_peer_index = null;
         self.is_tunnel = false;
+        self.x402 = .none;
         // active_list_pos is set by ConnectionPool.acquire
     }
 

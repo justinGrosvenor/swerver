@@ -52,6 +52,7 @@ const cache_mod = @import("../proxy/cache.zig");
 const otel_mod = @import("../middleware/otel.zig");
 const body_schema_mod = @import("../middleware/body_schema.zig");
 const settlement_mod = @import("../middleware/settlement.zig");
+const x402_client = @import("../middleware/x402_client.zig");
 
 /// Global shutdown flag set by signal handler (atomic for signal safety)
 var shutdown_requested = std.atomic.Value(bool).init(false);
@@ -147,6 +148,12 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
     // Initialize settlement reporting from proxy route config + auth token
     initSettlement(server);
 
+    // Start async x402 facilitator thread unconditionally. Idle-sleeps 1ms
+    // when no work — negligible. Must be unconditional so a hot-reload that
+    // adds a facilitator route doesn't leave paid requests unserviced.
+    x402_client.start();
+    defer x402_client.stop();
+
     const deadline = if (run_for_ms) |ms| server.io.nowMs() + ms else null;
     var last_housekeeping_ms: u64 = server.io.nowMs();
     var drain_deadline_ms: u64 = 0;
@@ -231,6 +238,46 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
             // Flush settlement reports (non-blocking batch POST)
             settlement_mod.flush();
         }
+        // Drain async x402 facilitator results. The 10ms poll timeout
+        // bounds delivery latency without needing an eventfd wakeup.
+        while (x402_client.pollResult()) |result| {
+            const rconn = server.io.getConnection(result.conn_index) orelse continue;
+            if (rconn.id != result.conn_id) continue;
+            if (rconn.x402 != .pending) continue;
+            switch (result.kind) {
+                .verify => {
+                    rconn.x402 = if (result.is_valid) .resolved_allow else .resolved_reject;
+                    if (rconn.isAccumulatingBody()) {
+                        http1_mod.dispatchWithAccumulatedBody(server, rconn) catch {};
+                    } else {
+                        handleRead(server, result.conn_index) catch {};
+                    }
+                    const postconn = server.io.getConnection(result.conn_index) orelse continue;
+                    if (postconn.id == result.conn_id and postconn.state != .closed) {
+                        if (postconn.write_count > 0 or postconn.hasPendingH2Streams()) {
+                            handleWrite(server, result.conn_index) catch {};
+                        }
+                        if (!postconn.close_after_write and postconn.x402 == .none) {
+                            if (postconn.fd) |pfd| server.io.rearmRecv(result.conn_index, pfd);
+                        }
+                    }
+                },
+                .settle => {
+                    if (result.success and result.has_settlement_url) {
+                        settlement_mod.enqueue(
+                            result.gateway_id[0..result.gateway_id_len],
+                            result.transaction[0..result.transaction_len],
+                            result.settle_network[0..result.settle_network_len],
+                            result.settle_asset[0..result.settle_asset_len],
+                            result.settle_amount[0..result.settle_amount_len],
+                        );
+                    } else if (!result.success) {
+                        std.log.warn("x402 async settlement failed: {s}", .{result.error_reason[0..result.error_reason_len]});
+                    }
+                },
+            }
+        }
+
         if (events.len == 0) continue;
         for (events) |event| {
             switch (event.kind) {
@@ -366,7 +413,8 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
                             const postconn = server.io.getConnection(index) orelse continue;
                             if (postconn.id == pre_id and
                                 postconn.state != .closed and
-                                !postconn.close_after_write)
+                                !postconn.close_after_write and
+                                postconn.x402 == .none)
                             {
                                 if (postconn.fd) |pfd| {
                                     server.io.rearmRecv(index, pfd);
@@ -589,13 +637,6 @@ pub fn handleRead(server: *Server, index: u32) !void {
                 return;
             },
             .again => {
-                // With edge-triggered epoll + TLS, the speculative read
-                // or handleWrite re-entry may call handleRead when
-                // read_buffered_bytes > 0 (data already decrypted from
-                // a prior SSL_read). If SSL_read returns WouldBlock here
-                // (no MORE records), we must still process the existing
-                // buffered data — returning would strand it, since no
-                // EPOLLIN will fire for data already in userspace.
                 if (conn.read_buffered_bytes == 0) return;
             },
             .err => {
@@ -720,6 +761,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
     }
 
     while (conn.state != .closed and conn.read_buffered_bytes > 0 and conn.canEnqueueWrite()) {
+        if (conn.x402 == .pending) break;
         // Opportunistic inline write drain: push enqueued responses
         // to the kernel while still processing pipelined requests.
         // At low connection counts (e.g. 512 conns / 64 workers =
@@ -821,6 +863,8 @@ pub fn handleRead(server: *Server, index: u32) !void {
         // Reset sent_continue for each new request in pipelined connections
         conn.sent_continue = false;
         if (!parse.keep_alive) conn.close_after_write = true;
+        const saved_read_offset = conn.read_offset;
+        const saved_read_buffered = conn.read_buffered_bytes;
         server.io.onReadConsumed(conn, parse.consumed_bytes);
 
         if (!server.isAllowedHost(parse.view)) {
@@ -870,19 +914,65 @@ pub fn handleRead(server: *Server, index: u32) !void {
                 const route_idx = proxy.routeIndex(matched_route);
                 const x402_policy = proxy.route_x402_policies[route_idx];
                 const route_fac = proxy.route_facilitators[route_idx] orelse server.app_router.facilitator;
-                const x402_result = x402_mod.evaluateWithFacilitator(
-                    parse.view,
-                    x402_policy,
-                    route_fac,
-                );
-                switch (x402_result) {
-                    .allow => {},
-                    .reject => |info| {
-                        if (parse.view.method == .POST or parse.view.method == .PUT or parse.view.method == .PATCH) conn.close_after_write = true;
-                        try http1_mod.queueResponse(server, conn, info.resp);
-                        if (conn.read_buffered_bytes == 0) break;
-                        continue;
-                    },
+                var x402_result: x402_mod.EvaluateResult = undefined;
+                if (conn.x402 == .resolved_allow) {
+                    conn.x402 = .none;
+                    x402_result = .{ .allow = .{
+                        .payment_header = x402_mod.findValidPaymentHeader(parse.view) orelse "",
+                        .needs_settlement = true,
+                    } };
+                } else if (conn.x402 == .resolved_reject) {
+                    conn.x402 = .none;
+                    const reject_info = x402_mod.rejectWith(.facilitator_rejected, x402_policy);
+                    if (parse.view.method == .POST or parse.view.method == .PUT or parse.view.method == .PATCH) conn.close_after_write = true;
+                    try http1_mod.queueResponse(server, conn, reject_info.resp);
+                    if (conn.read_buffered_bytes == 0) break;
+                    continue;
+                } else {
+                    x402_result = x402_mod.evaluateWithFacilitator(parse.view, x402_policy, null);
+                    switch (x402_result) {
+                        .reject => |info| {
+                            if (parse.view.method == .POST or parse.view.method == .PUT or parse.view.method == .PATCH) conn.close_after_write = true;
+                            try http1_mod.queueResponse(server, conn, info.resp);
+                            if (conn.read_buffered_bytes == 0) break;
+                            continue;
+                        },
+                        .allow => |ctx| {
+                            if (route_fac != null and x402_policy.require_payment and ctx.payment_header.len > 0) {
+                                var entry = x402_client.RequestEntry{ .kind = .verify, .conn_index = conn.index, .conn_id = conn.id };
+                                const rf = route_fac.?;
+                                const hl: u8 = @intCast(@min(rf.host.len, entry.host.len));
+                                @memcpy(entry.host[0..hl], rf.host[0..hl]);
+                                entry.host_len = hl;
+                                entry.port = rf.port;
+                                entry.use_tls = rf.use_tls;
+                                entry.timeout_ms = rf.timeout_ms;
+                                var json_buf: [4096]u8 = undefined;
+                                const req_json_len = x402_mod.buildVerifyRequestJson(&json_buf, ctx.payment_header, &x402_policy) catch 0;
+                                if (req_json_len > 0) {
+                                    entry.http_len = @intCast(x402_mod.buildFacilitatorPost(&entry.http_buf, rf, "/verify", json_buf[0..req_json_len]) catch 0);
+                                }
+                                if (entry.http_len > 0 and x402_client.submit(entry)) {
+                                    conn.x402 = .pending;
+                                    conn.markActive(server.now_ms);
+                                    server.io.unReadConsumed(conn, saved_read_offset, saved_read_buffered);
+                                    break;
+                                }
+                                // Queue full or build failed — fast-reject
+                                conn.close_after_write = true;
+                                try http1_mod.queueResponse(server, conn, .{
+                                    .status = 503,
+                                    .headers = &[_]response_mod.Header{
+                                        .{ .name = "Retry-After", .value = "1" },
+                                        .{ .name = "Content-Length", .value = "0" },
+                                    },
+                                    .body = .{ .bytes = "" },
+                                });
+                                if (conn.read_buffered_bytes == 0) break;
+                                continue;
+                            }
+                        },
+                    }
                 }
                 const auth_result = auth_mod.evaluate(parse.view, matched_route.auth);
                 switch (auth_result) {
@@ -1042,14 +1132,42 @@ pub fn handleRead(server: *Server, index: u32) !void {
                             const charge = for (proxy_result.resp.headers) |hdr| {
                                 if (std.ascii.eqlIgnoreCase(hdr.name, "x-charge-amount")) break hdr.value;
                             } else "";
-                            const settle = x402_mod.facilitatorSettle(fac, x402_result.allow.payment_header, &x402_policy, charge);
-                            if (settle.success) {
-                                if (x402_policy.settlement_url.len > 0) {
-                                    const amount = if (charge.len > 0) charge else x402_policy.price;
-                                    settlement_mod.enqueue(x402_policy.gateway_id, settle.transaction, x402_policy.network, x402_policy.asset, amount);
+                            var settle_entry = x402_client.RequestEntry{ .kind = .settle, .conn_index = conn.index, .conn_id = conn.id };
+                            const shl: u8 = @intCast(@min(fac.host.len, settle_entry.host.len));
+                            @memcpy(settle_entry.host[0..shl], fac.host[0..shl]);
+                            settle_entry.host_len = shl;
+                            settle_entry.port = fac.port;
+                            settle_entry.use_tls = fac.use_tls;
+                            settle_entry.timeout_ms = fac.timeout_ms;
+                            var settle_json_buf: [4096]u8 = undefined;
+                            const settle_json_len = x402_mod.buildSettleRequestJson(&settle_json_buf, x402_result.allow.payment_header, &x402_policy, charge) catch 0;
+                            if (settle_json_len > 0) {
+                                settle_entry.http_len = @intCast(x402_mod.buildFacilitatorPost(&settle_entry.http_buf, fac, "/settle", settle_json_buf[0..settle_json_len]) catch 0);
+                            }
+                            if (settle_entry.http_len > 0) {
+                                settle_entry.has_settlement_url = x402_policy.settlement_url.len > 0;
+                                const gid_len: u8 = @intCast(@min(x402_policy.gateway_id.len, settle_entry.gateway_id.len));
+                                @memcpy(settle_entry.gateway_id[0..gid_len], x402_policy.gateway_id[0..gid_len]);
+                                settle_entry.gateway_id_len = gid_len;
+                                const net_len: u8 = @intCast(@min(x402_policy.network.len, settle_entry.settle_network.len));
+                                @memcpy(settle_entry.settle_network[0..net_len], x402_policy.network[0..net_len]);
+                                settle_entry.settle_network_len = net_len;
+                                const asset_len: u8 = @intCast(@min(x402_policy.asset.len, settle_entry.settle_asset.len));
+                                @memcpy(settle_entry.settle_asset[0..asset_len], x402_policy.asset[0..asset_len]);
+                                settle_entry.settle_asset_len = asset_len;
+                                const amt = if (charge.len > 0) charge else x402_policy.price;
+                                const amt_len: u8 = @intCast(@min(amt.len, settle_entry.settle_amount.len));
+                                @memcpy(settle_entry.settle_amount[0..amt_len], amt[0..amt_len]);
+                                settle_entry.settle_amount_len = amt_len;
+                                if (!x402_client.submit(settle_entry)) {
+                                    x402_client.spillSettle(
+                                        x402_policy.gateway_id,
+                                        x402_policy.network,
+                                        x402_policy.asset,
+                                        if (charge.len > 0) charge else x402_policy.price,
+                                        "settle queue full",
+                                    );
                                 }
-                            } else {
-                                std.log.warn("x402 proxy settlement failed: {s}", .{settle.error_reason});
                             }
                         }
                     }
