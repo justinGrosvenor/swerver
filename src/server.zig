@@ -832,6 +832,11 @@ pub const Server = struct {
         conn.send_in_flight = false;
         conn.async_send_iov_count = 0;
         conn.async_send_total_bytes = 0;
+        // Release settle-park held response buffer
+        if (conn.x402_held_buf) |held_buf| {
+            self.io.releaseBuffer(held_buf);
+            conn.x402_held_buf = null;
+        }
         // Clean up pending file descriptor and body reference
         conn.cleanupPendingFile();
         conn.pending_body = &[_]u8{};

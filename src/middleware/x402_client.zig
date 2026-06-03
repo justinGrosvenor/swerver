@@ -47,6 +47,8 @@ pub const ResultEntry = struct {
     settle_amount: [32]u8 = undefined,
     settle_amount_len: u8 = 0,
     has_settlement_url: bool = false,
+    receipt_b64: [512]u8 = undefined,
+    receipt_b64_len: u16 = 0,
 };
 
 // SPSC ring buffers. Correctness relies on release/acquire pairing:
@@ -176,6 +178,11 @@ fn workerLoop() void {
                             if (sr.success) {
                                 result.success = true;
                                 copyFixed(&result.transaction, &result.transaction_len, sr.transaction);
+                                if (x402_mod.buildReceiptB64(&sr)) |rb64| {
+                                    const rlen: u16 = @intCast(@min(rb64.len, result.receipt_b64.len));
+                                    @memcpy(result.receipt_b64[0..rlen], rb64[0..rlen]);
+                                    result.receipt_b64_len = rlen;
+                                }
                                 break;
                             }
                         } else {
@@ -279,4 +286,21 @@ test "settle_fail_count increments on spill" {
     spillSettle("gw1", "base", "USDC", "100", "test error");
     try std.testing.expectEqual(before + 1, settle_fail_count.load(.monotonic));
     spill_fd = saved_fd;
+}
+
+test "settle result carries receipt_b64" {
+    result_head.store(0, .release);
+    result_tail.store(0, .release);
+
+    var r = ResultEntry{ .kind = .settle, .conn_index = 7, .conn_id = 42, .success = true };
+    const receipt = "eyJzdWNjZXNzIjp0cnVlfQ==";
+    const rlen: u16 = @intCast(receipt.len);
+    @memcpy(r.receipt_b64[0..rlen], receipt);
+    r.receipt_b64_len = rlen;
+    enqueueResult(r);
+
+    const polled = pollResult() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(polled.success);
+    try std.testing.expectEqual(@as(u16, rlen), polled.receipt_b64_len);
+    try std.testing.expectEqualStrings(receipt, polled.receipt_b64[0..polled.receipt_b64_len]);
 }

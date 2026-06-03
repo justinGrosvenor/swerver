@@ -247,8 +247,14 @@ pub const Connection = struct {
     is_tunnel: bool = false,
     /// Async x402 facilitator verify state (H1 only — H2/H3 needs per-stream state).
     x402: X402State = .none,
+    /// Settle-park: pool buffer holding packed upstream response (headers + body).
+    x402_held_buf: ?buffer_pool.BufferHandle = null,
+    x402_held_status: u16 = 0,
+    x402_held_hdr_count: u8 = 0,
+    x402_held_body_offset: u16 = 0,
+    x402_held_body_len: u32 = 0,
 
-    pub const X402State = enum(u8) { none, pending, resolved_allow, resolved_reject };
+    pub const X402State = enum(u8) { none, pending, resolved_allow, resolved_reject, settle_pending };
 
     pub fn init(index: u32) Connection {
         return .{
@@ -349,6 +355,12 @@ pub const Connection = struct {
         self.tunnel_peer_index = null;
         self.is_tunnel = false;
         self.x402 = .none;
+        // x402_held_buf is released by the server (dispatch pollResult) before reset
+        self.x402_held_buf = null;
+        self.x402_held_status = 0;
+        self.x402_held_hdr_count = 0;
+        self.x402_held_body_offset = 0;
+        self.x402_held_body_len = 0;
         // active_list_pos is set by ConnectionPool.acquire
     }
 

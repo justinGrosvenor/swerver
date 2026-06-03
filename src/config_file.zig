@@ -302,6 +302,7 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
                 .facilitator_url = x.facilitator_url orelse "",
                 .extensions_json = extensions_json,
                 .resource_url = x.resource_url orelse "",
+                .inline_receipt = x.inline_receipt orelse false,
             };
         }
 
@@ -631,6 +632,7 @@ const RouteX402Json = struct {
     facilitator_url: ?[]const u8 = null,
     extensions: ?std.json.Value = null,
     resource_url: ?[]const u8 = null,
+    inline_receipt: ?bool = null,
 };
 
 const UpstreamJson = struct {

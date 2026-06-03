@@ -29,6 +29,7 @@ pub const RoutePaymentConfig = struct {
     extra_version: []const u8 = "",
     facilitator_url: []const u8 = "",
     extensions_json: []const u8 = "",
+    inline_receipt: bool = false,
 };
 
 pub const Policy = RoutePaymentConfig;
@@ -229,6 +230,7 @@ pub fn configFromProxyRoute(proxy_x402: anytype, allocator: std.mem.Allocator, u
         .extra_version = proxy_x402.extra_version,
         .facilitator_url = proxy_x402.facilitator_url,
         .extensions_json = proxy_x402.extensions_json,
+        .inline_receipt = proxy_x402.inline_receipt,
     };
 }
 
@@ -473,7 +475,7 @@ pub fn facilitatorSettle(
 threadlocal var receipt_buf: [1024]u8 = undefined;
 threadlocal var receipt_b64_buf: [2048]u8 = undefined;
 
-fn buildReceiptB64(settle: *const SettleResult) ?[]const u8 {
+pub fn buildReceiptB64(settle: *const SettleResult) ?[]const u8 {
     const json_len = std.fmt.bufPrint(&receipt_buf,
         \\{{"success":true,"transaction":"{s}","network":"{s}","payer":"{s}"}}
     , .{ settle.transaction, settle.network, settle.payer }) catch return null;
