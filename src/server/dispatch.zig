@@ -1900,18 +1900,33 @@ fn fillSettleEntry(
 /// to fire-and-forget settlement.
 fn packHeldResponse(server: *Server, conn: *connection.Connection, resp: response_mod.Response) bool {
     const buf = server.io.acquireBuffer() orelse return false;
-    const bytes = buf.bytes;
+    const body_bytes = resp.bodyBytes();
+    const result = packHeaders(buf.bytes, resp.headers, body_bytes) orelse {
+        server.io.releaseBuffer(buf);
+        return false;
+    };
+    conn.x402_held_buf = buf;
+    conn.x402_held_status = resp.status;
+    conn.x402_held_hdr_count = result.count;
+    conn.x402_held_body_offset = result.body_offset;
+    conn.x402_held_body_len = @intCast(body_bytes.len);
+    return true;
+}
+
+const PackResult = struct { count: u8, body_offset: u16 };
+
+/// Encode response headers + body into a flat byte buffer.
+/// Format per header: [name_len:u8][value_len_lo:u8][value_len_hi:u8][name][value]
+/// Body follows immediately after the last header.
+fn packHeaders(bytes: []u8, headers: []const response_mod.Header, body: []const u8) ?PackResult {
     var pos: usize = 0;
     var count: u8 = 0;
-    for (resp.headers) |hdr| {
+    for (headers) |hdr| {
         if (count >= 62) break;
         if (hdr.name.len > 255) continue;
         const val_len: u16 = @intCast(@min(hdr.value.len, 65535));
         const need = 3 + hdr.name.len + val_len;
-        if (pos + need > bytes.len) {
-            server.io.releaseBuffer(buf);
-            return false;
-        }
+        if (pos + need > bytes.len) return null;
         bytes[pos] = @intCast(hdr.name.len);
         bytes[pos + 1] = @truncate(val_len);
         bytes[pos + 2] = @truncate(val_len >> 8);
@@ -1922,21 +1937,35 @@ fn packHeldResponse(server: *Server, conn: *connection.Connection, resp: respons
         pos += val_len;
         count += 1;
     }
-
-    const body_bytes = resp.bodyBytes();
-    if (pos > std.math.maxInt(u16) or pos + body_bytes.len > bytes.len) {
-        server.io.releaseBuffer(buf);
-        return false;
-    }
+    if (pos > std.math.maxInt(u16) or pos + body.len > bytes.len) return null;
     const body_offset: u16 = @intCast(pos);
-    @memcpy(bytes[pos..][0..body_bytes.len], body_bytes);
+    @memcpy(bytes[pos..][0..body.len], body);
+    return .{ .count = count, .body_offset = body_offset };
+}
 
-    conn.x402_held_buf = buf;
-    conn.x402_held_status = resp.status;
-    conn.x402_held_hdr_count = count;
-    conn.x402_held_body_offset = body_offset;
-    conn.x402_held_body_len = @intCast(body_bytes.len);
-    return true;
+/// Decode headers from the packed format written by packHeaders.
+fn unpackHeaders(
+    buf_bytes: []const u8,
+    hdr_count: u8,
+    body_offset: u16,
+    out: []response_mod.Header,
+) usize {
+    var pos: usize = 0;
+    var idx: usize = 0;
+    while (idx < hdr_count and pos < body_offset) : (idx += 1) {
+        if (pos + 3 > buf_bytes.len) break;
+        const name_len: usize = buf_bytes[pos];
+        const value_len: usize = @as(u16, buf_bytes[pos + 1]) | (@as(u16, buf_bytes[pos + 2]) << 8);
+        pos += 3;
+        if (pos + name_len + value_len > buf_bytes.len) break;
+        if (idx >= out.len) break;
+        out[idx] = .{
+            .name = buf_bytes[pos..][0..name_len],
+            .value = buf_bytes[pos + name_len ..][0..value_len],
+        };
+        pos += name_len + value_len;
+    }
+    return idx;
 }
 
 fn releaseHeldBuffer(server: *Server, conn: *connection.Connection) void {
@@ -1955,22 +1984,8 @@ fn resumeSettlePark(server: *Server, conn: *connection.Connection, result: *cons
     };
     const buf_bytes = held_buf.bytes;
 
-    // Unpack headers from held buffer
     var held_headers: [64]response_mod.Header = undefined;
-    var pos: usize = 0;
-    var hdr_idx: usize = 0;
-    while (hdr_idx < conn.x402_held_hdr_count and pos < conn.x402_held_body_offset) : (hdr_idx += 1) {
-        if (pos + 3 > buf_bytes.len) break;
-        const name_len: usize = buf_bytes[pos];
-        const value_len: usize = @as(u16, buf_bytes[pos + 1]) | (@as(u16, buf_bytes[pos + 2]) << 8);
-        pos += 3;
-        if (pos + name_len + value_len > buf_bytes.len) break;
-        held_headers[hdr_idx] = .{
-            .name = buf_bytes[pos..][0..name_len],
-            .value = buf_bytes[pos + name_len ..][0..value_len],
-        };
-        pos += name_len + value_len;
-    }
+    var hdr_idx = unpackHeaders(buf_bytes, conn.x402_held_hdr_count, conn.x402_held_body_offset, &held_headers);
 
     // Inject receipt headers (V2 PAYMENT-RESPONSE + V1 X-PAYMENT-RESPONSE)
     if (result.success and result.receipt_b64_len > 0 and hdr_idx + 2 <= held_headers.len) {
@@ -1999,6 +2014,102 @@ fn resumeSettlePark(server: *Server, conn: *connection.Connection, result: *cons
     }
     releaseHeldBuffer(server, conn);
     conn.x402 = .none;
+}
+
+// ============================================================
+// Tests — settle-park pack/unpack roundtrip
+// ============================================================
+
+test "packHeaders roundtrip with body" {
+    var buf: [4096]u8 = undefined;
+    const headers = [_]response_mod.Header{
+        .{ .name = "Content-Type", .value = "application/json" },
+        .{ .name = "X-Request-Id", .value = "abc-123" },
+    };
+    const body = "{\"ok\":true}";
+    const result = packHeaders(&buf, &headers, body) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u8, 2), result.count);
+
+    var out: [64]response_mod.Header = undefined;
+    const n = unpackHeaders(&buf, result.count, result.body_offset, &out);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqualStrings("Content-Type", out[0].name);
+    try std.testing.expectEqualStrings("application/json", out[0].value);
+    try std.testing.expectEqualStrings("X-Request-Id", out[1].name);
+    try std.testing.expectEqualStrings("abc-123", out[1].value);
+
+    const body_end = @as(usize, result.body_offset) + body.len;
+    try std.testing.expectEqualStrings(body, buf[result.body_offset..body_end]);
+}
+
+test "packHeaders empty body" {
+    var buf: [4096]u8 = undefined;
+    const headers = [_]response_mod.Header{
+        .{ .name = "Content-Length", .value = "0" },
+    };
+    const result = packHeaders(&buf, &headers, "") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u8, 1), result.count);
+
+    var out: [64]response_mod.Header = undefined;
+    const n = unpackHeaders(&buf, result.count, result.body_offset, &out);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqualStrings("Content-Length", out[0].name);
+    try std.testing.expectEqualStrings("0", out[0].value);
+}
+
+test "packHeaders no headers with body" {
+    var buf: [4096]u8 = undefined;
+    const result = packHeaders(&buf, &.{}, "hello") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u8, 0), result.count);
+    try std.testing.expectEqual(@as(u16, 0), result.body_offset);
+    try std.testing.expectEqualStrings("hello", buf[0..5]);
+}
+
+test "packHeaders rejects when buffer too small" {
+    var buf: [10]u8 = undefined;
+    const headers = [_]response_mod.Header{
+        .{ .name = "Content-Type", .value = "application/json" },
+    };
+    try std.testing.expect(packHeaders(&buf, &headers, "") == null);
+}
+
+test "packHeaders caps at 62 headers" {
+    var buf: [65536]u8 = undefined;
+    var headers: [70]response_mod.Header = undefined;
+    for (&headers) |*h| h.* = .{ .name = "X", .value = "Y" };
+    const result = packHeaders(&buf, &headers, "") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u8, 62), result.count);
+
+    var out: [64]response_mod.Header = undefined;
+    const n = unpackHeaders(&buf, result.count, result.body_offset, &out);
+    try std.testing.expectEqual(@as(usize, 62), n);
+}
+
+test "packHeaders skips headers with name > 255 bytes" {
+    var buf: [4096]u8 = undefined;
+    var long_name: [256]u8 = undefined;
+    @memset(&long_name, 'X');
+    const headers = [_]response_mod.Header{
+        .{ .name = &long_name, .value = "v" },
+        .{ .name = "Ok", .value = "yes" },
+    };
+    const result = packHeaders(&buf, &headers, "") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u8, 1), result.count);
+
+    var out: [64]response_mod.Header = undefined;
+    const n = unpackHeaders(&buf, result.count, result.body_offset, &out);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqualStrings("Ok", out[0].name);
+}
+
+test "packHeaders body too large for buffer" {
+    var buf: [32]u8 = undefined;
+    const headers = [_]response_mod.Header{
+        .{ .name = "A", .value = "B" },
+    };
+    var body: [30]u8 = undefined;
+    @memset(&body, 'Z');
+    try std.testing.expect(packHeaders(&buf, &headers, &body) == null);
 }
 
 fn initSettlement(server: *Server) void {
