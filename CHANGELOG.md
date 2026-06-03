@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Observability
+
+- **feat: OTLP trace exporter now supports TLS and custom headers.** The
+  exporter previously did a plaintext-only HTTP POST with no auth header, so
+  it could only reach a co-located collector. It now wraps the socket in TLS
+  for `https://` collector URLs (verifying the peer against the system trust
+  store, with hostname check + SNI — mirroring the x402 facilitator client),
+  and sends operator-configured request headers via a new `otel.headers`
+  config field in the `OTEL_EXPORTER_OTLP_HEADERS` form
+  (`key1=value1,key2=value2`, e.g. `Authorization=Bearer …`). This lets
+  swerver export directly to an authenticated OTLP backend (Honeycomb,
+  Grafana Cloud, Dash0, …) without a collector sidecar. An `https://` URL in
+  a build without TLS sends nothing rather than downgrading to plaintext, and
+  CR/LF in a configured header is dropped (injection guard).
+
 ### x402
 
 - **fix: local signature verification now actually verifies x402 payments.**
