@@ -1247,3 +1247,99 @@ test "handler processes Initial packet" {
     try std.testing.expect(result.response != null);
     try std.testing.expectEqual(@as(usize, 1), server_handler.connectionCount());
 }
+
+// ---- Builder wire-format round trips ----
+// The two packet builders previously had only the single end-to-end
+// "processes Initial packet" test above, which never inspects what goes
+// on the wire. These drive each builder directly and then parse + unprotect
+// the bytes back, locking in the header layout, the Length-field fixup, and
+// frame placement. They use AES-128-GCM from std (no TLS provider), so they
+// run in the base build alongside the parser tests — encrypting and
+// decrypting with the same key set means the exact key bytes don't matter.
+
+test "buildHandshakePacket produces a parseable, decryptable Handshake packet" {
+    const allocator = std.testing.allocator;
+    const peer_cid = types.ConnectionId.init(&[_]u8{ 0xc1, 0xc2, 0xc3, 0xc4 });
+    var conn = connection.Connection.init(allocator, true, peer_cid);
+    defer conn.deinit();
+
+    const keys = crypto.deriveKeysFromSecret(&([_]u8{0x37} ** 32));
+    const crypto_payload = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee };
+
+    var out: [512]u8 = undefined;
+    const built = try buildHandshakePacket(&out, .{
+        .packet_type = .handshake,
+        .conn = &conn,
+        .crypto_data = &crypto_payload,
+        .keys = &keys,
+        .pad_datagram_to = 0,
+        .datagram_bytes_so_far = 0,
+        .ack_largest = null,
+    });
+    try std.testing.expect(built.bytes_written > 0);
+
+    // Parse the long header back out of the protected bytes.
+    const parsed = packet.parseHeader(out[0..built.bytes_written], 0);
+    try std.testing.expectEqual(packet.ParseState.complete, parsed.state);
+    const lh = parsed.header.?.long;
+    try std.testing.expectEqual(types.PacketType.handshake, lh.packet_type);
+    try std.testing.expectEqual(@as(u32, 1), lh.version);
+    try std.testing.expectEqualSlices(u8, peer_cid.slice(), lh.dcid.slice());
+
+    // Decrypt and confirm the CRYPTO frame carries our bytes verbatim.
+    var dec: [512]u8 = undefined;
+    @memcpy(dec[0..built.bytes_written], out[0..built.bytes_written]);
+    const un = try crypto.unprotectPacket(&keys, 0, lh.packet_number_offset, dec[0..], built.bytes_written);
+    const payload = dec[un.header_len .. un.header_len + un.payload_len];
+    var saw_crypto = false;
+    var off: usize = 0;
+    while (off < payload.len) {
+        const fr = try frame.parseFrame(payload[off..]);
+        off += fr.consumed;
+        if (fr.frame == .crypto) {
+            try std.testing.expectEqualSlices(u8, &crypto_payload, fr.frame.crypto.data);
+            saw_crypto = true;
+        }
+    }
+    try std.testing.expect(saw_crypto);
+}
+
+test "buildShortPacket produces a parseable, decryptable 1-RTT packet" {
+    const allocator = std.testing.allocator;
+    // Fixed 8-byte peer CID so the DCID length is known when parsing back
+    // (short headers carry no DCID-length byte).
+    const peer_cid = types.ConnectionId.init(&[_]u8{ 0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8 });
+    var conn = connection.Connection.init(allocator, true, peer_cid);
+    defer conn.deinit();
+
+    const keys = crypto.deriveKeysFromSecret(&([_]u8{0x42} ** 32));
+
+    var out: [256]u8 = undefined;
+    const built = try buildShortPacket(&out, .{
+        .conn = &conn,
+        .keys = &keys,
+        .ack_largest = null,
+        .send_handshake_done = true,
+    });
+    try std.testing.expect(built.bytes_written > 0);
+
+    // Parse the short header back; the DCID is the peer CID we sent to.
+    const parsed = packet.parseHeader(out[0..built.bytes_written], peer_cid.len);
+    try std.testing.expectEqual(packet.ParseState.complete, parsed.state);
+    const sh = parsed.header.?.short;
+    try std.testing.expectEqualSlices(u8, peer_cid.slice(), sh.dcid.slice());
+
+    // Decrypt and confirm the HANDSHAKE_DONE frame we asked for is present.
+    var dec: [256]u8 = undefined;
+    @memcpy(dec[0..built.bytes_written], out[0..built.bytes_written]);
+    const un = try crypto.unprotectPacket(&keys, 0, sh.packet_number_offset, dec[0..], built.bytes_written);
+    const payload = dec[un.header_len .. un.header_len + un.payload_len];
+    var saw_handshake_done = false;
+    var off: usize = 0;
+    while (off < payload.len) {
+        const fr = try frame.parseFrame(payload[off..]);
+        off += fr.consumed;
+        if (fr.frame == .handshake_done) saw_handshake_done = true;
+    }
+    try std.testing.expect(saw_handshake_done);
+}

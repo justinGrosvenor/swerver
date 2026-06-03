@@ -842,6 +842,47 @@ test "decode packet number" {
     }
 }
 
+test "encode packet number — 3- and 4-byte lengths" {
+    // Range in [0x4000, 0x200000) → 3-byte encoding.
+    {
+        const r = encodePacketNumber(0x123456, 0);
+        try std.testing.expectEqual(@as(u8, 3), r.len);
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 0x12, 0x34, 0x56 }, r.bytes[0..3]);
+    }
+    // Range >= 0x200000 → 4-byte encoding.
+    {
+        const r = encodePacketNumber(0x1234567, 0);
+        try std.testing.expectEqual(@as(u8, 4), r.len);
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0x23, 0x45, 0x67 }, r.bytes[0..4]);
+    }
+}
+
+test "encode packet number > 2^32 truncates from the full value, not a u32" {
+    // Locks in the encodePacketNumber comment: a small range keeps the
+    // 1-byte encoding even though the full PN is above 2^32, and the byte
+    // is taken from the low bits of the full value (not a u32 cast).
+    const full: u64 = 0x1_0000_0005;
+    const r = encodePacketNumber(full, 0x1_0000_0000);
+    try std.testing.expectEqual(@as(u8, 1), r.len);
+    try std.testing.expectEqual(@as(u8, 0x05), r.bytes[0]);
+}
+
+test "packet number encode/decode round trip across sizes" {
+    // encodePacketNumber (largest_acked = 0 forces the length from the
+    // magnitude alone) → reconstruct the truncated big-endian value →
+    // decodePacketNumber with largest_received = full - 1 must recover it.
+    const cases = [_]u64{
+        0, 1, 0x7f, 0x80, 0x3fff, 0x4000, 0x1fffff, 0x200000, 0x123456, 0x1_0000_0005,
+    };
+    for (cases) |full| {
+        const enc = encodePacketNumber(full, 0);
+        var truncated: u64 = 0;
+        for (enc.bytes[0..enc.len]) |b| truncated = (truncated << 8) | b;
+        const decoded = decodePacketNumber(truncated, enc.len, full -| 1);
+        try std.testing.expectEqual(full, decoded);
+    }
+}
+
 test "header protection mask generation" {
     // Test that header protection produces deterministic output
     const hp_key = [_]u8{0} ** 16;
