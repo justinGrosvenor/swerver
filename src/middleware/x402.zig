@@ -135,9 +135,9 @@ pub const PaymentRequiredEncoded = struct {
 pub fn buildPaymentRequired(allocator: std.mem.Allocator, required: PaymentRequired, extensions_json: []const u8) !PaymentRequiredEncoded {
     var json_list = std.ArrayList(u8).empty;
     var writer = std.Io.Writer.Allocating.fromArrayList(allocator, &json_list);
-    defer writer.deinit();
     try std.json.Stringify.value(required, .{}, &writer.writer);
     json_list = writer.toArrayList();
+    defer json_list.deinit(allocator);
 
     const base = json_list.items;
     const has_ext = extensions_json.len > 0 and base.len > 0 and base[base.len - 1] == '}';
@@ -588,7 +588,6 @@ fn isHttpResponseComplete(data: []const u8) bool {
 
 pub fn buildSettleRequestJson(buf: []u8, payment_header: []const u8, policy: *const RoutePaymentConfig, charge_amount: []const u8) !usize {
     _ = charge_amount;
-    // Decode base64 payment header to get the raw JSON payload object
     var decode_buf: [8192]u8 = undefined;
     const max_decoded = std.base64.standard.Decoder.calcSizeUpperBound(payment_header.len) catch return error.BufferTooSmall;
     if (max_decoded > decode_buf.len) return error.BufferTooSmall;
@@ -599,29 +598,12 @@ pub fn buildSettleRequestJson(buf: []u8, payment_header: []const u8, policy: *co
     var off: usize = 0;
     off += copyInto(buf[off..], "{\"x402Version\":2,\"paymentPayload\":");
     off += copyInto(buf[off..], decoded_payload);
-    off += copyInto(buf[off..], ",\"paymentRequirements\":{\"scheme\":\"");
-    off += jsonEscape(buf[off..], policy.scheme);
-    off += copyInto(buf[off..], "\",\"network\":\"");
-    off += jsonEscape(buf[off..], policy.network);
-    off += copyInto(buf[off..], "\",\"amount\":\"");
-    off += jsonEscape(buf[off..], policy.price);
-    off += copyInto(buf[off..], "\",\"asset\":\"");
-    off += jsonEscape(buf[off..], policy.asset);
-    off += copyInto(buf[off..], "\",\"payTo\":\"");
-    off += jsonEscape(buf[off..], policy.pay_to);
-    if (policy.extra_name.len > 0) {
-        const tail = std.fmt.bufPrint(buf[off..], "\",\"maxTimeoutSeconds\":{d},\"extra\":{{\"name\":\"{s}\",\"version\":\"{s}\"}}}}}}", .{ policy.max_timeout_seconds, policy.extra_name, policy.extra_version }) catch return error.BufferTooSmall;
-        off += tail.len;
-    } else {
-        const tail = std.fmt.bufPrint(buf[off..], "\",\"maxTimeoutSeconds\":{d}}}}}", .{policy.max_timeout_seconds}) catch return error.BufferTooSmall;
-        off += tail.len;
-    }
+    off += buildPaymentRequirementsJson(buf[off..], policy);
+    off += copyInto(buf[off..], "}");
     return off;
 }
 
 pub fn buildVerifyRequestJson(buf: []u8, payment_header: []const u8, policy: *const RoutePaymentConfig) !usize {
-    // Decode base64 payment header to get the raw JSON payload object.
-    // The facilitator expects paymentPayload as a JSON object, not a base64 string.
     var decode_buf: [8192]u8 = undefined;
     const max_decoded = std.base64.standard.Decoder.calcSizeUpperBound(payment_header.len) catch return error.BufferTooSmall;
     if (max_decoded > decode_buf.len) return error.BufferTooSmall;
@@ -632,6 +614,13 @@ pub fn buildVerifyRequestJson(buf: []u8, payment_header: []const u8, policy: *co
     var off: usize = 0;
     off += copyInto(buf[off..], "{\"x402Version\":2,\"paymentPayload\":");
     off += copyInto(buf[off..], decoded_payload);
+    off += buildPaymentRequirementsJson(buf[off..], policy);
+    off += copyInto(buf[off..], "}");
+    return off;
+}
+
+fn buildPaymentRequirementsJson(buf: []u8, policy: *const RoutePaymentConfig) usize {
+    var off: usize = 0;
     off += copyInto(buf[off..], ",\"paymentRequirements\":{\"scheme\":\"");
     off += jsonEscape(buf[off..], policy.scheme);
     off += copyInto(buf[off..], "\",\"network\":\"");
@@ -643,10 +632,10 @@ pub fn buildVerifyRequestJson(buf: []u8, payment_header: []const u8, policy: *co
     off += copyInto(buf[off..], "\",\"payTo\":\"");
     off += jsonEscape(buf[off..], policy.pay_to);
     if (policy.extra_name.len > 0) {
-        const tail = std.fmt.bufPrint(buf[off..], "\",\"maxTimeoutSeconds\":{d},\"extra\":{{\"name\":\"{s}\",\"version\":\"{s}\"}}}}}}", .{ policy.max_timeout_seconds, policy.extra_name, policy.extra_version }) catch return error.BufferTooSmall;
+        const tail = std.fmt.bufPrint(buf[off..], "\",\"maxTimeoutSeconds\":{d},\"extra\":{{\"name\":\"{s}\",\"version\":\"{s}\"}}}}", .{ policy.max_timeout_seconds, policy.extra_name, policy.extra_version }) catch return off;
         off += tail.len;
     } else {
-        const tail = std.fmt.bufPrint(buf[off..], "\",\"maxTimeoutSeconds\":{d}}}}}", .{policy.max_timeout_seconds}) catch return error.BufferTooSmall;
+        const tail = std.fmt.bufPrint(buf[off..], "\",\"maxTimeoutSeconds\":{d}}}", .{policy.max_timeout_seconds}) catch return off;
         off += tail.len;
     }
     return off;
@@ -1046,7 +1035,7 @@ test "x402: parseSettleResponse failure includes errorReason" {
     try std.testing.expectEqualStrings("insufficient_funds", result.error_reason);
 }
 
-test "x402: buildVerifyRequestJson matches spec format" {
+test "x402: buildVerifyRequestJson V2 format" {
     const policy = RoutePaymentConfig{
         .require_payment = true,
         .price = "10000",
@@ -1062,10 +1051,11 @@ test "x402: buildVerifyRequestJson matches spec format" {
     var buf: [4096]u8 = undefined;
     const len = try buildVerifyRequestJson(&buf, b64_buf[0..b64_len], &policy);
     const json = buf[0..len];
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"x402Version\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"paymentPayload\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"paymentRequirements\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"x402Version\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"amount\":\"10000\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"network\":\"eip155:8453\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"0xUSDC\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"payTo\":\"0xRecv\"") != null);
 }
@@ -1274,6 +1264,7 @@ test "x402: buildSettleRequestJson produces valid settle request" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"paymentPayload\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scheme\":\"upto\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"amount\":\"100000\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"network\":\"eip155:8453\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"payTo\":\"0xRecv\"") != null);
 }
 
@@ -1326,6 +1317,11 @@ test "x402: buildSettleRequestJson rejects invalid base64" {
     };
     var buf: [4096]u8 = undefined;
     try std.testing.expectError(error.BufferTooSmall, buildSettleRequestJson(&buf, "not-valid-b64!!!", &policy, "999999"));
+}
+
+test "x402: V2 envelope accepted by validatePaymentHeader" {
+    const v2_envelope = "{\"x402Version\":2,\"payload\":{\"signature\":\"0xabc\",\"authorization\":{\"from\":\"0x1\",\"to\":\"0x2\",\"value\":\"10000\"}},\"accepted\":{\"scheme\":\"exact\",\"network\":\"eip155:8453\"}}";
+    try std.testing.expect(validatePaymentHeader(encodeJson(v2_envelope)));
 }
 
 fn encodeJson(json: []const u8) []const u8 {

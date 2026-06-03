@@ -11,8 +11,9 @@ const clock = @import("../runtime/clock.zig");
 /// middleware-accumulated headers (security, CORS, etc.) before the
 /// response gets serialized. Sized to hold the handler's max + the
 /// middleware chain's max in one pass. See `Router.handle`.
-threadlocal var merged_headers_tls: [MAX_RESPONSE_HEADERS + middleware.Chain.MAX_MIDDLEWARE_HEADERS + 1]response.Header = undefined;
+threadlocal var merged_headers_tls: [MAX_RESPONSE_HEADERS + middleware.Chain.MAX_MIDDLEWARE_HEADERS + 2]response.Header = undefined;
 threadlocal var x402_receipt_tls: response.Header = undefined;
+threadlocal var x402_receipt_v1_tls: response.Header = undefined;
 threadlocal var x402_has_receipt: bool = false;
 
 /// Errors surfaced by `Router` registration and routing.
@@ -865,6 +866,7 @@ pub const Router = struct {
                         if (settle.success) {
                             if (settle.receipt_b64.len > 0) {
                                 x402_receipt_tls = .{ .name = "PAYMENT-RESPONSE", .value = settle.receipt_b64 };
+                                x402_receipt_v1_tls = .{ .name = "X-PAYMENT-RESPONSE", .value = settle.receipt_b64 };
                                 x402_has_receipt = true;
                             }
                             if (effective_policy.settlement_url.len > 0) {
@@ -919,9 +921,15 @@ pub const Router = struct {
                 merged_headers_tls[i] = h;
                 i += 1;
             }
-            if (x402_has_receipt and i < merge_cap) {
-                merged_headers_tls[i] = x402_receipt_tls;
-                i += 1;
+            if (x402_has_receipt) {
+                if (i < merge_cap) {
+                    merged_headers_tls[i] = x402_receipt_tls;
+                    i += 1;
+                }
+                if (i < merge_cap) {
+                    merged_headers_tls[i] = x402_receipt_v1_tls;
+                    i += 1;
+                }
             }
             result_resp.headers = merged_headers_tls[0..i];
         }
