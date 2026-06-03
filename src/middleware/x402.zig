@@ -376,16 +376,31 @@ pub fn evaluateWithFacilitator(
         };
     };
 
-    // Local signature verification: fast-reject invalid v1 signatures
-    // before hitting the facilitator. v2 payloads use EIP-3009/Permit2
-    // typed data which requires on-chain verification via the facilitator.
-    if (build_options.enable_x402_crypto and policy.pay_to.len > 0) {
-        const decoded = decodePaymentHeader(payment_header) orelse
-            return .{ .reject = rejectWith(.malformed_header, policy) };
-        if (!isV2Payload(decoded)) {
-            if (!x402_crypto.verifyPaymentSignature(decoded, policy.pay_to)) {
-                return .{ .reject = rejectWith(.invalid_signature, policy) };
-            }
+    // Local EIP-712/EIP-3009 signature pre-filter. For the `exact` scheme,
+    // when the route is fully configured with the token's EIP-712 domain
+    // (asset = verifyingContract, network → chainId, extra_name/version),
+    // reconstruct the TransferWithAuthorization digest, recover the signer,
+    // and reject forgeries (or a wrong recipient) before a facilitator
+    // round-trip. If any domain input is missing we cannot verify safely, so
+    // we defer to the facilitator rather than risk rejecting a valid payment.
+    if (build_options.enable_x402_crypto and
+        policy.pay_to.len > 0 and
+        std.mem.eql(u8, policy.scheme, "exact") and
+        policy.asset.len > 0 and
+        policy.extra_name.len > 0 and
+        policy.extra_version.len > 0)
+    {
+        if (parseChainId(policy.network)) |chain_id| {
+            const decoded = decodePaymentHeader(payment_header) orelse
+                return .{ .reject = rejectWith(.malformed_header, policy) };
+            const ok = x402_crypto.verifyPaymentSignature(decoded, .{
+                .name = policy.extra_name,
+                .version = policy.extra_version,
+                .chain_id = chain_id,
+                .verifying_contract = policy.asset,
+                .merchant = policy.pay_to,
+            });
+            if (!ok) return .{ .reject = rejectWith(.invalid_signature, policy) };
         }
     }
 
@@ -400,8 +415,18 @@ pub fn evaluateWithFacilitator(
     return .{ .allow = .{ .payment_header = payment_header, .needs_settlement = false } };
 }
 
-fn isV2Payload(decoded: []const u8) bool {
-    return std.mem.indexOf(u8, decoded, "\"x402Version\"") != null;
+/// Parse an EVM chain id from a network identifier. Accepts CAIP-2
+/// ("eip155:8453") and a couple of legacy x402 v1 network names. Returns
+/// null when the network isn't a recognized EVM chain, which makes the
+/// caller skip local verification and defer to the facilitator.
+fn parseChainId(network: []const u8) ?u64 {
+    const prefix = "eip155:";
+    if (std.mem.startsWith(u8, network, prefix)) {
+        return std.fmt.parseInt(u64, network[prefix.len..], 10) catch return null;
+    }
+    if (std.mem.eql(u8, network, "base")) return 8453;
+    if (std.mem.eql(u8, network, "base-sepolia")) return 84532;
+    return null;
 }
 
 pub fn findValidPaymentHeader(req: request.RequestView) ?[]const u8 {
@@ -1114,50 +1139,54 @@ test "x402: evaluateWithFacilitator returns 400 for malformed header" {
     }
 }
 
-test "x402: local crypto verification rejects wrong signer" {
-    if (!build_options.enable_x402_crypto) return error.SkipZigTest;
-    // Payment header signed by 0xb2BA25C6..., but pay_to expects a different address
-    const json =
-        \\{"signature":"0x693db4a72b7e8fd75c1894ace1058706c4be88a30830a63658489250e4fd89053fe9863ad7e748c51fab5fcbf5a44772776d1afc94d34d277a2bae702b7137331c","payload":{"amount":"10000","asset":"0xUSDC","network":"eip155:8453"}}
-    ;
-    const policy = RoutePaymentConfig{
-        .require_payment = true,
-        .payment_required_b64 = "dGVzdA==",
-        .pay_to = "0x0000000000000000000000000000000000000001",
-    };
-    const headers = [_]request.Header{
-        .{ .name = "X-Payment", .value = encodeJson(json) },
-    };
-    const req = makeRequest("/", &headers);
-    switch (evaluateWithFacilitator(req, policy, null)) {
-        .allow => return error.TestUnexpectedResult,
-        .reject => |info| {
-            try std.testing.expectEqual(@as(u16, 400), info.resp.status);
-            try std.testing.expectEqual(RejectReason.invalid_signature, info.reason);
-        },
-    }
-}
+// A fully-configured `exact`-scheme route matching the EIP-3009 golden
+// vector (USD Coin v2 / Base / USDC), so the local pre-filter actually runs.
+const TEST_X402_POLICY = RoutePaymentConfig{
+    .require_payment = true,
+    .payment_required_b64 = "dGVzdA==",
+    .pay_to = "0x000000000000000000000000000000000000dEaD",
+    .asset = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    .network = "eip155:8453",
+    .extra_name = "USD Coin",
+    .extra_version = "2",
+    .scheme = "exact",
+};
 
-test "x402: local crypto verification allows correct signer" {
+test "x402: local crypto verification allows a valid EIP-3009 payment" {
     if (!build_options.enable_x402_crypto) return error.SkipZigTest;
     const json =
-        \\{"signature":"0x693db4a72b7e8fd75c1894ace1058706c4be88a30830a63658489250e4fd89053fe9863ad7e748c51fab5fcbf5a44772776d1afc94d34d277a2bae702b7137331c","payload":{"amount":"10000","asset":"0xUSDC","network":"eip155:8453"}}
+        \\{"x402Version":2,"payload":{"signature":"0x61cf25d6dc05ff0c98238d2c8aa1def38222c6a4c2c0d2b66375c2d4ab1968266a4bb6f56db95f4ef9f7fb73b28c63e20f391f5969c8d32f3722ff40c9858ea01c","authorization":{"from":"0xb2BA25C6A5d758a6599A400FFA8810e68b2Ac4Db","to":"0x000000000000000000000000000000000000dEaD","value":"10000","validAfter":"0","validBefore":"1900000000","nonce":"0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"}},"accepted":{"scheme":"exact","network":"eip155:8453"}}
     ;
-    const policy = RoutePaymentConfig{
-        .require_payment = true,
-        .payment_required_b64 = "dGVzdA==",
-        .pay_to = "0xb2BA25C6A5d758a6599A400FFA8810e68b2Ac4Db",
-    };
     const headers = [_]request.Header{
         .{ .name = "X-Payment", .value = encodeJson(json) },
     };
     const req = makeRequest("/", &headers);
-    switch (evaluateWithFacilitator(req, policy, null)) {
+    switch (evaluateWithFacilitator(req, TEST_X402_POLICY, null)) {
         .allow => |ctx| {
             try std.testing.expect(ctx.payment_header.len > 0);
             try std.testing.expect(!ctx.needs_settlement);
         },
         .reject => return error.TestUnexpectedResult,
+    }
+}
+
+test "x402: local crypto verification rejects a forged signature" {
+    if (!build_options.enable_x402_crypto) return error.SkipZigTest;
+    // Identical authorization, but the signature's v byte is flipped
+    // (1c -> 1b): the recovered signer no longer equals authorization.from.
+    const json =
+        \\{"x402Version":2,"payload":{"signature":"0x61cf25d6dc05ff0c98238d2c8aa1def38222c6a4c2c0d2b66375c2d4ab1968266a4bb6f56db95f4ef9f7fb73b28c63e20f391f5969c8d32f3722ff40c9858ea01b","authorization":{"from":"0xb2BA25C6A5d758a6599A400FFA8810e68b2Ac4Db","to":"0x000000000000000000000000000000000000dEaD","value":"10000","validAfter":"0","validBefore":"1900000000","nonce":"0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"}},"accepted":{"scheme":"exact","network":"eip155:8453"}}
+    ;
+    const headers = [_]request.Header{
+        .{ .name = "X-Payment", .value = encodeJson(json) },
+    };
+    const req = makeRequest("/", &headers);
+    switch (evaluateWithFacilitator(req, TEST_X402_POLICY, null)) {
+        .allow => return error.TestUnexpectedResult,
+        .reject => |info| {
+            try std.testing.expectEqual(@as(u16, 400), info.resp.status);
+            try std.testing.expectEqual(RejectReason.invalid_signature, info.reason);
+        },
     }
 }
 

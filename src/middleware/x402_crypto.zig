@@ -255,55 +255,217 @@ pub fn ecrecover(msg_hash: [32]u8, sig: [65]u8) EcrecoverError![20]u8 {
     return addr;
 }
 
-pub fn verifyPaymentSignature(payment_json: []const u8, expected_pay_to: []const u8) bool {
+// ============================================================
+// EIP-712 / EIP-3009 TransferWithAuthorization verification
+//
+// x402's `exact` scheme on EVM chains has the payer sign an EIP-3009
+// TransferWithAuthorization as EIP-712 typed data over the token's domain.
+// To verify locally we reconstruct the EIP-712 digest from the payment
+// envelope plus the route's configured domain (token name/version, chainId,
+// token address), recover the signer, and require it to equal
+// authorization.from — and authorization.to to equal the merchant.
+// ============================================================
+
+/// keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
+const DOMAIN_TYPEHASH = blk: {
+    @setEvalBranchQuota(100000);
+    break :blk keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+};
+/// keccak256("TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)")
+const TRANSFER_TYPEHASH = blk: {
+    @setEvalBranchQuota(100000);
+    break :blk keccak256("TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)");
+};
+
+pub const Eip712Domain = struct {
+    name: []const u8,
+    version: []const u8,
+    chain_id: u64,
+    /// Token contract address ("0x" + 40 hex).
+    verifying_contract: []const u8,
+};
+
+pub const TransferAuthorization = struct {
+    from: []const u8,
+    to: []const u8,
+    /// Decimal strings (uint256).
+    value: []const u8,
+    valid_after: []const u8,
+    valid_before: []const u8,
+    /// "0x" + 64 hex (bytes32).
+    nonce: []const u8,
+};
+
+pub const VerifyParams = struct {
+    name: []const u8,
+    version: []const u8,
+    chain_id: u64,
+    verifying_contract: []const u8,
+    /// Expected authorization.to (the configured merchant / pay_to).
+    merchant: []const u8,
+};
+
+fn stripHex(s: []const u8) []const u8 {
+    return if (std.mem.startsWith(u8, s, "0x") or std.mem.startsWith(u8, s, "0X")) s[2..] else s;
+}
+
+/// 20-byte EVM address from hex, left-padded into a 32-byte ABI word.
+fn addrWord(s: []const u8) ?[32]u8 {
+    const h = stripHex(s);
+    if (h.len != 40) return null;
+    var out = [_]u8{0} ** 32;
+    for (0..20) |i| out[12 + i] = std.fmt.parseInt(u8, h[i * 2 ..][0..2], 16) catch return null;
+    return out;
+}
+
+fn addr20(s: []const u8) ?[20]u8 {
+    const h = stripHex(s);
+    if (h.len != 40) return null;
+    var out: [20]u8 = undefined;
+    for (0..20) |i| out[i] = std.fmt.parseInt(u8, h[i * 2 ..][0..2], 16) catch return null;
+    return out;
+}
+
+fn bytes32(s: []const u8) ?[32]u8 {
+    const h = stripHex(s);
+    if (h.len != 64) return null;
+    var out: [32]u8 = undefined;
+    for (0..32) |i| out[i] = std.fmt.parseInt(u8, h[i * 2 ..][0..2], 16) catch return null;
+    return out;
+}
+
+/// Decimal string → 32-byte big-endian uint256. Rejects non-digits and
+/// values that overflow 2^256.
+fn decWord(s: []const u8) ?[32]u8 {
+    if (s.len == 0) return null;
+    var out = [_]u8{0} ** 32;
+    for (s) |ch| {
+        if (ch < '0' or ch > '9') return null;
+        var carry: u16 = ch - '0';
+        var i: usize = 32;
+        while (i > 0) {
+            i -= 1;
+            const v: u16 = @as(u16, out[i]) * 10 + carry;
+            out[i] = @intCast(v & 0xff);
+            carry = v >> 8;
+        }
+        if (carry != 0) return null; // > 2^256
+    }
+    return out;
+}
+
+fn u64Word(v: u64) [32]u8 {
+    var out = [_]u8{0} ** 32;
+    std.mem.writeInt(u64, out[24..32], v, .big);
+    return out;
+}
+
+fn sig65(s: []const u8) ?[65]u8 {
+    const h = stripHex(s);
+    if (h.len != 130) return null;
+    var out: [65]u8 = undefined;
+    for (0..65) |i| out[i] = std.fmt.parseInt(u8, h[i * 2 ..][0..2], 16) catch return null;
+    return out;
+}
+
+fn domainSeparator(d: Eip712Domain) ?[32]u8 {
+    const vc = addrWord(d.verifying_contract) orelse return null;
+    var buf: [160]u8 = undefined;
+    @memcpy(buf[0..32], &DOMAIN_TYPEHASH);
+    @memcpy(buf[32..64], &keccak256(d.name));
+    @memcpy(buf[64..96], &keccak256(d.version));
+    @memcpy(buf[96..128], &u64Word(d.chain_id));
+    @memcpy(buf[128..160], &vc);
+    return keccak256(&buf);
+}
+
+fn transferStructHash(a: TransferAuthorization) ?[32]u8 {
+    const from = addrWord(a.from) orelse return null;
+    const to = addrWord(a.to) orelse return null;
+    const value = decWord(a.value) orelse return null;
+    const va = decWord(a.valid_after) orelse return null;
+    const vb = decWord(a.valid_before) orelse return null;
+    const nonce = bytes32(a.nonce) orelse return null;
+    var buf: [224]u8 = undefined;
+    @memcpy(buf[0..32], &TRANSFER_TYPEHASH);
+    @memcpy(buf[32..64], &from);
+    @memcpy(buf[64..96], &to);
+    @memcpy(buf[96..128], &value);
+    @memcpy(buf[128..160], &va);
+    @memcpy(buf[160..192], &vb);
+    @memcpy(buf[192..224], &nonce);
+    return keccak256(&buf);
+}
+
+/// EIP-712 digest: keccak256(0x1901 || domainSeparator || hashStruct(message)).
+pub fn eip712Digest(domain: Eip712Domain, auth: TransferAuthorization) ?[32]u8 {
+    const ds = domainSeparator(domain) orelse return null;
+    const sh = transferStructHash(auth) orelse return null;
+    var buf: [66]u8 = undefined;
+    buf[0] = 0x19;
+    buf[1] = 0x01;
+    @memcpy(buf[2..34], &ds);
+    @memcpy(buf[34..66], &sh);
+    return keccak256(&buf);
+}
+
+/// Verify an x402 `exact`-scheme (EIP-3009) payment envelope locally:
+/// rebuild the EIP-712 digest, recover the signer, and require it to equal
+/// authorization.from, with authorization.to equal to the configured
+/// merchant. Returns true only if both hold; any parse/shape failure → false.
+/// This is a cheap forgery pre-filter; the facilitator still verifies funding
+/// and nonce state on-chain.
+pub fn verifyPaymentSignature(payment_json: []const u8, params: VerifyParams) bool {
     if (!has_crypto) return false;
 
     var arena_buf: [8192]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&arena_buf);
 
-    const Parsed = struct {
-        signature: []const u8 = "",
-        payload: std.json.Value = .null,
+    // Both x402 v1 and v2 envelopes nest the signed material under
+    // `payload`: { signature, authorization: { from, to, value, ... } }.
+    const Auth = struct {
+        from: []const u8 = "",
+        to: []const u8 = "",
+        value: []const u8 = "",
+        validAfter: []const u8 = "",
+        validBefore: []const u8 = "",
+        nonce: []const u8 = "",
     };
-    const parsed = std.json.parseFromSliceLeaky(Parsed, fba.allocator(), payment_json, .{
+    const Payload = struct {
+        signature: []const u8 = "",
+        authorization: Auth = .{},
+    };
+    const Envelope = struct {
+        payload: Payload = .{},
+    };
+    const env = std.json.parseFromSliceLeaky(Envelope, fba.allocator(), payment_json, .{
         .ignore_unknown_fields = true,
     }) catch return false;
 
-    if (parsed.signature.len == 0) return false;
+    const a = env.payload.authorization;
+    if (env.payload.signature.len == 0 or a.from.len == 0 or a.to.len == 0) return false;
 
-    // Verify payTo in payload matches configured merchant address
-    const payload_obj = switch (parsed.payload) {
-        .object => |obj| obj,
-        else => return false,
-    };
-    const pay_to_val = payload_obj.get("payTo") orelse return false;
-    const payload_pay_to = switch (pay_to_val) {
-        .string => |s| s,
-        else => return false,
-    };
-    if (!std.ascii.eqlIgnoreCase(payload_pay_to, expected_pay_to)) return false;
+    // authorization.to must be the configured merchant.
+    if (!std.ascii.eqlIgnoreCase(a.to, params.merchant)) return false;
 
-    var payload_buf: [4096]u8 = undefined;
-    var writer = std.Io.Writer.fixed(&payload_buf);
-    std.json.Stringify.value(parsed.payload, .{}, &writer) catch return false;
-    const payload_str = writer.buffered();
+    const digest = eip712Digest(.{
+        .name = params.name,
+        .version = params.version,
+        .chain_id = params.chain_id,
+        .verifying_contract = params.verifying_contract,
+    }, .{
+        .from = a.from,
+        .to = a.to,
+        .value = a.value,
+        .valid_after = a.validAfter,
+        .valid_before = a.validBefore,
+        .nonce = a.nonce,
+    }) orelse return false;
 
-    const msg_hash = eip191Hash(payload_str);
-
-    const sig_hex = if (std.mem.startsWith(u8, parsed.signature, "0x"))
-        parsed.signature[2..]
-    else
-        parsed.signature;
-    if (sig_hex.len != 130) return false;
-
-    var sig_bytes: [65]u8 = undefined;
-    for (0..65) |idx| {
-        sig_bytes[idx] = std.fmt.parseInt(u8, sig_hex[idx * 2 ..][0..2], 16) catch return false;
-    }
-
-    _ = ecrecover(msg_hash, sig_bytes) catch return false;
-
-    return true;
+    const sig = sig65(env.payload.signature) orelse return false;
+    const recovered = ecrecover(digest, sig) catch return false;
+    const expected_from = addr20(a.from) orelse return false;
+    return std.mem.eql(u8, &recovered, &expected_from);
 }
 
 // ============================================================
@@ -473,49 +635,111 @@ test "ecrecover: different v values produce different addresses" {
     try std.testing.expectEqualSlices(u8, &TEST_ADDR, &addr1);
 }
 
-// --- verifyPaymentSignature ---
+// --- EIP-712 / EIP-3009 verification ---
+//
+// Golden vector generated with ethers v6 signTypedData using the test key
+// (0x4c0883...e3b4 → 0xb2BA25C6...). Domain: USD Coin v2 / chainId 8453 /
+// USDC@Base. The intermediate domain-separator, struct-hash, and digest
+// values are asserted directly so an encoding bug is localized rather than
+// only surfacing as a recovery mismatch.
 
-test "verifyPaymentSignature: rejects empty json" {
-    try std.testing.expect(!verifyPaymentSignature("{}", "0x0000000000000000000000000000000000000000"));
+const VEC_DOMAIN = Eip712Domain{
+    .name = "USD Coin",
+    .version = "2",
+    .chain_id = 8453,
+    .verifying_contract = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+};
+const VEC_AUTH = TransferAuthorization{
+    .from = "0xb2BA25C6A5d758a6599A400FFA8810e68b2Ac4Db",
+    .to = "0x000000000000000000000000000000000000dEaD",
+    .value = "10000",
+    .valid_after = "0",
+    .valid_before = "1900000000",
+    .nonce = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+};
+// Full v2 envelope carrying VEC_AUTH plus the matching signature.
+const VEC_ENVELOPE =
+    \\{"x402Version":2,"payload":{"signature":"0x61cf25d6dc05ff0c98238d2c8aa1def38222c6a4c2c0d2b66375c2d4ab1968266a4bb6f56db95f4ef9f7fb73b28c63e20f391f5969c8d32f3722ff40c9858ea01c","authorization":{"from":"0xb2BA25C6A5d758a6599A400FFA8810e68b2Ac4Db","to":"0x000000000000000000000000000000000000dEaD","value":"10000","validAfter":"0","validBefore":"1900000000","nonce":"0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"}},"accepted":{"scheme":"exact","network":"eip155:8453"}}
+;
+const VEC_PARAMS = VerifyParams{
+    .name = "USD Coin",
+    .version = "2",
+    .chain_id = 8453,
+    .verifying_contract = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    .merchant = "0x000000000000000000000000000000000000dEaD",
+};
+
+// Pure keccak — these run in every build, no OpenSSL needed.
+test "eip712: domain separator matches ethers" {
+    const ds = domainSeparator(VEC_DOMAIN).?;
+    const expected = hexToBytes("02fa7265e7c5d81118673727957699e4d68f74cd74b7db77da710fe8a2c7834f");
+    try std.testing.expectEqualSlices(u8, &expected, &ds);
 }
 
-test "verifyPaymentSignature: rejects missing signature" {
-    const json =
-        \\{"payload":{"test":true}}
-    ;
-    try std.testing.expect(!verifyPaymentSignature(json, "0x0000000000000000000000000000000000000000"));
+test "eip712: transfer struct hash matches ethers" {
+    const sh = transferStructHash(VEC_AUTH).?;
+    const expected = hexToBytes("df36f3da18e07b411a82073d8dc76c8ec8545101847a3bcaafbe07cda166129d");
+    try std.testing.expectEqualSlices(u8, &expected, &sh);
 }
 
-test "verifyPaymentSignature: rejects invalid signature length" {
-    const json =
-        \\{"signature":"0xdeadbeef","payload":{"test":true}}
-    ;
-    try std.testing.expect(!verifyPaymentSignature(json, "0x0000000000000000000000000000000000000000"));
+test "eip712: digest matches ethers" {
+    const d = eip712Digest(VEC_DOMAIN, VEC_AUTH).?;
+    const expected = hexToBytes("6fa4591f063ae11f6f5aa7ef0957dbf9bc0b6da8ec4bd2b874249f81419f33ef");
+    try std.testing.expectEqualSlices(u8, &expected, &d);
 }
 
-test "verifyPaymentSignature: rejects malformed json" {
-    try std.testing.expect(!verifyPaymentSignature("not json at all", "0x0000000000000000000000000000000000000000"));
+test "decWord: decimal string to 32-byte big-endian uint256" {
+    const ten_k = decWord("10000").?; // 0x2710
+    var expected = [_]u8{0} ** 32;
+    expected[30] = 0x27;
+    expected[31] = 0x10;
+    try std.testing.expectEqualSlices(u8, &expected, &ten_k);
+
+    const zero = decWord("0").?;
+    const z32 = [_]u8{0} ** 32;
+    try std.testing.expectEqualSlices(u8, &z32, &zero);
+
+    try std.testing.expect(decWord("") == null);
+    try std.testing.expect(decWord("12a") == null);
 }
 
-test "verifyPaymentSignature: rejects null payload" {
-    const json =
-        \\{"signature":"0x0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000","payload":null}
-    ;
-    try std.testing.expect(!verifyPaymentSignature(json, "0x0000000000000000000000000000000000000000"));
-}
+// --- verifyPaymentSignature (full path; ecrecover needs OpenSSL) ---
 
-test "verifyPaymentSignature: rejects mismatched payTo" {
+test "verifyPaymentSignature: accepts a valid EIP-3009 authorization" {
     if (!has_crypto) return error.SkipZigTest;
-    const json =
-        \\{"signature":"0x693db4a72b7e8fd75c1894ace1058706c4be88a30830a63658489250e4fd89053fe9863ad7e748c51fab5fcbf5a44772776d1afc94d34d277a2bae702b7137331c","payload":{"amount":"10000","asset":"0xUSDC","network":"eip155:8453","payTo":"0xMerchant1234567890123456789012345678"}}
-    ;
-    try std.testing.expect(!verifyPaymentSignature(json, "0xDifferentMerchant12345678901234567890"));
+    try std.testing.expect(verifyPaymentSignature(VEC_ENVELOPE, VEC_PARAMS));
 }
 
-test "verifyPaymentSignature: rejects missing payTo in payload" {
+test "verifyPaymentSignature: rejects a tampered signature" {
     if (!has_crypto) return error.SkipZigTest;
-    const json =
-        \\{"signature":"0x693db4a72b7e8fd75c1894ace1058706c4be88a30830a63658489250e4fd89053fe9863ad7e748c51fab5fcbf5a44772776d1afc94d34d277a2bae702b7137331c","payload":{"amount":"10000","asset":"0xUSDC","network":"eip155:8453"}}
+    // Same r/s but v flipped 0x1c -> 0x1b: recovers the *other* candidate
+    // key, so the recovered signer no longer equals authorization.from.
+    const tampered =
+        \\{"x402Version":2,"payload":{"signature":"0x61cf25d6dc05ff0c98238d2c8aa1def38222c6a4c2c0d2b66375c2d4ab1968266a4bb6f56db95f4ef9f7fb73b28c63e20f391f5969c8d32f3722ff40c9858ea01b","authorization":{"from":"0xb2BA25C6A5d758a6599A400FFA8810e68b2Ac4Db","to":"0x000000000000000000000000000000000000dEaD","value":"10000","validAfter":"0","validBefore":"1900000000","nonce":"0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"}}}
     ;
-    try std.testing.expect(!verifyPaymentSignature(json, "0xb2BA25C6A5d758a6599A400FFA8810e68b2Ac4Db"));
+    try std.testing.expect(!verifyPaymentSignature(tampered, VEC_PARAMS));
+}
+
+test "verifyPaymentSignature: rejects when authorization.to != merchant" {
+    if (!has_crypto) return error.SkipZigTest;
+    var params = VEC_PARAMS;
+    params.merchant = "0x0000000000000000000000000000000000000001";
+    try std.testing.expect(!verifyPaymentSignature(VEC_ENVELOPE, params));
+}
+
+test "verifyPaymentSignature: rejects a wrong EIP-712 domain (chainId)" {
+    if (!has_crypto) return error.SkipZigTest;
+    // Correct signature, wrong domain → different digest → recovered != from.
+    var params = VEC_PARAMS;
+    params.chain_id = 1;
+    try std.testing.expect(!verifyPaymentSignature(VEC_ENVELOPE, params));
+}
+
+test "verifyPaymentSignature: rejects empty / malformed / missing fields" {
+    if (!has_crypto) return error.SkipZigTest;
+    try std.testing.expect(!verifyPaymentSignature("{}", VEC_PARAMS));
+    try std.testing.expect(!verifyPaymentSignature("not json at all", VEC_PARAMS));
+    try std.testing.expect(!verifyPaymentSignature(
+        \\{"payload":{"authorization":{"from":"0xb2BA25C6A5d758a6599A400FFA8810e68b2Ac4Db","to":"0x000000000000000000000000000000000000dEaD"}}}
+    , VEC_PARAMS));
 }

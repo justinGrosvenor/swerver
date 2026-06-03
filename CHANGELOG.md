@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### x402
+
+- **fix: local signature verification now actually verifies x402 payments.**
+  The `enable-x402-crypto` path previously hashed a synthetic payload shape
+  with EIP-191 personal_sign and discarded the recovered signer, and was
+  gated off for any envelope carrying `x402Version` — i.e. every real client
+  — so it never ran on live traffic. It now reconstructs the real EIP-712
+  EIP-3009 `TransferWithAuthorization` digest from the payment envelope and
+  the route's configured token domain (`asset`, `network`→chainId,
+  `extra_name`/`extra_version`), recovers the signer, and requires it to
+  equal `authorization.from` with `authorization.to` equal to the merchant —
+  rejecting forgeries before a facilitator round-trip. Verified against an
+  ethers v6 golden vector (domain separator, struct hash, and digest match
+  byte-for-byte). When the route lacks complete domain config, verification
+  is skipped and the request defers to the facilitator (no false rejects).
+
+---
+
 ## 0.1.0-alpha.9 — 2026-05-20
 
 ### HTTP/1.1 Correctness
