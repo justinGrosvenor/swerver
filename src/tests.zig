@@ -73,6 +73,7 @@ const otel = @import("middleware/otel.zig");
 const body_schema = @import("middleware/body_schema.zig");
 const grpc = @import("middleware/grpc.zig");
 const compress = @import("middleware/compress.zig");
+const usage = @import("middleware/usage.zig");
 
 // Admin
 const admin = @import("admin/admin.zig");
@@ -173,6 +174,10 @@ comptime {
     _ = body_schema;
     _ = grpc;
     _ = compress;
+    // usage.zig is imported transitively (dispatch/middleware/admin) but
+    // Zig's lazy analysis only pulls a file's test blocks in on a direct
+    // reference — without this its 5 tests ran in no build variant.
+    _ = usage;
 
     // Admin
     _ = admin;
