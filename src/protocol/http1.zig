@@ -410,57 +410,7 @@ fn parseHeadersInternal(_bytes: []u8, _limits: Limits) HeaderParseResult {
             }
         }
         if (std.ascii.eqlIgnoreCase(name, "content-length")) {
-            if (value.len == 0) {
-                return .{
-                    .state = .err,
-                    .view = emptyView(),
-                    .error_code = .invalid_content_length,
-                    .content_length = 0,
-                    .is_chunked = false,
-                    .keep_alive = true,
-                    .expect_continue = false,
-                    .headers_consumed = 0,
-                };
-            }
-            for (value) |ch| {
-                if (ch < '0' or ch > '9') {
-                    return .{
-                        .state = .err,
-                        .view = emptyView(),
-                        .error_code = .invalid_content_length,
-                        .content_length = 0,
-                        .is_chunked = false,
-                        .keep_alive = true,
-                        .expect_continue = false,
-                        .headers_consumed = 0,
-                    };
-                }
-            }
-            if (value.len > 1 and value[0] == '0') {
-                return .{
-                    .state = .err,
-                    .view = emptyView(),
-                    .error_code = .invalid_content_length,
-                    .content_length = 0,
-                    .is_chunked = false,
-                    .keep_alive = true,
-                    .expect_continue = false,
-                    .headers_consumed = 0,
-                };
-            }
-            if (value.len > 19) {
-                return .{
-                    .state = .err,
-                    .view = emptyView(),
-                    .error_code = .invalid_content_length,
-                    .content_length = 0,
-                    .is_chunked = false,
-                    .keep_alive = true,
-                    .expect_continue = false,
-                    .headers_consumed = 0,
-                };
-            }
-            const parsed_len = std.fmt.parseUnsigned(usize, value, 10) catch {
+            const parsed_len = parseContentLengthValue(value) catch {
                 return .{
                     .state = .err,
                     .view = emptyView(),
@@ -1086,52 +1036,7 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
             }
         }
         if (std.ascii.eqlIgnoreCase(name, "content-length")) {
-            // Reject values with leading zeros, signs, or whitespace to prevent smuggling
-            if (value.len == 0) {
-                return .{
-                    .state = .err,
-                    .view = emptyView(),
-                    .error_code = .invalid_content_length,
-                    .consumed_bytes = 0,
-                    .keep_alive = true,
-                    .expect_continue = false,
-                };
-            }
-            for (value) |ch| {
-                if (ch < '0' or ch > '9') {
-                    return .{
-                        .state = .err,
-                        .view = emptyView(),
-                        .error_code = .invalid_content_length,
-                        .consumed_bytes = 0,
-                        .keep_alive = true,
-                        .expect_continue = false,
-                    };
-                }
-            }
-            // RFC 9112 §6.3: Reject leading zeros to prevent smuggling
-            if (value.len > 1 and value[0] == '0') {
-                return .{
-                    .state = .err,
-                    .view = emptyView(),
-                    .error_code = .invalid_content_length,
-                    .consumed_bytes = 0,
-                    .keep_alive = true,
-                    .expect_continue = false,
-                };
-            }
-            // Reject unreasonably long digit strings to prevent overflow in parseInt
-            if (value.len > 19) {
-                return .{
-                    .state = .err,
-                    .view = emptyView(),
-                    .error_code = .invalid_content_length,
-                    .consumed_bytes = 0,
-                    .keep_alive = true,
-                    .expect_continue = false,
-                };
-            }
-            const parsed_len = std.fmt.parseUnsigned(usize, value, 10) catch {
+            const parsed_len = parseContentLengthValue(value) catch {
                 return .{
                     .state = .err,
                     .view = emptyView(),
@@ -1371,6 +1276,21 @@ fn hasInvalidHostChar(value: []const u8) bool {
         if (ch == '@' or ch == '/' or ch == ',') return true;
     }
     return false;
+}
+
+/// RFC 9112 §6.3 + smuggling defense: validate and parse a Content-Length value.
+/// Rejects empty, non-digit, leading-zero (except a lone "0"), signs/whitespace,
+/// and over-long (>19 digit) values that could overflow. Returns the parsed
+/// length or error.Invalid. The body-size limit and duplicate-header
+/// consistency checks are the caller's responsibility (they need request state).
+fn parseContentLengthValue(value: []const u8) error{Invalid}!usize {
+    if (value.len == 0) return error.Invalid;
+    for (value) |ch| {
+        if (ch < '0' or ch > '9') return error.Invalid;
+    }
+    if (value.len > 1 and value[0] == '0') return error.Invalid; // leading zero
+    if (value.len > 19) return error.Invalid; // overflow guard for parseUnsigned
+    return std.fmt.parseUnsigned(usize, value, 10) catch error.Invalid;
 }
 
 const ChunkedResult = struct {
@@ -1617,4 +1537,76 @@ test "scanChunked: zero-length body no trailers" {
     try std.testing.expect(result.complete);
     try std.testing.expectEqual(@as(usize, 0), result.body_len);
     try std.testing.expectEqual(@as(usize, buf.len), result.consumed_bytes);
+}
+
+// ── header-semantics primitives ──────────────────────────────────────────────
+
+test "parseContentLengthValue: valid lengths" {
+    try std.testing.expectEqual(@as(usize, 0), try parseContentLengthValue("0"));
+    try std.testing.expectEqual(@as(usize, 5), try parseContentLengthValue("5"));
+    try std.testing.expectEqual(@as(usize, 123456), try parseContentLengthValue("123456"));
+    // 19 digits is the max allowed length (fits in usize on 64-bit)
+    try std.testing.expectEqual(@as(usize, 9_999_999_999_999_999_999), try parseContentLengthValue("9999999999999999999"));
+}
+
+test "parseContentLengthValue: rejects smuggling / malformed" {
+    const bad = [_][]const u8{
+        "", // empty
+        "01", "00", "007", // leading zeros (RFC 9112 §6.3)
+        "1a", "0x10", "12.0", // non-digit
+        "+5", "-5", // signs
+        " 5", "5 ", "\t5", "5\t", // whitespace
+        "99999999999999999999", // 20 digits — overflow guard
+    };
+    for (bad) |v| {
+        try std.testing.expectError(error.Invalid, parseContentLengthValue(v));
+    }
+}
+
+test "isToken: RFC tchar set" {
+    try std.testing.expect(isToken("GET"));
+    try std.testing.expect(isToken("X-Custom-Header"));
+    try std.testing.expect(isToken("!#$%&'*+-.^_`|~"));
+    try std.testing.expect(!isToken("")); // empty
+    try std.testing.expect(!isToken("a b")); // space
+    try std.testing.expect(!isToken("a:b")); // colon
+    try std.testing.expect(!isToken("a/b")); // slash
+    try std.testing.expect(!isToken("a(b)")); // parens
+}
+
+test "isValidFieldValue: control chars rejected, obs-text allowed" {
+    try std.testing.expect(isValidFieldValue("hello world"));
+    try std.testing.expect(isValidFieldValue("with\ttab"));
+    try std.testing.expect(isValidFieldValue("")); // empty is valid
+    try std.testing.expect(isValidFieldValue("obs\x80text")); // obs-text 0x80-0xFF
+    try std.testing.expect(!isValidFieldValue("bare\nlf"));
+    try std.testing.expect(!isValidFieldValue("bare\rcr"));
+    try std.testing.expect(!isValidFieldValue("nul\x00byte"));
+    try std.testing.expect(!isValidFieldValue("del\x7fchar"));
+}
+
+test "hasInvalidHostChar: reject @ / ," {
+    try std.testing.expect(!hasInvalidHostChar("example.com"));
+    try std.testing.expect(!hasInvalidHostChar("example.com:8080"));
+    try std.testing.expect(hasInvalidHostChar("user@evil.com")); // userinfo smuggling
+    try std.testing.expect(hasInvalidHostChar("a/b"));
+    try std.testing.expect(hasInvalidHostChar("a,b"));
+}
+
+test "containsToken: comma list, case-insensitive, trimmed" {
+    try std.testing.expect(containsToken("close", "close"));
+    try std.testing.expect(containsToken("keep-alive, close", "close"));
+    try std.testing.expect(containsToken("Keep-Alive", "keep-alive")); // case
+    try std.testing.expect(containsToken("  close  ", "close")); // OWS trimmed
+    try std.testing.expect(!containsToken("closely", "close")); // not a substring match
+    try std.testing.expect(!containsToken("keep-alive", "close"));
+}
+
+test "lastToken: chunked must be final coding" {
+    try std.testing.expect(lastToken("gzip, chunked", "chunked"));
+    try std.testing.expect(lastToken("chunked", "chunked"));
+    try std.testing.expect(lastToken("chunked,", "chunked")); // trailing comma ignored
+    try std.testing.expect(!lastToken("chunked, gzip", "chunked")); // not last — smuggling vector
+    try std.testing.expect(!lastToken("gzip", "chunked"));
+    try std.testing.expect(!lastToken("", "chunked"));
 }
