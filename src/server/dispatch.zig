@@ -278,8 +278,6 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
                                 if (postconn.fd) |pfd| server.io.rearmRecv(result.conn_index, pfd);
                             }
                         }
-                    } else if (!result.success) {
-                        std.log.warn("x402 async settlement failed: {s}", .{result.error_reason[0..result.error_reason_len]});
                     }
 
                     if (result.success and result.has_settlement_url) {
@@ -289,6 +287,15 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
                             result.settle_network[0..result.settle_network_len],
                             result.settle_asset[0..result.settle_asset_len],
                             result.settle_amount[0..result.settle_amount_len],
+                        );
+                    } else if (!result.success) {
+                        std.log.warn("x402 async settlement failed: {s}", .{result.error_reason[0..result.error_reason_len]});
+                        x402_client.spillSettle(
+                            result.gateway_id[0..result.gateway_id_len],
+                            result.settle_network[0..result.settle_network_len],
+                            result.settle_asset[0..result.settle_asset_len],
+                            result.settle_amount[0..result.settle_amount_len],
+                            result.error_reason[0..result.error_reason_len],
                         );
                     }
                 },
