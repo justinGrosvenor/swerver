@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased
+
+### Observability
+
+- **feat: OTLP trace exporter now supports TLS and custom headers.** The
+  exporter previously did a plaintext-only HTTP POST with no auth header, so
+  it could only reach a co-located collector. It now wraps the socket in TLS
+  for `https://` collector URLs (verifying the peer against the system trust
+  store, with hostname check + SNI — mirroring the x402 facilitator client),
+  and sends operator-configured request headers via a new `otel.headers`
+  config field in the `OTEL_EXPORTER_OTLP_HEADERS` form
+  (`key1=value1,key2=value2`, e.g. `Authorization=Bearer …`). This lets
+  swerver export directly to an authenticated OTLP backend (Honeycomb,
+  Grafana Cloud, Dash0, …) without a collector sidecar. An `https://` URL in
+  a build without TLS sends nothing rather than downgrading to plaintext, and
+  CR/LF in a configured header is dropped (injection guard).
+
+### x402
+
+- **fix: local signature verification now actually verifies x402 payments.**
+  The `enable-x402-crypto` path previously hashed a synthetic payload shape
+  with EIP-191 personal_sign and discarded the recovered signer, and was
+  gated off for any envelope carrying `x402Version` — i.e. every real client
+  — so it never ran on live traffic. It now reconstructs the real EIP-712
+  EIP-3009 `TransferWithAuthorization` digest from the payment envelope and
+  the route's configured token domain (`asset`, `network`→chainId,
+  `extra_name`/`extra_version`), recovers the signer, and requires it to
+  equal `authorization.from` with `authorization.to` equal to the merchant —
+  rejecting forgeries before a facilitator round-trip. Verified against an
+  ethers v6 golden vector (domain separator, struct hash, and digest match
+  byte-for-byte). When the route lacks complete domain config, verification
+  is skipped and the request defers to the facilitator (no false rejects).
+
+---
+
 ## 0.1.0-alpha.9 — 2026-05-20
 
 ### HTTP/1.1 Correctness

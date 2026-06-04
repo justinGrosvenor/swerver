@@ -164,6 +164,7 @@ pub const ProxyRouteX402 = struct {
     facilitator_url: []const u8 = "",
     extensions_json: []const u8 = "",
     resource_url: []const u8 = "",
+    inline_receipt: bool = false,
 };
 
 /// Path rewrite rule

@@ -184,6 +184,7 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
         if (o.flush_interval_s) |v| cfg.otel.flush_interval_s = v;
         if (o.sample_rate) |v| cfg.otel.sample_rate = v;
         if (o.max_batch_size) |v| cfg.otel.max_batch_size = v;
+        if (o.headers) |v| cfg.otel.headers = v;
     }
 
     // Upstreams
@@ -302,6 +303,7 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
                 .facilitator_url = x.facilitator_url orelse "",
                 .extensions_json = extensions_json,
                 .resource_url = x.resource_url orelse "",
+                .inline_receipt = x.inline_receipt orelse false,
             };
         }
 
@@ -615,6 +617,7 @@ const OtelJson = struct {
     flush_interval_s: ?u32 = null,
     sample_rate: ?u16 = null,
     max_batch_size: ?u16 = null,
+    headers: ?[]const u8 = null,
 };
 
 const RouteX402Json = struct {
@@ -631,6 +634,7 @@ const RouteX402Json = struct {
     facilitator_url: ?[]const u8 = null,
     extensions: ?std.json.Value = null,
     resource_url: ?[]const u8 = null,
+    inline_receipt: ?bool = null,
 };
 
 const UpstreamJson = struct {

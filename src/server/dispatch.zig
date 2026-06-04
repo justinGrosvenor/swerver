@@ -263,6 +263,23 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
                     }
                 },
                 .settle => {
+                    const sconn = server.io.getConnection(result.conn_index);
+                    const is_parked = if (sconn) |sc| sc.id == result.conn_id and sc.x402 == .settle_pending else false;
+
+                    if (is_parked) {
+                        resumeSettlePark(server, sconn.?, &result);
+                        handleRead(server, result.conn_index) catch {};
+                        const postconn = server.io.getConnection(result.conn_index) orelse continue;
+                        if (postconn.id == result.conn_id and postconn.state != .closed) {
+                            if (postconn.write_count > 0 or postconn.hasPendingH2Streams()) {
+                                handleWrite(server, result.conn_index) catch {};
+                            }
+                            if (!postconn.close_after_write and postconn.x402 == .none) {
+                                if (postconn.fd) |pfd| server.io.rearmRecv(result.conn_index, pfd);
+                            }
+                        }
+                    }
+
                     if (result.success and result.has_settlement_url) {
                         settlement_mod.enqueue(
                             result.gateway_id[0..result.gateway_id_len],
@@ -273,6 +290,13 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
                         );
                     } else if (!result.success) {
                         std.log.warn("x402 async settlement failed: {s}", .{result.error_reason[0..result.error_reason_len]});
+                        x402_client.spillSettle(
+                            result.gateway_id[0..result.gateway_id_len],
+                            result.settle_network[0..result.settle_network_len],
+                            result.settle_asset[0..result.settle_asset_len],
+                            result.settle_amount[0..result.settle_amount_len],
+                            result.error_reason[0..result.error_reason_len],
+                        );
                     }
                 },
             }
@@ -761,7 +785,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
     }
 
     while (conn.state != .closed and conn.read_buffered_bytes > 0 and conn.canEnqueueWrite()) {
-        if (conn.x402 == .pending) break;
+        if (conn.x402 == .pending or conn.x402 == .settle_pending) break;
         // Opportunistic inline write drain: push enqueued responses
         // to the kernel while still processing pipelined requests.
         // At low connection counts (e.g. 512 conns / 64 workers =
@@ -1122,56 +1146,50 @@ pub fn handleRead(server: *Server, index: u32) !void {
                     }
                 }
 
-                try http1_mod.queueResponse(server, conn, proxy_result.resp);
                 if (server.otel) |otel_exp| {
                     otel_exp.recordSpan(parse.view.method, parse.view.path, proxy_result.resp.status, otel_start, clock.realtimeNanos() orelse 0);
                 }
-                if (proxy_result.resp.status >= 200 and proxy_result.resp.status < 300) {
-                    if (x402_result == .allow and x402_result.allow.needs_settlement) {
-                        if (route_fac) |fac| {
-                            const charge = for (proxy_result.resp.headers) |hdr| {
-                                if (std.ascii.eqlIgnoreCase(hdr.name, "x-charge-amount")) break hdr.value;
-                            } else "";
-                            var settle_entry = x402_client.RequestEntry{ .kind = .settle, .conn_index = conn.index, .conn_id = conn.id };
-                            const shl: u8 = @intCast(@min(fac.host.len, settle_entry.host.len));
-                            @memcpy(settle_entry.host[0..shl], fac.host[0..shl]);
-                            settle_entry.host_len = shl;
-                            settle_entry.port = fac.port;
-                            settle_entry.use_tls = fac.use_tls;
-                            settle_entry.timeout_ms = fac.timeout_ms;
-                            var settle_json_buf: [4096]u8 = undefined;
-                            const settle_json_len = x402_mod.buildSettleRequestJson(&settle_json_buf, x402_result.allow.payment_header, &x402_policy, charge) catch 0;
-                            if (settle_json_len > 0) {
-                                settle_entry.http_len = @intCast(x402_mod.buildFacilitatorPost(&settle_entry.http_buf, fac, "/settle", settle_json_buf[0..settle_json_len]) catch 0);
-                            }
-                            if (settle_entry.http_len > 0) {
-                                settle_entry.has_settlement_url = x402_policy.settlement_url.len > 0;
-                                const gid_len: u8 = @intCast(@min(x402_policy.gateway_id.len, settle_entry.gateway_id.len));
-                                @memcpy(settle_entry.gateway_id[0..gid_len], x402_policy.gateway_id[0..gid_len]);
-                                settle_entry.gateway_id_len = gid_len;
-                                const net_len: u8 = @intCast(@min(x402_policy.network.len, settle_entry.settle_network.len));
-                                @memcpy(settle_entry.settle_network[0..net_len], x402_policy.network[0..net_len]);
-                                settle_entry.settle_network_len = net_len;
-                                const asset_len: u8 = @intCast(@min(x402_policy.asset.len, settle_entry.settle_asset.len));
-                                @memcpy(settle_entry.settle_asset[0..asset_len], x402_policy.asset[0..asset_len]);
-                                settle_entry.settle_asset_len = asset_len;
-                                const amt = if (charge.len > 0) charge else x402_policy.price;
-                                const amt_len: u8 = @intCast(@min(amt.len, settle_entry.settle_amount.len));
-                                @memcpy(settle_entry.settle_amount[0..amt_len], amt[0..amt_len]);
-                                settle_entry.settle_amount_len = amt_len;
-                                if (!x402_client.submit(settle_entry)) {
-                                    x402_client.spillSettle(
-                                        x402_policy.gateway_id,
-                                        x402_policy.network,
-                                        x402_policy.asset,
-                                        if (charge.len > 0) charge else x402_policy.price,
-                                        "settle queue full",
-                                    );
-                                }
-                            }
+
+                // Settlement: submit async, optionally park for inline receipt
+                settle_blk: {
+                    if (proxy_result.resp.status < 200 or proxy_result.resp.status >= 300) break :settle_blk;
+                    if (!(x402_result == .allow and x402_result.allow.needs_settlement)) break :settle_blk;
+                    const fac = route_fac orelse break :settle_blk;
+                    const charge = for (proxy_result.resp.headers) |hdr| {
+                        if (std.ascii.eqlIgnoreCase(hdr.name, "x-charge-amount")) break hdr.value;
+                    } else "";
+                    var settle_entry = x402_client.RequestEntry{ .kind = .settle, .conn_index = conn.index, .conn_id = conn.id };
+                    fillSettleEntry(&settle_entry, fac, x402_result.allow.payment_header, &x402_policy, charge);
+                    if (settle_entry.http_len == 0) break :settle_blk;
+
+                    // Settle-park: hold response until settlement completes, then inject receipt header.
+                    // Enabled by config (inline_receipt) or per-request header (X-Inline-Receipt: true).
+                    const want_receipt = x402_policy.inline_receipt or for (parse.view.headers) |hdr| {
+                        if (std.ascii.eqlIgnoreCase(hdr.name, "x-inline-receipt")) break std.mem.eql(u8, hdr.value, "true");
+                    } else false;
+                    if (want_receipt and packHeldResponse(server, conn, proxy_result.resp)) {
+                        if (x402_client.submit(settle_entry)) {
+                            conn.x402 = .settle_pending;
+                            conn.markActive(server.now_ms);
+                            if (conn.read_buffered_bytes == 0) break;
+                            continue;
                         }
+                        releaseHeldBuffer(server, conn);
+                    }
+
+                    // Fire-and-forget: submit settle without parking
+                    if (!x402_client.submit(settle_entry)) {
+                        x402_client.spillSettle(
+                            x402_policy.gateway_id,
+                            x402_policy.network,
+                            x402_policy.asset,
+                            if (charge.len > 0) charge else x402_policy.price,
+                            "settle queue full",
+                        );
                     }
                 }
+
+                try http1_mod.queueResponse(server, conn, proxy_result.resp);
                 // Materialize pending_body before proxy_result.release() frees the upstream buffer
                 if (conn.pending_body.len > 0) {
                     http1_mod.materializePendingBody(server, conn);
@@ -1838,6 +1856,260 @@ pub fn connWrite(server: *Server, conn: *connection.Connection, data: []const u8
         };
     }
     return .{ .bytes = @intCast(raw) };
+}
+
+// ============================================================
+// x402 settle-park helpers
+// ============================================================
+
+fn fillSettleEntry(
+    entry: *x402_client.RequestEntry,
+    fac: x402_mod.FacilitatorConfig,
+    payment_header: []const u8,
+    policy: *const x402_mod.RoutePaymentConfig,
+    charge: []const u8,
+) void {
+    const shl: u8 = @intCast(@min(fac.host.len, entry.host.len));
+    @memcpy(entry.host[0..shl], fac.host[0..shl]);
+    entry.host_len = shl;
+    entry.port = fac.port;
+    entry.use_tls = fac.use_tls;
+    entry.timeout_ms = fac.timeout_ms;
+    var settle_json_buf: [4096]u8 = undefined;
+    const settle_json_len = x402_mod.buildSettleRequestJson(&settle_json_buf, payment_header, policy, charge) catch return;
+    entry.http_len = @intCast(x402_mod.buildFacilitatorPost(&entry.http_buf, fac, "/settle", settle_json_buf[0..settle_json_len]) catch return);
+    entry.has_settlement_url = policy.settlement_url.len > 0;
+    const gid_len: u8 = @intCast(@min(policy.gateway_id.len, entry.gateway_id.len));
+    @memcpy(entry.gateway_id[0..gid_len], policy.gateway_id[0..gid_len]);
+    entry.gateway_id_len = gid_len;
+    const net_len: u8 = @intCast(@min(policy.network.len, entry.settle_network.len));
+    @memcpy(entry.settle_network[0..net_len], policy.network[0..net_len]);
+    entry.settle_network_len = net_len;
+    const asset_len: u8 = @intCast(@min(policy.asset.len, entry.settle_asset.len));
+    @memcpy(entry.settle_asset[0..asset_len], policy.asset[0..asset_len]);
+    entry.settle_asset_len = asset_len;
+    const amt = if (charge.len > 0) charge else policy.price;
+    const amt_len: u8 = @intCast(@min(amt.len, entry.settle_amount.len));
+    @memcpy(entry.settle_amount[0..amt_len], amt[0..amt_len]);
+    entry.settle_amount_len = amt_len;
+}
+
+/// Pack upstream response (status + headers + body) into a pool buffer
+/// so it survives proxy_result.release(). Returns false if the response
+/// doesn't fit (> ~64KB) or no buffer is available — caller falls back
+/// to fire-and-forget settlement.
+fn packHeldResponse(server: *Server, conn: *connection.Connection, resp: response_mod.Response) bool {
+    const buf = server.io.acquireBuffer() orelse return false;
+    const body_bytes = resp.bodyBytes();
+    const result = packHeaders(buf.bytes, resp.headers, body_bytes) orelse {
+        server.io.releaseBuffer(buf);
+        return false;
+    };
+    conn.x402_held_buf = buf;
+    conn.x402_held_status = resp.status;
+    conn.x402_held_hdr_count = result.count;
+    conn.x402_held_body_offset = result.body_offset;
+    conn.x402_held_body_len = @intCast(body_bytes.len);
+    return true;
+}
+
+const PackResult = struct { count: u8, body_offset: u16 };
+
+/// Encode response headers + body into a flat byte buffer.
+/// Format per header: [name_len:u8][value_len_lo:u8][value_len_hi:u8][name][value]
+/// Body follows immediately after the last header.
+fn packHeaders(bytes: []u8, headers: []const response_mod.Header, body: []const u8) ?PackResult {
+    var pos: usize = 0;
+    var count: u8 = 0;
+    for (headers) |hdr| {
+        if (count >= 62) break;
+        if (hdr.name.len > 255) continue;
+        const val_len: u16 = @intCast(@min(hdr.value.len, 65535));
+        const need = 3 + hdr.name.len + val_len;
+        if (pos + need > bytes.len) return null;
+        bytes[pos] = @intCast(hdr.name.len);
+        bytes[pos + 1] = @truncate(val_len);
+        bytes[pos + 2] = @truncate(val_len >> 8);
+        pos += 3;
+        @memcpy(bytes[pos..][0..hdr.name.len], hdr.name);
+        pos += hdr.name.len;
+        @memcpy(bytes[pos..][0..val_len], hdr.value[0..val_len]);
+        pos += val_len;
+        count += 1;
+    }
+    if (pos > std.math.maxInt(u16) or pos + body.len > bytes.len) return null;
+    const body_offset: u16 = @intCast(pos);
+    @memcpy(bytes[pos..][0..body.len], body);
+    return .{ .count = count, .body_offset = body_offset };
+}
+
+/// Decode headers from the packed format written by packHeaders.
+fn unpackHeaders(
+    buf_bytes: []const u8,
+    hdr_count: u8,
+    body_offset: u16,
+    out: []response_mod.Header,
+) usize {
+    var pos: usize = 0;
+    var idx: usize = 0;
+    while (idx < hdr_count and pos < body_offset) : (idx += 1) {
+        if (pos + 3 > buf_bytes.len) break;
+        const name_len: usize = buf_bytes[pos];
+        const value_len: usize = @as(u16, buf_bytes[pos + 1]) | (@as(u16, buf_bytes[pos + 2]) << 8);
+        pos += 3;
+        if (pos + name_len + value_len > buf_bytes.len) break;
+        if (idx >= out.len) break;
+        out[idx] = .{
+            .name = buf_bytes[pos..][0..name_len],
+            .value = buf_bytes[pos + name_len ..][0..value_len],
+        };
+        pos += name_len + value_len;
+    }
+    return idx;
+}
+
+fn releaseHeldBuffer(server: *Server, conn: *connection.Connection) void {
+    if (conn.x402_held_buf) |buf| {
+        server.io.releaseBuffer(buf);
+        conn.x402_held_buf = null;
+    }
+}
+
+/// Resume a settle-parked connection: unpack the held response, inject
+/// receipt headers, and queue it for transmission.
+fn resumeSettlePark(server: *Server, conn: *connection.Connection, result: *const x402_client.ResultEntry) void {
+    const held_buf = conn.x402_held_buf orelse {
+        conn.x402 = .none;
+        return;
+    };
+    const buf_bytes = held_buf.bytes;
+
+    var held_headers: [64]response_mod.Header = undefined;
+    var hdr_idx = unpackHeaders(buf_bytes, conn.x402_held_hdr_count, conn.x402_held_body_offset, &held_headers);
+
+    // Inject receipt headers (V2 PAYMENT-RESPONSE + V1 X-PAYMENT-RESPONSE)
+    if (result.success and result.receipt_b64_len > 0 and hdr_idx + 2 <= held_headers.len) {
+        const receipt = result.receipt_b64[0..result.receipt_b64_len];
+        held_headers[hdr_idx] = .{ .name = "PAYMENT-RESPONSE", .value = receipt };
+        hdr_idx += 1;
+        held_headers[hdr_idx] = .{ .name = "X-PAYMENT-RESPONSE", .value = receipt };
+        hdr_idx += 1;
+    }
+
+    const body_end = @as(usize, conn.x402_held_body_offset) + conn.x402_held_body_len;
+    const body = if (conn.x402_held_body_len > 0 and body_end <= buf_bytes.len)
+        buf_bytes[conn.x402_held_body_offset..body_end]
+    else
+        @as([]const u8, "");
+
+    const resp = response_mod.Response{
+        .status = conn.x402_held_status,
+        .headers = held_headers[0..hdr_idx],
+        .body = .{ .bytes = body },
+    };
+    http1_mod.queueResponse(server, conn, resp) catch {};
+    // Materialize pending_body before releasing the held buffer
+    if (conn.pending_body.len > 0) {
+        http1_mod.materializePendingBody(server, conn);
+    }
+    releaseHeldBuffer(server, conn);
+    conn.x402 = .none;
+}
+
+// ============================================================
+// Tests — settle-park pack/unpack roundtrip
+// ============================================================
+
+test "packHeaders roundtrip with body" {
+    var buf: [4096]u8 = undefined;
+    const headers = [_]response_mod.Header{
+        .{ .name = "Content-Type", .value = "application/json" },
+        .{ .name = "X-Request-Id", .value = "abc-123" },
+    };
+    const body = "{\"ok\":true}";
+    const result = packHeaders(&buf, &headers, body) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u8, 2), result.count);
+
+    var out: [64]response_mod.Header = undefined;
+    const n = unpackHeaders(&buf, result.count, result.body_offset, &out);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqualStrings("Content-Type", out[0].name);
+    try std.testing.expectEqualStrings("application/json", out[0].value);
+    try std.testing.expectEqualStrings("X-Request-Id", out[1].name);
+    try std.testing.expectEqualStrings("abc-123", out[1].value);
+
+    const body_end = @as(usize, result.body_offset) + body.len;
+    try std.testing.expectEqualStrings(body, buf[result.body_offset..body_end]);
+}
+
+test "packHeaders empty body" {
+    var buf: [4096]u8 = undefined;
+    const headers = [_]response_mod.Header{
+        .{ .name = "Content-Length", .value = "0" },
+    };
+    const result = packHeaders(&buf, &headers, "") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u8, 1), result.count);
+
+    var out: [64]response_mod.Header = undefined;
+    const n = unpackHeaders(&buf, result.count, result.body_offset, &out);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqualStrings("Content-Length", out[0].name);
+    try std.testing.expectEqualStrings("0", out[0].value);
+}
+
+test "packHeaders no headers with body" {
+    var buf: [4096]u8 = undefined;
+    const result = packHeaders(&buf, &.{}, "hello") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u8, 0), result.count);
+    try std.testing.expectEqual(@as(u16, 0), result.body_offset);
+    try std.testing.expectEqualStrings("hello", buf[0..5]);
+}
+
+test "packHeaders rejects when buffer too small" {
+    var buf: [10]u8 = undefined;
+    const headers = [_]response_mod.Header{
+        .{ .name = "Content-Type", .value = "application/json" },
+    };
+    try std.testing.expect(packHeaders(&buf, &headers, "") == null);
+}
+
+test "packHeaders caps at 62 headers" {
+    var buf: [65536]u8 = undefined;
+    var headers: [70]response_mod.Header = undefined;
+    for (&headers) |*h| h.* = .{ .name = "X", .value = "Y" };
+    const result = packHeaders(&buf, &headers, "") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u8, 62), result.count);
+
+    var out: [64]response_mod.Header = undefined;
+    const n = unpackHeaders(&buf, result.count, result.body_offset, &out);
+    try std.testing.expectEqual(@as(usize, 62), n);
+}
+
+test "packHeaders skips headers with name > 255 bytes" {
+    var buf: [4096]u8 = undefined;
+    var long_name: [256]u8 = undefined;
+    @memset(&long_name, 'X');
+    const headers = [_]response_mod.Header{
+        .{ .name = &long_name, .value = "v" },
+        .{ .name = "Ok", .value = "yes" },
+    };
+    const result = packHeaders(&buf, &headers, "") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u8, 1), result.count);
+
+    var out: [64]response_mod.Header = undefined;
+    const n = unpackHeaders(&buf, result.count, result.body_offset, &out);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqualStrings("Ok", out[0].name);
+}
+
+test "packHeaders body too large for buffer" {
+    var buf: [32]u8 = undefined;
+    const headers = [_]response_mod.Header{
+        .{ .name = "A", .value = "B" },
+    };
+    var body: [30]u8 = undefined;
+    @memset(&body, 'Z');
+    try std.testing.expect(packHeaders(&buf, &headers, &body) == null);
 }
 
 fn initSettlement(server: *Server) void {

@@ -188,7 +188,7 @@ pub const HealthChecker = struct {
             total_read += n;
 
             // Try to parse — stop if complete
-            if (forward.parseUpstreamResponse(self.response_buf[0..total_read])) |_| {
+            if (forward.parseUpstreamResponse(self.response_buf[0..total_read], false)) |_| {
                 break;
             } else |_| {}
         }
@@ -246,7 +246,7 @@ pub const HealthChecker = struct {
 
     /// Validate health check response
     fn validateResponse(self: *HealthChecker, response_data: []const u8) bool {
-        const parsed = forward.parseUpstreamResponse(response_data) catch return false;
+        const parsed = forward.parseUpstreamResponse(response_data, false) catch return false;
 
         // Check status code
         if (parsed.status != self.config.expected_status) {

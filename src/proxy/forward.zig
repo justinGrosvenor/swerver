@@ -422,8 +422,8 @@ fn rewritePath(path: []const u8, rewrite: ?upstream.RewriteRule) []const u8 {
 }
 
 /// Parse an HTTP/1.1 response from upstream
-pub fn parseUpstreamResponse(buf: []const u8) !ParsedResponse {
-    var parser = ResponseParser{ .buf = buf };
+pub fn parseUpstreamResponse(buf: []const u8, is_head: bool) !ParsedResponse {
+    var parser = ResponseParser{ .buf = buf, .is_head = is_head };
     return parser.parse();
 }
 
@@ -431,6 +431,7 @@ pub fn parseUpstreamResponse(buf: []const u8) !ParsedResponse {
 const ResponseParser = struct {
     buf: []const u8,
     pos: usize = 0,
+    is_head: bool = false,
 
     const ParseError = error{
         InvalidResponse,
@@ -498,9 +499,10 @@ const ResponseParser = struct {
 
         if (content_length != null and is_chunked) return error.InvalidResponse;
 
-        // RFC 9110 §6.4.1: 1xx, 204, 304 MUST NOT contain a message body
+        // RFC 9110 §6.4.1: 1xx, 204, 304 MUST NOT contain a message body.
+        // RFC 9110 §9.3.2: HEAD response MUST NOT contain a body.
         const status_no_body = (status >= 100 and status < 200) or
-            status == 204 or status == 304;
+            status == 204 or status == 304 or self.is_head;
 
         // Determine body bounds
         var body_end = self.buf.len;
@@ -564,6 +566,7 @@ pub fn normalizeUpstreamResponse(
     upstream_buf: []u8,
     route: *const upstream.ProxyRoute,
     out_headers: []response.Header,
+    is_head: bool,
 ) !response.Response {
     var header_count: usize = 0;
 
@@ -587,7 +590,7 @@ pub fn normalizeUpstreamResponse(
     }
 
     const suppress_body = (parsed.status >= 100 and parsed.status < 200) or
-        parsed.status == 204 or parsed.status == 304;
+        parsed.status == 204 or parsed.status == 304 or is_head;
 
     for (parsed.headers()) |hdr| {
         if (upstream.isHopByHop(hdr.name)) continue;
@@ -1037,7 +1040,7 @@ test "buildUpstreamRequest basic" {
 test "parseUpstreamResponse basic" {
     const resp_data = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\nhello";
 
-    const parsed = try parseUpstreamResponse(resp_data);
+    const parsed = try parseUpstreamResponse(resp_data, false);
 
     try std.testing.expectEqual(@as(u16, 200), parsed.status);
     try std.testing.expect(parsed.keep_alive);
@@ -1046,12 +1049,12 @@ test "parseUpstreamResponse basic" {
 
 test "parseUpstreamResponse waits for complete chunked body" {
     const resp_data = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n";
-    try std.testing.expectError(error.IncompleteResponse, parseUpstreamResponse(resp_data));
+    try std.testing.expectError(error.IncompleteResponse, parseUpstreamResponse(resp_data, false));
 }
 
 test "parseUpstreamResponse disables keep-alive for close-delimited bodies" {
     const resp_data = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nhello";
-    const parsed = try parseUpstreamResponse(resp_data);
+    const parsed = try parseUpstreamResponse(resp_data, false);
 
     try std.testing.expect(parsed.close_delimited);
     try std.testing.expect(!parsed.keep_alive);
@@ -1072,7 +1075,7 @@ test "normalizeUpstreamResponse strips framing headers and decodes chunked" {
     var buf: [512]u8 = undefined;
     @memcpy(buf[0..raw.len], raw);
 
-    const parsed = try parseUpstreamResponse(buf[0..raw.len]);
+    const parsed = try parseUpstreamResponse(buf[0..raw.len], false);
     var headers: [16]response.Header = undefined;
     const route = upstream.ProxyRoute{
         .path_prefix = "/",
@@ -1084,7 +1087,7 @@ test "normalizeUpstreamResponse strips framing headers and decodes chunked" {
         },
     };
 
-    const normalized = try normalizeUpstreamResponse(&parsed, buf[0..], &route, headers[0..]);
+    const normalized = try normalizeUpstreamResponse(&parsed, buf[0..], &route, headers[0..], false);
 
     try std.testing.expectEqual(@as(u16, 200), normalized.status);
     try std.testing.expectEqualStrings("Wikipedia", normalized.bodyBytes());

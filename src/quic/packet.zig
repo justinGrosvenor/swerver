@@ -512,3 +512,189 @@ test "invalid fixed bit" {
     const result = parseHeader(&buf, 0);
     try std.testing.expectEqual(ParseState.err, result.state);
 }
+
+// ---- parseLongHeader: branches the original four tests never exercised ----
+// parseLongHeader is long precisely because of these edge/error paths
+// (Retry, Version Negotiation, token parsing, the DoS length guards, and
+// the partial-buffer cutoffs). They carry the smuggling/DoS-relevant logic
+// yet were untested; the tests below pin each branch to fixed inputs.
+
+test "parseLongHeader: Retry packet exposes its retry token" {
+    // Retry first byte: long | fixed | type=0b11 (retry). No length field,
+    // no packet number — the tail is Retry Token + 16-byte integrity tag.
+    var buf: [27]u8 = undefined;
+    buf[0] = 0xc0 | 0x30; // 0b11 << 4 = retry type bits
+    buf[1] = 0x00;
+    buf[2] = 0x00;
+    buf[3] = 0x00;
+    buf[4] = 0x01; // version v1
+    buf[5] = 0x00; // DCID len = 0
+    buf[6] = 0x00; // SCID len = 0
+    const token = [_]u8{ 0xde, 0xad, 0xbe, 0xef };
+    @memcpy(buf[7..11], &token);
+    @memset(buf[11..27], 0x55); // 16-byte retry integrity tag
+
+    const result = parseHeader(&buf, 0);
+    try std.testing.expectEqual(ParseState.complete, result.state);
+    const h = result.header.?.long;
+    try std.testing.expectEqual(types.PacketType.retry, h.packet_type);
+    try std.testing.expectEqualSlices(u8, &token, h.retry_token);
+    try std.testing.expectEqual(@as(usize, 27), result.consumed);
+}
+
+test "parseLongHeader: Retry packet without room for the integrity tag is partial" {
+    // Only 13 bytes after the header (offset 7) — short of the 16-byte tag.
+    var buf: [20]u8 = undefined;
+    buf[0] = 0xf0; // long | fixed | retry
+    buf[1] = 0x00;
+    buf[2] = 0x00;
+    buf[3] = 0x00;
+    buf[4] = 0x01;
+    buf[5] = 0x00;
+    buf[6] = 0x00;
+    @memset(buf[7..20], 0x55);
+    const result = parseHeader(&buf, 0);
+    try std.testing.expectEqual(ParseState.partial, result.state);
+}
+
+test "parseLongHeader: Version Negotiation packet (version 0)" {
+    // version == 0 short-circuits to a Version Negotiation packet whose
+    // payload is the list of supported versions.
+    var buf: [11]u8 = undefined;
+    buf[0] = 0xc0; // type bits are ignored for version negotiation
+    buf[1] = 0x00;
+    buf[2] = 0x00;
+    buf[3] = 0x00;
+    buf[4] = 0x00; // version == 0
+    buf[5] = 0x00; // DCID len
+    buf[6] = 0x00; // SCID len
+    buf[7] = 0x00;
+    buf[8] = 0x00;
+    buf[9] = 0x00;
+    buf[10] = 0x01; // one supported version in the list
+    const result = parseHeader(&buf, 0);
+    try std.testing.expectEqual(ParseState.complete, result.state);
+    const h = result.header.?.long;
+    try std.testing.expectEqual(@as(u32, 0), h.version);
+    try std.testing.expectEqual(@as(usize, 7), h.payload_offset);
+    try std.testing.expectEqual(@as(usize, 4), h.payload_length);
+    try std.testing.expectEqual(@as(usize, 11), result.consumed);
+}
+
+test "parseLongHeader: Initial with a non-empty token" {
+    var buf: [25]u8 = undefined;
+    var o: usize = 0;
+    buf[o] = 0xc0; // initial
+    o += 1;
+    buf[o] = 0x00;
+    buf[o + 1] = 0x00;
+    buf[o + 2] = 0x00;
+    buf[o + 3] = 0x01;
+    o += 4;
+    buf[o] = 0x04; // DCID len = 4
+    o += 1;
+    @memset(buf[o .. o + 4], 0xaa);
+    o += 4;
+    buf[o] = 0x00; // SCID len = 0
+    o += 1;
+    buf[o] = 0x03; // token length = 3 (1-byte varint)
+    o += 1;
+    const tok = [_]u8{ 0x11, 0x22, 0x33 };
+    @memcpy(buf[o .. o + 3], &tok);
+    o += 3;
+    buf[o] = 0x05; // length = 5 (1-byte varint)
+    o += 1;
+    @memset(buf[o .. o + 5], 0x00); // 5-byte payload
+    o += 5;
+
+    const result = parseHeader(buf[0..o], 0);
+    try std.testing.expectEqual(ParseState.complete, result.state);
+    const h = result.header.?.long;
+    try std.testing.expectEqual(types.PacketType.initial, h.packet_type);
+    try std.testing.expectEqualSlices(u8, &tok, h.token);
+    try std.testing.expectEqual(@as(usize, 5), h.payload_length);
+    try std.testing.expectEqual(o, result.consumed);
+}
+
+test "parseLongHeader: DCID longer than the maximum is an error" {
+    const buf = [_]u8{ 0xc0, 0x00, 0x00, 0x00, 0x01, 21, 0x00 };
+    const result = parseHeader(&buf, 0);
+    try std.testing.expectEqual(ParseState.err, result.state);
+}
+
+test "parseLongHeader: SCID longer than the maximum is an error" {
+    const buf = [_]u8{ 0xc0, 0x00, 0x00, 0x00, 0x01, 0x00, 21 };
+    const result = parseHeader(&buf, 0);
+    try std.testing.expectEqual(ParseState.err, result.state);
+}
+
+test "parseLongHeader: payload length over the DoS cap is an error" {
+    // 4-byte varint Length = 70000, above MAX_LENGTH_FIELD (65535).
+    const buf = [_]u8{ 0xc0, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x80, 0x01, 0x11, 0x70 };
+    const result = parseHeader(&buf, 0);
+    try std.testing.expectEqual(ParseState.err, result.state);
+}
+
+test "parseLongHeader: token length over the DoS cap is an error" {
+    // 4-byte varint token length = 70000, above MAX_LENGTH_FIELD.
+    const buf = [_]u8{ 0xc0, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x80, 0x01, 0x11, 0x70 };
+    const result = parseHeader(&buf, 0);
+    try std.testing.expectEqual(ParseState.err, result.state);
+}
+
+test "parseLongHeader: complete Initial reports consumed = header + payload" {
+    const buf = [_]u8{ 0xc0, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0xaa, 0xbb, 0xcc, 0xdd };
+    const result = parseHeader(&buf, 0);
+    try std.testing.expectEqual(ParseState.complete, result.state);
+    try std.testing.expectEqual(@as(usize, 13), result.consumed);
+    try std.testing.expectEqual(@as(usize, 4), result.header.?.long.payload_length);
+}
+
+test "parseLongHeader: Length pointing past the buffer is partial" {
+    // Length claims 10 payload bytes but only 3 are present.
+    const buf = [_]u8{ 0xc0, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x0a, 0x11, 0x22, 0x33 };
+    const result = parseHeader(&buf, 0);
+    try std.testing.expectEqual(ParseState.partial, result.state);
+}
+
+test "parseShortHeader: spin bit and key phase are decoded independently" {
+    var buf: [12]u8 = undefined;
+    buf[0] = 0x40 | 0x20; // fixed + spin set, key phase clear
+    @memset(buf[1..9], 0xcc); // 8-byte DCID
+    @memset(buf[9..12], 0x00); // packet number + payload
+    const result = parseHeader(&buf, 8);
+    try std.testing.expectEqual(ParseState.complete, result.state);
+    const h = result.header.?.short;
+    try std.testing.expect(h.spin_bit);
+    try std.testing.expect(!h.key_phase);
+    try std.testing.expectEqual(@as(usize, 9), h.packet_number_offset);
+}
+
+test "isLongHeader distinguishes header form" {
+    try std.testing.expect(isLongHeader(&[_]u8{0xc0}));
+    try std.testing.expect(!isLongHeader(&[_]u8{0x40}));
+    try std.testing.expect(!isLongHeader(&[_]u8{}));
+}
+
+test "peekVersion returns a version only for long headers" {
+    const long = [_]u8{ 0xc0, 0x00, 0x00, 0x00, 0x01, 0x00 };
+    try std.testing.expectEqual(@as(?u32, 1), peekVersion(&long));
+    // Short header → null
+    try std.testing.expectEqual(@as(?u32, null), peekVersion(&[_]u8{ 0x40, 0x00, 0x00, 0x00, 0x01 }));
+    // Too short → null
+    try std.testing.expectEqual(@as(?u32, null), peekVersion(&[_]u8{ 0xc0, 0x00, 0x00 }));
+}
+
+test "peekDcid extracts the routing CID from both header forms" {
+    // Long header, DCID len = 4
+    const long = [_]u8{ 0xc0, 0x00, 0x00, 0x00, 0x01, 0x04, 0xa1, 0xa2, 0xa3, 0xa4, 0x00 };
+    const ld = peekDcid(&long, 0).?;
+    try std.testing.expectEqual(@as(u8, 4), ld.len);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xa1, 0xa2, 0xa3, 0xa4 }, ld.slice());
+
+    // Short header, caller supplies the DCID len = 5
+    const short = [_]u8{ 0x40, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0x00, 0x00 };
+    const sd = peekDcid(&short, 5).?;
+    try std.testing.expectEqual(@as(u8, 5), sd.len);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xb1, 0xb2, 0xb3, 0xb4, 0xb5 }, sd.slice());
+}

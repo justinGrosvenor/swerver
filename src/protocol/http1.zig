@@ -48,6 +48,34 @@ pub const HeaderParseResult = struct {
     headers_consumed: usize, // bytes up to and including \r\n\r\n
 };
 
+/// Build an error ParseResult. `keep_alive` is explicit because some callers
+/// propagate the connection's computed keep-alive onto the error response
+/// (e.g. honoring `Connection: close` on a 400) while most default to true.
+fn parseErr(code: ErrorCode, keep_alive: bool) ParseResult {
+    return .{
+        .state = .err,
+        .view = emptyView(),
+        .error_code = code,
+        .consumed_bytes = 0,
+        .keep_alive = keep_alive,
+        .expect_continue = false,
+    };
+}
+
+/// Build an error HeaderParseResult (see `parseErr`).
+fn headerErr(code: ErrorCode, keep_alive: bool) HeaderParseResult {
+    return .{
+        .state = .err,
+        .view = emptyView(),
+        .error_code = code,
+        .content_length = 0,
+        .is_chunked = false,
+        .keep_alive = keep_alive,
+        .expect_continue = false,
+        .headers_consumed = 0,
+    };
+}
+
 /// Parse only the headers of an HTTP/1.1 request, returning immediately
 /// after \r\n\r\n is found and headers validate. Does NOT check body presence.
 pub fn parseHeaders(_bytes: []u8, _limits: Limits) HeaderParseResult {
@@ -57,16 +85,7 @@ pub fn parseHeaders(_bytes: []u8, _limits: Limits) HeaderParseResult {
 
 fn parseHeadersInternal(_bytes: []u8, _limits: Limits) HeaderParseResult {
     if (_limits.headers_storage.len < _limits.max_header_count) {
-        return .{
-            .state = .err,
-            .view = emptyView(),
-            .error_code = .header_too_large,
-            .content_length = 0,
-            .is_chunked = false,
-            .keep_alive = true,
-            .expect_continue = false,
-            .headers_consumed = 0,
-        };
+        return headerErr(.header_too_large, true);
     }
     const header_end = std.mem.indexOf(u8, _bytes, "\r\n\r\n") orelse {
         return .{
@@ -81,66 +100,21 @@ fn parseHeadersInternal(_bytes: []u8, _limits: Limits) HeaderParseResult {
         };
     };
     if (header_end + 4 > _limits.max_header_bytes) {
-        return .{
-            .state = .err,
-            .view = emptyView(),
-            .error_code = .header_too_large,
-            .content_length = 0,
-            .is_chunked = false,
-            .keep_alive = true,
-            .expect_continue = false,
-            .headers_consumed = 0,
-        };
+        return headerErr(.header_too_large, true);
     }
     const line_end = std.mem.indexOfPos(u8, _bytes, 0, "\r\n") orelse {
-        return .{
-            .state = .err,
-            .view = emptyView(),
-            .error_code = .invalid_request_line,
-            .content_length = 0,
-            .is_chunked = false,
-            .keep_alive = true,
-            .expect_continue = false,
-            .headers_consumed = 0,
-        };
+        return headerErr(.invalid_request_line, true);
     };
     const line = _bytes[0..line_end];
     const first_space = std.mem.indexOfScalar(u8, line, ' ') orelse {
-        return .{
-            .state = .err,
-            .view = emptyView(),
-            .error_code = .invalid_request_line,
-            .content_length = 0,
-            .is_chunked = false,
-            .keep_alive = true,
-            .expect_continue = false,
-            .headers_consumed = 0,
-        };
+        return headerErr(.invalid_request_line, true);
     };
     const second_space = std.mem.indexOfScalarPos(u8, line, first_space + 1, ' ') orelse {
-        return .{
-            .state = .err,
-            .view = emptyView(),
-            .error_code = .invalid_request_line,
-            .content_length = 0,
-            .is_chunked = false,
-            .keep_alive = true,
-            .expect_continue = false,
-            .headers_consumed = 0,
-        };
+        return headerErr(.invalid_request_line, true);
     };
     const method_str = line[0..first_space];
     if (method_str.len > 16) {
-        return .{
-            .state = .err,
-            .view = emptyView(),
-            .error_code = .invalid_method,
-            .content_length = 0,
-            .is_chunked = false,
-            .keep_alive = true,
-            .expect_continue = false,
-            .headers_consumed = 0,
-        };
+        return headerErr(.invalid_method, true);
     }
     const request_target = line[first_space + 1 .. second_space];
     // Reject paths containing control characters, non-ASCII, or
@@ -148,44 +122,17 @@ fn parseHeadersInternal(_bytes: []u8, _limits: Limits) HeaderParseResult {
     // must consist of visible ASCII (0x21-0x7E) plus SP in queries.
     for (request_target, 0..) |c, i| {
         if (c <= 0x1f or c == 0x7f or c >= 0x80) {
-            return .{
-                .state = .err,
-                .view = emptyView(),
-                .error_code = .invalid_path,
-                .content_length = 0,
-                .is_chunked = false,
-                .keep_alive = true,
-                .expect_continue = false,
-                .headers_consumed = 0,
-            };
+            return headerErr(.invalid_path, true);
         }
         if (c == '%' and i + 2 < request_target.len) {
             if (request_target[i + 1] == '0' and request_target[i + 2] == '0') {
-                return .{
-                    .state = .err,
-                    .view = emptyView(),
-                    .error_code = .invalid_path,
-                    .content_length = 0,
-                    .is_chunked = false,
-                    .keep_alive = true,
-                    .expect_continue = false,
-                    .headers_consumed = 0,
-                };
+                return headerErr(.invalid_path, true);
             }
         }
     }
     const version = line[second_space + 1 ..];
     const method = request.Method.fromStringExtended(method_str) orelse {
-        return .{
-            .state = .err,
-            .view = emptyView(),
-            .error_code = .invalid_method,
-            .content_length = 0,
-            .is_chunked = false,
-            .keep_alive = true,
-            .expect_continue = false,
-            .headers_consumed = 0,
-        };
+        return headerErr(.invalid_method, true);
     };
     var keep_alive = true;
     if (std.mem.eql(u8, version, "HTTP/1.1")) {
@@ -193,40 +140,13 @@ fn parseHeadersInternal(_bytes: []u8, _limits: Limits) HeaderParseResult {
     } else if (std.mem.eql(u8, version, "HTTP/1.0")) {
         keep_alive = false;
     } else {
-        return .{
-            .state = .err,
-            .view = emptyView(),
-            .error_code = .invalid_version,
-            .content_length = 0,
-            .is_chunked = false,
-            .keep_alive = true,
-            .expect_continue = false,
-            .headers_consumed = 0,
-        };
+        return headerErr(.invalid_version, true);
     }
     if (header_end + 4 > _bytes.len) {
-        return .{
-            .state = .err,
-            .view = emptyView(),
-            .error_code = .invalid_header,
-            .content_length = 0,
-            .is_chunked = false,
-            .keep_alive = true,
-            .expect_continue = false,
-            .headers_consumed = 0,
-        };
+        return headerErr(.invalid_header, true);
     }
     if (request_target.len == 0) {
-        return .{
-            .state = .err,
-            .view = emptyView(),
-            .error_code = .invalid_request_line,
-            .content_length = 0,
-            .is_chunked = false,
-            .keep_alive = true,
-            .expect_continue = false,
-            .headers_consumed = 0,
-        };
+        return headerErr(.invalid_request_line, true);
     }
     var path: []const u8 = request_target;
     var host_in_target = false;
@@ -234,44 +154,17 @@ fn parseHeadersInternal(_bytes: []u8, _limits: Limits) HeaderParseResult {
         path = request_target;
     } else if (request_target[0] == '*') {
         if (request_target.len != 1 or method != .OPTIONS) {
-            return .{
-                .state = .err,
-                .view = emptyView(),
-                .error_code = .invalid_request_line,
-                .content_length = 0,
-                .is_chunked = false,
-                .keep_alive = keep_alive,
-                .expect_continue = false,
-                .headers_consumed = 0,
-            };
+            return headerErr(.invalid_request_line, keep_alive);
         }
         path = request_target;
     } else if (std.mem.indexOf(u8, request_target, "://")) |scheme_end| {
         const authority_start = scheme_end + 3;
         if (authority_start >= request_target.len) {
-            return .{
-                .state = .err,
-                .view = emptyView(),
-                .error_code = .invalid_request_line,
-                .content_length = 0,
-                .is_chunked = false,
-                .keep_alive = keep_alive,
-                .expect_continue = false,
-                .headers_consumed = 0,
-            };
+            return headerErr(.invalid_request_line, keep_alive);
         }
         const path_start = std.mem.indexOfScalarPos(u8, request_target, authority_start, '/') orelse request_target.len;
         if (path_start == authority_start) {
-            return .{
-                .state = .err,
-                .view = emptyView(),
-                .error_code = .invalid_request_line,
-                .content_length = 0,
-                .is_chunked = false,
-                .keep_alive = keep_alive,
-                .expect_continue = false,
-                .headers_consumed = 0,
-            };
+            return headerErr(.invalid_request_line, keep_alive);
         }
         host_in_target = true;
         if (path_start < request_target.len) {
@@ -281,30 +174,12 @@ fn parseHeadersInternal(_bytes: []u8, _limits: Limits) HeaderParseResult {
         }
     } else if (method == .CONNECT) {
         if (std.mem.indexOfScalar(u8, request_target, ':') == null) {
-            return .{
-                .state = .err,
-                .view = emptyView(),
-                .error_code = .invalid_request_line,
-                .content_length = 0,
-                .is_chunked = false,
-                .keep_alive = keep_alive,
-                .expect_continue = false,
-                .headers_consumed = 0,
-            };
+            return headerErr(.invalid_request_line, keep_alive);
         }
         path = request_target;
         host_in_target = true;
     } else {
-        return .{
-            .state = .err,
-            .view = emptyView(),
-            .error_code = .invalid_request_line,
-            .content_length = 0,
-            .is_chunked = false,
-            .keep_alive = keep_alive,
-            .expect_continue = false,
-            .headers_consumed = 0,
-        };
+        return headerErr(.invalid_request_line, keep_alive);
     }
     var header_count: usize = 0;
     var content_length: usize = 0;
@@ -318,183 +193,43 @@ fn parseHeadersInternal(_bytes: []u8, _limits: Limits) HeaderParseResult {
         const header_line = _bytes[pos..next];
         if (header_line.len == 0) break;
         if (header_line[0] == ' ' or header_line[0] == '\t') {
-            return .{
-                .state = .err,
-                .view = emptyView(),
-                .error_code = .invalid_header_value,
-                .content_length = 0,
-                .is_chunked = false,
-                .keep_alive = true,
-                .expect_continue = false,
-                .headers_consumed = 0,
-            };
+            return headerErr(.invalid_header_value, true);
         }
         const colon = std.mem.indexOfScalar(u8, header_line, ':') orelse {
-            return .{
-                .state = .err,
-                .view = emptyView(),
-                .error_code = .invalid_header,
-                .content_length = 0,
-                .is_chunked = false,
-                .keep_alive = true,
-                .expect_continue = false,
-                .headers_consumed = 0,
-            };
+            return headerErr(.invalid_header, true);
         };
         const name = header_line[0..colon];
         var value: []const u8 = header_line[colon + 1 ..];
         value = std.mem.trim(u8, value, " \t");
         if (header_count >= _limits.max_header_count or header_count >= _limits.headers_storage.len) {
-            return .{
-                .state = .err,
-                .view = emptyView(),
-                .error_code = .header_too_large,
-                .content_length = 0,
-                .is_chunked = false,
-                .keep_alive = true,
-                .expect_continue = false,
-                .headers_consumed = 0,
-            };
+            return headerErr(.header_too_large, true);
         }
         if (!isToken(name)) {
-            return .{
-                .state = .err,
-                .view = emptyView(),
-                .error_code = .invalid_header_name,
-                .content_length = 0,
-                .is_chunked = false,
-                .keep_alive = true,
-                .expect_continue = false,
-                .headers_consumed = 0,
-            };
+            return headerErr(.invalid_header_name, true);
         }
         if (!isValidFieldValue(value)) {
-            return .{
-                .state = .err,
-                .view = emptyView(),
-                .error_code = .invalid_header_value,
-                .content_length = 0,
-                .is_chunked = false,
-                .keep_alive = true,
-                .expect_continue = false,
-                .headers_consumed = 0,
-            };
+            return headerErr(.invalid_header_value, true);
         }
         _limits.headers_storage[header_count] = .{ .name = name, .value = value };
         header_count += 1;
         if (std.ascii.eqlIgnoreCase(name, "host")) {
             host_count += 1;
             if (host_count > 1) {
-                return .{
-                    .state = .err,
-                    .view = emptyView(),
-                    .error_code = .invalid_header,
-                    .content_length = 0,
-                    .is_chunked = false,
-                    .keep_alive = true,
-                    .expect_continue = false,
-                    .headers_consumed = 0,
-                };
+                return headerErr(.invalid_header, true);
             }
             if (value.len == 0 or hasInvalidHostChar(value)) {
-                return .{
-                    .state = .err,
-                    .view = emptyView(),
-                    .error_code = .invalid_header_value,
-                    .content_length = 0,
-                    .is_chunked = false,
-                    .keep_alive = true,
-                    .expect_continue = false,
-                    .headers_consumed = 0,
-                };
+                return headerErr(.invalid_header_value, true);
             }
         }
         if (std.ascii.eqlIgnoreCase(name, "content-length")) {
-            if (value.len == 0) {
-                return .{
-                    .state = .err,
-                    .view = emptyView(),
-                    .error_code = .invalid_content_length,
-                    .content_length = 0,
-                    .is_chunked = false,
-                    .keep_alive = true,
-                    .expect_continue = false,
-                    .headers_consumed = 0,
-                };
-            }
-            for (value) |ch| {
-                if (ch < '0' or ch > '9') {
-                    return .{
-                        .state = .err,
-                        .view = emptyView(),
-                        .error_code = .invalid_content_length,
-                        .content_length = 0,
-                        .is_chunked = false,
-                        .keep_alive = true,
-                        .expect_continue = false,
-                        .headers_consumed = 0,
-                    };
-                }
-            }
-            if (value.len > 1 and value[0] == '0') {
-                return .{
-                    .state = .err,
-                    .view = emptyView(),
-                    .error_code = .invalid_content_length,
-                    .content_length = 0,
-                    .is_chunked = false,
-                    .keep_alive = true,
-                    .expect_continue = false,
-                    .headers_consumed = 0,
-                };
-            }
-            if (value.len > 19) {
-                return .{
-                    .state = .err,
-                    .view = emptyView(),
-                    .error_code = .invalid_content_length,
-                    .content_length = 0,
-                    .is_chunked = false,
-                    .keep_alive = true,
-                    .expect_continue = false,
-                    .headers_consumed = 0,
-                };
-            }
-            const parsed_len = std.fmt.parseUnsigned(usize, value, 10) catch {
-                return .{
-                    .state = .err,
-                    .view = emptyView(),
-                    .error_code = .invalid_content_length,
-                    .content_length = 0,
-                    .is_chunked = false,
-                    .keep_alive = true,
-                    .expect_continue = false,
-                    .headers_consumed = 0,
-                };
+            const parsed_len = parseContentLengthValue(value) catch {
+                return headerErr(.invalid_content_length, true);
             };
             if (parsed_len > _limits.max_body_bytes) {
-                return .{
-                    .state = .err,
-                    .view = emptyView(),
-                    .error_code = .body_too_large,
-                    .content_length = 0,
-                    .is_chunked = false,
-                    .keep_alive = true,
-                    .expect_continue = false,
-                    .headers_consumed = 0,
-                };
+                return headerErr(.body_too_large, true);
             }
             if (has_content_length and content_length != parsed_len) {
-                return .{
-                    .state = .err,
-                    .view = emptyView(),
-                    .error_code = .invalid_content_length,
-                    .content_length = 0,
-                    .is_chunked = false,
-                    .keep_alive = true,
-                    .expect_continue = false,
-                    .headers_consumed = 0,
-                };
+                return headerErr(.invalid_content_length, true);
             }
             content_length = parsed_len;
             has_content_length = true;
@@ -503,32 +238,14 @@ fn parseHeadersInternal(_bytes: []u8, _limits: Limits) HeaderParseResult {
             if (lastToken(value, "chunked")) {
                 is_chunked = true;
             } else {
-                return .{
-                    .state = .err,
-                    .view = emptyView(),
-                    .error_code = .unsupported_transfer_encoding,
-                    .content_length = 0,
-                    .is_chunked = false,
-                    .keep_alive = true,
-                    .expect_continue = false,
-                    .headers_consumed = 0,
-                };
+                return headerErr(.unsupported_transfer_encoding, true);
             }
         }
         if (std.ascii.eqlIgnoreCase(name, "expect")) {
             if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t"), "100-continue")) {
                 expect_continue = true;
             } else {
-                return .{
-                    .state = .err,
-                    .view = emptyView(),
-                    .error_code = .expectation_failed,
-                    .content_length = 0,
-                    .is_chunked = false,
-                    .keep_alive = true,
-                    .expect_continue = false,
-                    .headers_consumed = 0,
-                };
+                return headerErr(.expectation_failed, true);
             }
         }
         if (std.ascii.eqlIgnoreCase(name, "connection")) {
@@ -542,28 +259,10 @@ fn parseHeadersInternal(_bytes: []u8, _limits: Limits) HeaderParseResult {
         pos = next + 2;
     }
     if (std.mem.eql(u8, version, "HTTP/1.1") and host_count == 0 and !host_in_target) {
-        return .{
-            .state = .err,
-            .view = emptyView(),
-            .error_code = .missing_host,
-            .content_length = 0,
-            .is_chunked = false,
-            .keep_alive = keep_alive,
-            .expect_continue = false,
-            .headers_consumed = 0,
-        };
+        return headerErr(.missing_host, keep_alive);
     }
     if (is_chunked and has_content_length) {
-        return .{
-            .state = .err,
-            .view = emptyView(),
-            .error_code = .invalid_header,
-            .content_length = 0,
-            .is_chunked = false,
-            .keep_alive = keep_alive,
-            .expect_continue = false,
-            .headers_consumed = 0,
-        };
+        return headerErr(.invalid_header, keep_alive);
     }
     const wants_body = is_chunked or (has_content_length and content_length > 0);
     if (!wants_body) expect_continue = false;
@@ -779,14 +478,7 @@ pub fn extractQuickLine(bytes: []const u8) ?QuickLine {
 
 pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
     if (_limits.headers_storage.len < _limits.max_header_count) {
-        return .{
-            .state = .err,
-            .view = emptyView(),
-            .error_code = .header_too_large,
-            .consumed_bytes = 0,
-            .keep_alive = true,
-            .expect_continue = false,
-        };
+        return parseErr(.header_too_large, true);
     }
     const header_end = std.mem.indexOf(u8, _bytes, "\r\n\r\n") orelse {
         return .{
@@ -799,93 +491,37 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
         };
     };
     if (header_end + 4 > _limits.max_header_bytes) {
-        return .{
-            .state = .err,
-            .view = emptyView(),
-            .error_code = .header_too_large,
-            .consumed_bytes = 0,
-            .keep_alive = true,
-            .expect_continue = false,
-        };
+        return parseErr(.header_too_large, true);
     }
     const line_end = std.mem.indexOfPos(u8, _bytes, 0, "\r\n") orelse {
-        return .{
-            .state = .err,
-            .view = emptyView(),
-            .error_code = .invalid_request_line,
-            .consumed_bytes = 0,
-            .keep_alive = true,
-            .expect_continue = false,
-        };
+        return parseErr(.invalid_request_line, true);
     };
     const line = _bytes[0..line_end];
     const first_space = std.mem.indexOfScalar(u8, line, ' ') orelse {
-        return .{
-            .state = .err,
-            .view = emptyView(),
-            .error_code = .invalid_request_line,
-            .consumed_bytes = 0,
-            .keep_alive = true,
-            .expect_continue = false,
-        };
+        return parseErr(.invalid_request_line, true);
     };
     const second_space = std.mem.indexOfScalarPos(u8, line, first_space + 1, ' ') orelse {
-        return .{
-            .state = .err,
-            .view = emptyView(),
-            .error_code = .invalid_request_line,
-            .consumed_bytes = 0,
-            .keep_alive = true,
-            .expect_continue = false,
-        };
+        return parseErr(.invalid_request_line, true);
     };
     const method_str = line[0..first_space];
     if (method_str.len > 16) {
-        return .{
-            .state = .err,
-            .view = emptyView(),
-            .error_code = .invalid_method,
-            .consumed_bytes = 0,
-            .keep_alive = true,
-            .expect_continue = false,
-        };
+        return parseErr(.invalid_method, true);
     }
     const request_target = line[first_space + 1 .. second_space];
     for (request_target, 0..) |c, i| {
         if (c <= 0x1f or c == 0x7f or c >= 0x80) {
-            return .{
-                .state = .err,
-                .view = emptyView(),
-                .error_code = .invalid_path,
-                .consumed_bytes = 0,
-                .keep_alive = true,
-                .expect_continue = false,
-            };
+            return parseErr(.invalid_path, true);
         }
         if (c == '%' and i + 2 < request_target.len) {
             if (request_target[i + 1] == '0' and request_target[i + 2] == '0') {
-                return .{
-                    .state = .err,
-                    .view = emptyView(),
-                    .error_code = .invalid_path,
-                    .consumed_bytes = 0,
-                    .keep_alive = true,
-                    .expect_continue = false,
-                };
+                return parseErr(.invalid_path, true);
             }
         }
     }
     const version = line[second_space + 1 ..];
     // Use extended parsing to accept any valid token method (RFC 7230 compliance)
     const method = request.Method.fromStringExtended(method_str) orelse {
-        return .{
-            .state = .err,
-            .view = emptyView(),
-            .error_code = .invalid_method,
-            .consumed_bytes = 0,
-            .keep_alive = true,
-            .expect_continue = false,
-        };
+        return parseErr(.invalid_method, true);
     };
     var keep_alive = true;
     if (std.mem.eql(u8, version, "HTTP/1.1")) {
@@ -893,35 +529,14 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
     } else if (std.mem.eql(u8, version, "HTTP/1.0")) {
         keep_alive = false;
     } else {
-        return .{
-            .state = .err,
-            .view = emptyView(),
-            .error_code = .invalid_version,
-            .consumed_bytes = 0,
-            .keep_alive = true,
-            .expect_continue = false,
-        };
+        return parseErr(.invalid_version, true);
     }
     if (header_end + 4 > _bytes.len) {
-        return .{
-            .state = .err,
-            .view = emptyView(),
-            .error_code = .invalid_header,
-            .consumed_bytes = 0,
-            .keep_alive = true,
-            .expect_continue = false,
-        };
+        return parseErr(.invalid_header, true);
     }
     // Token validation is now done by Method.fromStringExtended
     if (request_target.len == 0) {
-        return .{
-            .state = .err,
-            .view = emptyView(),
-            .error_code = .invalid_request_line,
-            .consumed_bytes = 0,
-            .keep_alive = true,
-            .expect_continue = false,
-        };
+        return parseErr(.invalid_request_line, true);
     }
     var path: []const u8 = request_target;
     var host_in_target = false;
@@ -930,38 +545,17 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
     } else if (request_target[0] == '*') {
         // RFC 9112 §3.2.4: asterisk-form is exactly "*", only for OPTIONS
         if (request_target.len != 1 or method != .OPTIONS) {
-            return .{
-                .state = .err,
-                .view = emptyView(),
-                .error_code = .invalid_request_line,
-                .consumed_bytes = 0,
-                .keep_alive = keep_alive,
-                .expect_continue = false,
-            };
+            return parseErr(.invalid_request_line, keep_alive);
         }
         path = request_target;
     } else if (std.mem.indexOf(u8, request_target, "://")) |scheme_end| {
         const authority_start = scheme_end + 3;
         if (authority_start >= request_target.len) {
-            return .{
-                .state = .err,
-                .view = emptyView(),
-                .error_code = .invalid_request_line,
-                .consumed_bytes = 0,
-                .keep_alive = keep_alive,
-                .expect_continue = false,
-            };
+            return parseErr(.invalid_request_line, keep_alive);
         }
         const path_start = std.mem.indexOfScalarPos(u8, request_target, authority_start, '/') orelse request_target.len;
         if (path_start == authority_start) {
-            return .{
-                .state = .err,
-                .view = emptyView(),
-                .error_code = .invalid_request_line,
-                .consumed_bytes = 0,
-                .keep_alive = keep_alive,
-                .expect_continue = false,
-            };
+            return parseErr(.invalid_request_line, keep_alive);
         }
         host_in_target = true;
         if (path_start < request_target.len) {
@@ -971,26 +565,12 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
         }
     } else if (method == .CONNECT) {
         if (std.mem.indexOfScalar(u8, request_target, ':') == null) {
-            return .{
-                .state = .err,
-                .view = emptyView(),
-                .error_code = .invalid_request_line,
-                .consumed_bytes = 0,
-                .keep_alive = keep_alive,
-                .expect_continue = false,
-            };
+            return parseErr(.invalid_request_line, keep_alive);
         }
         path = request_target;
         host_in_target = true;
     } else {
-        return .{
-            .state = .err,
-            .view = emptyView(),
-            .error_code = .invalid_request_line,
-            .consumed_bytes = 0,
-            .keep_alive = keep_alive,
-            .expect_continue = false,
-        };
+        return parseErr(.invalid_request_line, keep_alive);
     }
     var header_count: usize = 0;
     var content_length: usize = 0;
@@ -1004,24 +584,10 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
         const header_line = _bytes[pos..next];
         if (header_line.len == 0) break;
         if (header_line[0] == ' ' or header_line[0] == '\t') {
-            return .{
-                .state = .err,
-                .view = emptyView(),
-                .error_code = .invalid_header_value,
-                .consumed_bytes = 0,
-                .keep_alive = true,
-                .expect_continue = false,
-            };
+            return parseErr(.invalid_header_value, true);
         }
         const colon = std.mem.indexOfScalar(u8, header_line, ':') orelse {
-            return .{
-                .state = .err,
-                .view = emptyView(),
-                .error_code = .invalid_header,
-                .consumed_bytes = 0,
-                .keep_alive = true,
-                .expect_continue = false,
-            };
+            return parseErr(.invalid_header, true);
         };
         const name = header_line[0..colon];
         var value: []const u8 = header_line[colon + 1 ..];
@@ -1029,35 +595,14 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
         value = std.mem.trim(u8, value, " \t");
         // Check both configured limit and actual storage capacity for defense-in-depth
         if (header_count >= _limits.max_header_count or header_count >= _limits.headers_storage.len) {
-            return .{
-                .state = .err,
-                .view = emptyView(),
-                .error_code = .header_too_large,
-                .consumed_bytes = 0,
-                .keep_alive = true,
-                .expect_continue = false,
-            };
+            return parseErr(.header_too_large, true);
         }
         if (!isToken(name)) {
-            return .{
-                .state = .err,
-                .view = emptyView(),
-                .error_code = .invalid_header_name,
-                .consumed_bytes = 0,
-                .keep_alive = true,
-                .expect_continue = false,
-            };
+            return parseErr(.invalid_header_name, true);
         }
         // RFC 9110 §5.5: Reject header values containing NUL or bare CR/LF
         if (!isValidFieldValue(value)) {
-            return .{
-                .state = .err,
-                .view = emptyView(),
-                .error_code = .invalid_header_value,
-                .consumed_bytes = 0,
-                .keep_alive = true,
-                .expect_continue = false,
-            };
+            return parseErr(.invalid_header_value, true);
         }
         _limits.headers_storage[header_count] = .{ .name = name, .value = value };
         header_count += 1;
@@ -1065,101 +610,21 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
             host_count += 1;
             // RFC 9112 §3.2: A server MUST respond with 400 if multiple Host headers
             if (host_count > 1) {
-                return .{
-                    .state = .err,
-                    .view = emptyView(),
-                    .error_code = .invalid_header,
-                    .consumed_bytes = 0,
-                    .keep_alive = true,
-                    .expect_continue = false,
-                };
+                return parseErr(.invalid_header, true);
             }
             if (value.len == 0 or hasInvalidHostChar(value)) {
-                return .{
-                    .state = .err,
-                    .view = emptyView(),
-                    .error_code = .invalid_header_value,
-                    .consumed_bytes = 0,
-                    .keep_alive = true,
-                    .expect_continue = false,
-                };
+                return parseErr(.invalid_header_value, true);
             }
         }
         if (std.ascii.eqlIgnoreCase(name, "content-length")) {
-            // Reject values with leading zeros, signs, or whitespace to prevent smuggling
-            if (value.len == 0) {
-                return .{
-                    .state = .err,
-                    .view = emptyView(),
-                    .error_code = .invalid_content_length,
-                    .consumed_bytes = 0,
-                    .keep_alive = true,
-                    .expect_continue = false,
-                };
-            }
-            for (value) |ch| {
-                if (ch < '0' or ch > '9') {
-                    return .{
-                        .state = .err,
-                        .view = emptyView(),
-                        .error_code = .invalid_content_length,
-                        .consumed_bytes = 0,
-                        .keep_alive = true,
-                        .expect_continue = false,
-                    };
-                }
-            }
-            // RFC 9112 §6.3: Reject leading zeros to prevent smuggling
-            if (value.len > 1 and value[0] == '0') {
-                return .{
-                    .state = .err,
-                    .view = emptyView(),
-                    .error_code = .invalid_content_length,
-                    .consumed_bytes = 0,
-                    .keep_alive = true,
-                    .expect_continue = false,
-                };
-            }
-            // Reject unreasonably long digit strings to prevent overflow in parseInt
-            if (value.len > 19) {
-                return .{
-                    .state = .err,
-                    .view = emptyView(),
-                    .error_code = .invalid_content_length,
-                    .consumed_bytes = 0,
-                    .keep_alive = true,
-                    .expect_continue = false,
-                };
-            }
-            const parsed_len = std.fmt.parseUnsigned(usize, value, 10) catch {
-                return .{
-                    .state = .err,
-                    .view = emptyView(),
-                    .error_code = .invalid_content_length,
-                    .consumed_bytes = 0,
-                    .keep_alive = true,
-                    .expect_continue = false,
-                };
+            const parsed_len = parseContentLengthValue(value) catch {
+                return parseErr(.invalid_content_length, true);
             };
             if (parsed_len > _limits.max_body_bytes) {
-                return .{
-                    .state = .err,
-                    .view = emptyView(),
-                    .error_code = .body_too_large,
-                    .consumed_bytes = 0,
-                    .keep_alive = true,
-                    .expect_continue = false,
-                };
+                return parseErr(.body_too_large, true);
             }
             if (has_content_length and content_length != parsed_len) {
-                return .{
-                    .state = .err,
-                    .view = emptyView(),
-                    .error_code = .invalid_content_length,
-                    .consumed_bytes = 0,
-                    .keep_alive = true,
-                    .expect_continue = false,
-                };
+                return parseErr(.invalid_content_length, true);
             }
             content_length = parsed_len;
             has_content_length = true;
@@ -1169,14 +634,7 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
             if (lastToken(value, "chunked")) {
                 is_chunked = true;
             } else {
-                return .{
-                    .state = .err,
-                    .view = emptyView(),
-                    .error_code = .unsupported_transfer_encoding,
-                    .consumed_bytes = 0,
-                    .keep_alive = true,
-                    .expect_continue = false,
-                };
+                return parseErr(.unsupported_transfer_encoding, true);
             }
         }
         if (std.ascii.eqlIgnoreCase(name, "expect")) {
@@ -1184,14 +642,7 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
                 expect_continue = true;
             } else {
                 // RFC 9110 §10.1.1: If expectation cannot be met, respond with 417
-                return .{
-                    .state = .err,
-                    .view = emptyView(),
-                    .error_code = .expectation_failed,
-                    .consumed_bytes = 0,
-                    .keep_alive = true,
-                    .expect_continue = false,
-                };
+                return parseErr(.expectation_failed, true);
             }
         }
         if (std.ascii.eqlIgnoreCase(name, "connection")) {
@@ -1205,41 +656,20 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
         pos = next + 2;
     }
     if (std.mem.eql(u8, version, "HTTP/1.1") and host_count == 0 and !host_in_target) {
-        return .{
-            .state = .err,
-            .view = emptyView(),
-            .error_code = .missing_host,
-            .consumed_bytes = 0,
-            .keep_alive = keep_alive,
-            .expect_continue = false,
-        };
+        return parseErr(.missing_host, keep_alive);
     }
     if (is_chunked and has_content_length) {
-        return .{
-            .state = .err,
-            .view = emptyView(),
-            .error_code = .invalid_header,
-            .consumed_bytes = 0,
-            .keep_alive = keep_alive,
-            .expect_continue = false,
-        };
+        return parseErr(.invalid_header, keep_alive);
     }
     const wants_body = is_chunked or (has_content_length and content_length > 0);
     if (!wants_body) expect_continue = false;
     const body_start = header_end + 4;
     if (is_chunked) {
         const scan = scanChunked(_bytes, body_start, _limits.max_body_bytes) catch |err| {
-            return .{
-                .state = .err,
-                .view = emptyView(),
-                .error_code = switch (err) {
-                    error.BodyTooLarge => .body_too_large,
-                    else => .invalid_chunked_body,
-                },
-                .consumed_bytes = 0,
-                .keep_alive = keep_alive,
-                .expect_continue = false,
-            };
+            return parseErr(switch (err) {
+                error.BodyTooLarge => .body_too_large,
+                else => .invalid_chunked_body,
+            }, keep_alive);
         };
         if (scan == null) {
             return .{
@@ -1252,14 +682,7 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
             };
         }
         const chunked = decodeChunkedInPlace(_bytes, body_start) catch {
-            return .{
-                .state = .err,
-                .view = emptyView(),
-                .error_code = .invalid_chunked_body,
-                .consumed_bytes = 0,
-                .keep_alive = keep_alive,
-                .expect_continue = false,
-            };
+            return parseErr(.invalid_chunked_body, keep_alive);
         };
         const headers = _limits.headers_storage[0..header_count];
         const body = _bytes[chunked.body_start .. chunked.body_start + chunked.body_len];
@@ -1371,6 +794,21 @@ fn hasInvalidHostChar(value: []const u8) bool {
         if (ch == '@' or ch == '/' or ch == ',') return true;
     }
     return false;
+}
+
+/// RFC 9112 §6.3 + smuggling defense: validate and parse a Content-Length value.
+/// Rejects empty, non-digit, leading-zero (except a lone "0"), signs/whitespace,
+/// and over-long (>19 digit) values that could overflow. Returns the parsed
+/// length or error.Invalid. The body-size limit and duplicate-header
+/// consistency checks are the caller's responsibility (they need request state).
+fn parseContentLengthValue(value: []const u8) error{Invalid}!usize {
+    if (value.len == 0) return error.Invalid;
+    for (value) |ch| {
+        if (ch < '0' or ch > '9') return error.Invalid;
+    }
+    if (value.len > 1 and value[0] == '0') return error.Invalid; // leading zero
+    if (value.len > 19) return error.Invalid; // overflow guard for parseUnsigned
+    return std.fmt.parseUnsigned(usize, value, 10) catch error.Invalid;
 }
 
 const ChunkedResult = struct {
@@ -1617,4 +1055,76 @@ test "scanChunked: zero-length body no trailers" {
     try std.testing.expect(result.complete);
     try std.testing.expectEqual(@as(usize, 0), result.body_len);
     try std.testing.expectEqual(@as(usize, buf.len), result.consumed_bytes);
+}
+
+// ── header-semantics primitives ──────────────────────────────────────────────
+
+test "parseContentLengthValue: valid lengths" {
+    try std.testing.expectEqual(@as(usize, 0), try parseContentLengthValue("0"));
+    try std.testing.expectEqual(@as(usize, 5), try parseContentLengthValue("5"));
+    try std.testing.expectEqual(@as(usize, 123456), try parseContentLengthValue("123456"));
+    // 19 digits is the max allowed length (fits in usize on 64-bit)
+    try std.testing.expectEqual(@as(usize, 9_999_999_999_999_999_999), try parseContentLengthValue("9999999999999999999"));
+}
+
+test "parseContentLengthValue: rejects smuggling / malformed" {
+    const bad = [_][]const u8{
+        "", // empty
+        "01", "00", "007", // leading zeros (RFC 9112 §6.3)
+        "1a", "0x10", "12.0", // non-digit
+        "+5", "-5", // signs
+        " 5", "5 ", "\t5", "5\t", // whitespace
+        "99999999999999999999", // 20 digits — overflow guard
+    };
+    for (bad) |v| {
+        try std.testing.expectError(error.Invalid, parseContentLengthValue(v));
+    }
+}
+
+test "isToken: RFC tchar set" {
+    try std.testing.expect(isToken("GET"));
+    try std.testing.expect(isToken("X-Custom-Header"));
+    try std.testing.expect(isToken("!#$%&'*+-.^_`|~"));
+    try std.testing.expect(!isToken("")); // empty
+    try std.testing.expect(!isToken("a b")); // space
+    try std.testing.expect(!isToken("a:b")); // colon
+    try std.testing.expect(!isToken("a/b")); // slash
+    try std.testing.expect(!isToken("a(b)")); // parens
+}
+
+test "isValidFieldValue: control chars rejected, obs-text allowed" {
+    try std.testing.expect(isValidFieldValue("hello world"));
+    try std.testing.expect(isValidFieldValue("with\ttab"));
+    try std.testing.expect(isValidFieldValue("")); // empty is valid
+    try std.testing.expect(isValidFieldValue("obs\x80text")); // obs-text 0x80-0xFF
+    try std.testing.expect(!isValidFieldValue("bare\nlf"));
+    try std.testing.expect(!isValidFieldValue("bare\rcr"));
+    try std.testing.expect(!isValidFieldValue("nul\x00byte"));
+    try std.testing.expect(!isValidFieldValue("del\x7fchar"));
+}
+
+test "hasInvalidHostChar: reject @ / ," {
+    try std.testing.expect(!hasInvalidHostChar("example.com"));
+    try std.testing.expect(!hasInvalidHostChar("example.com:8080"));
+    try std.testing.expect(hasInvalidHostChar("user@evil.com")); // userinfo smuggling
+    try std.testing.expect(hasInvalidHostChar("a/b"));
+    try std.testing.expect(hasInvalidHostChar("a,b"));
+}
+
+test "containsToken: comma list, case-insensitive, trimmed" {
+    try std.testing.expect(containsToken("close", "close"));
+    try std.testing.expect(containsToken("keep-alive, close", "close"));
+    try std.testing.expect(containsToken("Keep-Alive", "keep-alive")); // case
+    try std.testing.expect(containsToken("  close  ", "close")); // OWS trimmed
+    try std.testing.expect(!containsToken("closely", "close")); // not a substring match
+    try std.testing.expect(!containsToken("keep-alive", "close"));
+}
+
+test "lastToken: chunked must be final coding" {
+    try std.testing.expect(lastToken("gzip, chunked", "chunked"));
+    try std.testing.expect(lastToken("chunked", "chunked"));
+    try std.testing.expect(lastToken("chunked,", "chunked")); // trailing comma ignored
+    try std.testing.expect(!lastToken("chunked, gzip", "chunked")); // not last — smuggling vector
+    try std.testing.expect(!lastToken("gzip", "chunked"));
+    try std.testing.expect(!lastToken("", "chunked"));
 }

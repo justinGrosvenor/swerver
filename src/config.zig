@@ -215,6 +215,12 @@ pub const OtelConfig = struct {
     flush_interval_s: u32 = 5,
     sample_rate: u16 = 100,
     max_batch_size: u16 = 256,
+    /// Extra request headers for the OTLP exporter, in the
+    /// OTEL_EXPORTER_OTLP_HEADERS convention: `key1=value1,key2=value2`.
+    /// Each becomes a `Key: value` header on the POST — used for backend auth
+    /// (e.g. `Authorization=Bearer …`, `x-honeycomb-team=…`). Pair with an
+    /// `https://` collector_url so secrets aren't sent in the clear.
+    headers: []const u8 = "",
 };
 
 pub const ConfigError = error{
