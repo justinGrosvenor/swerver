@@ -539,7 +539,8 @@ pub const Proxy = struct {
 
                     // Try to parse — if we have a complete response, stop reading
                     // For close-delimited responses, keep reading until EOF
-                    if (forward.parseUpstreamResponse(self.response_bufs[resp_buf_idx][0..total_read])) |parsed_check| {
+                    const head = req.method == .HEAD;
+                    if (forward.parseUpstreamResponse(self.response_bufs[resp_buf_idx][0..total_read], head)) |parsed_check| {
                         if (!parsed_check.close_delimited) break;
                     } else |_| {}
                 }
@@ -559,7 +560,8 @@ pub const Proxy = struct {
                 }
 
                 // Parse the upstream response
-                const parsed = forward.parseUpstreamResponse(self.response_bufs[resp_buf_idx][0..total_read]) catch {
+                const is_head = req.method == .HEAD;
+                const parsed = forward.parseUpstreamResponse(self.response_bufs[resp_buf_idx][0..total_read], is_head) catch {
                     pool.markConnectionFailed(c, now_ms, connect_server.max_fails);
                     continue;
                 };
@@ -578,6 +580,7 @@ pub const Proxy = struct {
                     self.response_bufs[resp_buf_idx][0..],
                     route,
                     self.response_header_bufs[resp_buf_idx][0..],
+                    is_head,
                 ) catch {
                     pool.markConnectionFailed(c, now_ms, connect_server.max_fails);
                     continue;
@@ -793,7 +796,8 @@ pub const Proxy = struct {
                     if (n == 0) break;
                     total_read += n;
 
-                    if (forward.parseUpstreamResponse(self.response_bufs[resp_buf_idx][0..total_read])) |parsed_check| {
+                    const head_b = req.method == .HEAD;
+                    if (forward.parseUpstreamResponse(self.response_bufs[resp_buf_idx][0..total_read], head_b)) |parsed_check| {
                         if (!parsed_check.close_delimited) break;
                     } else |_| {}
                 }
@@ -811,7 +815,8 @@ pub const Proxy = struct {
                     continue;
                 }
 
-                const parsed = forward.parseUpstreamResponse(self.response_bufs[resp_buf_idx][0..total_read]) catch {
+                const is_head_b = req.method == .HEAD;
+                const parsed = forward.parseUpstreamResponse(self.response_bufs[resp_buf_idx][0..total_read], is_head_b) catch {
                     pool.markConnectionFailed(c, now_ms, connect_server_b.max_fails);
                     continue;
                 };
@@ -829,6 +834,7 @@ pub const Proxy = struct {
                     self.response_bufs[resp_buf_idx][0..],
                     route,
                     self.response_header_bufs[resp_buf_idx][0..],
+                    is_head_b,
                 ) catch {
                     pool.markConnectionFailed(c, now_ms, connect_server_b.max_fails);
                     continue;
