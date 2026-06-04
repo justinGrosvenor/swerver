@@ -154,6 +154,11 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
     x402_client.start();
     defer x402_client.stop();
 
+    // Start the OTel exporter's background sender thread so flushes never block
+    // the reactor on the (remote, TLS) collector. No-op when otel is disabled.
+    if (server.otel) |otel_exp| otel_mod.startSender(otel_exp.config);
+    defer otel_mod.stopSender();
+
     const deadline = if (run_for_ms) |ms| server.io.nowMs() + ms else null;
     var last_housekeeping_ms: u64 = server.io.nowMs();
     var drain_deadline_ms: u64 = 0;
