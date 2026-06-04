@@ -97,7 +97,9 @@ pub const TraceExporter = struct {
         var buf: [65536]u8 = undefined;
         const json = self.encodeOtlpJson(&buf, batch_size) orelse return;
 
-        self.sendToCollector(json);
+        // Hand the encoded payload to the background sender (non-blocking).
+        // The reactor must never do network I/O — see the sender section below.
+        submitPayload(json);
 
         self.read_pos = (self.read_pos + batch_size) % RING_SIZE;
         self.count -= batch_size;
@@ -155,38 +157,149 @@ pub const TraceExporter = struct {
         return buf[0..off];
     }
 
-    fn sendToCollector(self: *TraceExporter, body: []const u8) void {
-        const parsed = parseCollectorUrl(self.config.collector_url) orelse return;
-
-        var header_buf: [8192]u8 = undefined;
-        const req_header = buildRequestHeader(&header_buf, parsed, self.config.headers, body.len) orelse return;
-
-        const fd = net.connectBlocking(parsed.host, parsed.port, 2000) catch return;
-        defer clock.closeFd(fd);
-
-        net.setSocketTimeouts(fd, 2000, 2000);
-
-        if (parsed.use_tls) {
-            // https:// collector: wrap the socket in TLS (verify peer + SNI).
-            // Guarded by comptime `enable_tls` so the ffi calls in
-            // sendTlsRequest are only analyzed in TLS builds.
-            if (build_options.enable_tls) {
-                sendTlsRequest(parsed.host, fd, req_header, body);
-            }
-            // If TLS wasn't compiled in we deliberately send nothing rather
-            // than downgrade an https endpoint to plaintext (which would leak
-            // any auth header).
-            return;
-        }
-
-        net.sendAll(fd, req_header) catch return;
-        net.sendAll(fd, body) catch return;
-
-        // Read response (don't care about status, just drain the socket)
-        var resp_buf: [512]u8 = undefined;
-        _ = net.recvBlocking(fd, &resp_buf) catch {};
-    }
 };
+
+// ── Off-reactor sender ───────────────────────────────────────────────────
+//
+// The single-threaded reactor must NEVER block on network I/O. recordSpan and
+// encodeOtlpJson run on the reactor (cheap, bounded); the encoded OTLP payload
+// is handed to a bounded SPSC queue drained by a dedicated background thread
+// that performs the blocking TLS POST. A slow or failing collector therefore
+// can never stall the reactor — payloads are dropped (and counted) when the
+// queue is full. Mirrors the x402 facilitator client's off-reactor design.
+//
+// State is module-level: there is one reactor per forked worker process, and
+// startSender() is called once per worker, so each process gets its own queue
+// + thread (fork copies these; no cross-process sharing).
+
+const SEND_QUEUE_SIZE = 4;
+const SEND_PAYLOAD_CAP = 65536;
+
+const SendPayload = struct {
+    data: [SEND_PAYLOAD_CAP]u8 = undefined,
+    len: usize = 0,
+};
+
+var send_queue: [SEND_QUEUE_SIZE]SendPayload = undefined;
+var send_head: std.atomic.Value(u32) = std.atomic.Value(u32).init(0); // consumer: sender thread
+var send_tail: std.atomic.Value(u32) = std.atomic.Value(u32).init(0); // producer: reactor
+var sender_shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+var sender_thread: ?std.Thread = null;
+pub var send_dropped: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+// Collector config snapshot for the sender thread — copied at start so it never
+// aliases (or outlives) the server config.
+var snap_url: [512]u8 = undefined;
+var snap_url_len: usize = 0;
+var snap_headers: [4096]u8 = undefined;
+var snap_headers_len: usize = 0;
+
+/// Spawn the background sender thread. Idempotent; no-op if otel is disabled or
+/// the collector_url/headers don't fit the snapshot buffers.
+pub fn startSender(config: OtelConfig) void {
+    if (sender_thread != null) return;
+    if (!config.enabled) return;
+    if (config.collector_url.len > snap_url.len or config.headers.len > snap_headers.len) {
+        std.log.warn("otel: collector_url/headers too large to snapshot; exporter disabled", .{});
+        return;
+    }
+    @memcpy(snap_url[0..config.collector_url.len], config.collector_url);
+    snap_url_len = config.collector_url.len;
+    @memcpy(snap_headers[0..config.headers.len], config.headers);
+    snap_headers_len = config.headers.len;
+
+    sender_shutdown.store(false, .release);
+    send_head.store(0, .release);
+    send_tail.store(0, .release);
+    sender_thread = std.Thread.spawn(.{}, senderLoop, .{}) catch |err| {
+        std.log.warn("otel: failed to spawn sender thread: {}", .{err});
+        return;
+    };
+}
+
+/// Stop and join the sender thread. Safe if it was never started.
+pub fn stopSender() void {
+    sender_shutdown.store(true, .release);
+    if (sender_thread) |t| {
+        t.join();
+        sender_thread = null;
+    }
+}
+
+/// Enqueue an encoded OTLP payload for the sender thread. Non-blocking: drops
+/// (and counts) if the sender isn't running or the queue is full.
+fn submitPayload(body: []const u8) void {
+    if (sender_thread == null or body.len > SEND_PAYLOAD_CAP) {
+        _ = send_dropped.fetchAdd(1, .monotonic);
+        return;
+    }
+    const tail = send_tail.load(.monotonic);
+    const next_tail = (tail + 1) % SEND_QUEUE_SIZE;
+    if (next_tail == send_head.load(.acquire)) {
+        _ = send_dropped.fetchAdd(1, .monotonic); // queue full → drop newest
+        return;
+    }
+    @memcpy(send_queue[tail].data[0..body.len], body);
+    send_queue[tail].len = body.len;
+    send_tail.store(next_tail, .release);
+}
+
+fn senderLoop() void {
+    while (!sender_shutdown.load(.acquire)) {
+        const head = send_head.load(.monotonic);
+        if (head == send_tail.load(.acquire)) {
+            sleepNs(50 * std.time.ns_per_ms);
+            continue;
+        }
+        const p = &send_queue[head];
+        postToCollector(snap_url[0..snap_url_len], snap_headers[0..snap_headers_len], p.data[0..p.len]);
+        send_head.store((head + 1) % SEND_QUEUE_SIZE, .release);
+    }
+}
+
+fn sleepNs(ns: u64) void {
+    var ts = std.posix.timespec{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
+    var rem: std.posix.timespec = .{ .sec = 0, .nsec = 0 };
+    while (true) {
+        const rc = std.posix.system.nanosleep(&ts, &rem);
+        if (rc == 0) return;
+        switch (std.posix.errno(rc)) {
+            .INTR => ts = rem,
+            else => return,
+        }
+    }
+}
+
+/// Blocking OTLP POST. Runs ONLY on the sender thread, never the reactor.
+fn postToCollector(collector_url: []const u8, headers: []const u8, body: []const u8) void {
+    const parsed = parseCollectorUrl(collector_url) orelse return;
+
+    var header_buf: [8192]u8 = undefined;
+    const req_header = buildRequestHeader(&header_buf, parsed, headers, body.len) orelse return;
+
+    const fd = net.connectBlocking(parsed.host, parsed.port, 2000) catch return;
+    defer clock.closeFd(fd);
+
+    net.setSocketTimeouts(fd, 2000, 2000);
+
+    if (parsed.use_tls) {
+        // https:// collector: TLS (verify peer + SNI). Guarded by comptime
+        // enable_tls so the ffi calls aren't analyzed in non-TLS builds.
+        if (build_options.enable_tls) {
+            sendTlsRequest(parsed.host, fd, req_header, body);
+        }
+        // No TLS compiled in → send nothing rather than leak the auth header
+        // over plaintext.
+        return;
+    }
+
+    net.sendAll(fd, req_header) catch return;
+    net.sendAll(fd, body) catch return;
+
+    // Drain the response (status ignored).
+    var resp_buf: [512]u8 = undefined;
+    _ = net.recvBlocking(fd, &resp_buf) catch {};
+}
 
 /// Build the OTLP POST request header into `buf`, including any operator-
 /// configured auth headers. `headers_cfg` follows the OTEL_EXPORTER_OTLP_HEADERS
