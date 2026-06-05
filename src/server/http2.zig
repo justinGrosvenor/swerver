@@ -331,16 +331,7 @@ fn queueFileResponseH2(
 
     const root_fd = server.static_root_fd orelse return error.NotFound;
 
-    var path_buf: [4096]u8 = undefined;
-    if (file_path.len >= path_buf.len) return error.NotFound;
-    @memcpy(path_buf[0..file_path.len], file_path);
-    path_buf[file_path.len] = 0;
-    const path_z: [*:0]const u8 = @ptrCast(&path_buf);
-
-    var o_flags: std.posix.O = .{ .ACCMODE = .RDONLY };
-    if (@hasField(std.posix.O, "NOFOLLOW")) o_flags.NOFOLLOW = true;
-    if (@hasField(std.posix.O, "CLOEXEC")) o_flags.CLOEXEC = true;
-    const file_fd = std.posix.openatZ(root_fd, path_z, o_flags, 0) catch return error.NotFound;
+    const file_fd = Server.safeOpenStatic(root_fd, file_path) orelse return error.NotFound;
 
     const end_pos = std.c.lseek(file_fd, 0, std.posix.SEEK.END);
     if (end_pos < 0) {

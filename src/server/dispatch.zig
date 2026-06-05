@@ -219,12 +219,17 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
 
         if (needs_housekeeping) {
             last_housekeeping_ms = now_ms;
-            // Enforce timeouts and close timed-out connections
-            const timeout_result = server.io.enforceTimeouts(now_ms);
-            for (timeout_result.to_close[0..timeout_result.count]) |conn_index| {
-                if (server.io.getConnection(conn_index)) |conn| {
-                    server.closeConnection(conn);
+            // Enforce timeouts and close timed-out connections.
+            // Loop until all timed-out connections are drained (the fixed-size
+            // result array can only hold 64 per call).
+            while (true) {
+                const timeout_result = server.io.enforceTimeouts(now_ms);
+                for (timeout_result.to_close[0..timeout_result.count]) |conn_index| {
+                    if (server.io.getConnection(conn_index)) |conn| {
+                        server.closeConnection(conn);
+                    }
                 }
+                if (timeout_result.count < timeout_result.to_close.len) break;
             }
             // Periodic QUIC cleanup
             if (server.quic) |*q| {
@@ -946,8 +951,10 @@ pub fn handleRead(server: *Server, index: u32) !void {
                 var x402_result: x402_mod.EvaluateResult = undefined;
                 if (conn.x402 == .resolved_allow) {
                     conn.x402 = .none;
+                    const pay_hdr = x402_mod.findValidPaymentHeader(parse.view) orelse "";
+                    if (pay_hdr.len > 0) x402_mod.recordPayment(pay_hdr, x402_policy.max_timeout_seconds);
                     x402_result = .{ .allow = .{
-                        .payment_header = x402_mod.findValidPaymentHeader(parse.view) orelse "",
+                        .payment_header = pay_hdr,
                         .needs_settlement = true,
                     } };
                 } else if (conn.x402 == .resolved_reject) {

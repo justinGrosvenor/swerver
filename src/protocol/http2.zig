@@ -469,13 +469,14 @@ pub const HpackDecoder = struct {
             return;
         }
         self.ensureStorage(storage_len);
-        const base = self.storage_tail;
-        // Defensive bounds check: ensure we have contiguous space
+        var base = self.storage_tail;
         if (base + storage_len > self.storage.len) {
-            // Not enough contiguous space at end - this shouldn't happen if
-            // ensureStorage worked correctly, but handle it defensively
-            self.clear();
-            return;
+            self.storage_tail = 0;
+            base = 0;
+            if (self.entry_count > 0 and base + storage_len > self.entries[self.entry_head].base) {
+                self.clear();
+                return;
+            }
         }
         @memcpy(self.storage[base .. base + name.len], name);
         @memcpy(self.storage[base + name.len .. base + storage_len], value);
@@ -552,11 +553,15 @@ pub const HpackDecoder = struct {
         self.entry_head = (self.entry_head + 1) % self.entries.len;
         self.entry_count -= 1;
         self.dynamic_size -= entry.size;
-        if (self.storage_used >= entry.name_len + entry.value_len) {
-            self.storage_used -= entry.name_len + entry.value_len;
-            self.storage_head = (self.storage_head + entry.name_len + entry.value_len) % self.storage.len;
+        const entry_storage = entry.name_len + entry.value_len;
+        if (self.storage_used >= entry_storage) {
+            self.storage_used -= entry_storage;
         } else {
             self.storage_used = 0;
+        }
+        if (self.entry_count > 0) {
+            self.storage_head = self.entries[self.entry_head].base;
+        } else {
             self.storage_head = self.storage_tail;
         }
     }
@@ -1009,9 +1014,25 @@ pub const Stack = struct {
 
     fn handleData(self: *Stack, frame: Frame, events: []Event) FrameHandle {
         if (frame.header.stream_id == 0) return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
-        const stream = self.findStream(frame.header.stream_id) orelse return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
+        const stream = self.findStream(frame.header.stream_id) orelse {
+            // RFC 9113 §6.9.1: must deduct from connection window even for stream errors
+            const fc_len: i32 = @intCast(frame.header.length);
+            if (self.conn_recv_window >= fc_len) self.conn_recv_window -= fc_len;
+            if (events.len > 0) {
+                events[0] = .{ .err = .{ .stream_id = frame.header.stream_id, .code = .stream_closed } };
+                return .{ .state = .stream_err, .error_code = .none, .event_count = 1 };
+            }
+            return .{ .state = .stream_err, .error_code = .none, .event_count = 0 };
+        };
         if (stream.state == .half_closed_remote or stream.state == .closed) {
-            return .{ .state = .err, .error_code = .stream_closed, .event_count = 0 };
+            stream.state = .closed;
+            const fc_len: i32 = @intCast(frame.header.length);
+            if (self.conn_recv_window >= fc_len) self.conn_recv_window -= fc_len;
+            if (events.len > 0) {
+                events[0] = .{ .err = .{ .stream_id = frame.header.stream_id, .code = .stream_closed } };
+                return .{ .state = .stream_err, .error_code = .none, .event_count = 1 };
+            }
+            return .{ .state = .stream_err, .error_code = .none, .event_count = 0 };
         }
         const data = parseDataPayload(frame.payload, frame.header.flags) catch {
             return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
@@ -1026,12 +1047,14 @@ pub const Stack = struct {
         if (flow_len > conn_window) {
             return .{ .state = .err, .error_code = .flow_control_error, .event_count = 0 };
         }
-        if (stream.recv_window <= 0) {
-            return .{ .state = .err, .error_code = .flow_control_error, .event_count = 0 };
-        }
-        const stream_window: usize = @intCast(stream.recv_window);
-        if (flow_len > stream_window) {
-            return .{ .state = .err, .error_code = .flow_control_error, .event_count = 0 };
+        if (stream.recv_window <= 0 or flow_len > @as(usize, @intCast(stream.recv_window))) {
+            stream.state = .closed;
+            self.conn_recv_window -= @intCast(flow_len);
+            if (events.len > 0) {
+                events[0] = .{ .err = .{ .stream_id = frame.header.stream_id, .code = .flow_control_error } };
+                return .{ .state = .stream_err, .error_code = .none, .event_count = 1 };
+            }
+            return .{ .state = .stream_err, .error_code = .none, .event_count = 0 };
         }
         self.conn_recv_window -= @intCast(flow_len);
         stream.recv_window -= @intCast(flow_len);

@@ -352,12 +352,19 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Server) void {
+        // QUIC handler must be freed before its TLS provider
+        if (self.quic) |*q| q.deinit();
         if (self.tcp_tls_provider) |*p| p.deinit();
+        if (self.tls_provider) |*p| p.deinit();
+        if (self.proxy) |p| {
+            p.deinit();
+            self.allocator.destroy(p);
+        }
+        if (self.spare_fd) |fd| clock.closeFd(fd);
         if (self.listener_fd) |fd| clock.closeFd(fd);
         if (self.udp_fd) |fd| clock.closeFd(fd);
         if (self.static_root_fd) |fd| clock.closeFd(fd);
         if (self.admin_listener_fd) |fd| clock.closeFd(fd);
-        if (self.quic) |*q| q.deinit();
         if (self.otel) |otel_ptr| self.allocator.destroy(otel_ptr);
         if (self.pending_reload.swap(null, .acq_rel)) |pr| {
             var loaded = pr.loaded;
@@ -767,6 +774,59 @@ pub const Server = struct {
         }
 
         return trimmed;
+    }
+
+    /// Open a file relative to `static_root_fd`, rejecting symlinks in ALL
+    /// path components (not just the leaf). Walks the path segment-by-segment
+    /// with O_NOFOLLOW|O_DIRECTORY, then opens the leaf with O_NOFOLLOW.
+    /// Prevents intermediate-symlink escapes from the static root.
+    pub fn safeOpenStatic(root_fd: std.posix.fd_t, path: []const u8) ?std.posix.fd_t {
+        if (path.len == 0 or path.len >= 4096) return null;
+        var buf: [4096]u8 = undefined;
+        @memcpy(buf[0..path.len], path);
+
+        var dir_fd = root_fd;
+        var need_close_dir = false;
+        var pos: usize = 0;
+
+        while (pos < path.len) {
+            var end = pos;
+            while (end < path.len and buf[end] != '/') end += 1;
+            if (end == pos) {
+                pos = end + 1;
+                continue;
+            }
+
+            buf[end] = 0;
+            const seg: [*:0]const u8 = @ptrCast(&buf[pos]);
+
+            if (end < path.len) {
+                var o: std.posix.O = .{ .DIRECTORY = true };
+                if (@hasField(std.posix.O, "NOFOLLOW")) o.NOFOLLOW = true;
+                if (@hasField(std.posix.O, "CLOEXEC")) o.CLOEXEC = true;
+                const next = std.posix.openatZ(dir_fd, seg, o, 0) catch {
+                    if (need_close_dir) clock.closeFd(dir_fd);
+                    return null;
+                };
+                if (need_close_dir) clock.closeFd(dir_fd);
+                dir_fd = next;
+                need_close_dir = true;
+            } else {
+                var o: std.posix.O = .{};
+                if (@hasField(std.posix.O, "NOFOLLOW")) o.NOFOLLOW = true;
+                if (@hasField(std.posix.O, "CLOEXEC")) o.CLOEXEC = true;
+                const file_fd = std.posix.openatZ(dir_fd, seg, o, 0) catch {
+                    if (need_close_dir) clock.closeFd(dir_fd);
+                    return null;
+                };
+                if (need_close_dir) clock.closeFd(dir_fd);
+                return file_fd;
+            }
+            pos = end + 1;
+        }
+
+        if (need_close_dir) clock.closeFd(dir_fd);
+        return null;
     }
 
     pub fn closeConnection(self: *Server, conn: *connection.Connection) void {

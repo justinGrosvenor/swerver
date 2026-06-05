@@ -622,23 +622,7 @@ pub fn queueFileResponse(server: *Server, conn: *connection.Connection, static_r
         return;
     };
 
-    // Build null-terminated relative path.
-    var path_buf: [4096]u8 = undefined;
-    if (file_path.len >= path_buf.len) {
-        try queueResponse(server, conn, Server.notFoundResponse());
-        return;
-    }
-    @memcpy(path_buf[0..file_path.len], file_path);
-    path_buf[file_path.len] = 0;
-    const path_z: [*:0]const u8 = @ptrCast(&path_buf);
-
-    // Open with NOFOLLOW on the leaf. Intermediate-component symlinks
-    // under static_root can still escape — operators should not place
-    // arbitrary symlinks inside the static tree. Linux-only full
-    // containment via openat2(RESOLVE_BENEATH) is a future enhancement.
-    var o_flags: std.posix.O = .{};
-    if (@hasField(std.posix.O, "NOFOLLOW")) o_flags.NOFOLLOW = true;
-    const file_fd = std.posix.openatZ(root_fd, path_z, o_flags, 0) catch {
+    const file_fd = Server.safeOpenStatic(root_fd, file_path) orelse {
         try queueResponse(server, conn, Server.notFoundResponse());
         return;
     };
@@ -807,9 +791,10 @@ pub fn initBodyAccumulation(
     const accum = conn.body_accum orelse unreachable;
     accum.original_read_buffer = conn.read_buffer;
     conn.read_buffer = server.io.acquireBuffer() orelse {
-        // No buffers available — abort body accumulation
         conn.read_buffer = accum.original_read_buffer;
         accum.original_read_buffer = null;
+        server.allocator.destroy(accum);
+        conn.body_accum = null;
         return error.OutOfMemory;
     };
     conn.read_offset = 0;

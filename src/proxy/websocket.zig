@@ -112,6 +112,7 @@ fn buildUpgradeRequest(
     for (req.headers) |hdr| {
         if (std.ascii.eqlIgnoreCase(hdr.name, "host")) continue;
         if (upstream.isHopByHop(hdr.name) and !isWsHeader(hdr.name)) continue;
+        if (containsCrlf(hdr.name) or containsCrlf(hdr.value)) continue;
         pos += (std.fmt.bufPrint(buf[pos..], "{s}: {s}\r\n", .{ hdr.name, hdr.value }) catch return error.BufferFull).len;
     }
 
@@ -123,6 +124,10 @@ fn buildUpgradeRequest(
     @memcpy(buf[pos .. pos + 2], "\r\n");
     pos += 2;
     return pos;
+}
+
+fn containsCrlf(s: []const u8) bool {
+    return std.mem.indexOfAny(u8, s, "\r\n") != null;
 }
 
 fn isWsHeader(name: []const u8) bool {

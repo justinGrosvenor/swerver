@@ -62,6 +62,47 @@ pub const Extra = struct {
     version: []const u8,
 };
 
+/// Per-process replay guard: time-windowed hash table keyed on payment header hash.
+/// Prevents the same payment header from being reused within max_timeout_seconds.
+const ReplayGuard = struct {
+    const SLOTS = 8192;
+    const MASK = SLOTS - 1;
+    const PROBE_LIMIT = 4;
+
+    const Entry = struct { hash: u64 = 0, expiry_ms: u64 = 0 };
+
+    entries: [SLOTS]Entry = [_]Entry{.{}} ** SLOTS,
+
+    fn seen(self: *ReplayGuard, sig: []const u8, now_ms: u64) bool {
+        const h = std.hash.Wyhash.hash(0, sig);
+        for (0..PROBE_LIMIT) |i| {
+            const slot = self.entries[(h +% i) & MASK];
+            if (slot.hash == h and slot.expiry_ms > now_ms) return true;
+        }
+        return false;
+    }
+
+    fn record(self: *ReplayGuard, sig: []const u8, now_ms: u64, ttl_ms: u64) void {
+        const h = std.hash.Wyhash.hash(0, sig);
+        for (0..PROBE_LIMIT) |i| {
+            const slot = &self.entries[(h +% i) & MASK];
+            if (slot.expiry_ms <= now_ms or slot.hash == 0) {
+                slot.* = .{ .hash = h, .expiry_ms = now_ms + ttl_ms };
+                return;
+            }
+        }
+        self.entries[h & MASK] = .{ .hash = h, .expiry_ms = now_ms + ttl_ms };
+    }
+};
+
+var replay_guard = ReplayGuard{};
+
+pub fn recordPayment(header_value: []const u8, ttl_seconds: u32) void {
+    const ts = clock.realtimeTimespec() orelse return;
+    const now_ms: u64 = @intCast(ts.sec * 1000 + @divTrunc(ts.nsec, 1_000_000));
+    replay_guard.record(header_value, now_ms, @as(u64, ttl_seconds) * 1000);
+}
+
 /// Evaluate x402 payment policy for a request.
 ///
 /// Validates payment header structure: base64-encoded JSON with "signature"
@@ -70,21 +111,22 @@ pub const Extra = struct {
 pub fn evaluate(req: request.RequestView, policy: Policy) Decision {
     if (!policy.require_payment) return .allow;
 
-    // Check ALL payment headers, not just the first one. A request
-    // may contain both X-Payment and Payment-Signature headers (or
-    // duplicates). If ANY of them validates, allow the request.
-    // Only reject after exhausting all candidates.
-    var found_any = false;
+    const now_ms: u64 = blk: {
+        const ts = clock.realtimeTimespec() orelse break :blk 0;
+        break :blk @intCast(ts.sec * 1000 + @divTrunc(ts.nsec, 1_000_000));
+    };
+
     for (req.headers) |hdr| {
         if (std.ascii.eqlIgnoreCase(hdr.name, "x-payment") or
             std.ascii.eqlIgnoreCase(hdr.name, "payment-signature"))
         {
             if (hdr.value.len > 0) {
-                found_any = true;
+                if (now_ms > 0 and replay_guard.seen(hdr.value, now_ms)) {
+                    return .{ .reject = rejectWith(.facilitator_rejected, policy).resp };
+                }
                 if (validatePaymentHeader(hdr.value)) {
                     return .allow;
                 }
-                // Invalid — keep searching for a valid one
             }
         }
     }
@@ -360,7 +402,6 @@ pub fn evaluateWithFacilitator(
     if (!policy.require_payment) return .{ .allow = .{ .payment_header = "", .needs_settlement = false } };
 
     const payment_header = findValidPaymentHeader(req) orelse {
-        // Distinguish missing header from malformed: check if ANY payment header exists
         const has_any = for (req.headers) |hdr| {
             if (std.ascii.eqlIgnoreCase(hdr.name, "x-payment") or
                 std.ascii.eqlIgnoreCase(hdr.name, "payment-signature"))
@@ -375,6 +416,15 @@ pub fn evaluateWithFacilitator(
             ),
         };
     };
+
+    // Replay check: reject if this exact payment header was already accepted
+    const now_ms: u64 = blk: {
+        const ts = clock.realtimeTimespec() orelse break :blk 0;
+        break :blk @intCast(ts.sec * 1000 + @divTrunc(ts.nsec, 1_000_000));
+    };
+    if (now_ms > 0 and replay_guard.seen(payment_header, now_ms)) {
+        return .{ .reject = rejectWith(.facilitator_rejected, policy) };
+    }
 
     // Local EIP-712/EIP-3009 signature pre-filter. For the `exact` scheme,
     // when the route is fully configured with the token's EIP-712 domain

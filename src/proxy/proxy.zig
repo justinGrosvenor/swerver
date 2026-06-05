@@ -257,6 +257,8 @@ pub const Proxy = struct {
             try proxy.health_manager.registerUpstream(up);
         }
 
+        proxy.health_manager.startThread();
+
         return proxy;
     }
 
@@ -925,8 +927,8 @@ pub const Proxy = struct {
         // Evict expired connections
         _ = self.pool_manager.evictAllExpired(now_ms);
 
-        // Run health checks
-        self.health_manager.runAllChecks(now_ms, &self.pool_manager);
+        // Apply health check results (non-blocking — checks run on background thread)
+        self.health_manager.applyResults(&self.pool_manager);
 
         // DNS service discovery re-resolution
         _ = self.dns_discovery.tick(now_ms);
