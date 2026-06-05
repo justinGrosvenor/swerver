@@ -281,16 +281,7 @@ fn serveStaticFileH3(
 
     const root_fd = server.static_root_fd orelse return sendNotFoundH3(server, udp_fd, conn, stream_id, peer_addr);
 
-    var path_buf: [4096]u8 = undefined;
-    if (file_path.len >= path_buf.len) return sendNotFoundH3(server, udp_fd, conn, stream_id, peer_addr);
-    @memcpy(path_buf[0..file_path.len], file_path);
-    path_buf[file_path.len] = 0;
-    const path_z: [*:0]const u8 = @ptrCast(&path_buf);
-
-    var o_flags: std.posix.O = .{ .ACCMODE = .RDONLY };
-    if (@hasField(std.posix.O, "NOFOLLOW")) o_flags.NOFOLLOW = true;
-    if (@hasField(std.posix.O, "CLOEXEC")) o_flags.CLOEXEC = true;
-    const file_fd = std.posix.openatZ(root_fd, path_z, o_flags, 0) catch return sendNotFoundH3(server, udp_fd, conn, stream_id, peer_addr);
+    const file_fd = Server.safeOpenStatic(root_fd, file_path) orelse return sendNotFoundH3(server, udp_fd, conn, stream_id, peer_addr);
     defer clock.closeFd(file_fd);
 
     const buf_handle = server.io.acquireBuffer() orelse return;
