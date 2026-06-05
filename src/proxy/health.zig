@@ -92,8 +92,10 @@ pub const HealthChecker = struct {
     upstream_def: *const upstream.Upstream,
     /// Health check configuration
     config: upstream.HealthCheck,
-    /// Health state for each server
+    /// Health state for each server (owned by background thread after start)
     server_health: []ServerHealth,
+    /// Atomic published states — written by background thread, read by reactor
+    published_states: []std.atomic.Value(u8),
     /// Buffer for health check requests
     request_buf: []u8,
     /// Buffer for health check responses
@@ -104,9 +106,15 @@ pub const HealthChecker = struct {
 
     pub fn init(allocator: std.mem.Allocator, upstream_def: *const upstream.Upstream) !HealthChecker {
         const config = upstream_def.health_check orelse upstream.HealthCheck{};
-        const server_health = try allocator.alloc(ServerHealth, upstream_def.servers.len);
+        const server_count = upstream_def.servers.len;
+
+        const server_health = try allocator.alloc(ServerHealth, server_count);
         errdefer allocator.free(server_health);
         @memset(server_health, ServerHealth{});
+
+        const published_states = try allocator.alloc(std.atomic.Value(u8), server_count);
+        errdefer allocator.free(published_states);
+        for (published_states) |*s| s.* = std.atomic.Value(u8).init(@intFromEnum(HealthState.unknown));
 
         const request_buf = try allocator.alloc(u8, REQUEST_BUF_SIZE);
         errdefer allocator.free(request_buf);
@@ -118,6 +126,7 @@ pub const HealthChecker = struct {
             .upstream_def = upstream_def,
             .config = config,
             .server_health = server_health,
+            .published_states = published_states,
             .request_buf = request_buf,
             .response_buf = response_buf,
         };
@@ -125,12 +134,14 @@ pub const HealthChecker = struct {
 
     pub fn deinit(self: *HealthChecker) void {
         self.allocator.free(self.server_health);
+        self.allocator.free(self.published_states);
         self.allocator.free(self.request_buf);
         self.allocator.free(self.response_buf);
     }
 
-    /// Run health checks on all servers that need it
-    pub fn runChecks(self: *HealthChecker, now_ms: u64, conn_pool: *pool_mod.Pool) void {
+    /// Run health checks (called from background thread). Updates server_health
+    /// and publishes state atomically for the reactor to read.
+    pub fn runChecks(self: *HealthChecker, now_ms: u64) void {
         for (self.upstream_def.servers, 0..) |server, i| {
             const health = &self.server_health[i];
 
@@ -138,18 +149,21 @@ pub const HealthChecker = struct {
                 continue;
             }
 
-            // Perform health check
-            const result = self.checkServer(&server, i, now_ms);
+            _ = self.checkServer(&server, i, now_ms);
+            self.published_states[i].store(@intFromEnum(health.state), .release);
+        }
+    }
 
-            // Update pool availability based on health state
-            if (health.state == .unhealthy) {
+    /// Apply published health states to pool availability (called from reactor — non-blocking).
+    pub fn applyHealthToPool(self: *const HealthChecker, conn_pool: *pool_mod.Pool) void {
+        for (0..self.published_states.len) |i| {
+            const state: HealthState = @enumFromInt(self.published_states[i].load(.acquire));
+            if (state == .unhealthy) {
                 conn_pool.server_failures[i].available = false;
-            } else if (health.state == .healthy) {
+            } else if (state == .healthy) {
                 conn_pool.server_failures[i].available = true;
                 conn_pool.server_failures[i].consecutive_failures = 0;
             }
-
-            _ = result;
         }
     }
 
@@ -212,11 +226,6 @@ pub const HealthChecker = struct {
             0;
         health_state.recordSuccess(now_ms, response_time_ms, &self.config);
         return true;
-    }
-
-    fn getMonotonicMs() u64 {
-        const instant = clock.Instant.now() orelse return 0;
-        return instant.ns / @as(u64, std.time.ns_per_ms);
     }
 
     /// Build HTTP health check request
@@ -316,6 +325,8 @@ pub const UpstreamStatus = struct {
 pub const HealthManager = struct {
     allocator: std.mem.Allocator,
     checkers: std.StringHashMap(*HealthChecker),
+    thread_handle: ?std.Thread = null,
+    shutdown_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn init(allocator: std.mem.Allocator) HealthManager {
         return .{
@@ -325,6 +336,7 @@ pub const HealthManager = struct {
     }
 
     pub fn deinit(self: *HealthManager) void {
+        self.stopThread();
         var it = self.checkers.valueIterator();
         while (it.next()) |checker| {
             checker.*.deinit();
@@ -349,15 +361,57 @@ pub const HealthManager = struct {
         try self.checkers.put(upstream_def.name, checker);
     }
 
-    /// Run all health checks
+    pub fn startThread(self: *HealthManager) void {
+        if (self.thread_handle != null) return;
+        if (self.checkers.count() == 0) return;
+        self.shutdown_flag.store(false, .release);
+        self.thread_handle = std.Thread.spawn(.{}, threadLoop, .{self}) catch |err| {
+            std.log.warn("health: failed to spawn thread: {}", .{err});
+            return;
+        };
+    }
+
+    pub fn stopThread(self: *HealthManager) void {
+        self.shutdown_flag.store(true, .release);
+        if (self.thread_handle) |t| {
+            t.join();
+            self.thread_handle = null;
+        }
+    }
+
+    fn threadLoop(self: *HealthManager) void {
+        while (!self.shutdown_flag.load(.acquire)) {
+            const now_ms = getMonotonicMs();
+            var it = self.checkers.valueIterator();
+            while (it.next()) |checker| {
+                if (self.shutdown_flag.load(.acquire)) return;
+                checker.*.runChecks(now_ms);
+            }
+            sleepNs(1_000_000_000);
+        }
+    }
+
+    /// Apply published health states to pools (called from reactor — non-blocking).
+    pub fn applyResults(self: *HealthManager, pool_manager: *pool_mod.PoolManager) void {
+        var it = self.checkers.iterator();
+        while (it.next()) |entry| {
+            const name = entry.key_ptr.*;
+            const checker = entry.value_ptr.*;
+            if (pool_manager.getPool(name)) |pool| {
+                checker.applyHealthToPool(pool);
+            }
+        }
+    }
+
+    /// Run all health checks inline and apply results (blocking — fallback when thread not started).
     pub fn runAllChecks(self: *HealthManager, now_ms: u64, pool_manager: *pool_mod.PoolManager) void {
         var it = self.checkers.iterator();
         while (it.next()) |entry| {
             const name = entry.key_ptr.*;
             const checker = entry.value_ptr.*;
-
+            checker.runChecks(now_ms);
             if (pool_manager.getPool(name)) |pool| {
-                checker.runChecks(now_ms, pool);
+                checker.applyHealthToPool(pool);
             }
         }
     }
@@ -367,6 +421,27 @@ pub const HealthManager = struct {
         return self.checkers.get(name);
     }
 };
+
+fn getMonotonicMs() u64 {
+    const instant = clock.Instant.now() orelse return 0;
+    return instant.ns / @as(u64, std.time.ns_per_ms);
+}
+
+fn sleepNs(ns: u64) void {
+    var ts = std.posix.timespec{
+        .sec = @intCast(ns / std.time.ns_per_s),
+        .nsec = @intCast(ns % std.time.ns_per_s),
+    };
+    var rem: std.posix.timespec = .{ .sec = 0, .nsec = 0 };
+    while (true) {
+        const rc = std.posix.system.nanosleep(&ts, &rem);
+        if (rc == 0) return;
+        switch (std.posix.errno(rc)) {
+            .INTR => ts = rem,
+            else => return,
+        }
+    }
+}
 
 // Tests
 test "ServerHealth state transitions" {

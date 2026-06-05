@@ -261,8 +261,10 @@ fn parseHeadersInternal(_bytes: []u8, _limits: Limits) HeaderParseResult {
     if (std.mem.eql(u8, version, "HTTP/1.1") and host_count == 0 and !host_in_target) {
         return headerErr(.missing_host, keep_alive);
     }
+    // RFC 9112 §6.1: Transfer-Encoding overrides Content-Length
     if (is_chunked and has_content_length) {
-        return headerErr(.invalid_header, keep_alive);
+        has_content_length = false;
+        content_length = 0;
     }
     const wants_body = is_chunked or (has_content_length and content_length > 0);
     if (!wants_body) expect_continue = false;
@@ -658,8 +660,10 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
     if (std.mem.eql(u8, version, "HTTP/1.1") and host_count == 0 and !host_in_target) {
         return parseErr(.missing_host, keep_alive);
     }
+    // RFC 9112 §6.1: Transfer-Encoding overrides Content-Length
     if (is_chunked and has_content_length) {
-        return parseErr(.invalid_header, keep_alive);
+        has_content_length = false;
+        content_length = 0;
     }
     const wants_body = is_chunked or (has_content_length and content_length > 0);
     if (!wants_body) expect_continue = false;
