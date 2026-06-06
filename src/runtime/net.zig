@@ -666,6 +666,11 @@ pub fn connectBlockingValidated(address: []const u8, port: u16, timeout_ms: u32)
     return connectBlockingResolved(resolved, timeout_ms);
 }
 
+pub fn proxyConnect(address: []const u8, port: u16, timeout_ms: u32, allow_private: bool) ConnectError!std.posix.fd_t {
+    if (allow_private) return connectBlocking(address, port, timeout_ms);
+    return connectBlockingValidated(address, port, timeout_ms);
+}
+
 // ============================================================
 // sendfile() - Zero-copy file transfer to socket
 // ============================================================

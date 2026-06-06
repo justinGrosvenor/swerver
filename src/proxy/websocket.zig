@@ -44,11 +44,13 @@ pub fn performUpgrade(
     route: *const upstream.ProxyRoute,
     client_ip: ?[]const u8,
     resp_buf: []u8,
+    allow_private: bool,
 ) UpgradeResult {
-    const fd = net.connectBlocking(
+    const fd = net.proxyConnect(
         server_addr,
         server_port,
         route.timeouts.connect_ms,
+        allow_private,
     ) catch {
         return .{ .err = errorResp(502) };
     };

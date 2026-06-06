@@ -27,6 +27,9 @@ pub const Upstream = struct {
     dns_discovery: ?dns_mod.DnsConfig = null,
     /// Consul service discovery configuration
     consul_discovery: ?consul_mod.ConsulConfig = null,
+    /// Allow connections to private/loopback addresses (default true for backwards compat).
+    /// Set false to enable SSRF protection on this upstream.
+    allow_private: bool = true,
 };
 
 /// Individual backend server definition
