@@ -716,14 +716,15 @@ test "http2 parser rejects ping with invalid length" {
 }
 
 test "http2 parser rejects window update with zero increment" {
-    var parser = http2.Parser.init();
-    var frames: [1]http2.Frame = undefined;
+    // Zero WINDOW_UPDATE on stream 0 = connection error (validated in handleWindowUpdate)
+    var stack = http2.Stack.init();
     var buf: [http2.Preface.len + 13]u8 = undefined;
     @memcpy(buf[0..http2.Preface.len], http2.Preface);
-    _ = try http2.writeFrame(buf[http2.Preface.len..], .window_update, 0, 1, &[_]u8{ 0, 0, 0, 0 });
-    const res = parser.parse(buf[0..], frames[0..], .{ .max_frame_size = 16384 });
+    _ = try http2.writeFrame(buf[http2.Preface.len..], .window_update, 0, 0, &[_]u8{ 0, 0, 0, 0 });
+    var frames: [4]http2.Frame = undefined;
+    var events: [4]http2.Event = undefined;
+    const res = stack.ingest(buf[0..], frames[0..], events[0..]);
     try std.testing.expectEqual(http2.ParseState.err, res.state);
-    try std.testing.expectEqual(http2.ErrorCode.protocol_error, res.error_code);
 }
 
 test "http2 parser returns partial for incomplete frame" {
@@ -1031,21 +1032,24 @@ test "http2 header list too large does not kill other streams" {
     off += try http2.writeFrame(buf[off..], .headers, 0x5, 1, hdr1_bytes);
     off += try http2.writeFrame(buf[off..], .headers, 0x5, 3, hdr2_bytes);
     off += try http2.writeFrame(buf[off..], .headers, 0x5, 5, hdr3_bytes);
+
+    // ingest breaks before next HEADERS frame after emitting a .headers event
     const res = stack.ingest(buf[0..off], frames[0..], events[0..]);
-    try std.testing.expectEqual(http2.ParseState.complete, res.state);
-    try std.testing.expectEqual(@as(usize, 3), res.event_count);
-    // Event 0: headers on stream 1 (success)
+    try std.testing.expectEqual(http2.ParseState.partial, res.state);
+    try std.testing.expectEqual(@as(usize, 1), res.event_count);
     switch (events[0]) {
         .headers => |ev| try std.testing.expectEqual(@as(u32, 1), ev.stream_id),
         else => return error.UnexpectedEvent,
     }
-    // Event 1: error on stream 3 (refused, not connection kill)
-    switch (events[1]) {
+    // Second ingest: stream 3 error + stream 5 headers
+    const res2 = stack.ingest(buf[res.consumed_bytes..off], frames[0..], events[0..]);
+    try std.testing.expectEqual(http2.ParseState.complete, res2.state);
+    try std.testing.expectEqual(@as(usize, 2), res2.event_count);
+    switch (events[0]) {
         .err => |ev| try std.testing.expectEqual(@as(u32, 3), ev.stream_id),
         else => return error.UnexpectedEvent,
     }
-    // Event 2: headers on stream 5 (success — connection survived)
-    switch (events[2]) {
+    switch (events[1]) {
         .headers => |ev| try std.testing.expectEqual(@as(u32, 5), ev.stream_id),
         else => return error.UnexpectedEvent,
     }

@@ -1,9 +1,11 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const request = @import("../protocol/request.zig");
 const response = @import("../response/response.zig");
 const middleware = @import("middleware.zig");
 const net = @import("../runtime/net.zig");
 const clock = @import("../runtime/clock.zig");
+const ffi = if (build_options.enable_tls) @import("../tls/ffi.zig") else struct {};
 
 // ── Types ──────────────────────────────────────────────────────
 
@@ -494,15 +496,45 @@ fn evaluateForwardAuth(req: request.RequestView, cfg: ForwardAuthConfig) AuthRes
 
     pos += (std.fmt.bufPrint(req_buf[pos..], "Connection: close\r\n\r\n", .{}) catch return .{ .reject = UNAUTHORIZED }).len;
 
-    net.sendAll(fd, req_buf[0..pos]) catch return .{ .reject = UNAUTHORIZED };
-
     var resp_buf: [4096]u8 = undefined;
     var total_read: usize = 0;
-    while (total_read < resp_buf.len) {
-        const n = net.recvBlocking(fd, resp_buf[total_read..]) catch break;
-        if (n == 0) break;
-        total_read += n;
-        if (std.mem.indexOf(u8, resp_buf[0..total_read], "\r\n\r\n") != null) break;
+
+    if (parsed.is_tls and build_options.enable_tls) {
+        const ctx = ffi.SSL_CTX_new(ffi.TLS_client_method()) orelse return .{ .reject = UNAUTHORIZED };
+        defer ffi.SSL_CTX_free(ctx);
+        ffi.loadDefaultVerifyPaths(ctx) catch return .{ .reject = UNAUTHORIZED };
+        ffi.setVerifyPeer(ctx, true);
+
+        const ssl = ffi.SSL_new(ctx) orelse return .{ .reject = UNAUTHORIZED };
+        defer ffi.SSL_free(ssl);
+
+        var host_z: [253:0]u8 = undefined;
+        if (parsed.host.len >= host_z.len) return .{ .reject = UNAUTHORIZED };
+        @memcpy(host_z[0..parsed.host.len], parsed.host);
+        host_z[parsed.host.len] = 0;
+        const host_sentinel: [:0]const u8 = host_z[0..parsed.host.len :0];
+        if (!ffi.setHostnameVerification(ssl, host_sentinel)) return .{ .reject = UNAUTHORIZED };
+        if (!ffi.setSniHostname(ssl, host_sentinel)) return .{ .reject = UNAUTHORIZED };
+
+        if (ffi.SSL_set_fd(ssl, @intCast(fd)) != 1) return .{ .reject = UNAUTHORIZED };
+        if (ffi.SSL_connect(ssl) != 1) return .{ .reject = UNAUTHORIZED };
+        defer _ = ffi.SSL_shutdown(ssl);
+
+        sslWriteAll(ssl, req_buf[0..pos]) catch return .{ .reject = UNAUTHORIZED };
+        while (total_read < resp_buf.len) {
+            const n = ffi.SSL_read(ssl, resp_buf[total_read..].ptr, @intCast(resp_buf.len - total_read));
+            if (n <= 0) break;
+            total_read += @intCast(n);
+            if (std.mem.indexOf(u8, resp_buf[0..total_read], "\r\n\r\n") != null) break;
+        }
+    } else {
+        net.sendAll(fd, req_buf[0..pos]) catch return .{ .reject = UNAUTHORIZED };
+        while (total_read < resp_buf.len) {
+            const n = net.recvBlocking(fd, resp_buf[total_read..]) catch break;
+            if (n == 0) break;
+            total_read += n;
+            if (std.mem.indexOf(u8, resp_buf[0..total_read], "\r\n\r\n") != null) break;
+        }
     }
 
     if (total_read == 0) return .{ .reject = UNAUTHORIZED };
@@ -527,15 +559,26 @@ fn evaluateForwardAuth(req: request.RequestView, cfg: ForwardAuthConfig) AuthRes
     return .{ .allow = info };
 }
 
-fn parseUrl(url: []const u8, host_buf: []u8, path_buf: []u8) ?struct { host: []const u8, port: u16, path: []const u8 } {
+fn sslWriteAll(ssl: *ffi.SSL, data: []const u8) !void {
+    var sent: usize = 0;
+    while (sent < data.len) {
+        const n = ffi.SSL_write(ssl, data[sent..].ptr, @intCast(data.len - sent));
+        if (n <= 0) return error.TlsSendFailed;
+        sent += @intCast(n);
+    }
+}
+
+fn parseUrl(url: []const u8, host_buf: []u8, path_buf: []u8) ?struct { host: []const u8, port: u16, path: []const u8, is_tls: bool } {
     var remaining = url;
     var default_port: u16 = 80;
+    var is_tls = false;
 
     if (std.mem.startsWith(u8, remaining, "http://")) {
         remaining = remaining[7..];
     } else if (std.mem.startsWith(u8, remaining, "https://")) {
         remaining = remaining[8..];
         default_port = 443;
+        is_tls = true;
     }
 
     const path_start = std.mem.indexOfScalar(u8, remaining, '/') orelse remaining.len;
@@ -551,12 +594,12 @@ fn parseUrl(url: []const u8, host_buf: []u8, path_buf: []u8) ?struct { host: []c
         const port = std.fmt.parseInt(u16, port_str, 10) catch return null;
         if (host.len > host_buf.len) return null;
         @memcpy(host_buf[0..host.len], host);
-        return .{ .host = host_buf[0..host.len], .port = port, .path = path_buf[0..path.len] };
+        return .{ .host = host_buf[0..host.len], .port = port, .path = path_buf[0..path.len], .is_tls = is_tls };
     }
 
     if (host_part.len > host_buf.len) return null;
     @memcpy(host_buf[0..host_part.len], host_part);
-    return .{ .host = host_buf[0..host_part.len], .port = default_port, .path = path_buf[0..path.len] };
+    return .{ .host = host_buf[0..host_part.len], .port = default_port, .path = path_buf[0..path.len], .is_tls = is_tls };
 }
 
 fn parseResponseStatus(data: []const u8) ?u16 {

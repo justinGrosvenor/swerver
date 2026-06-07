@@ -794,6 +794,9 @@ pub fn initBodyAccumulation(
     conn.read_buffer = server.io.acquireBuffer() orelse {
         conn.read_buffer = accum.original_read_buffer;
         accum.original_read_buffer = null;
+        for (0..accum.buffer_count) |i| {
+            server.io.releaseBodyBuffer(accum.body_buffers[i]);
+        }
         server.allocator.destroy(accum);
         conn.body_accum = null;
         return error.OutOfMemory;

@@ -283,7 +283,7 @@ fn parseHeadersInternal(_bytes: []u8, _limits: Limits) HeaderParseResult {
         .content_length = content_length,
         .is_chunked = is_chunked,
         .keep_alive = keep_alive,
-        .expect_continue = expect_continue and content_length > 0,
+        .expect_continue = expect_continue and (content_length > 0 or is_chunked),
         .headers_consumed = headers_consumed,
     };
 }
@@ -713,7 +713,7 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
             .error_code = .none,
             .consumed_bytes = 0,
             .keep_alive = keep_alive,
-            .expect_continue = expect_continue and content_length > 0,
+            .expect_continue = expect_continue and (content_length > 0 or is_chunked),
         };
     }
     const headers = _limits.headers_storage[0..header_count];

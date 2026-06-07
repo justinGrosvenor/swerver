@@ -63,23 +63,32 @@ pub fn pollAdmin(server: *Server) void {
     setTimeouts(client);
 
     var req_buf: [MAX_REQUEST]u8 = undefined;
-    const n = std.posix.read(client, &req_buf) catch return;
-    if (n == 0) return;
+    var total_read: usize = 0;
+    while (total_read < req_buf.len) {
+        const n = std.posix.read(client, req_buf[total_read..]) catch break;
+        if (n == 0) break;
+        total_read += n;
+        if (std.mem.indexOf(u8, req_buf[0..total_read], "\r\n\r\n")) |hdr_end| {
+            const cl = findContentLength(req_buf[0..hdr_end]);
+            if (total_read >= hdr_end + 4 + cl) break;
+        }
+    }
+    if (total_read == 0) return;
 
-    const req = parseHttpRequest(req_buf[0..n]) orelse {
+    const req = parseHttpRequest(req_buf[0..total_read]) orelse {
         _ = writeHttpResponse(client, 400, "{\"error\":\"bad request\"}");
         return;
     };
 
     if (server.cfg.admin.api_key.len > 0) {
-        if (!checkApiKey(req.headers_start, req.headers_end, req_buf[0..n], server.cfg.admin.api_key)) {
+        if (!checkApiKey(req.headers_start, req.headers_end, req_buf[0..total_read], server.cfg.admin.api_key)) {
             _ = writeHttpResponse(client, 401, "{\"error\":\"unauthorized\"}");
             return;
         }
     }
 
     var resp_buf: [MAX_RESPONSE]u8 = undefined;
-    const result = dispatch(server, req.method, req.path, req.body(req_buf[0..n]), &resp_buf);
+    const result = dispatch(server, req.method, req.path, req.body(req_buf[0..total_read]), &resp_buf);
     _ = writeHttpResponse(client, result.status, result.body);
 }
 
@@ -503,6 +512,21 @@ const ParsedRequest = struct {
         return raw[self.body_start..];
     }
 };
+
+fn findContentLength(headers: []const u8) usize {
+    var i: usize = 0;
+    while (i < headers.len) {
+        const line_end = std.mem.indexOfPos(u8, headers, i, "\r\n") orelse break;
+        const line = headers[i..line_end];
+        if (line.len > 16 and (line[0] == 'C' or line[0] == 'c')) {
+            if (std.ascii.eqlIgnoreCase(line[0..16], "content-length: ")) {
+                return std.fmt.parseInt(usize, line[16..], 10) catch 0;
+            }
+        }
+        i = line_end + 2;
+    }
+    return 0;
+}
 
 fn parseHttpRequest(raw: []const u8) ?ParsedRequest {
     const line_end = std.mem.indexOf(u8, raw, "\r\n") orelse return null;
