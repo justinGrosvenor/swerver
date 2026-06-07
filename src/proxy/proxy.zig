@@ -384,8 +384,6 @@ pub const Proxy = struct {
         const upstream_def = self.upstreams_by_name.get(effective_upstream) orelse {
             return .{ .resp = forward.createErrorResponse(502), .proxy = self };
         };
-        _ = upstream_def;
-
         // Get balancer and pool
         const bal = self.balancers.get(effective_upstream) orelse {
             return .{ .resp = forward.createErrorResponse(502), .proxy = self };
@@ -453,10 +451,11 @@ pub const Proxy = struct {
                     return .{ .resp = forward.createErrorResponse(503), .proxy = self };
                 };
 
-                const fd = net.connectBlocking(
+                const fd = net.proxyConnect(
                     connect_server.address,
                     connect_server.port,
                     route.timeouts.connect_ms,
+                    upstream_def.allow_private,
                 ) catch {
                     // Connect failed — mark server failure
                     if (selection) |s| {
@@ -634,7 +633,6 @@ pub const Proxy = struct {
         const upstream_def_b = self.upstreams_by_name.get(effective_upstream_b) orelse {
             return .{ .resp = forward.createErrorResponse(502), .proxy = self };
         };
-        _ = upstream_def_b;
 
         // Get balancer and pool
         const bal = self.balancers.get(effective_upstream_b) orelse {
@@ -696,10 +694,11 @@ pub const Proxy = struct {
                     return .{ .resp = forward.createErrorResponse(503), .proxy = self };
                 };
 
-                const fd = net.connectBlocking(
+                const fd = net.proxyConnect(
                     connect_server_b.address,
                     connect_server_b.port,
                     route.timeouts.connect_ms,
+                    upstream_def_b.allow_private,
                 ) catch {
                     if (selection) |s| {
                         if (s.server_index < pool.server_failures.len) {
@@ -888,10 +887,11 @@ pub const Proxy = struct {
         now_ms: u64,
     ) void {
         const bal_m = self.balancers.get(mirror_name) orelse return;
+        const upstream_m = self.upstreams_by_name.get(mirror_name) orelse return;
         const selection = bal_m.select(null, now_ms) orelse return;
         const server_m = selection.server;
 
-        const fd = net.connectBlocking(server_m.address, server_m.port, 500) catch return;
+        const fd = net.proxyConnect(server_m.address, server_m.port, 500, upstream_m.allow_private) catch return;
         defer clock.closeFd(fd);
 
         const dummy_route = upstream.ProxyRoute{

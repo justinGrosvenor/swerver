@@ -1402,6 +1402,10 @@ fn setupWebSocketTunnel(
     client_ip: ?[]const u8,
 ) void {
     const effective_upstream = matched_route.selectUpstream();
+    const upstream_def = proxy.upstreams_by_name.get(effective_upstream) orelse {
+        http1_mod.queueResponse(server, conn, ws_mod.errorResp(502)) catch {};
+        return;
+    };
     const bal = proxy.balancers.get(effective_upstream) orelse {
         http1_mod.queueResponse(server, conn, ws_mod.errorResp(502)) catch {};
         return;
@@ -1413,7 +1417,7 @@ fn setupWebSocketTunnel(
     };
 
     var resp_buf: [4096]u8 = undefined;
-    const result = ws_mod.performUpgrade(req, selection.server.address, selection.server.port, matched_route, client_ip, &resp_buf);
+    const result = ws_mod.performUpgrade(req, selection.server.address, selection.server.port, matched_route, client_ip, &resp_buf, upstream_def.allow_private);
 
     switch (result) {
         .err => |resp| {

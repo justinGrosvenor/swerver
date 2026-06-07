@@ -788,7 +788,7 @@ pub fn initBodyAccumulation(
 
     // Retain original read buffer (header slices point into it) and acquire a fresh one.
     // This prevents subsequent body reads from overwriting the header data.
-    const accum = conn.body_accum orelse unreachable;
+    const accum = conn.body_accum orelse return error.InvalidState;
     accum.original_read_buffer = conn.read_buffer;
     conn.read_buffer = server.io.acquireBuffer() orelse {
         conn.read_buffer = accum.original_read_buffer;

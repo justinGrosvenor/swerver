@@ -4,7 +4,7 @@
 
 <h1 align="center">swerver</h1>
 
-<p align="center">A zero-copy, zero-allocation HTTP server written in pure Zig.</p>
+<p align="center">A bare metal HTTP server written in pure Zig.</p>
 
 ```
 HTTP/1.1 ──┐
@@ -15,51 +15,11 @@ HTTP/3   ──┘      │
 
 > **Alpha release.** The public library API in `src/lib.zig` will change between alpha versions as it's iterated on. Breaking changes are announced in release notes. See [Known limitations](#known-limitations) for what's in and out of scope for the current release.
 
-## Why
+## What
 
-Because the fastest memory operation is the one you don't do.
+Swerver is a bare-metal HTTP/1.1 + HTTP/2 + HTTP/3 server. It holds **#1 on JSON-over-TLS** on HttpArena's 64-core benchmark (1.95M req/s) and runs top-tier across baseline, pipelined, HTTP/2, and HTTP/3, carrying a full middleware chain, TLS termination, and routing.
 
-Swerver processes HTTP requests using fixed-size buffer pools and stack-allocated parsing. No garbage collection. No hidden allocations. No surprises.
-
-## Features
-
-| Feature | Status |
-|---------|--------|
-| HTTP/1.1 with keep-alive | ✓ |
-| HTTP/2 with HPACK compression | ✓ |
-| HTTP/3 over QUIC | ✓ |
-| Zero-copy request parsing | ✓ |
-| Fixed-size buffer pools | ✓ |
-| Backpressure handling | ✓ |
-| kqueue (macOS/BSD) | ✓ |
-| epoll (Linux) | ✓ |
-| io_uring backend (Linux) | ✓ |
-| TLS 1.3 (via OpenSSL/BoringSSL) | ✓ |
-| SNI multi-certificate TLS | ✓ |
-| mTLS client certificate verification | ✓ |
-| Reverse proxy (load balancing, health checks) | ✓ |
-| WebSocket proxy | ✓ |
-| gRPC-aware proxy | ✓ |
-| Response caching (LRU) | ✓ |
-| Response compression (gzip/deflate) | ✓ |
-| Traffic splitting (canary/blue-green) | ✓ |
-| Traffic mirroring (shadow testing) | ✓ |
-| DNS / Consul service discovery | ✓ |
-| Admin API (runtime route management) | ✓ |
-| SIGHUP hot reload (routes + upstreams) | ✓ |
-| API key / JWT authentication | ✓ |
-| Forward-auth proxy | ✓ |
-| Request body validation (JSON Schema) | ✓ |
-| OpenTelemetry trace export | ✓ |
-| Multi-worker (fork + SO_REUSEPORT) | ✓ |
-| JSON config file (`--config`) | ✓ |
-| Access logging (combined/JSON) | ✓ |
-| Static file serving (sendfile) | ✓ |
-| Prometheus metrics (`/metrics`) | ✓ |
-| Health probes (`/.healthz`, `/.ready`) | ✓ |
-| Rate limiting (per-IP / per-consumer) | ✓ |
-| Security headers (HSTS, CSP, CORS) | ✓ |
-| x402 payment protocol | ✓ |
+Fixed-size buffer pools. Stack-allocated parsing. No garbage collection. No hidden allocations. No surprises.
 
 ## Quick Start
 
@@ -67,14 +27,14 @@ Swerver processes HTTP requests using fixed-size buffer pools and stack-allocate
 # Build
 zig build
 
+# Build with TLS + HTTP/2 + HTTP/3
+zig build -Denable-tls=true -Denable-http2=true -Denable-http3=true
+
 # Run
 zig build run
 
 # Run with a config file
 zig build run -- --config config.json
-
-# Run with HTTP/3 enabled
-zig build -Denable-http3=true -Denable-tls=true run
 
 # Test
 zig build test
@@ -92,7 +52,7 @@ The server listens on `0.0.0.0:8080` by default.
 
 ### Build from source
 
-The canonical install path, and currently the only way to get a binary with TLS / HTTP/2 / HTTP/3 enabled. Requires Zig `0.16.0` (stable) and OpenSSL 3.5+.
+Requires Zig `0.16.0` (stable). OpenSSL 3.5+ for TLS/HTTP/2/HTTP/3.
 
 ```bash
 git clone https://github.com/justinGrosvenor/swerver.git
@@ -106,12 +66,12 @@ zig build -Doptimize=ReleaseFast -Denable-tls=true -Denable-http2=true -Denable-
 Tagged alpha releases publish cross-compiled binaries for linux-{x86_64, aarch64} and macos-{x86_64, aarch64} on the [Releases page](https://github.com/justinGrosvenor/swerver/releases). Download, extract, and run:
 
 ```bash
-curl -LO https://github.com/justinGrosvenor/swerver/releases/download/v0.1.0-alpha.7/swerver-v0.1.0-alpha.7-linux-x86_64.tar.gz
-tar -xzf swerver-v0.1.0-alpha.7-linux-x86_64.tar.gz
-./swerver-v0.1.0-alpha.7-linux-x86_64 --config config.json
+curl -LO https://github.com/justinGrosvenor/swerver/releases/download/v0.1.0-alpha.12/swerver-v0.1.0-alpha.12-linux-x86_64.tar.gz
+tar -xzf swerver-v0.1.0-alpha.12-linux-x86_64.tar.gz
+./swerver-v0.1.0-alpha.12-linux-x86_64 --config config.json
 ```
 
-> **Release binaries are built without TLS, HTTP/2, or HTTP/3.** OpenSSL linking requires the host toolchain, so the cross-compiled binaries ship as HTTP/1.1-only. If you need HTTPS / HTTP/2 / HTTP/3 support, build from source (above) or use the Docker image (below). A future release may split the matrix into TLS and no-TLS variants.
+> **Release binaries are built without TLS, HTTP/2, or HTTP/3.** OpenSSL linking requires the host toolchain, so the cross-compiled binaries ship as HTTP/1.1-only. Build from source or use the Docker image for full protocol support.
 
 ### Docker
 
@@ -129,7 +89,7 @@ In your downstream project's `build.zig.zon`:
     .version = "0.1.0",
     .dependencies = .{
         .swerver = .{
-            .url = "https://github.com/justinGrosvenor/swerver/archive/refs/tags/v0.1.0-alpha.7.tar.gz",
+            .url = "https://github.com/justinGrosvenor/swerver/archive/refs/tags/v0.1.0-alpha.12.tar.gz",
             // .hash will be filled in by `zig fetch --save`
         },
     },
@@ -153,37 +113,43 @@ In your application code:
 const std = @import("std");
 const swerver = @import("swerver");
 
-fn handleHello(ctx: *swerver.router.HandlerContext) swerver.response.Response {
-    _ = ctx;
-    return .{
-        .status = 200,
-        .headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
-        .body = .{ .bytes = "Hello, World!\n" },
-    };
+const AppState = struct { greeting: []const u8 };
+
+fn hello(ctx: *swerver.router.HandlerContext) swerver.response.Response {
+    const state = ctx.state(AppState);
+    return ctx.text(200, state.greeting);
+}
+
+fn echo(ctx: *swerver.router.HandlerContext) swerver.response.Response {
+    var builder = ctx.respond() catch return ctx.text(503, "No buffers available");
+    defer ctx.releaseBuilder(&builder);
+    return builder.json(200, ctx.request.body.sliceOrNull() orelse "") catch
+        ctx.text(500, "Response buffer full");
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
 
-    var app_router = swerver.router.Router.init(.{
-        .require_payment = false,
-        .payment_required_b64 = "",
-    });
-    try app_router.get("/hello", handleHello);
+    var state = AppState{ .greeting = "hello, galaxy" };
 
-    var builder = swerver.ServerBuilder.configDefault().router(app_router);
-    const srv = try builder.build(allocator);
-    defer {
-        srv.deinit();
-        allocator.destroy(srv);
-    }
-    try srv.run(null);
+    var router = swerver.router.Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+    var api = router.group("/api");
+    try api.get("/hello", hello);
+    try api.post("/echo", echo);
+
+    var server = try swerver.ServerBuilder
+        .configDefault()
+        .router(router)
+        .withState(&state)
+        .build(gpa.allocator());
+    defer server.deinit();
+
+    try server.run(null);
 }
 ```
 
-See `examples/embedded/` for a complete, compiling example.
+See `examples/embedded/` and `examples/gateway/` for complete, compiling examples.
 
 ## Architecture
 
@@ -373,14 +339,16 @@ pub const Decision = union(enum) {
 
 ## Build Options
 
-| Flag | Description |
-|------|-------------|
-| `-Denable-tls=true` | Enable TLS 1.3 support |
-| `-Denable-http2=true` | Enable HTTP/2 support |
-| `-Denable-http3=true` | Enable HTTP/3 over QUIC |
-| `-Denable-proxy=true` | Enable reverse proxy |
-| `-Denable-io-uring=true` | Enable io_uring backend (Linux) |
-| `-Doptimize=ReleaseFast` | Maximum performance |
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-Denable-tls` | false | TLS 1.3 support (requires OpenSSL) |
+| `-Denable-http2` | false | HTTP/2 support |
+| `-Denable-http3` | false | HTTP/3 over QUIC |
+| `-Denable-proxy` | false | Reverse proxy |
+| `-Denable-io-uring` | false | io_uring backend (Linux) |
+| `-Denable-compression` | false | Response compression (requires zlib) |
+| `-Denable-x402-crypto` | false | x402 local signature verification (secp256k1) |
+| `-Doptimize=ReleaseFast` | | Maximum performance |
 
 ## Requirements
 
@@ -388,31 +356,64 @@ pub const Decision = union(enum) {
 - OpenSSL 3.5+ (for TLS / HTTP/2 / HTTP/3)
 - macOS or Linux
 
-## Performance
+## Benchmarks
 
-### Local sanity check (wrk, single process, macOS Apple Silicon)
+[HttpArena](https://www.http-arena.com/) leaderboard (64-core dedicated hardware, same Docker-compose environment for every framework):
 
-These are reproducible laptop numbers for people checking the repo out. They're not the authoritative competitive benchmark — see the HttpArena submission for that.
+| Test | Conns | Requests/sec | |
+|---|---:|---:|---|
+| **json-tls** (TLS + JSON serialize) | 4096 | **1,950,310** | **#1** |
+| baseline (HTTP/1.1 plaintext) | 4096 | 3,664,110 | |
+| pipelined (HTTP/1.1) | 4096 | 24,907,762 | |
+| limited-conn (connection churn) | 4096 | 2,556,130 | |
+| json (HTTP/1.1) | 4096 | 2,366,920 | |
+| static file serving | 6800 | 1,197,205 | |
+| baseline (HTTP/2) | 1024 | 2,267,290 | |
+| baseline (HTTP/3) | 64 | 872,911 | |
 
-| Endpoint | Connections | Requests/sec | Avg Latency | Transfer/sec |
-|----------|------------|-------------|-------------|--------------|
-| GET /health | 100 | **274,617** | 328us | 19.6 MB/s |
-| GET /echo | 50 | **264,698** | 163us | 31.1 MB/s |
-| GET /plaintext | 100 | **285,606** | 321us | 31.3 MB/s |
-| GET /json | 100 | **267,543** | 335us | 34.5 MB/s |
-| GET /blob (1MB) | 50 | **6,811** | 7.35ms | 6.65 GB/s |
+Zero errors at 64-core saturation. ~222us average latency on limited-conn.
 
-### HttpArena leaderboard
+**A note on "fastest":** on raw HTTP/1.1 microbenchmarks (plaintext baseline, pipelined, limited-conn), feature-stripped reference servers edge swerver by 1-2%. Neither implements TLS, HTTP/2, or HTTP/3, so neither appears on json-tls, baseline-h2, or baseline-h3. Swerver is the fastest server that does the full job: three protocols, TLS termination, routing, and a complete middleware chain.
 
-Swerver is submitted to [HttpArena's](https://www.http-arena.com/) engine-tier cohort, which runs every framework in the same Docker-compose environment on the same 64-core hardware with the same wrk/gcannon/oha harness. See the HttpArena leaderboard for the current state.
+## Features
 
-### Microbenchmarks
-
-```
-zig build bench
-buffer_pool acquire/release: 21 ns/op
-connection_pool acquire/release: 30 ns/op
-```
+| Feature | Status |
+|---------|--------|
+| HTTP/1.1 with keep-alive | ✓ |
+| HTTP/2 with HPACK compression | ✓ |
+| HTTP/3 over QUIC | ✓ |
+| Zero-copy request parsing | ✓ |
+| Fixed-size buffer pools | ✓ |
+| Backpressure handling | ✓ |
+| kqueue (macOS/BSD) | ✓ |
+| epoll (Linux) | ✓ |
+| io_uring backend (Linux) | ✓ |
+| TLS 1.3 (via OpenSSL/BoringSSL) | ✓ |
+| SNI multi-certificate TLS | ✓ |
+| mTLS client certificate verification | ✓ |
+| Reverse proxy (load balancing, health checks) | ✓ |
+| WebSocket proxy | ✓ |
+| gRPC-aware proxy | ✓ |
+| Response caching (LRU) | ✓ |
+| Response compression (gzip/deflate) | ✓ |
+| Traffic splitting (canary/blue-green) | ✓ |
+| Traffic mirroring (shadow testing) | ✓ |
+| DNS / Consul service discovery | ✓ |
+| Admin API (runtime route management) | ✓ |
+| SIGHUP hot reload (routes + upstreams) | ✓ |
+| API key / JWT authentication | ✓ |
+| Forward-auth proxy | ✓ |
+| Request body validation (JSON Schema) | ✓ |
+| OpenTelemetry trace export | ✓ |
+| Multi-worker (fork + SO_REUSEPORT) | ✓ |
+| JSON config file (`--config`) | ✓ |
+| Access logging (combined/JSON) | ✓ |
+| Static file serving (sendfile) | ✓ |
+| Prometheus metrics (`/metrics`) | ✓ |
+| Health probes (`/.healthz`, `/.ready`) | ✓ |
+| Rate limiting (per-IP / per-consumer) | ✓ |
+| Security headers (HSTS, CSP, CORS) | ✓ |
+| x402 payment protocol | ✓ |
 
 ## Known limitations
 
@@ -423,9 +424,15 @@ Forward-looking notes about API stability and feature scope. **These are not kno
 - **Platform support is Linux and macOS only.** Windows is cross-compile-only — no IOCP backend, no sendfile. On the long-term roadmap but not part of the alpha.
 - **Full QUIC 0-RTT / early data is not implemented.** The handshake works and post-handshake throughput is competitive; 0-RTT adds replay protection and per-session token storage that are deferred to a later release.
 
+## Roadmap
+
+- **Alpha iteration:** public API refinement based on feedback, HttpArena re-submissions across kernel/hardware variation, expanded examples.
+- **Beta:** API surface frozen, PostgreSQL-backed REST benchmark added to HttpArena, long-form operational documentation.
+- **1.0:** WebSocket server support, full QUIC 0-RTT / early data, security audit, stable C ABI for embedding in non-Zig programs, Windows support.
+
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow, build options, test matrix, and repo-specific style conventions. Security issues go through [SECURITY.md](SECURITY.md) — please don't open public issues for vulnerabilities.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow, build options, test matrix, and repo-specific style conventions. Security issues go through [SECURITY.md](SECURITY.md) - please don't open public issues for vulnerabilities.
 
 ## License
 

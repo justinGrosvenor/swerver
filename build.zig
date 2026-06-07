@@ -5,7 +5,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const enable_tls = b.option(bool, "enable-tls", "Enable TLS support") orelse true;
+    const enable_tls = b.option(bool, "enable-tls", "Enable TLS support") orelse false;
     const enable_http2 = b.option(bool, "enable-http2", "Enable HTTP/2 support") orelse false;
     const enable_http3 = b.option(bool, "enable-http3", "Enable HTTP/3 support") orelse false;
     const enable_proxy = b.option(bool, "enable-proxy", "Enable reverse proxy support") orelse false;
@@ -70,6 +70,10 @@ pub fn build(b: *std.Build) void {
 
     const options_tls = makeOptions(b, .{ .enable_tls = true });
     const test_tls = addTestVariant(b, target, optimize, swerver_module, options_tls);
+    if (is_native) {
+        test_tls.root_module.linkSystemLibrary("ssl", .{});
+        test_tls.root_module.linkSystemLibrary("crypto", .{});
+    }
     const test_tls_run = b.addRunArtifact(test_tls);
 
     const options_http2 = makeOptions(b, .{ .enable_http2 = true });
@@ -78,6 +82,10 @@ pub fn build(b: *std.Build) void {
 
     const options_http3 = makeOptions(b, .{ .enable_tls = true, .enable_http3 = true });
     const test_http3 = addTestVariant(b, target, optimize, swerver_module, options_http3);
+    if (is_native) {
+        test_http3.root_module.linkSystemLibrary("ssl", .{});
+        test_http3.root_module.linkSystemLibrary("crypto", .{});
+    }
     const test_http3_run = b.addRunArtifact(test_http3);
 
     const options_proxy = makeOptions(b, .{ .enable_proxy = true });
@@ -95,6 +103,10 @@ pub fn build(b: *std.Build) void {
 
     const options_all = makeOptions(b, .{ .enable_tls = true, .enable_http2 = true, .enable_http3 = true, .enable_proxy = true, .enable_io_uring = true, .enable_x402_crypto = true });
     const test_all = addTestVariant(b, target, optimize, swerver_module, options_all);
+    if (is_native) {
+        test_all.root_module.linkSystemLibrary("ssl", .{});
+        test_all.root_module.linkSystemLibrary("crypto", .{});
+    }
     const test_all_run = b.addRunArtifact(test_all);
 
     const test_matrix = b.step("test-matrix", "Run unit tests across build flag combinations");

@@ -258,6 +258,7 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
             .connection_pool = pool_config,
             .dns_discovery = dns_discovery,
             .consul_discovery = consul_discovery,
+            .allow_private = u.allow_private orelse true,
         };
     }
 
@@ -645,6 +646,7 @@ const UpstreamJson = struct {
     connection_pool: ?PoolConfigJson = null,
     dns_discovery: ?DnsDiscoveryJson = null,
     consul_discovery: ?ConsulDiscoveryJson = null,
+    allow_private: ?bool = null,
 };
 
 const DnsDiscoveryJson = struct {
