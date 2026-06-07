@@ -22,7 +22,7 @@ pub const ServerConfig = struct {
     /// Number of worker processes. 1 = single-process (no fork). 0 = auto-detect CPU count.
     workers: u16 = 1,
     /// Max connections per IP address. 0 = unlimited.
-    per_ip_limit: u16 = 0,
+    per_ip_limit: u16 = 100,
     /// Graceful shutdown drain timeout in milliseconds.
     drain_timeout_ms: u32 = 30_000,
     /// Disable security headers, metrics, and access logging middleware.
