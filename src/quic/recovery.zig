@@ -89,7 +89,12 @@ pub const RttEstimator = struct {
 
     /// Get PTO (Probe Timeout) duration
     pub fn getPto(self: *const RttEstimator) u64 {
-        return self.smoothed_rtt + @max(4 * self.rttvar, Constants.granularity_ms * std.time.ns_per_ms) + self.max_ack_delay;
+        return self.getPtoForSpace(true);
+    }
+
+    /// Get PTO with optional max_ack_delay (omit for Initial/Handshake spaces per RFC 9002 §6.2.1)
+    pub fn getPtoForSpace(self: *const RttEstimator, include_ack_delay: bool) u64 {
+        return self.smoothed_rtt + @max(4 * self.rttvar, Constants.granularity_ms * std.time.ns_per_ms) + if (include_ack_delay) self.max_ack_delay else 0;
     }
 
     /// Get loss delay threshold
@@ -146,6 +151,8 @@ pub const Recovery = struct {
     bytes_in_flight: usize = 0,
     /// Packets lost callback
     lost_packets: std.ArrayList(SentPacket) = .empty,
+    /// Set on OOM during loss detection — caller should tear down connection
+    has_oom: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) Recovery {
         return Recovery{
@@ -266,7 +273,10 @@ pub const Recovery = struct {
                 if (pkt.in_flight) {
                     self.bytes_in_flight -|= pkt.size;
                 }
-                self.lost_packets.append(self.allocator, pkt.*) catch {};
+                self.lost_packets.append(self.allocator, pkt.*) catch {
+                    self.has_oom = true;
+                    return;
+                };
                 continue;
             }
 
@@ -276,7 +286,10 @@ pub const Recovery = struct {
                 if (pkt.in_flight) {
                     self.bytes_in_flight -|= pkt.size;
                 }
-                self.lost_packets.append(self.allocator, pkt.*) catch {};
+                self.lost_packets.append(self.allocator, pkt.*) catch {
+                    self.has_oom = true;
+                    return;
+                };
                 continue;
             }
 

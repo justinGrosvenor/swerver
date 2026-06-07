@@ -263,6 +263,8 @@ pub const RouteRateLimit = struct {
 
 const MAX_CONSUMER_BUCKETS = 4096;
 
+/// Hash-only key — equality is by hash, not original string. Collisions cause two
+/// consumers to share a rate-limit bucket (conservative: may throttle earlier).
 const ConsumerKey = struct {
     hash_val: u64,
 

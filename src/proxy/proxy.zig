@@ -186,7 +186,12 @@ pub const Proxy = struct {
 
         // Initialize per-route response caches
         const route_caches = try allocator.alloc(?cache_mod.ResponseCache, config.routes.len);
-        errdefer allocator.free(route_caches);
+        errdefer {
+            for (route_caches) |*rc| {
+                if (rc.*) |*c| c.deinit();
+            }
+            allocator.free(route_caches);
+        }
         for (config.routes, 0..) |route, i| {
             if (route.cache) |cc| {
                 route_caches[i] = cache_mod.ResponseCache.init(allocator, cc.max_entries) catch null;
@@ -280,6 +285,10 @@ pub const Proxy = struct {
             if (rc.*) |*c| c.deinit();
         }
         self.allocator.free(self.route_caches);
+        for (self.route_x402_policies) |policy| {
+            if (policy.payment_required_b64.len > 0) self.allocator.free(policy.payment_required_b64);
+            if (policy.payment_required_json.len > 0) self.allocator.free(policy.payment_required_json);
+        }
         self.allocator.free(self.route_x402_policies);
         self.allocator.free(self.route_facilitators);
         self.allocator.free(self.free_request_stack);
@@ -877,6 +886,7 @@ pub const Proxy = struct {
         return &servers[consul_rr_counter % servers.len];
     }
 
+    /// Per-worker (single event loop thread) — safe because each worker is a separate process.
     threadlocal var mirror_req_buf: [REQUEST_BUF_SIZE]u8 = undefined;
 
     fn fireMirror(

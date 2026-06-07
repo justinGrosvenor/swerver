@@ -276,20 +276,21 @@ pub const HealthChecker = struct {
         return true;
     }
 
-    /// Get health state for a server
-    pub fn getServerHealth(self: *const HealthChecker, server_index: usize) ?*const ServerHealth {
-        if (server_index >= self.server_health.len) return null;
-        return &self.server_health[server_index];
+    /// Get published health state for a server (safe for cross-thread reads)
+    pub fn getServerHealthState(self: *const HealthChecker, server_index: usize) ?HealthState {
+        if (server_index >= self.published_states.len) return null;
+        return @enumFromInt(self.published_states[server_index].load(.acquire));
     }
 
-    /// Get overall upstream health status
+    /// Get overall upstream health status (safe for cross-thread reads via atomics)
     pub fn getUpstreamStatus(self: *const HealthChecker) UpstreamStatus {
         var healthy_count: u16 = 0;
         var unhealthy_count: u16 = 0;
         var unknown_count: u16 = 0;
 
-        for (self.server_health) |health| {
-            switch (health.state) {
+        for (0..self.published_states.len) |i| {
+            const state: HealthState = @enumFromInt(self.published_states[i].load(.acquire));
+            switch (state) {
                 .healthy => healthy_count += 1,
                 .unhealthy => unhealthy_count += 1,
                 .unknown => unknown_count += 1,
@@ -297,7 +298,7 @@ pub const HealthChecker = struct {
         }
 
         return .{
-            .total_servers = @intCast(self.server_health.len),
+            .total_servers = @intCast(self.published_states.len),
             .healthy = healthy_count,
             .unhealthy = unhealthy_count,
             .unknown = unknown_count,

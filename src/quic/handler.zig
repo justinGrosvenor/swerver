@@ -953,7 +953,7 @@ fn buildHandshakePacket(out: []u8, opts: BuildPacketOptions) Error!BuildPacketRe
             largest,
             ranges.first_range,
             additional,
-            0,
+            0, // TODO: compute real ack_delay from packet receive timestamps
         ) catch return Error.HandshakeFailed;
         off += acked;
     }
@@ -1112,7 +1112,7 @@ pub fn buildShortPacket(out: []u8, opts: BuildShortPacketOptions) Error!BuildPac
             largest,
             ranges.first_range,
             additional,
-            0,
+            0, // TODO: compute real ack_delay from packet receive timestamps
         ) catch return Error.HandshakeFailed;
         off += acked;
     }
