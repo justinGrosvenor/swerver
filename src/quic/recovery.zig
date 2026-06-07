@@ -62,11 +62,12 @@ pub const RttEstimator = struct {
             self.min_rtt = rtt_sample;
         }
 
-        // Adjust for ACK delay (only for application data)
+        // RFC 9002 §5.3: clamp ack_delay to max_ack_delay
         var adjusted_rtt = rtt_sample;
-        if (!is_handshake and ack_delay <= self.max_ack_delay) {
-            if (rtt_sample > self.min_rtt + ack_delay) {
-                adjusted_rtt = rtt_sample - ack_delay;
+        if (!is_handshake) {
+            const clamped_delay = @min(ack_delay, self.max_ack_delay);
+            if (rtt_sample > self.min_rtt + clamped_delay) {
+                adjusted_rtt = rtt_sample - clamped_delay;
             }
         }
 

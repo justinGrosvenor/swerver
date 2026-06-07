@@ -276,7 +276,7 @@ pub fn configFromProxyRoute(proxy_x402: anytype, allocator: std.mem.Allocator, u
     };
 }
 
-var reject_402_headers: [2]response.Header = undefined;
+threadlocal var reject_402_headers: [2]response.Header = undefined;
 
 pub fn rejectWith(reason: RejectReason, policy: RoutePaymentConfig) RejectInfo {
     const status: u16 = switch (reason) {

@@ -9,18 +9,6 @@ const clock = @import("../runtime/clock.zig");
 /// Implements token bucket rate limiting per IP address.
 /// Zero heap allocations using fixed-size bucket storage.
 
-const SpinMutex = struct {
-    state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
-
-    fn lock(self: *SpinMutex) void {
-        while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {}
-    }
-
-    fn unlock(self: *SpinMutex) void {
-        self.state.store(0, .release);
-    }
-};
-
 /// Maximum number of tracked IPs
 const MAX_TRACKED_IPS = 4096;
 
@@ -119,7 +107,7 @@ const BucketEntry = struct {
 };
 
 /// Rate limiter with fixed-size bucket storage.
-/// Thread-safe via mutex for concurrent access from multiple event loops.
+/// Single-threaded: accessed only from the per-process reactor.
 pub const RateLimiter = struct {
     /// Bucket entries (fixed size, LRU eviction)
     entries: [MAX_TRACKED_IPS]BucketEntry,
@@ -127,7 +115,6 @@ pub const RateLimiter = struct {
     count: usize,
     /// Configuration
     config: Config,
-    mutex: SpinMutex = .{},
 
     pub const Config = struct {
         /// Maximum requests per second per IP
@@ -165,8 +152,7 @@ pub const RateLimiter = struct {
     pub fn check(self: *RateLimiter, ip: IpKey) bool {
         if (!self.config.enabled) return true;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+
         const entry = self.getOrCreateBucket(ip);
         return entry.bucket.tryConsume(1);
     }
@@ -175,8 +161,7 @@ pub const RateLimiter = struct {
     pub fn checkWeighted(self: *RateLimiter, ip: IpKey, weight: u32) bool {
         if (!self.config.enabled) return true;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+
         const entry = self.getOrCreateBucket(ip);
         return entry.bucket.tryConsume(weight);
     }
@@ -233,8 +218,7 @@ pub const RateLimiter = struct {
     pub fn checkAndGetInfo(self: *RateLimiter, ip: IpKey) ?RateLimitInfo {
         if (!self.config.enabled) return null;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+
         const entry = self.getOrCreateBucket(ip);
         if (entry.bucket.tryConsume(1)) return null;
         const ms = entry.bucket.timeUntilToken();
@@ -246,8 +230,7 @@ pub const RateLimiter = struct {
 
     /// Get retry-after header value in seconds
     pub fn getRetryAfter(self: *RateLimiter, ip: IpKey) u64 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+
         for (&self.entries) |*entry| {
             if (entry.active and entry.key.eql(ip)) {
                 return (entry.bucket.timeUntilToken() + 999) / 1000;
@@ -258,8 +241,7 @@ pub const RateLimiter = struct {
 
     /// Get time until next token is available in milliseconds (for backpressure)
     pub fn getTimeUntilToken(self: *RateLimiter, ip: IpKey) u64 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+
         for (&self.entries) |*entry| {
             if (entry.active and entry.key.eql(ip)) {
                 return entry.bucket.timeUntilToken();
@@ -307,7 +289,6 @@ const ConsumerBucketEntry = struct {
 pub const ConsumerRateLimiter = struct {
     entries: [MAX_CONSUMER_BUCKETS]ConsumerBucketEntry,
     count: usize,
-    mutex: SpinMutex = .{},
 
     pub fn init() ConsumerRateLimiter {
         @setEvalBranchQuota(MAX_CONSUMER_BUCKETS * 8);
@@ -327,8 +308,7 @@ pub const ConsumerRateLimiter = struct {
         rps: u32,
         burst: u32,
     ) CheckResult {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+
 
         const entry = self.getOrCreate(key, burst, rps);
         const remaining = entry.bucket.tokens;
