@@ -776,6 +776,7 @@ pub fn initBodyAccumulation(
     }
 
     server.io.setTimeoutPhase(conn, .body);
+    conn.phase_enter_ms = server.now_ms;
 
     // Seed with any body bytes already in the read buffer after headers
     const start = conn.read_offset;
@@ -952,14 +953,18 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
                 conn.x402 = .none;
                 const reject_info = x402_mod.rejectWith(.facilitator_rejected, x402_policy);
                 cleanupBodyAccumulation(server, conn);
-                queueResponse(server, conn, reject_info.resp) catch {};
+                queueResponse(server, conn, reject_info.resp) catch {
+                    conn.close_after_write = true;
+                };
                 return;
             } else {
                 x402_result = x402_mod.evaluateWithFacilitator(hparse.view, x402_policy, null);
                 switch (x402_result) {
                     .reject => |info| {
                         cleanupBodyAccumulation(server, conn);
-                        queueResponse(server, conn, info.resp) catch {};
+                        queueResponse(server, conn, info.resp) catch {
+                            conn.close_after_write = true;
+                        };
                         return;
                     },
                     .allow => |ctx| {
@@ -1002,7 +1007,9 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
                 .allow => {},
                 .reject => |resp| {
                     cleanupBodyAccumulation(server, conn);
-                    queueResponse(server, conn, resp) catch {};
+                    queueResponse(server, conn, resp) catch {
+                        conn.close_after_write = true;
+                    };
                     return;
                 },
             }
@@ -1025,7 +1032,9 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
                 if (ratelimit_mod.evaluateRoute(consumer, client_key, rl_cfg)) |rl_resp| {
                     conn.setRateLimitPause(server.now_ms, rl_resp.pause_ms);
                     cleanupBodyAccumulation(server, conn);
-                    queueResponse(server, conn, rl_resp.resp) catch {};
+                    queueResponse(server, conn, rl_resp.resp) catch {
+                        conn.close_after_write = true;
+                    };
                     return;
                 }
             }
@@ -1042,7 +1051,9 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
                             .headers = &json_ct,
                             .body = .{ .bytes = err_json },
                         };
-                        queueResponse(server, conn, resp) catch {};
+                        queueResponse(server, conn, resp) catch {
+                            conn.close_after_write = true;
+                        };
                         return;
                     }
                 }
@@ -1158,7 +1169,9 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
     }
 
     cleanupBodyAccumulation(server, conn);
-    queueResponse(server, conn, result.resp) catch {};
+    queueResponse(server, conn, result.resp) catch {
+        conn.close_after_write = true;
+    };
     if (server.otel) |otel_exp| {
         otel_exp.recordSpan(req_view.method, req_view.path, result.resp.status, otel_start, clock.realtimeNanos() orelse 0);
     }
@@ -1180,7 +1193,9 @@ pub fn dispatchToRouter(server: *Server, conn: *connection.Connection, req_view:
             .status = 200,
             .headers = &[_]response_mod.Header{},
             .body = .none,
-        }) catch {};
+        }) catch {
+            conn.close_after_write = true;
+        };
         return;
     }
     // RFC 9110 §9.3.6: CONNECT is for tunneling — reject without a proxy
@@ -1229,7 +1244,9 @@ pub fn dispatchToRouter(server: *Server, conn: *connection.Connection, req_view:
     if (result.pause_reads_ms) |pause_ms| {
         conn.setRateLimitPause(server.now_ms, pause_ms);
     }
-    queueResponse(server, conn, result.resp) catch {};
+    queueResponse(server, conn, result.resp) catch {
+        conn.close_after_write = true;
+    };
     if (server.otel) |otel_exp| {
         otel_exp.recordSpan(req_view.method, req_view.path, result.resp.status, otel_start, clock.realtimeNanos() orelse 0);
     }

@@ -30,6 +30,8 @@ pub const SettlementConfig = struct {
 };
 
 var queue: [QUEUE_SIZE]Record = undefined;
+// Reactor-thread-only: enqueue() and flush() are both called from the
+// single-threaded event loop.  No synchronization needed.
 var head: usize = 0;
 var tail: usize = 0;
 var count: usize = 0;

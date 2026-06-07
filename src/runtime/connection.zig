@@ -162,6 +162,7 @@ pub const Connection = struct {
     fd: ?std.posix.fd_t,
     state_enter_ms: u64,
     last_active_ms: u64,
+    phase_enter_ms: u64,
     read_offset: usize,
     read_buffered_bytes: usize,
     write_buffered_bytes: usize,
@@ -264,6 +265,7 @@ pub const Connection = struct {
             .fd = null,
             .state_enter_ms = 0,
             .last_active_ms = 0,
+            .phase_enter_ms = 0,
             .read_offset = 0,
             .read_buffered_bytes = 0,
             .write_buffered_bytes = 0,
@@ -310,6 +312,7 @@ pub const Connection = struct {
         self.fd = null;
         self.state_enter_ms = now_ms;
         self.last_active_ms = now_ms;
+        self.phase_enter_ms = now_ms;
         self.read_offset = 0;
         self.read_buffered_bytes = 0;
         self.write_buffered_bytes = 0;
@@ -407,14 +410,21 @@ pub const Connection = struct {
     }
 
     pub fn isTimedOut(self: *Connection, now_ms: u64, phase: TimeoutPhase, timeouts: config.Timeouts) bool {
-        if (now_ms <= self.last_active_ms) return false;
-        const elapsed = now_ms - self.last_active_ms;
-        return switch (phase) {
-            .idle => elapsed >= timeouts.idle_ms,
-            .header => elapsed >= timeouts.header_ms,
-            .body => elapsed >= timeouts.body_ms,
-            .write => elapsed >= timeouts.write_ms,
+        const phase_timeout: u64 = switch (phase) {
+            .idle => timeouts.idle_ms,
+            .header => timeouts.header_ms,
+            .body => timeouts.body_ms,
+            .write => timeouts.write_ms,
         };
+        if (now_ms > self.last_active_ms and (now_ms - self.last_active_ms) >= phase_timeout)
+            return true;
+        // Absolute phase deadline: 3x the phase timeout from when the phase
+        // started, regardless of activity resets (slowloris mitigation).
+        // Idle phase is excluded — long-lived keep-alive connections are valid.
+        if (phase != .idle and self.phase_enter_ms > 0 and now_ms > self.phase_enter_ms) {
+            if ((now_ms - self.phase_enter_ms) >= phase_timeout * 3) return true;
+        }
+        return false;
     }
 
     pub fn canRead(self: *Connection, backpressure: config.Backpressure, now_ms: u64) bool {

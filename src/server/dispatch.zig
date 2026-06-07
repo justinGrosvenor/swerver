@@ -543,7 +543,10 @@ pub fn handleRead(server: *Server, index: u32) !void {
         return;
     }
 
-    if (conn.timeout_phase == .idle) server.io.setTimeoutPhase(conn, .header);
+    if (conn.timeout_phase == .idle) {
+        server.io.setTimeoutPhase(conn, .header);
+        conn.phase_enter_ms = server.now_ms;
+    }
     const buffer_handle = conn.read_buffer orelse return;
 
     // If we're accumulating a large body, continue that instead of parsing.
@@ -1182,6 +1185,8 @@ pub fn handleRead(server: *Server, index: u32) !void {
                     if (want_receipt and packHeldResponse(server, conn, proxy_result.resp)) {
                         if (x402_client.submit(settle_entry)) {
                             conn.x402 = .settle_pending;
+                            server.io.setTimeoutPhase(conn, .write);
+                            conn.phase_enter_ms = server.now_ms;
                             conn.markActive(server.now_ms);
                             if (conn.read_buffered_bytes == 0) break;
                             continue;
@@ -1403,16 +1408,22 @@ fn setupWebSocketTunnel(
 ) void {
     const effective_upstream = matched_route.selectUpstream();
     const upstream_def = proxy.upstreams_by_name.get(effective_upstream) orelse {
-        http1_mod.queueResponse(server, conn, ws_mod.errorResp(502)) catch {};
+        http1_mod.queueResponse(server, conn, ws_mod.errorResp(502)) catch {
+            conn.close_after_write = true;
+        };
         return;
     };
     const bal = proxy.balancers.get(effective_upstream) orelse {
-        http1_mod.queueResponse(server, conn, ws_mod.errorResp(502)) catch {};
+        http1_mod.queueResponse(server, conn, ws_mod.errorResp(502)) catch {
+            conn.close_after_write = true;
+        };
         return;
     };
 
     const selection = bal.select(null, server.now_ms) orelse {
-        http1_mod.queueResponse(server, conn, ws_mod.errorResp(502)) catch {};
+        http1_mod.queueResponse(server, conn, ws_mod.errorResp(502)) catch {
+            conn.close_after_write = true;
+        };
         return;
     };
 
@@ -1421,7 +1432,9 @@ fn setupWebSocketTunnel(
 
     switch (result) {
         .err => |resp| {
-            http1_mod.queueResponse(server, conn, resp) catch {};
+            http1_mod.queueResponse(server, conn, resp) catch {
+                conn.close_after_write = true;
+            };
         },
         .ok => |info| {
             const upstream_fd = info.upstream_fd;
@@ -1430,6 +1443,7 @@ fn setupWebSocketTunnel(
             // Queue the raw 101 response to the client
             const write_handle = server.io.acquireBuffer() orelse {
                 clock.closeFd(upstream_fd);
+                conn.close_after_write = true;
                 return;
             };
             const copy_len = @min(raw_101.len, write_handle.bytes.len);
@@ -2023,7 +2037,9 @@ fn resumeSettlePark(server: *Server, conn: *connection.Connection, result: *cons
         .headers = held_headers[0..hdr_idx],
         .body = .{ .bytes = body },
     };
-    http1_mod.queueResponse(server, conn, resp) catch {};
+    http1_mod.queueResponse(server, conn, resp) catch {
+        conn.close_after_write = true;
+    };
     // Materialize pending_body before releasing the held buffer
     if (conn.pending_body.len > 0) {
         http1_mod.materializePendingBody(server, conn);

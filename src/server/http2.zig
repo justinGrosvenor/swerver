@@ -848,9 +848,17 @@ fn accumulateH2Body(server: *Server, conn: *connection.Connection, data_ev: http
             }
             const buf = slot.body_handle.?.bytes;
             const avail = buf.len - slot.body_len;
-            const to_copy = @min(data_ev.data.len, avail);
-            @memcpy(buf[slot.body_len .. slot.body_len + to_copy], data_ev.data[0..to_copy]);
-            slot.body_len += to_copy;
+            if (data_ev.data.len > avail) {
+                sendRstStream(server, conn, data_ev.stream_id, 0x3);
+                slot.active = false;
+                if (slot.body_handle) |bh| {
+                    if (slot.body_is_body_pool) server.io.releaseBodyBuffer(bh) else server.io.releaseBuffer(bh);
+                    slot.body_handle = null;
+                }
+                return;
+            }
+            @memcpy(buf[slot.body_len .. slot.body_len + data_ev.data.len], data_ev.data);
+            slot.body_len += data_ev.data.len;
             return;
         }
     }
