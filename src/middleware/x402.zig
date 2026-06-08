@@ -64,10 +64,11 @@ pub const Extra = struct {
 
 /// Per-process replay guard: time-windowed hash table keyed on payment header hash.
 /// Prevents the same payment header from being reused within max_timeout_seconds.
+/// Note: per-process (not shared across workers), so effective capacity scales with worker count.
 const ReplayGuard = struct {
-    const SLOTS = 8192;
+    const SLOTS = 65536;
     const MASK = SLOTS - 1;
-    const PROBE_LIMIT = 4;
+    const PROBE_LIMIT = 8;
 
     const Entry = struct { hash: u64 = 0, expiry_ms: u64 = 0 };
 

@@ -42,7 +42,8 @@ const preencoded = @import("preencoded.zig");
 const write_queue = @import("write_queue.zig");
 
 pub fn matchesHttp2Preface(candidate: []const u8) bool {
-    const n = if (candidate.len < http2.Preface.len) candidate.len else http2.Preface.len;
+    if (candidate.len == 0) return false;
+    const n = @min(candidate.len, http2.Preface.len);
     return std.mem.eql(u8, candidate[0..n], http2.Preface[0..n]);
 }
 
@@ -842,7 +843,11 @@ fn accumulateH2Body(server: *Server, conn: *connection.Connection, data_ev: http
     for (pending) |*slot| {
         if (slot.active and slot.stream_id == data_ev.stream_id) {
             if (slot.body_handle == null) {
-                slot.body_handle = server.io.acquireBodyBuffer() orelse return;
+                slot.body_handle = server.io.acquireBodyBuffer() orelse {
+                    sendRstStream(server, conn, data_ev.stream_id, 0x7);
+                    slot.active = false;
+                    return;
+                };
                 slot.body_len = 0;
                 slot.body_is_body_pool = true;
             }

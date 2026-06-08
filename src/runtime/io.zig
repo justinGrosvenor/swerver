@@ -278,7 +278,7 @@ pub const IoRuntime = struct {
     }
 
     pub const TimeoutResult = struct {
-        to_close: [64]u32 = undefined,
+        to_close: [256]u32 = undefined,
         count: usize = 0,
     };
 

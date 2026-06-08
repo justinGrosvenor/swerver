@@ -52,14 +52,19 @@ pub const BufferPool = struct {
     }
 
     pub fn release(self: *BufferPool, handle: BufferHandle) void {
-        std.debug.assert(handle.index < self.buffer_count);
-        // Detect double-release: buffer must be in acquired state
+        if (handle.index >= self.buffer_count) {
+            std.log.err("BufferPool: release of invalid buffer index {}", .{handle.index});
+            return;
+        }
         if (!self.acquired[handle.index]) {
             std.log.err("BufferPool: double-release of buffer index {}", .{handle.index});
             return;
         }
         self.acquired[handle.index] = false;
-        std.debug.assert(self.free_len < self.free_stack.len);
+        if (self.free_len >= self.free_stack.len) {
+            std.log.err("BufferPool: free stack overflow on release of index {}", .{handle.index});
+            return;
+        }
         self.free_stack[self.free_len] = handle.index;
         self.free_len += 1;
     }

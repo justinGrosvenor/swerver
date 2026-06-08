@@ -72,6 +72,7 @@ const SETTLE_RETRY_NS: u64 = 1_000_000_000;
 
 pub var settle_fail_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 var spill_fd: i32 = -1;
+pub var worker_id: u16 = 0;
 
 pub fn start() void {
     if (thread_handle != null) return;
@@ -123,7 +124,7 @@ pub fn spillSettle(gateway_id: []const u8, network: []const u8, asset: []const u
     const fd = spill_fd;
     if (fd < 0) return;
     var buf: [1024]u8 = undefined;
-    const line = std.fmt.bufPrint(&buf, "{{\"gateway_id\":\"{s}\",\"network\":\"{s}\",\"asset\":\"{s}\",\"amount\":\"{s}\",\"error\":\"{s}\"}}\n", .{ gateway_id, network, asset, amount, err_reason }) catch return;
+    const line = std.fmt.bufPrint(&buf, "{{\"worker\":{d},\"gateway_id\":\"{s}\",\"network\":\"{s}\",\"asset\":\"{s}\",\"amount\":\"{s}\",\"error\":\"{s}\"}}\n", .{ worker_id, gateway_id, network, asset, amount, err_reason }) catch return;
     _ = std.c.write(fd, line.ptr, line.len);
 }
 

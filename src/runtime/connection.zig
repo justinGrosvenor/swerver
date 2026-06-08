@@ -244,6 +244,8 @@ pub const Connection = struct {
     async_send_total_bytes: usize = 0,
     /// WebSocket tunnel: index of the peer connection (client↔upstream).
     tunnel_peer_index: ?u32 = null,
+    /// WebSocket tunnel: generation ID of the peer connection for stale-reference detection.
+    tunnel_peer_id: u64 = 0,
     /// True when this connection is in bidirectional tunnel mode (WebSocket).
     is_tunnel: bool = false,
     /// Async x402 facilitator verify state (H1 only — H2/H3 needs per-stream state).

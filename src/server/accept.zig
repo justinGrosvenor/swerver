@@ -33,6 +33,10 @@ const server_tls = @import("tls.zig");
 const IP_TRACKER_SLOTS = 4096;
 const DEFAULT_PER_IP_LIMIT: u16 = 256;
 
+/// Per-worker IP connection tracker. Each forked worker process has its own instance,
+/// so the effective per-IP limit is multiplied by the number of workers.
+/// Keys are IP hashes — collisions cause two IPs to share a counter (conservative: may
+/// deny earlier than configured, but never allows more than the limit).
 pub const IpConnTracker = struct {
     keys: [IP_TRACKER_SLOTS]u64 = [_]u64{0} ** IP_TRACKER_SLOTS,
     counts: [IP_TRACKER_SLOTS]u16 = [_]u16{0} ** IP_TRACKER_SLOTS,
@@ -49,7 +53,7 @@ pub const IpConnTracker = struct {
     }
 
     pub fn increment(self: *IpConnTracker, hash: u64, limit: u16) bool {
-        const idx = self.slot(hash) orelse return true;
+        const idx = self.slot(hash) orelse return false;
         if (self.keys[idx] == 0) {
             self.keys[idx] = hash;
             self.counts[idx] = 1;

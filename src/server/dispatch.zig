@@ -1351,7 +1351,7 @@ fn handleTunnelRead(server: *Server, conn: *connection.Connection) void {
         closeTunnel(server, conn);
         return;
     };
-    if (!peer.is_tunnel or peer.fd == null) {
+    if (!peer.is_tunnel or peer.fd == null or peer.id != conn.tunnel_peer_id) {
         closeTunnel(server, conn);
         return;
     }
@@ -1464,6 +1464,7 @@ fn setupWebSocketTunnel(
             upstream_conn.state = .active;
             upstream_conn.is_tunnel = true;
             upstream_conn.tunnel_peer_index = conn.index;
+            upstream_conn.tunnel_peer_id = conn.id;
             upstream_conn.is_tls = false;
 
             // Give upstream connection a read buffer
@@ -1499,6 +1500,7 @@ fn setupWebSocketTunnel(
             // Mark client connection as tunnel
             conn.is_tunnel = true;
             conn.tunnel_peer_index = upstream_conn.index;
+            conn.tunnel_peer_id = upstream_conn.id;
 
             // Consume all buffered data from client read (the HTTP request)
             server.io.onReadConsumed(conn, conn.read_buffered_bytes);

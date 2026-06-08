@@ -350,7 +350,17 @@ fn sendHttp3ResponseFromResponse(
         sendHttp3ResponseBytes(server, udp_fd, conn, stream_id, peer_addr, encoded_response_buf[0..resp_len]);
     } else {
         const needed = body_len + HEADER_OVERHEAD;
-        const heap_buf = server.allocator.alloc(u8, needed) catch return;
+        const heap_buf = server.allocator.alloc(u8, needed) catch {
+            var err_buf: [256]u8 = undefined;
+            const err_len = conn.encodeHttp3Response(
+                &err_buf,
+                500,
+                @ptrCast(&[0]request.Header{}),
+                null,
+            ) catch return;
+            sendHttp3ResponseBytes(server, udp_fd, conn, stream_id, peer_addr, err_buf[0..err_len]);
+            return;
+        };
         defer server.allocator.free(heap_buf);
         const resp_len = conn.encodeHttp3Response(
             heap_buf,
@@ -412,10 +422,9 @@ fn sendStreamData(
 
     while (remaining.len > 0) {
         if (!conn.canSendPacket(GSO_SEGMENT_SIZE)) {
-            // Congestion window full — buffer for later.
+            if (conn.pending_send != null) return;
             const copy = conn.allocator.alloc(u8, remaining.len) catch return;
             @memcpy(copy, remaining);
-            if (conn.pending_send) |*old| old.deinit();
             conn.pending_send = .{
                 .stream_id = stream_id,
                 .data = copy,

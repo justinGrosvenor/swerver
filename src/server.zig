@@ -830,6 +830,19 @@ pub const Server = struct {
     }
 
     pub fn closeConnection(self: *Server, conn: *connection.Connection) void {
+        if (conn.is_tunnel) {
+            if (conn.tunnel_peer_index) |pi| {
+                conn.tunnel_peer_index = null;
+                conn.is_tunnel = false;
+                if (self.io.getConnection(pi)) |peer| {
+                    if (peer.is_tunnel and peer.tunnel_peer_id == conn.id) {
+                        peer.tunnel_peer_index = null;
+                        peer.is_tunnel = false;
+                        peer.close_after_write = true;
+                    }
+                }
+            }
+        }
         if (conn.ip_hash != 0) {
             accept_mod.ip_tracker.decrement(conn.ip_hash);
             conn.ip_hash = 0;

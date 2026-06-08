@@ -277,6 +277,7 @@ const Stream = struct {
     end_stream_pending: bool,
     saw_headers: bool,
     saw_data: bool,
+    saw_trailers: bool,
     continuation_count: u16,
 
     fn reset(self: *Stream, id: u32, initial_recv_window: i32) void {
@@ -289,6 +290,7 @@ const Stream = struct {
         self.end_stream_pending = false;
         self.saw_headers = false;
         self.saw_data = false;
+        self.saw_trailers = false;
         self.continuation_count = 0;
     }
 };
@@ -376,11 +378,12 @@ pub const HpackDecoder = struct {
                 const name_index = try decodeInt(block, &idx, 6);
                 const name = if (name_index == 0) try decodeString(self, block, &idx) else (self.lookup(name_index) orelse return error.InvalidIndex).name;
                 const value = try decodeString(self, block, &idx);
-                try appendHeader(.request, name, value, out_headers, &out_count, &total_size, max_header_list_size, &saw_regular, &method, &path, &authority, null, &scheme);
                 self.addEntry(name, value);
+                try appendHeader(.request, name, value, out_headers, &out_count, &total_size, max_header_list_size, &saw_regular, &method, &path, &authority, null, &scheme);
                 continue;
             }
             if ((b & 0x20) != 0) {
+                if (out_count > 0) return error.Protocol;
                 const new_size = try decodeInt(block, &idx, 5);
                 self.setMaxSize(new_size);
                 continue;
@@ -432,11 +435,12 @@ pub const HpackDecoder = struct {
                 const name_index = try decodeInt(block, &idx, 6);
                 const name = if (name_index == 0) try decodeString(self, block, &idx) else (self.lookup(name_index) orelse return error.InvalidIndex).name;
                 const value = try decodeString(self, block, &idx);
-                try appendHeader(.response, name, value, out_headers, &out_count, &total_size, max_header_list_size, &saw_regular, null, null, null, &status, null);
                 self.addEntry(name, value);
+                try appendHeader(.response, name, value, out_headers, &out_count, &total_size, max_header_list_size, &saw_regular, null, null, null, &status, null);
                 continue;
             }
             if ((b & 0x20) != 0) {
+                if (out_count > 0) return error.Protocol;
                 const new_size = try decodeInt(block, &idx, 5);
                 self.setMaxSize(new_size);
                 continue;
@@ -794,11 +798,16 @@ pub const Stack = struct {
         }
         const base = parsed.consumed_bytes - total_frame_bytes;
         var consumed: usize = base;
+        var saw_headers_event = false;
         for (frames[0..parsed.frame_count]) |frame| {
             if (event_count >= events.len) break;
+            if (saw_headers_event and (frame.header.typ == .headers or frame.header.typ == .continuation)) break;
             const handle = self.handleFrame(frame, events[event_count..]);
             switch (handle.state) {
                 .complete => {
+                    if (handle.event_count > 0 and events[event_count] == .headers) {
+                        saw_headers_event = true;
+                    }
                     consumed = frameConsumed(consumed, frame);
                     event_count += handle.event_count;
                 },
@@ -1095,7 +1104,19 @@ pub const Stack = struct {
 
     fn handleWindowUpdate(self: *Stack, frame: Frame, events: []Event) FrameHandle {
         if (frame.payload.len != 4) return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
-        const increment = parseWindowIncrement(frame.payload) orelse return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
+        const increment = parseWindowIncrement(frame.payload) orelse {
+            if (frame.header.stream_id == 0) {
+                return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
+            }
+            const stream = self.findStream(frame.header.stream_id) orelse
+                return .{ .state = .complete, .error_code = .none, .event_count = 0 };
+            stream.state = .closed;
+            if (events.len > 0) {
+                events[0] = .{ .err = .{ .stream_id = frame.header.stream_id, .code = .protocol_error } };
+                return .{ .state = .stream_err, .error_code = .none, .event_count = 1 };
+            }
+            return .{ .state = .stream_err, .error_code = .none, .event_count = 0 };
+        };
         const max_window: i32 = 0x7FFF_FFFF; // 2^31-1 per RFC 7540
         if (frame.header.stream_id == 0) {
             const was_blocked = self.conn_send_window <= 0;
@@ -1134,6 +1155,7 @@ pub const Stack = struct {
         _ = events;
         if (frame.payload.len != 4) return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
         if (frame.header.stream_id == 0) return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
+        if (frame.header.stream_id > self.last_stream_id) return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
         const stream = self.findStream(frame.header.stream_id) orelse
             return .{ .state = .complete, .error_code = .none, .event_count = 0 };
         stream.state = .closed;
@@ -1337,7 +1359,8 @@ pub const Stack = struct {
     }
 
     fn decodeHeaders(self: *Stack, stream: *Stream) !HeaderBlockResult {
-        if (stream.saw_headers and !stream.saw_data) return error.Protocol;
+        if (stream.saw_headers and stream.saw_trailers) return error.Protocol;
+        if (stream.saw_headers) stream.saw_trailers = true;
         stream.saw_headers = true;
         const result = try self.decoder.decodeRequestBlock(self.header_block[0..stream.header_block_len], self.headers_storage[0..], self.max_header_list_size);
         stream.header_block_len = 0;
@@ -1565,7 +1588,7 @@ fn validateLength(typ: FrameType, flags: u8, payload: []const u8) bool {
         .settings => if ((flags & 0x1) != 0) payload.len == 0 else payload.len % 6 == 0,
         .priority => payload.len == 5,
         .rst_stream => payload.len == 4,
-        .window_update => if (payload.len != 4) false else parseWindowIncrement(payload) != null,
+        .window_update => payload.len == 4,
         .goaway => payload.len >= 8,
         else => true,
     };
