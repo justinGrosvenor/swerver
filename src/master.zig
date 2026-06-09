@@ -5,6 +5,7 @@ const ServerBuilder = @import("server_builder.zig").ServerBuilder;
 const router = @import("router/router.zig");
 const clock = @import("runtime/clock.zig");
 const proxy_mod = @import("proxy/proxy.zig");
+const x402_client = @import("middleware/x402_client.zig");
 
 const MAX_WORKERS = 256;
 
@@ -155,6 +156,8 @@ pub const Master = struct {
             // Child process
             resetChildSignals();
             worker_id_global = worker_id;
+            // Tag this worker's settlement spill lines with its id.
+            x402_client.worker_id = worker_id;
             pinWorkerCpu(worker_id);
 
             std.log.info("[w{d}] worker starting", .{worker_id});
