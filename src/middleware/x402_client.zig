@@ -74,6 +74,15 @@ pub var settle_fail_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0)
 var spill_fd: i32 = -1;
 pub var worker_id: u16 = 0;
 
+/// Spill file path and rotation cap. The file records lost settlements (lost
+/// revenue), so it is fsync'd per line and rotated rather than grown without
+/// bound.
+const SPILL_PATH = "settle-failures.jsonl";
+const SPILL_ROTATE_PATH = "settle-failures.jsonl.1";
+const SPILL_MAX_BYTES: u64 = 16 * 1024 * 1024;
+var spill_bytes: u64 = 0;
+var spill_mutex: std.Thread.Mutex = .{};
+
 pub fn start() void {
     if (thread_handle != null) return;
     shutdown_flag.store(false, .release);
@@ -81,7 +90,12 @@ pub fn start() void {
     request_tail.store(0, .release);
     result_head.store(0, .release);
     result_tail.store(0, .release);
-    spill_fd = std.posix.openat(std.posix.AT.FDCWD, "settle-failures.jsonl", .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644) catch -1;
+    // 0o600: the file holds financial metadata; keep it owner-only.
+    spill_fd = std.posix.openat(std.posix.AT.FDCWD, SPILL_PATH, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o600) catch -1;
+    if (spill_fd >= 0) {
+        const st = std.posix.fstat(spill_fd) catch null;
+        spill_bytes = if (st) |s| @intCast(@max(s.size, 0)) else 0;
+    }
     thread_handle = std.Thread.spawn(.{}, workerLoop, .{}) catch |err| {
         std.log.warn("x402_client: failed to spawn thread: {}", .{err});
         return;
@@ -121,11 +135,32 @@ pub fn pollResult() ?ResultEntry {
 /// Safe to call from any thread — O_APPEND writes under PIPE_BUF are atomic.
 pub fn spillSettle(gateway_id: []const u8, network: []const u8, asset: []const u8, amount: []const u8, err_reason: []const u8) void {
     _ = settle_fail_count.fetchAdd(1, .monotonic);
-    const fd = spill_fd;
-    if (fd < 0) return;
+    if (spill_fd < 0) return;
     var buf: [1024]u8 = undefined;
     const line = std.fmt.bufPrint(&buf, "{{\"worker\":{d},\"gateway_id\":\"{s}\",\"network\":\"{s}\",\"asset\":\"{s}\",\"amount\":\"{s}\",\"error\":\"{s}\"}}\n", .{ worker_id, gateway_id, network, asset, amount, err_reason }) catch return;
-    _ = std.c.write(fd, line.ptr, line.len);
+
+    // Serialize append + rotation; spillSettle may be called from the worker
+    // thread and the reactor (on queue-full drop).
+    spill_mutex.lock();
+    defer spill_mutex.unlock();
+    if (spill_fd < 0) return;
+
+    // Rotate when the cap is reached so the file never grows without bound.
+    if (spill_bytes + line.len > SPILL_MAX_BYTES) {
+        _ = std.c.rename(SPILL_PATH, SPILL_ROTATE_PATH);
+        clock.closeFd(spill_fd);
+        spill_fd = std.posix.openat(std.posix.AT.FDCWD, SPILL_PATH, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o600) catch -1;
+        spill_bytes = 0;
+        if (spill_fd < 0) return;
+    }
+
+    const written = std.c.write(spill_fd, line.ptr, line.len);
+    if (written > 0) {
+        spill_bytes += @intCast(written);
+        // Durability: this is a lost-revenue record, so flush to disk rather
+        // than risk losing it in the page cache on crash/power-loss.
+        _ = std.c.fsync(spill_fd);
+    }
 }
 
 fn dequeueRequest() ?RequestEntry {
