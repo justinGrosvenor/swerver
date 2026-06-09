@@ -134,6 +134,7 @@ const ssl = if (has_crypto) struct {
     extern fn BN_new() ?*BIGNUM;
     extern fn BN_free(bn: *BIGNUM) void;
     extern fn BN_bin2bn(s: [*]const u8, len: c_int, ret: ?*BIGNUM) ?*BIGNUM;
+    extern fn BN_cmp(a: *const BIGNUM, b: *const BIGNUM) c_int;
     extern fn BN_mod_inverse(r: ?*BIGNUM, a: *const BIGNUM, n: *const BIGNUM, ctx: *BN_CTX_T) ?*BIGNUM;
     extern fn BN_mod_mul(r: *BIGNUM, a: *const BIGNUM, b: *const BIGNUM, m: *const BIGNUM, ctx: *BN_CTX_T) c_int;
     extern fn BN_CTX_new() ?*BN_CTX_T;
@@ -172,6 +173,21 @@ pub fn ecrecover(msg_hash: [32]u8, sig: [65]u8) EcrecoverError![20]u8 {
     defer ssl.BN_free(r_bn);
     const s_bn = ssl.BN_bin2bn(s_bytes.ptr, 32, null) orelse return error.OpenSSLError;
     defer ssl.BN_free(s_bn);
+
+    // Enforce low-S (s <= n/2) to reject the malleated signature (r, n-s, v^1)
+    // of a valid (r, s, v). EIP-2 / BIP-62: a high-S signature is non-canonical.
+    // Without this, a replayed-but-mutated header recovers the same signer yet
+    // hashes differently, bypassing the per-process replay guard.
+    // secp256k1 n/2, big-endian.
+    const half_order_be = [_]u8{
+        0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0x5d, 0x57, 0x6e, 0x73, 0x57, 0xa4, 0x50, 0x1d,
+        0xdf, 0xe9, 0x2f, 0x46, 0x68, 0x1b, 0x20, 0xa0,
+    };
+    const half_order = ssl.BN_bin2bn(&half_order_be, 32, null) orelse return error.OpenSSLError;
+    defer ssl.BN_free(half_order);
+    if (ssl.BN_cmp(s_bn, half_order) > 0) return error.InvalidSignature;
     const e_bn = ssl.BN_bin2bn(&msg_hash, 32, null) orelse return error.OpenSSLError;
     defer ssl.BN_free(e_bn);
 
@@ -782,6 +798,18 @@ test "verifyPaymentSignature: rejects a wrong EIP-712 domain (chainId)" {
     var params = VEC_PARAMS;
     params.chain_id = 1;
     try std.testing.expect(!verifyPaymentSignature(VEC_ENVELOPE, params));
+}
+
+test "ecrecover: rejects high-S (non-canonical) signature" {
+    if (!has_crypto) return error.SkipZigTest;
+    var sig: [65]u8 = undefined;
+    // r = 1 (valid-shaped), s = 0xFF..FF which is > n/2 (high-S), v = 0.
+    @memset(sig[0..32], 0);
+    sig[31] = 1;
+    @memset(sig[32..64], 0xff);
+    sig[64] = 0;
+    const hash = [_]u8{0xab} ** 32;
+    try std.testing.expectError(error.InvalidSignature, ecrecover(hash, sig));
 }
 
 test "verifyPaymentSignature: rejects empty / malformed / missing fields" {
