@@ -699,6 +699,12 @@ fn isHttpResponseComplete(data: []const u8) bool {
 }
 
 pub fn buildSettleRequestJson(buf: []u8, payment_header: []const u8, policy: *const RoutePaymentConfig, charge_amount: []const u8) !usize {
+    // Intentional: the facilitator settles the full configured price
+    // (paymentRequirements.amount = policy.price), not the metered
+    // charge_amount. For the `upto` scheme the merchant captures the
+    // configured maximum, so the per-request charge is reported in the
+    // settlement report but NOT sent to /settle. Do not "fix" this to use
+    // charge_amount without changing the capture semantics.
     _ = charge_amount;
     var decode_buf: [8192]u8 = undefined;
     const max_decoded = std.base64.standard.Decoder.calcSizeUpperBound(payment_header.len) catch return error.BufferTooSmall;
