@@ -120,9 +120,16 @@ pub fn handleHttp2Read(server: *Server, conn: *connection.Connection) !void {
         // If we made no progress, we genuinely need more socket data.
         if (ingest.state == .partial and ingest.consumed_bytes == 0) return;
         if (ingest.state == .err) {
-            // RFC 9113 §5.4.1: Send GOAWAY before closing on connection error
+            // RFC 9113 §5.4.1: Send GOAWAY before closing on connection error,
+            // carrying the actual error code (e.g. ENHANCE_YOUR_CALM for the
+            // rapid-reset mitigation) so the peer learns why. Map internal
+            // sentinel codes that aren't valid on the wire to PROTOCOL_ERROR.
+            const wire_code: u32 = switch (ingest.error_code) {
+                .header_list_too_large, .invalid_preface => 0x01,
+                else => @intFromEnum(ingest.error_code),
+            };
             var goaway_buf: [17]u8 = undefined;
-            const goaway_len = http2.writeGoaway(&goaway_buf, stack.last_stream_id, 0x01) catch 0;
+            const goaway_len = http2.writeGoaway(&goaway_buf, stack.last_stream_id, wire_code) catch 0;
             if (goaway_len > 0) {
                 sendHttp2ControlFrame(server, conn, goaway_buf[0..goaway_len]);
             }
