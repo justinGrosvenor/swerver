@@ -762,7 +762,14 @@ pub const Stack = struct {
             .streams = undefined,
             .stream_count = 0,
             .last_stream_id = 0,
-            .conn_recv_window = @intCast(DefaultInitialWindow),
+            // Start the connection receive window at the configured size, the
+            // same value the server preface advertises via WINDOW_UPDATE.
+            // Starting at the 65535 default instead caused a double grant: the
+            // preface raised the peer's window to initial_window, then the
+            // first DATA frame (with conn_recv_window already below half)
+            // triggered the auto-refill and granted the difference a second
+            // time — advertising ~2x the configured window.
+            .conn_recv_window = initial_window,
             .initial_conn_window = initial_window,
             .initial_stream_window = initial_window,
             .conn_send_window = @intCast(DefaultInitialWindow),
@@ -1246,8 +1253,13 @@ pub const Stack = struct {
 
     fn applySetting(self: *Stack, id: u16, value: u32) !void {
         switch (id) {
-            // SETTINGS_HEADER_TABLE_SIZE (0x1)
-            0x1 => self.decoder.setMaxSize(value),
+            // SETTINGS_HEADER_TABLE_SIZE (0x1): the peer's value bounds the
+            // HPACK dynamic table that *our encoder* may use when sending to
+            // the peer, NOT our decoder. Our response encoder uses no dynamic
+            // table, so this is a no-op. (Previously this shrank our decoder,
+            // so a client advertising HEADER_TABLE_SIZE=0 while using dynamic
+            // indexing in its own requests would get a COMPRESSION_ERROR.)
+            0x1 => {},
             // SETTINGS_ENABLE_PUSH (0x2) - must be 0 or 1
             0x2 => {
                 if (value > 1) return error.InvalidSetting;
