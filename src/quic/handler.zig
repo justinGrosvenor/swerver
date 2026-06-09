@@ -20,6 +20,14 @@ const tls = @import("../tls/provider.zig");
 /// over-allocating on the stack for the common single-range case.
 const MAX_ACK_RANGES: usize = 32;
 
+/// Scratch buffer size for in-place packet decryption. A received datagram
+/// is delivered into at most a 16 KiB recv buffer (RECV_BUF_SIZE on the
+/// native io_uring backend; 2 KiB on the poll backend), so a single packet
+/// can never exceed this. The previous 64 KiB buffer reserved 4x the stack
+/// per received packet for no benefit; 16 KiB covers the maximum deliverable
+/// datagram. Oversized packets are rejected by the length guards below.
+const MAX_DATAGRAM_DECRYPT: usize = 16 * 1024;
+
 /// QUIC packet handler
 ///
 /// Processes incoming QUIC datagrams and produces responses.
@@ -366,7 +374,7 @@ pub const Handler = struct {
         if (packet_len > data.len) return Error.InvalidPacket;
 
         // Copy packet to mutable buffer for decryption
-        var decrypt_buf: [65536]u8 = undefined;
+        var decrypt_buf: [MAX_DATAGRAM_DECRYPT]u8 = undefined;
         if (packet_len > decrypt_buf.len) return Error.InvalidPacket;
         @memcpy(decrypt_buf[0..packet_len], data[0..packet_len]);
 
@@ -467,7 +475,7 @@ pub const Handler = struct {
         const pn_offset = 1 + header.dcid.len;
 
         // Copy packet to mutable buffer for decryption
-        var decrypt_buf: [65536]u8 = undefined;
+        var decrypt_buf: [MAX_DATAGRAM_DECRYPT]u8 = undefined;
         if (data.len > decrypt_buf.len) return Error.InvalidPacket;
         @memcpy(decrypt_buf[0..data.len], data);
 
