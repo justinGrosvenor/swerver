@@ -1314,6 +1314,17 @@ pub const Connection = struct {
     /// - Additional ranges: gap indicates unacked packets before next range
     pub fn processAckFrame(self: *Connection, ack: frame.AckFrame, space: types.PacketNumberSpace) void {
         const pn_space = self.getPacketSpace(space);
+
+        // RFC 9000 §13.1: an ACK for a packet number we never sent is a
+        // PROTOCOL_VIOLATION. Without this check a forged ACK with a huge
+        // largest_acked drives every in-flight packet into loss detection
+        // (spurious retransmits / congestion collapse) and poisons
+        // largest_acked. Highest sent pn in this space is next_pn - 1.
+        if (pn_space.next_pn == 0 or ack.largest_acked >= pn_space.next_pn) {
+            self.close(.protocol_violation, null);
+            return;
+        }
+
         pn_space.onAckReceived(ack.largest_acked);
 
         // Process first ACK range: [largest - first_range, largest]
@@ -1702,6 +1713,31 @@ test "connection state transitions" {
     // Close connection
     conn.close(.no_error, null);
     try std.testing.expectEqual(State.closing, conn.state);
+}
+
+test "processAckFrame rejects ACK for never-sent packet" {
+    const allocator = std.testing.allocator;
+    const dcid = types.ConnectionId.init(&[_]u8{ 0x01, 0x02, 0x03, 0x04 });
+    var conn = Connection.init(allocator, true, dcid);
+    defer conn.deinit();
+
+    // Send a couple of application packets: next_pn advances to 2, so the
+    // highest legitimately-acked pn is 1.
+    const space = conn.getPacketSpace(.application);
+    _ = space.allocatePacketNumber(); // pn 0
+    _ = space.allocatePacketNumber(); // pn 1
+
+    // A forged ACK claiming a huge largest_acked must be a protocol violation.
+    const bogus = frame.AckFrame{
+        .largest_acked = 1_000_000,
+        .ack_delay = 0,
+        .first_ack_range = 0,
+        .ranges = &.{},
+        .ecn = null,
+    };
+    conn.processAckFrame(bogus, .application);
+    try std.testing.expectEqual(State.closing, conn.state);
+    try std.testing.expectEqual(types.TransportError.protocol_violation, conn.close_error.?);
 }
 
 test "packet number space" {
