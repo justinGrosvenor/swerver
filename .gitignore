@@ -57,3 +57,4 @@ coverage/
 test_getaddrinfo
 .claude
 httparena/.local-test/
+FEATURE_REQUEST_settlement_reporting.md
