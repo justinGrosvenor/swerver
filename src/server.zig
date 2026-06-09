@@ -702,21 +702,58 @@ pub const Server = struct {
         }
     }
 
+    /// Connection-specific headers that are malformed in HTTP/3 (RFC 9114
+    /// §4.2). `te` is special-cased by the caller (allowed with "trailers").
+    fn isH3ForbiddenHeader(name: []const u8) bool {
+        const forbidden = [_][]const u8{ "connection", "keep-alive", "transfer-encoding", "upgrade", "proxy-connection", "te" };
+        for (forbidden) |f| {
+            if (std.ascii.eqlIgnoreCase(name, f)) return true;
+        }
+        return false;
+    }
+
     pub fn buildHttp3RequestView(req: http3.RequestReadyEvent, headers_out: []request.Header) ?request.RequestView {
         var method: ?[]const u8 = null;
         var path: ?[]const u8 = null;
         var authority: ?[]const u8 = null;
         var header_count: usize = 0;
         var saw_host = false;
+        var saw_regular = false;
 
         for (req.headers) |hdr| {
-            if (std.mem.eql(u8, hdr.name, ":method")) {
-                method = hdr.value;
-            } else if (std.mem.eql(u8, hdr.name, ":path")) {
-                path = hdr.value;
-            } else if (std.mem.eql(u8, hdr.name, ":authority")) {
-                authority = hdr.value;
-            } else if (hdr.name.len > 0 and hdr.name[0] != ':') {
+            if (hdr.name.len == 0) return null;
+            if (hdr.name[0] == ':') {
+                // RFC 9114 §4.3.1: all pseudo-headers precede regular fields.
+                if (saw_regular) return null;
+                if (std.mem.eql(u8, hdr.name, ":method")) {
+                    if (method != null) return null; // duplicate
+                    method = hdr.value;
+                } else if (std.mem.eql(u8, hdr.name, ":path")) {
+                    if (path != null) return null;
+                    path = hdr.value;
+                } else if (std.mem.eql(u8, hdr.name, ":authority")) {
+                    if (authority != null) return null;
+                    authority = hdr.value;
+                } else if (std.mem.eql(u8, hdr.name, ":scheme")) {
+                    // accepted, not forwarded
+                } else {
+                    return null; // unknown/invalid request pseudo-header
+                }
+            } else {
+                // RFC 9114 §4.2: field names must be lowercase, and
+                // connection-specific headers are malformed in HTTP/3.
+                for (hdr.name) |c| {
+                    if (c >= 'A' and c <= 'Z') return null;
+                }
+                if (isH3ForbiddenHeader(hdr.name)) {
+                    // TE is allowed only with the value "trailers".
+                    if (!std.ascii.eqlIgnoreCase(hdr.name, "te") or
+                        !std.ascii.eqlIgnoreCase(std.mem.trim(u8, hdr.value, " \t"), "trailers"))
+                    {
+                        return null;
+                    }
+                }
+                saw_regular = true;
                 if (header_count >= headers_out.len) return null;
                 headers_out[header_count] = .{ .name = hdr.name, .value = hdr.value };
                 saw_host = saw_host or std.ascii.eqlIgnoreCase(hdr.name, "host");
@@ -1398,6 +1435,58 @@ test "http1 managed response bytes from write queue" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "Date: ") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "Content-Length: 5\r\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, bytes, "\r\n\r\nhello"));
+}
+
+test "buildHttp3RequestView validates pseudo-headers and field names" {
+    var out: [16]request.Header = undefined;
+
+    // Valid request.
+    {
+        const hdrs = [_]http3.Header{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":path", .value = "/" },
+            .{ .name = ":authority", .value = "example.com" },
+            .{ .name = "accept", .value = "*/*" },
+        };
+        const view = Server.buildHttp3RequestView(.{ .stream_id = 0, .headers = &hdrs, .body = "" }, &out);
+        try std.testing.expect(view != null);
+    }
+    // Uppercase field name → malformed.
+    {
+        const hdrs = [_]http3.Header{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":path", .value = "/" },
+            .{ .name = "Accept", .value = "*/*" },
+        };
+        try std.testing.expect(Server.buildHttp3RequestView(.{ .stream_id = 0, .headers = &hdrs, .body = "" }, &out) == null);
+    }
+    // Connection-specific header → malformed.
+    {
+        const hdrs = [_]http3.Header{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":path", .value = "/" },
+            .{ .name = "connection", .value = "keep-alive" },
+        };
+        try std.testing.expect(Server.buildHttp3RequestView(.{ .stream_id = 0, .headers = &hdrs, .body = "" }, &out) == null);
+    }
+    // Duplicate :method → malformed.
+    {
+        const hdrs = [_]http3.Header{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":method", .value = "POST" },
+            .{ .name = ":path", .value = "/" },
+        };
+        try std.testing.expect(Server.buildHttp3RequestView(.{ .stream_id = 0, .headers = &hdrs, .body = "" }, &out) == null);
+    }
+    // Pseudo-header after a regular field → malformed.
+    {
+        const hdrs = [_]http3.Header{
+            .{ .name = "accept", .value = "*/*" },
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":path", .value = "/" },
+        };
+        try std.testing.expect(Server.buildHttp3RequestView(.{ .stream_id = 0, .headers = &hdrs, .body = "" }, &out) == null);
+    }
 }
 
 // Benchmark / TechEmpower handlers, `/json` dataset loader, and the

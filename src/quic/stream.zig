@@ -18,6 +18,10 @@ pub const Error = error{
     OutOfMemory,
 };
 
+/// Maximum number of out-of-order reassembly chunks buffered per stream.
+/// Bounds memory amplification from many tiny non-contiguous fragments.
+pub const MAX_PENDING_CHUNKS: usize = 256;
+
 /// Stream states per RFC 9000 Section 3
 pub const State = enum {
     /// Stream has not been created yet
@@ -200,6 +204,15 @@ pub const Stream = struct {
             // Skip exact duplicates already queued.
             for (self.pending_chunks.items) |existing| {
                 if (existing.offset == offset and existing.data.len == data.len) return;
+            }
+
+            // Cap the number of out-of-order chunks so a peer cannot inflate
+            // pending_chunks with many tiny non-contiguous fragments (bounded
+            // by the flow-control window, but that can still be hundreds of
+            // thousands of small allocations). Treat overflow as a flow-control
+            // violation rather than allocating without bound.
+            if (self.pending_chunks.items.len >= MAX_PENDING_CHUNKS) {
+                return Error.FlowControlError;
             }
 
             const data_copy = self.allocator.alloc(u8, data.len) catch return Error.OutOfMemory;

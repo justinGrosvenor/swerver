@@ -511,12 +511,14 @@ pub fn seedReadBuffer(server: *Server, conn: *connection.Connection, data: []con
     const buf = conn.read_buffer orelse return;
     const end = conn.read_offset + conn.read_buffered_bytes;
     if (end + data.len > buf.bytes.len) {
-        // Data doesn't fit in the remaining buffer space. In this
-        // case we simply drop the extra bytes — they were
-        // already consumed from the kernel ring. The connection
-        // will likely hit a parse error and close, which is the
-        // correct behavior for an oversized request.
+        // Data doesn't fit in the remaining buffer space, and the extra bytes
+        // were already consumed from the kernel ring (we can't get them back).
+        // Buffer what fits so any complete request already present is still
+        // handled, then close the connection: keeping it open would strand it
+        // waiting for bytes we discarded (a parser stuck on .partial until the
+        // idle timeout). close_after_write lets a queued response flush first.
         const available = if (end >= buf.bytes.len) 0 else buf.bytes.len - end;
+        conn.close_after_write = true;
         if (available == 0) return;
         @memcpy(buf.bytes[end..][0..available], data[0..available]);
         server.io.onReadBuffered(conn, available);
