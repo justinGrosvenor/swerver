@@ -131,6 +131,9 @@ pub fn buildUpstreamRequest(
         // what we forward — a request-smuggling vector. We always emit a
         // computed Content-Length below.
         if (std.ascii.eqlIgnoreCase(hdr.name, "content-length")) continue;
+        // Strip client-supplied trusted identity/forwarding headers; the
+        // proxy re-injects authoritative values below.
+        if (upstream.isProxyTrustedHeader(hdr.name)) continue;
 
         // Check if header should be removed
         var should_remove = false;
@@ -294,6 +297,9 @@ pub fn buildUpstreamRequestHeaders(
         if (std.ascii.eqlIgnoreCase(hdr.name, "host")) continue;
         if (std.ascii.eqlIgnoreCase(hdr.name, "via")) continue;
         if (std.ascii.eqlIgnoreCase(hdr.name, "content-length")) continue;
+        // Strip client-supplied trusted identity/forwarding headers; the
+        // proxy re-injects authoritative values below.
+        if (upstream.isProxyTrustedHeader(hdr.name)) continue;
 
         var should_remove = false;
         for (ctx.route.headers.remove_request) |remove_name| {
@@ -1098,6 +1104,53 @@ test "buildUpstreamRequest replaces client Content-Length with computed body len
 
     // Body appended unchanged
     try std.testing.expectEqualStrings("hello", result[header_end..]);
+}
+
+test "buildUpstreamRequest strips client-supplied trusted identity headers" {
+    var buf: [4096]u8 = undefined;
+
+    // Client tries to spoof identity / forwarding headers.
+    const headers = [_]request.Header{
+        .{ .name = "X-Consumer-Name", .value = "admin" },
+        .{ .name = "X-Client-Cert-DN", .value = "/CN=admin" },
+        .{ .name = "X-Real-IP", .value = "1.2.3.4" },
+        .{ .name = "X-Forwarded-Proto", .value = "https" },
+        .{ .name = "User-Agent", .value = "test/1.0" },
+    };
+
+    const req = request.RequestView{
+        .method = .GET,
+        .path = "/api/users",
+        .headers = &headers,
+        .body = .{ .slice = "" },
+    };
+    const server = upstream.Server{ .address = "10.0.0.1", .port = 8080 };
+    const route = upstream.ProxyRoute{ .path_prefix = "/api/", .upstream = "backend" };
+    const ctx = ForwardContext{
+        .client_request = req,
+        .client_ip = "192.168.1.100",
+        .client_tls = false,
+        .route = &route,
+        .server = &server,
+        .upstream_conn = undefined,
+        .request_buf = &buf,
+        .response_buf = undefined,
+    };
+
+    const len = try buildUpstreamRequest(&buf, &ctx);
+    const result = buf[0..len];
+
+    // Spoofed identity headers must not survive at all (no auth/mTLS here).
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(result, "X-Consumer-Name") == null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(result, "X-Client-Cert-DN") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "1.2.3.4") == null);
+    // The proxy's authoritative X-Real-IP (real client IP) is present once.
+    try std.testing.expect(std.mem.indexOf(u8, result, "X-Real-IP: 192.168.1.100\r\n") != null);
+    // The proxy sets X-Forwarded-Proto itself (http here), not the client's https.
+    try std.testing.expect(std.mem.indexOf(u8, result, "X-Forwarded-Proto: http\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "X-Forwarded-Proto: https\r\n") == null);
+    // Non-trusted headers still forwarded.
+    try std.testing.expect(std.mem.indexOf(u8, result, "User-Agent: test/1.0\r\n") != null);
 }
 
 test "parseUpstreamResponse basic" {

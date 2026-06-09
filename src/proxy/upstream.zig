@@ -251,6 +251,29 @@ pub fn isHopByHopGrpc(name: []const u8) bool {
     return isHopByHop(name);
 }
 
+/// Headers the proxy sets authoritatively (trusted identity / forwarding
+/// metadata). Any client-supplied copy must be stripped before forwarding,
+/// otherwise a client could spoof e.g. `X-Consumer-Name: admin` or
+/// `X-Client-Cert-DN` and have an upstream that reads the first occurrence
+/// trust it. The proxy re-injects the genuine values (X-Forwarded-* /
+/// X-Real-IP / X-Client-Cert-DN via addProxyHeaders; X-Consumer-Name via
+/// the auth identity headers).
+const proxy_trusted_headers = [_][]const u8{
+    "x-real-ip",
+    "x-forwarded-for",
+    "x-forwarded-proto",
+    "x-forwarded-host",
+    "x-client-cert-dn",
+    "x-consumer-name",
+};
+
+pub fn isProxyTrustedHeader(name: []const u8) bool {
+    for (proxy_trusted_headers) |h| {
+        if (std.ascii.eqlIgnoreCase(name, h)) return true;
+    }
+    return false;
+}
+
 // Tests
 test "isHopByHop identifies hop-by-hop headers" {
     try std.testing.expect(isHopByHop("Connection"));
@@ -259,6 +282,18 @@ test "isHopByHop identifies hop-by-hop headers" {
     try std.testing.expect(isHopByHop("Transfer-Encoding"));
     try std.testing.expect(!isHopByHop("Content-Type"));
     try std.testing.expect(!isHopByHop("X-Custom-Header"));
+}
+
+test "isProxyTrustedHeader identifies proxy-managed identity headers" {
+    try std.testing.expect(isProxyTrustedHeader("X-Consumer-Name"));
+    try std.testing.expect(isProxyTrustedHeader("x-consumer-name"));
+    try std.testing.expect(isProxyTrustedHeader("X-Client-Cert-DN"));
+    try std.testing.expect(isProxyTrustedHeader("X-Real-IP"));
+    try std.testing.expect(isProxyTrustedHeader("X-Forwarded-For"));
+    try std.testing.expect(isProxyTrustedHeader("X-Forwarded-Proto"));
+    try std.testing.expect(isProxyTrustedHeader("X-Forwarded-Host"));
+    try std.testing.expect(!isProxyTrustedHeader("X-Custom-Header"));
+    try std.testing.expect(!isProxyTrustedHeader("User-Agent"));
 }
 
 test "isHopByHopGrpc preserves te and trailer" {
