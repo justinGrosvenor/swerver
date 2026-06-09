@@ -509,7 +509,11 @@ const ResponseParser = struct {
             if (line.len == 0) continue;
 
             const colon_pos = std.mem.indexOf(u8, line, ":") orelse continue;
-            const name = line[0..colon_pos];
+            // Trim whitespace around the name so a non-compliant upstream
+            // sending e.g. "Transfer-Encoding : chunked" is still recognized as
+            // a framing header (otherwise we'd treat the body as close-
+            // delimited and mis-frame the response).
+            const name = std.mem.trim(u8, line[0..colon_pos], " \t");
             const value = std.mem.trimStart(u8, line[colon_pos + 1 ..], " \t");
 
             if (header_count < headers.len) {

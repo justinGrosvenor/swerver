@@ -907,3 +907,28 @@ pub fn recvBlocking(fd: std.posix.fd_t, buf: []u8) error{RecvFailed}!usize {
         return @intCast(rc);
     }
 }
+
+test "isPrivateAddress blocks expanded special ranges" {
+    const mk = struct {
+        fn v4(a: u8, b: u8, c: u8, d: u8) SockAddrStorage {
+            var sa = std.mem.zeroes(SockAddrIn);
+            sa.addr = @bitCast([4]u8{ a, b, c, d });
+            return .{ .ip4 = sa };
+        }
+    };
+    // Newly-added blocked ranges.
+    try std.testing.expect(isPrivateAddress(mk.v4(0, 1, 2, 3))); // 0.0.0.0/8
+    try std.testing.expect(isPrivateAddress(mk.v4(100, 64, 0, 1))); // 100.64.0.0/10 CGNAT
+    try std.testing.expect(isPrivateAddress(mk.v4(100, 127, 255, 255))); // CGNAT upper
+    try std.testing.expect(isPrivateAddress(mk.v4(192, 0, 0, 1))); // 192.0.0.0/24
+    try std.testing.expect(isPrivateAddress(mk.v4(192, 0, 2, 5))); // 192.0.2.0/24
+    try std.testing.expect(isPrivateAddress(mk.v4(198, 18, 0, 1))); // 198.18.0.0/15
+    try std.testing.expect(isPrivateAddress(mk.v4(198, 19, 0, 1)));
+    try std.testing.expect(isPrivateAddress(mk.v4(224, 0, 0, 1))); // multicast
+    try std.testing.expect(isPrivateAddress(mk.v4(255, 255, 255, 255))); // broadcast
+    try std.testing.expect(isPrivateAddress(mk.v4(169, 254, 169, 254))); // cloud metadata
+    // Public addresses still allowed.
+    try std.testing.expect(!isPrivateAddress(mk.v4(8, 8, 8, 8)));
+    try std.testing.expect(!isPrivateAddress(mk.v4(100, 63, 0, 1))); // just below CGNAT
+    try std.testing.expect(!isPrivateAddress(mk.v4(1, 1, 1, 1)));
+}

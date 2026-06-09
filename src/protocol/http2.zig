@@ -751,6 +751,8 @@ pub const Stack = struct {
     /// so the attacker never exceeds max_concurrent_streams while forcing
     /// unbounded request work.
     rst_stream_count: u32,
+    /// Counter for PRIORITY frames received (CVE-2019-9513 DoS protection).
+    priority_frame_count: u32,
     /// Stream ID expecting CONTINUATION frames (RFC 7540 Section 6.2).
     /// When set, only CONTINUATION frames for this stream are allowed.
     expecting_continuation: u32,
@@ -791,6 +793,7 @@ pub const Stack = struct {
             .cached_stream_index = 0,
             .settings_frame_count = 0,
             .rst_stream_count = 0,
+            .priority_frame_count = 0,
             .expecting_continuation = 0,
         };
         for (&stack.streams, 0..) |*stream, i| {
@@ -884,6 +887,8 @@ pub const Stack = struct {
 
     /// Maximum SETTINGS frames allowed per connection before triggering ENHANCE_YOUR_CALM
     const max_settings_frames: u32 = 100;
+    /// Maximum PRIORITY frames allowed per connection (CVE-2019-9513).
+    const max_priority_frames: u32 = 1000;
 
     fn handleSettings(self: *Stack, frame: Frame, events: []Event) FrameHandle {
         // Rate-limit SETTINGS frames to prevent DoS via SETTINGS flood
@@ -1220,12 +1225,17 @@ pub const Stack = struct {
     }
 
     fn handlePriority(self: *Stack, frame: Frame, events: []Event) FrameHandle {
-        _ = self;
         _ = events;
         // RFC 7540 Section 6.3: PRIORITY frame is exactly 5 bytes
         if (frame.payload.len != 5) return .{ .state = .err, .error_code = .frame_size_error, .event_count = 0 };
         // PRIORITY must be on a non-zero stream
         if (frame.header.stream_id == 0) return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
+        // Cap PRIORITY frames per connection (CVE-2019-9513 "Resource Loop"):
+        // a flood of PRIORITY frames is cheap per-frame but unbounded in count.
+        self.priority_frame_count += 1;
+        if (self.priority_frame_count > max_priority_frames) {
+            return .{ .state = .err, .error_code = .enhance_your_calm, .event_count = 0 };
+        }
         // Parse priority fields (we acknowledge but don't implement scheduling)
         // Exclusive flag (1 bit) + Stream Dependency (31 bits) + Weight (8 bits)
         const dependency_raw = (@as(u32, frame.payload[0]) << 24) |
