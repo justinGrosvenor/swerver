@@ -359,6 +359,14 @@ pub const ChunkDecoder = struct {
                             self.size_buf_len = 0;
                             if (chunk_size == 0) {
                                 self.state = .trailer;
+                                // The CRLF that ended the "0" size line is the
+                                // first half of the blank-line terminator. Seed
+                                // trailer_term_pos at 2 so a body with no
+                                // trailers (just the closing CRLF remaining)
+                                // completes; a real trailer line's first byte
+                                // won't match terminator[2]='\r' and resets the
+                                // match to scan for the full "\r\n\r\n".
+                                self.trailer_term_pos = 2;
                                 break;
                             }
                             if (self.total_decoded + chunk_size > self.max_body_bytes) return error.BodyTooLarge;
@@ -1059,6 +1067,37 @@ test "scanChunked: zero-length body no trailers" {
     try std.testing.expect(result.complete);
     try std.testing.expectEqual(@as(usize, 0), result.body_len);
     try std.testing.expectEqual(@as(usize, buf.len), result.consumed_bytes);
+}
+
+test "ChunkDecoder: completes without trailers (whole feed)" {
+    var dec = ChunkDecoder.init(1024);
+    var dst: [64]u8 = undefined;
+    const r = try dec.feed("5\r\nhello\r\n0\r\n\r\n", &dst);
+    try std.testing.expect(dec.isDone());
+    try std.testing.expectEqual(@as(usize, 5), r.decoded);
+    try std.testing.expectEqualStrings("hello", dst[0..r.decoded]);
+}
+
+test "ChunkDecoder: completes without trailers (byte-by-byte feed)" {
+    var dec = ChunkDecoder.init(1024);
+    var dst: [64]u8 = undefined;
+    var total_decoded: usize = 0;
+    const src = "5\r\nhello\r\n0\r\n\r\n";
+    var i: usize = 0;
+    while (i < src.len) : (i += 1) {
+        const r = try dec.feed(src[i .. i + 1], dst[total_decoded..]);
+        total_decoded += r.decoded;
+    }
+    try std.testing.expect(dec.isDone());
+    try std.testing.expectEqualStrings("hello", dst[0..total_decoded]);
+}
+
+test "ChunkDecoder: completes with trailers" {
+    var dec = ChunkDecoder.init(1024);
+    var dst: [64]u8 = undefined;
+    const r = try dec.feed("5\r\nhello\r\n0\r\nX-T: a\r\n\r\n", &dst);
+    try std.testing.expect(dec.isDone());
+    try std.testing.expectEqual(@as(usize, 5), r.decoded);
 }
 
 // ── header-semantics primitives ──────────────────────────────────────────────
