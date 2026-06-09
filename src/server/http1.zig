@@ -1001,6 +1001,14 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
                                 .body = .{ .bytes = "" },
                             }) catch {};
                             return;
+                        } else if (x402_mod.failClosedOnUnverified(x402_policy, ctx)) |reject_info| {
+                            // No facilitator will be consulted and the payment
+                            // was not verified locally — fail closed.
+                            cleanupBodyAccumulation(server, conn);
+                            queueResponse(server, conn, reject_info.resp) catch {
+                                conn.close_after_write = true;
+                            };
+                            return;
                         }
                     },
                 }
