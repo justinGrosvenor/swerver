@@ -85,14 +85,25 @@ const ReplayGuard = struct {
 
     fn record(self: *ReplayGuard, sig: []const u8, now_ms: u64, ttl_ms: u64) void {
         const h = std.hash.Wyhash.hash(0, sig);
+        var oldest_idx: usize = h & MASK;
+        var oldest_expiry: u64 = std.math.maxInt(u64);
         for (0..PROBE_LIMIT) |i| {
-            const slot = &self.entries[(h +% i) & MASK];
+            const idx = (h +% i) & MASK;
+            const slot = &self.entries[idx];
             if (slot.expiry_ms <= now_ms or slot.hash == 0) {
                 slot.* = .{ .hash = h, .expiry_ms = now_ms + ttl_ms };
                 return;
             }
+            // Track the slot expiring soonest in case all probes are live.
+            if (slot.expiry_ms < oldest_expiry) {
+                oldest_expiry = slot.expiry_ms;
+                oldest_idx = idx;
+            }
         }
-        self.entries[h & MASK] = .{ .hash = h, .expiry_ms = now_ms + ttl_ms };
+        // All probe slots hold live entries — evict the one expiring soonest
+        // rather than always clobbering the home slot, so we don't drop a
+        // longer-lived replay record (which would let that payment replay).
+        self.entries[oldest_idx] = .{ .hash = h, .expiry_ms = now_ms + ttl_ms };
     }
 };
 

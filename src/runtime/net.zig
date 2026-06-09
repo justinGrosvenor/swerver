@@ -625,12 +625,17 @@ pub fn isPrivateAddress(storage: SockAddrStorage) bool {
     switch (storage) {
         .ip4 => |sa| {
             const b: [4]u8 = @bitCast(sa.addr);
+            if (b[0] == 0) return true; // 0.0.0.0/8 ("this host")
             if (b[0] == 127) return true; // 127.0.0.0/8
             if (b[0] == 10) return true; // 10.0.0.0/8
             if (b[0] == 172 and (b[1] & 0xf0) == 16) return true; // 172.16.0.0/12
             if (b[0] == 192 and b[1] == 168) return true; // 192.168.0.0/16
-            if (b[0] == 169 and b[1] == 254) return true; // 169.254.0.0/16
-            if (sa.addr == 0) return true; // 0.0.0.0
+            if (b[0] == 169 and b[1] == 254) return true; // 169.254.0.0/16 (incl. metadata 169.254.169.254)
+            if (b[0] == 100 and (b[1] & 0xc0) == 64) return true; // 100.64.0.0/10 (CGNAT)
+            if (b[0] == 192 and b[1] == 0 and b[2] == 0) return true; // 192.0.0.0/24 (IETF protocol assignments)
+            if (b[0] == 192 and b[1] == 0 and b[2] == 2) return true; // 192.0.2.0/24 (TEST-NET-1)
+            if (b[0] == 198 and (b[1] & 0xfe) == 18) return true; // 198.18.0.0/15 (benchmarking)
+            if (b[0] >= 224) return true; // 224.0.0.0/4 multicast + 240.0.0.0/4 reserved + 255.255.255.255
             return false;
         },
         .ip6 => |sa| {
