@@ -621,22 +621,28 @@ fn resolveAddress(address: []const u8, port: u16) ConnectError!ResolvedAddr {
     };
 }
 
+/// True for IPv4 addresses that must not be reachable via SSRF (loopback,
+/// RFC 1918 private, link-local incl. cloud metadata, CGNAT, special-use,
+/// multicast/reserved/broadcast).
+fn isPrivateV4(b: [4]u8) bool {
+    if (b[0] == 0) return true; // 0.0.0.0/8 ("this host")
+    if (b[0] == 127) return true; // 127.0.0.0/8
+    if (b[0] == 10) return true; // 10.0.0.0/8
+    if (b[0] == 172 and (b[1] & 0xf0) == 16) return true; // 172.16.0.0/12
+    if (b[0] == 192 and b[1] == 168) return true; // 192.168.0.0/16
+    if (b[0] == 169 and b[1] == 254) return true; // 169.254.0.0/16 (incl. metadata 169.254.169.254)
+    if (b[0] == 100 and (b[1] & 0xc0) == 64) return true; // 100.64.0.0/10 (CGNAT)
+    if (b[0] == 192 and b[1] == 0 and b[2] == 0) return true; // 192.0.0.0/24 (IETF protocol assignments)
+    if (b[0] == 192 and b[1] == 0 and b[2] == 2) return true; // 192.0.2.0/24 (TEST-NET-1)
+    if (b[0] == 198 and (b[1] & 0xfe) == 18) return true; // 198.18.0.0/15 (benchmarking)
+    if (b[0] >= 224) return true; // 224.0.0.0/4 multicast + 240.0.0.0/4 reserved + 255.255.255.255
+    return false;
+}
+
 pub fn isPrivateAddress(storage: SockAddrStorage) bool {
     switch (storage) {
         .ip4 => |sa| {
-            const b: [4]u8 = @bitCast(sa.addr);
-            if (b[0] == 0) return true; // 0.0.0.0/8 ("this host")
-            if (b[0] == 127) return true; // 127.0.0.0/8
-            if (b[0] == 10) return true; // 10.0.0.0/8
-            if (b[0] == 172 and (b[1] & 0xf0) == 16) return true; // 172.16.0.0/12
-            if (b[0] == 192 and b[1] == 168) return true; // 192.168.0.0/16
-            if (b[0] == 169 and b[1] == 254) return true; // 169.254.0.0/16 (incl. metadata 169.254.169.254)
-            if (b[0] == 100 and (b[1] & 0xc0) == 64) return true; // 100.64.0.0/10 (CGNAT)
-            if (b[0] == 192 and b[1] == 0 and b[2] == 0) return true; // 192.0.0.0/24 (IETF protocol assignments)
-            if (b[0] == 192 and b[1] == 0 and b[2] == 2) return true; // 192.0.2.0/24 (TEST-NET-1)
-            if (b[0] == 198 and (b[1] & 0xfe) == 18) return true; // 198.18.0.0/15 (benchmarking)
-            if (b[0] >= 224) return true; // 224.0.0.0/4 multicast + 240.0.0.0/4 reserved + 255.255.255.255
-            return false;
+            return isPrivateV4(@bitCast(sa.addr));
         },
         .ip6 => |sa| {
             const a = sa.addr;
@@ -648,16 +654,13 @@ pub fn isPrivateAddress(storage: SockAddrStorage) bool {
             if (a[0] == 0xfe and (a[1] & 0xc0) == 0x80) return true; // fe80::/10
             if (a[0] & 0xfe == 0xfc) return true; // fc00::/7
             if (a[0] == 0xff) return true; // ff00::/8
-            // ::ffff:0:0/96 mapped IPv4 — check the embedded v4 address
+            // ::ffff:0:0/96 mapped IPv4 — apply the full v4 blocklist to the
+            // embedded address so it can't be used to bypass the v4 checks.
             const is_v4mapped = for (a[0..10]) |byte| {
                 if (byte != 0) break false;
             } else a[10] == 0xff and a[11] == 0xff;
             if (is_v4mapped) {
-                if (a[12] == 127) return true;
-                if (a[12] == 10) return true;
-                if (a[12] == 172 and (a[13] & 0xf0) == 16) return true;
-                if (a[12] == 192 and a[13] == 168) return true;
-                if (a[12] == 169 and a[13] == 254) return true;
+                return isPrivateV4(.{ a[12], a[13], a[14], a[15] });
             }
             return false;
         },
