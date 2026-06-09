@@ -156,6 +156,10 @@ pub const Server = struct {
     /// Reused batch buffer for GSO sends (single-threaded reactor, no
     /// reentrancy — each send fully drains it before returning).
     quic_gso_batch: [http3_mod.GSO_BATCH_BYTES]u8 = undefined,
+    /// Reused staging buffer for coalescing multiple TLS write-queue entries
+    /// into a single SSL_write (one TLS record + one socket write instead of
+    /// one per entry). Single-threaded reactor, reused per write event.
+    tls_gather: [server_tls.TLS_PLAINTEXT_WRITE_CAP]u8 = undefined,
     /// Pre-computed Alt-Svc header value for HTTP/3 advertisement
     alt_svc_value: [64]u8 = undefined,
     alt_svc_len: usize = 0,

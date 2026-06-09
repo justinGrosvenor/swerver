@@ -1550,33 +1550,47 @@ pub fn handleWrite(server: *Server, index: u32) !void {
                     return;
                 },
             }
-            // TLS: write one buffer at a time through SSL_write
+            // TLS: coalesce as many consecutive write-queue entries as fit
+            // in one TLS record (TLS_PLAINTEXT_WRITE_CAP) into a single
+            // SSL_write, so N small frames (e.g. concurrent h2 stream
+            // responses, or a static file split into DATA frames) become one
+            // record + one socket write instead of one per entry.
             while (conn.write_count > 0) {
-                const entry = conn.peekWrite() orelse break;
-                const data = entry.handle.bytes[entry.offset..entry.len];
-                if (data.len == 0) {
-                    server.io.releaseBuffer(entry.handle);
-                    conn.popWrite();
-                    continue;
+                var gathered: usize = 0;
+                {
+                    var idx = conn.write_head;
+                    var rem_entries = conn.write_count;
+                    while (rem_entries > 0 and gathered < server_tls.TLS_PLAINTEXT_WRITE_CAP) : (rem_entries -= 1) {
+                        const e = &conn.write_queue[idx];
+                        const s = e.handle.bytes[e.offset..e.len];
+                        if (s.len > 0) {
+                            const take = @min(s.len, server_tls.TLS_PLAINTEXT_WRITE_CAP - gathered);
+                            @memcpy(server.tls_gather[gathered..][0..take], s[0..take]);
+                            gathered += take;
+                            if (take < s.len) break; // record cap reached mid-entry
+                        }
+                        idx = if (idx + 1 >= conn.write_queue.len) 0 else idx + 1;
+                    }
                 }
-                switch (connWrite(server, conn, data)) {
+                if (gathered == 0) {
+                    // Only empty entries remain — drain and stop.
+                    while (conn.peekWrite()) |e| {
+                        if (e.len - e.offset != 0) break;
+                        server.io.releaseBuffer(e.handle);
+                        conn.popWrite();
+                    }
+                    break;
+                }
+                switch (connWrite(server, conn, server.tls_gather[0..gathered])) {
                     .bytes => |n| {
                         conn.markActive(server.now_ms);
-                        if (n >= data.len) {
-                            server.io.onWriteCompleted(conn, data.len);
-                            server.io.releaseBuffer(entry.handle);
-                            conn.popWrite();
-                            if (conn.hasPendingBody()) {
-                                http1_mod.streamBodyChunks(server, conn, conn.pending_body);
-                            }
-                        } else {
-                            entry.offset += n;
-                            server.io.onWriteCompleted(conn, n);
+                        consumeTlsWritten(server, conn, n);
+                        if (conn.hasPendingBody()) {
+                            http1_mod.streamBodyChunks(server, conn, conn.pending_body);
                         }
-                        // If connWrite populated the carry (writev was
-                        // only partially absorbed), pause the loop —
-                        // we'll resume once the next writable event
-                        // drains the carry.
+                        // If connWrite populated the carry (socket write only
+                        // partially absorbed the record), pause — we resume
+                        // when the next writable event drains the carry.
                         if (conn.tls_cipher_carry_handle != null) {
                             server.io.armWritable(conn.index, socket_fd) catch {};
                             return;
@@ -1873,6 +1887,31 @@ pub const WriteResult = union(enum) {
 };
 
 /// Write to a connection, using TLS if enabled. Returns bytes written, or error.
+/// Account `n` plaintext bytes written by a coalesced TLS SSL_write back
+/// across the write queue: pop fully-consumed entries (releasing their
+/// buffers) and advance the offset of a partially-consumed final entry.
+/// Mirrors the per-entry completion bookkeeping the non-coalesced path did.
+fn consumeTlsWritten(server: *Server, conn: *connection.Connection, n: usize) void {
+    var rem = n;
+    while (conn.write_count > 0) {
+        const e = conn.peekWrite() orelse break;
+        const avail = e.len - e.offset;
+        if (rem >= avail) {
+            // Whole entry consumed (avail may be 0 for an empty entry).
+            if (avail > 0) server.io.onWriteCompleted(conn, avail);
+            server.io.releaseBuffer(e.handle);
+            conn.popWrite();
+            rem -= avail;
+            if (rem == 0) break;
+        } else {
+            e.offset += rem;
+            server.io.onWriteCompleted(conn, rem);
+            rem = 0;
+            break;
+        }
+    }
+}
+
 pub fn connWrite(server: *Server, conn: *connection.Connection, data: []const u8) WriteResult {
     if (conn.is_tls) {
         // Cap plaintext per SSL_write so wbio never holds more ciphertext
