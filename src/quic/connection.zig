@@ -688,6 +688,16 @@ pub const Connection = struct {
     /// completes (RFC 9000 §19.20) and signals to the client that it
     /// can discard its Handshake-level keys.
     handshake_done_sent: bool = false,
+    /// Anti-amplification accounting (RFC 9000 §8.1). Until the peer's
+    /// address is validated, a server must not send more than 3× the bytes
+    /// it has received, to avoid being a reflection/amplification vector for
+    /// a spoofed source address.
+    amp_bytes_received: u64 = 0,
+    amp_bytes_sent: u64 = 0,
+    /// True once the peer's address is validated — for a server, on receipt
+    /// of a Handshake packet (proving the peer decrypted our Initial) or
+    /// handshake completion. Lifts the anti-amplification send cap.
+    address_validated: bool = false,
     /// Stream manager for this connection
     stream_manager: ?stream.StreamManager = null,
     /// HTTP/3 protocol stack
@@ -1165,6 +1175,9 @@ pub const Connection = struct {
     /// Transition to connected state
     pub fn onHandshakeComplete(self: *Connection) void {
         self.state = .connected;
+        // Handshake completion validates the peer address; lift the
+        // anti-amplification send cap.
+        self.address_validated = true;
 
         // Record handshake completion in metrics
         self.conn_metrics.handshakeComplete();

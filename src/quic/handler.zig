@@ -138,6 +138,13 @@ pub const Handler = struct {
                 if (self.pool.findByCid(long.dcid)) |c| {
                     conn = c;
                 } else if (long.packet_type == .initial and self.is_server) {
+                    // RFC 9000 §14.1: discard an Initial carried in a UDP
+                    // datagram smaller than 1200 bytes. This forces a client
+                    // to send at least 1200 bytes before we run TLS and emit
+                    // a multi-KB server flight, which (with the
+                    // anti-amplification cap below) prevents a spoofed-source
+                    // reflection/amplification DoS.
+                    if (data.len < 1200) return Error.InvalidPacket;
                     // Create new connection for Initial packet
                     conn = self.pool.createConnection(long.dcid, peer_addr) catch |err| {
                         return switch (err) {
@@ -163,6 +170,8 @@ pub const Handler = struct {
                 }
 
                 clearEvents(conn);
+                // Anti-amplification: count bytes received from the peer.
+                conn.amp_bytes_received +%= data.len;
                 // Process based on packet type
                 switch (long.packet_type) {
                     .initial => {
@@ -195,6 +204,7 @@ pub const Handler = struct {
                 };
 
                 clearEvents(conn);
+                conn.amp_bytes_received +%= data.len;
                 try self.handleShortPacket(conn, short, data);
 
                 // Collect HTTP/3 events after processing
@@ -288,6 +298,11 @@ pub const Handler = struct {
 
         // Decrypt and process Handshake packet
         try processEncryptedPacket(conn, &keys, header, data, types.PacketNumberSpace.handshake);
+
+        // RFC 9000 §8.1: a server validates the peer's address upon receiving
+        // a Handshake packet (the peer must have decrypted our Initial to
+        // produce it). Lift the anti-amplification cap.
+        if (conn.is_server) conn.address_validated = true;
 
         // Advance TLS handshake
         if (conn.tls_session != null) {
@@ -706,6 +721,20 @@ pub const Handler = struct {
     fn buildResponseFlight(self: *Handler, conn: *connection.Connection) Error![]const u8 {
         var offset: usize = 0;
 
+        // Anti-amplification (RFC 9000 §8.1): until the peer's address is
+        // validated, a server must not send more than 3× the bytes received.
+        // We gate the whole flight here; if we're already at the budget, send
+        // nothing until the peer sends more (its retransmits/ACKs grow the
+        // budget, and a Handshake packet lifts the cap entirely). Strict
+        // per-packet fragmentation to stay exactly within 3× is a follow-up
+        // (CRYPTO-flight fragmentation); the residual overage is bounded by a
+        // single flight, and the 1200-byte minimum-Initial rule keeps the
+        // factor small.
+        const amp_cap_active = conn.is_server and !conn.address_validated;
+        if (amp_cap_active and conn.amp_bytes_sent >= conn.amp_bytes_received *| 3) {
+            return &.{};
+        }
+
         // What will we end up emitting? We need to know in advance to
         // decide whether the Initial datagram-padding requirement still
         // applies (it only does until the handshake completes).
@@ -789,6 +818,7 @@ pub const Handler = struct {
             if (!conn.handshake_done_sent) conn.handshake_done_sent = true;
         }
 
+        if (amp_cap_active) conn.amp_bytes_sent +%= offset;
         return self.response_buffer[0..offset];
     }
 
@@ -1248,6 +1278,27 @@ test "handler processes Initial packet" {
     try std.testing.expect(result.conn != null);
     try std.testing.expect(result.response != null);
     try std.testing.expectEqual(@as(usize, 1), server_handler.connectionCount());
+}
+
+test "handler drops sub-1200-byte Initial (anti-amplification)" {
+    if (!build_options.enable_http3) return;
+    const allocator = std.testing.allocator;
+    var server_handler = Handler.init(allocator, true, 100);
+    defer server_handler.deinit();
+
+    const dcid_bytes = [_]u8{0xaa} ** 8;
+    const scid_bytes = [_]u8{0xbb} ** 4;
+    var pkt_buf: [types.Constants.min_initial_packet_size]u8 = undefined;
+    const packet_bytes = try test_utils.buildClientInitialPacket(&pkt_buf, &dcid_bytes, &scid_bytes, 256);
+
+    var peer_addr: connection_pool.SockAddrStorage = undefined;
+    @memset(std.mem.asBytes(&peer_addr), 0);
+
+    // Truncate below 1200 bytes: header still parses, but the datagram is too
+    // small per RFC 9000 §14.1, so no connection must be created.
+    const short = packet_bytes[0..1150];
+    try std.testing.expectError(Error.InvalidPacket, server_handler.processPacket(short, peer_addr));
+    try std.testing.expectEqual(@as(usize, 0), server_handler.connectionCount());
 }
 
 // ---- Builder wire-format round trips ----
