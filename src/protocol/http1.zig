@@ -475,9 +475,13 @@ pub fn extractQuickLine(bytes: []const u8) ?QuickLine {
     if (!is_http11 and !(version.len == 8 and std.mem.eql(u8, version, "HTTP/1.0"))) return null;
     const header_end = std.mem.indexOfPos(u8, bytes, line_end + 2, "\r\n\r\n") orelse return null;
     const header_area = bytes[line_end + 2 .. header_end];
-    if (std.mem.indexOf(u8, header_area, "ontent-Length") != null) return null;
-    if (std.mem.indexOf(u8, header_area, "ransfer-Encoding") != null) return null;
-    if (std.mem.indexOf(u8, header_area, "onnection:") != null) return null;
+    // Header names are case-insensitive (RFC 9110 §5.1). A case-sensitive
+    // match here would let a lowercase `content-length:` slip past the body
+    // detector, leaving the body in the buffer to be parsed as the next
+    // pipelined request — a request-smuggling desync on the cached-GET path.
+    if (std.ascii.indexOfIgnoreCase(header_area, "content-length") != null) return null;
+    if (std.ascii.indexOfIgnoreCase(header_area, "transfer-encoding") != null) return null;
+    if (std.ascii.indexOfIgnoreCase(header_area, "connection") != null) return null;
     return .{
         .method = method,
         .path = path,
@@ -1101,6 +1105,18 @@ test "ChunkDecoder: completes with trailers" {
 }
 
 // ── header-semantics primitives ──────────────────────────────────────────────
+
+test "extractQuickLine: bails on body headers regardless of case" {
+    // Canonical case — must bail (has a body).
+    try std.testing.expect(extractQuickLine("GET / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello") == null);
+    // Lowercase — must ALSO bail (case-insensitive). Regression for the
+    // case-sensitive sniff that let this fast-path and desync.
+    try std.testing.expect(extractQuickLine("GET / HTTP/1.1\r\ncontent-length: 5\r\n\r\nhello") == null);
+    try std.testing.expect(extractQuickLine("GET / HTTP/1.1\r\nTRANSFER-ENCODING: chunked\r\n\r\n") == null);
+    // No body headers — fast path applies.
+    const ql = extractQuickLine("GET /x HTTP/1.1\r\nHost: a\r\n\r\n") orelse return error.UnexpectedNull;
+    try std.testing.expectEqual(request.Method.GET, ql.method);
+}
 
 test "parseContentLengthValue: valid lengths" {
     try std.testing.expectEqual(@as(usize, 0), try parseContentLengthValue("0"));
