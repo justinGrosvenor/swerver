@@ -81,7 +81,7 @@ const SPILL_PATH = "settle-failures.jsonl";
 const SPILL_ROTATE_PATH = "settle-failures.jsonl.1";
 const SPILL_MAX_BYTES: u64 = 16 * 1024 * 1024;
 var spill_bytes: u64 = 0;
-var spill_mutex: std.Thread.Mutex = .{};
+var spill_lock: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
 
 pub fn start() void {
     if (thread_handle != null) return;
@@ -92,10 +92,7 @@ pub fn start() void {
     result_tail.store(0, .release);
     // 0o600: the file holds financial metadata; keep it owner-only.
     spill_fd = std.posix.openat(std.posix.AT.FDCWD, SPILL_PATH, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o600) catch -1;
-    if (spill_fd >= 0) {
-        const st = std.posix.fstat(spill_fd) catch null;
-        spill_bytes = if (st) |s| @intCast(@max(s.size, 0)) else 0;
-    }
+    spill_bytes = 0;
     thread_handle = std.Thread.spawn(.{}, workerLoop, .{}) catch |err| {
         std.log.warn("x402_client: failed to spawn thread: {}", .{err});
         return;
@@ -141,8 +138,8 @@ pub fn spillSettle(gateway_id: []const u8, network: []const u8, asset: []const u
 
     // Serialize append + rotation; spillSettle may be called from the worker
     // thread and the reactor (on queue-full drop).
-    spill_mutex.lock();
-    defer spill_mutex.unlock();
+    while (spill_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {}
+    defer spill_lock.store(0, .release);
     if (spill_fd < 0) return;
 
     // Rotate when the cap is reached so the file never grows without bound.
