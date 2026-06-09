@@ -766,12 +766,22 @@ pub const Connection = struct {
     pub fn initStreamManager(self: *Connection) void {
         if (self.stream_manager == null) {
             var mgr = stream.StreamManager.init(self.allocator, self.is_server);
-            // Set initial limits from local transport parameters
+            // Stream limits, by who may open the stream:
+            //  - peer-initiated streams (checked via the *_remote fields in
+            //    getOrCreateStream) are bounded by the limit WE advertised in
+            //    our local transport parameters.
+            //  - locally-initiated streams (checked via the *_local fields in
+            //    createLocalStream) are bounded by the grant the PEER
+            //    advertised.
+            // Feeding peer_params to the peer-initiated bound (as before) let a
+            // client advertise a huge initial_max_streams_bidi and then open
+            // unbounded peer streams against us. setLimits takes
+            // (bidi_local, bidi_remote, uni_local, uni_remote).
             mgr.setLimits(
-                self.local_params.initial_max_streams_bidi,
                 self.peer_params.initial_max_streams_bidi,
-                self.local_params.initial_max_streams_uni,
+                self.local_params.initial_max_streams_bidi,
                 self.peer_params.initial_max_streams_uni,
+                self.local_params.initial_max_streams_uni,
             );
             mgr.initial_max_stream_data = self.local_params.initial_max_stream_data_bidi_remote;
             self.stream_manager = mgr;
@@ -1634,6 +1644,28 @@ test "connection initialization" {
     try std.testing.expectEqual(@as(u8, 8), conn.our_cid.len);
     try std.testing.expect(conn.crypto_ctx.initial.client != null);
     try std.testing.expect(conn.crypto_ctx.initial.server != null);
+}
+
+test "peer-initiated stream limit uses our advertised limit, not the peer's" {
+    const allocator = std.testing.allocator;
+    const dcid = types.ConnectionId.init(&[_]u8{ 0x01, 0x02, 0x03, 0x04 });
+
+    var conn = Connection.init(allocator, true, dcid);
+    defer conn.deinit();
+
+    // We (server) advertise a small bidi stream limit; the client advertises
+    // a huge one. A client must not be able to open more peer-initiated
+    // streams than WE allowed, regardless of its own advertised value.
+    conn.local_params.initial_max_streams_bidi = 2;
+    conn.peer_params.initial_max_streams_bidi = 1_000_000;
+    conn.initStreamManager();
+
+    var mgr = &conn.stream_manager.?;
+    // Client-initiated bidi stream ids are 0, 4, 8, ...
+    _ = try mgr.getOrCreateStream(0);
+    _ = try mgr.getOrCreateStream(4);
+    // Third exceeds our advertised limit of 2 → must be rejected.
+    try std.testing.expectError(stream.Error.StreamLimitExceeded, mgr.getOrCreateStream(8));
 }
 
 test "connection state transitions" {
