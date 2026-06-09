@@ -149,6 +149,13 @@ pub const Server = struct {
     reload_in_progress: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Buffer for receiving UDP datagrams
     udp_recv_buf: [2048]u8 = undefined,
+    /// True when the kernel supports UDP GSO (UDP_SEGMENT) — probed once
+    /// at init. When set, the HTTP/3 send path coalesces a multi-packet
+    /// response into one sendmsg instead of one sendto per packet.
+    quic_gso: bool = false,
+    /// Reused batch buffer for GSO sends (single-threaded reactor, no
+    /// reentrancy — each send fully drains it before returning).
+    quic_gso_batch: [http3_mod.GSO_BATCH_BYTES]u8 = undefined,
     /// Pre-computed Alt-Svc header value for HTTP/3 advertisement
     alt_svc_value: [64]u8 = undefined,
     alt_svc_len: usize = 0,
@@ -327,6 +334,8 @@ pub const Server = struct {
         if (cfg.quic.enabled) {
             const alt_svc = cfg.quic.buildAltSvcHeader(&self.alt_svc_value) catch "";
             self.alt_svc_len = alt_svc.len;
+            // Probe once for UDP GSO so the h3 send path can batch packets.
+            self.quic_gso = net.supportsGso();
         }
 
         // Pre-encode the h3 response bytes for hot static endpoints

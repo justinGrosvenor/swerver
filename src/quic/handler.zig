@@ -1081,6 +1081,14 @@ pub const BuildShortPacketOptions = struct {
     /// response path to emit each 1200-byte response chunk through
     /// the unified builder.
     stream_data: ?StreamFramePayload = null,
+    /// If non-zero, pad the packet with PADDING frames so the final
+    /// protected packet (after the AEAD tag) is exactly this many bytes.
+    /// Used by the GSO send path: every segment in a UDP_SEGMENT batch
+    /// must be exactly the segment size except the last, so all but the
+    /// final response chunk are padded to GSO_SEGMENT_SIZE. Safe because
+    /// the STREAM frame always carries an explicit length, so trailing
+    /// 0x00 PADDING frames are not mistaken for stream data.
+    pad_to: usize = 0,
 };
 
 pub const StreamFramePayload = struct {
@@ -1235,6 +1243,19 @@ pub fn buildShortPacket(out: []u8, opts: BuildShortPacketOptions) Error!BuildPac
         if (off >= out.len) return Error.HandshakeFailed;
         out[off] = 0x00; // PADDING
         off += 1;
+    }
+
+    // GSO segment padding: pad with PADDING frames so the protected
+    // packet (plaintext + AEAD tag) is exactly `opts.pad_to` bytes. The
+    // GSO batch path requires every non-final segment to be the same
+    // size. protectPacket appends crypto.AEAD_TAG_LEN, so pad the
+    // plaintext until off + AEAD_TAG_LEN reaches pad_to.
+    if (opts.pad_to > 0) {
+        while (off + crypto.AEAD_TAG_LEN < opts.pad_to) {
+            if (off >= out.len) return Error.HandshakeFailed;
+            out[off] = 0x00; // PADDING frame (type 0x00)
+            off += 1;
+        }
     }
 
     // ---- AEAD + header protection ----
@@ -1407,4 +1428,74 @@ test "buildShortPacket produces a parseable, decryptable 1-RTT packet" {
         if (fr.frame == .handshake_done) saw_handshake_done = true;
     }
     try std.testing.expect(saw_handshake_done);
+}
+
+test "buildShortPacket pad_to produces an exact-size, decryptable STREAM packet (GSO segment)" {
+    const allocator = std.testing.allocator;
+    const peer_cid = types.ConnectionId.init(&[_]u8{ 0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8 });
+    var conn = connection.Connection.init(allocator, true, peer_cid);
+    defer conn.deinit();
+
+    const keys = crypto.deriveKeysFromSecret(&([_]u8{0x42} ** 32));
+
+    const SEG: usize = 1280;
+    const body = [_]u8{0xAB} ** 1200;
+
+    var out: [SEG]u8 = undefined;
+    const built = try buildShortPacket(&out, .{
+        .conn = &conn,
+        .keys = &keys,
+        .ack_largest = null,
+        .stream_data = .{ .stream_id = 0, .offset = 0, .data = &body, .fin = false },
+        .pad_to = SEG,
+    });
+
+    // The whole point of GSO padding: the protected packet is EXACTLY the
+    // segment size, so it can sit in a fixed UDP_SEGMENT slot.
+    try std.testing.expectEqual(SEG, built.bytes_written);
+
+    // It must still decrypt and yield the full STREAM payload, with the
+    // trailing PADDING frames parsing cleanly (not mistaken for data).
+    const parsed = packet.parseHeader(out[0..built.bytes_written], peer_cid.len);
+    try std.testing.expectEqual(packet.ParseState.complete, parsed.state);
+    const sh = parsed.header.?.short;
+
+    var dec: [SEG]u8 = undefined;
+    @memcpy(dec[0..built.bytes_written], out[0..built.bytes_written]);
+    const un = try crypto.unprotectPacket(&keys, 0, sh.packet_number_offset, dec[0..], built.bytes_written);
+    const payload = dec[un.header_len .. un.header_len + un.payload_len];
+
+    var saw_stream = false;
+    var stream_len: usize = 0;
+    var off: usize = 0;
+    while (off < payload.len) {
+        const fr = try frame.parseFrame(payload[off..]);
+        off += fr.consumed;
+        if (fr.frame == .stream) {
+            saw_stream = true;
+            stream_len = fr.frame.stream.data.len;
+            try std.testing.expectEqualSlices(u8, &body, fr.frame.stream.data);
+        }
+    }
+    try std.testing.expect(saw_stream);
+    try std.testing.expectEqual(@as(usize, 1200), stream_len);
+}
+
+test "buildShortPacket without pad_to is natural-sized (final GSO segment)" {
+    const allocator = std.testing.allocator;
+    const peer_cid = types.ConnectionId.init(&[_]u8{ 0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8 });
+    var conn = connection.Connection.init(allocator, true, peer_cid);
+    defer conn.deinit();
+    const keys = crypto.deriveKeysFromSecret(&([_]u8{0x42} ** 32));
+
+    const body = [_]u8{0xCD} ** 100;
+    var out: [1280]u8 = undefined;
+    const built = try buildShortPacket(&out, .{
+        .conn = &conn,
+        .keys = &keys,
+        .stream_data = .{ .stream_id = 0, .offset = 0, .data = &body, .fin = true },
+        // pad_to defaults to 0 → no padding → short final segment.
+    });
+    // A 100-byte body must NOT be padded to 1280.
+    try std.testing.expect(built.bytes_written < 200);
 }
