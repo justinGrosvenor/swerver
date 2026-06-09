@@ -218,6 +218,14 @@ pub const Stack = struct {
     body_storage: [MAX_H3_BODY_CONCAT]u8 = undefined,
     /// Bytes of `body_storage` currently in use (per-packet cursor).
     body_used: usize = 0,
+    /// Bytes already consumed on each peer unidirectional stream. The handler
+    /// does not consumeRead uni streams, so it re-delivers the whole stream
+    /// buffer (including the leading stream-type byte) on every STREAM frame.
+    /// These cursors let us parse only the new tail, so the type byte is seen
+    /// once and already-processed frames (e.g. SETTINGS) are not re-parsed.
+    control_consumed: usize = 0,
+    qpack_enc_consumed: usize = 0,
+    qpack_dec_consumed: usize = 0,
     /// Is server?
     is_server: bool,
     /// Cached IMF-fixdate string for the Date response header,
@@ -361,7 +369,10 @@ pub const Stack = struct {
                 return self.processRequestStream(stream_id, data, end_stream);
             },
             .control => {
-                return self.processControlStream(data);
+                const start = @min(self.control_consumed, data.len);
+                const res = try self.processControlStream(data[start..]);
+                self.control_consumed += res.consumed;
+                return .{ .consumed = self.control_consumed, .events = res.events, .need_more = res.need_more };
             },
             .unknown => {
                 // First byte is stream type
@@ -383,7 +394,10 @@ pub const Stack = struct {
                             if (existing != stream_id) return error.ConnectionError;
                         }
                         self.peer_control_stream = stream_id;
-                        return self.processControlStream(data[uni_type.len..]);
+                        self.control_consumed = uni_type.len;
+                        const res = try self.processControlStream(data[uni_type.len..]);
+                        self.control_consumed += res.consumed;
+                        return .{ .consumed = self.control_consumed, .events = res.events, .need_more = res.need_more };
                     },
                     .qpack_encoder => {
                         // RFC 9204 §4.2: "Only one encoder stream and one
@@ -396,7 +410,10 @@ pub const Stack = struct {
                         }
                         self.peer_qpack_encoder = stream_id;
                         // Process encoder stream instructions (updates our decoder's table)
-                        return self.processQpackEncoderStream(data[uni_type.len..]);
+                        self.qpack_enc_consumed = uni_type.len;
+                        const res = try self.processQpackEncoderStream(data[uni_type.len..]);
+                        self.qpack_enc_consumed += res.consumed;
+                        return .{ .consumed = self.qpack_enc_consumed, .events = res.events, .need_more = res.need_more };
                     },
                     .qpack_decoder => {
                         // RFC 9204 §4.2: see qpack_encoder comment above.
@@ -405,7 +422,10 @@ pub const Stack = struct {
                         }
                         self.peer_qpack_decoder = stream_id;
                         // Process decoder stream instructions (acknowledgments to our encoder)
-                        return self.processQpackDecoderStream(data[uni_type.len..]);
+                        self.qpack_dec_consumed = uni_type.len;
+                        const res = try self.processQpackDecoderStream(data[uni_type.len..]);
+                        self.qpack_dec_consumed += res.consumed;
+                        return .{ .consumed = self.qpack_dec_consumed, .events = res.events, .need_more = res.need_more };
                     },
                     .push => {
                         // Push streams (server to client only)
@@ -418,10 +438,16 @@ pub const Stack = struct {
                 }
             },
             .qpack_encoder => {
-                return self.processQpackEncoderStream(data);
+                const start = @min(self.qpack_enc_consumed, data.len);
+                const res = try self.processQpackEncoderStream(data[start..]);
+                self.qpack_enc_consumed += res.consumed;
+                return .{ .consumed = self.qpack_enc_consumed, .events = res.events, .need_more = res.need_more };
             },
             .qpack_decoder => {
-                return self.processQpackDecoderStream(data);
+                const start = @min(self.qpack_dec_consumed, data.len);
+                const res = try self.processQpackDecoderStream(data[start..]);
+                self.qpack_dec_consumed += res.consumed;
+                return .{ .consumed = self.qpack_dec_consumed, .events = res.events, .need_more = res.need_more };
             },
             .push => {
                 // Push streams (server to client only) - consume
@@ -1085,6 +1111,43 @@ test "control stream: GOAWAY after SETTINGS accepted (RFC 9114 §7.2.6)" {
         }
     }
     try std.testing.expect(saw_settings);
+    try std.testing.expect(saw_goaway);
+}
+
+test "control stream: re-delivered buffer does not re-parse type byte or SETTINGS" {
+    const allocator = std.testing.allocator;
+    var stack = Stack.init(allocator, true);
+    defer stack.deinit();
+
+    // The QUIC handler does not consumeRead uni streams, so it re-delivers the
+    // whole stream buffer (type byte + all frames so far) on each STREAM
+    // frame. Frame 1: [type][SETTINGS]. Frame 2 (re-delivers frame 1's bytes
+    // plus): [type][SETTINGS][GOAWAY]. The second ingest must NOT re-parse the
+    // type byte (as a DATA frame) or the SETTINGS (which would be a repeated-
+    // SETTINGS connection error); it must parse only the new GOAWAY.
+    var buf: [512]u8 = undefined;
+    const prologue_len = try encodeControlStreamPrologue(&buf);
+
+    const r1 = try stack.ingest(2, buf[0..prologue_len], false);
+    var saw_settings = false;
+    for (r1.events) |ev| if (ev == .settings) {
+        saw_settings = true;
+    };
+    try std.testing.expect(saw_settings);
+
+    const goaway_len = try frame.writeGoawayFrame(buf[prologue_len..], 8);
+    const total = prologue_len + goaway_len;
+
+    // Re-deliver the full buffer (frame 1 bytes + GOAWAY), as the handler does.
+    const r2 = try stack.ingest(2, buf[0..total], false);
+    var saw_goaway = false;
+    for (r2.events) |ev| switch (ev) {
+        .goaway => |g| {
+            saw_goaway = true;
+            try std.testing.expectEqual(@as(u64, 8), g.stream_id);
+        },
+        else => {},
+    };
     try std.testing.expect(saw_goaway);
 }
 
