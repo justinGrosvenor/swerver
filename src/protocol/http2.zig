@@ -740,6 +740,12 @@ pub const Stack = struct {
     cached_stream_index: usize,
     /// Counter for SETTINGS frames received on this connection (DoS protection)
     settings_frame_count: u32,
+    /// Counter for RST_STREAM frames received on this connection. Used to
+    /// detect the rapid-reset DoS (CVE-2023-44487): HEADERS(END_STREAM)
+    /// dispatches a full request, then an immediate RST_STREAM frees the slot
+    /// so the attacker never exceeds max_concurrent_streams while forcing
+    /// unbounded request work.
+    rst_stream_count: u32,
     /// Stream ID expecting CONTINUATION frames (RFC 7540 Section 6.2).
     /// When set, only CONTINUATION frames for this stream are allowed.
     expecting_continuation: u32,
@@ -772,6 +778,7 @@ pub const Stack = struct {
             .cached_stream_id = 0,
             .cached_stream_index = 0,
             .settings_frame_count = 0,
+            .rst_stream_count = 0,
             .expecting_continuation = 0,
         };
         for (&stack.streams, 0..) |*stream, i| {
@@ -1151,11 +1158,29 @@ pub const Stack = struct {
         return .{ .state = .complete, .error_code = .none, .event_count = 0 };
     }
 
+    /// Minimum RST_STREAM frames before the rapid-reset ratio check engages,
+    /// so short legitimate connections that cancel a few streams are unaffected.
+    const max_rst_streams_floor: u32 = 100;
+
     fn handleRstStream(self: *Stack, frame: Frame, events: []Event) FrameHandle {
         _ = events;
         if (frame.payload.len != 4) return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
         if (frame.header.stream_id == 0) return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
         if (frame.header.stream_id > self.last_stream_id) return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
+
+        // Rapid-reset (CVE-2023-44487) mitigation. Count resets; once past a
+        // floor, trip ENHANCE_YOUR_CALM if more than half of the client's
+        // initiated streams have been reset — the signature of HEADERS+RST
+        // flooding, while tolerating occasional legitimate cancellations.
+        self.rst_stream_count += 1;
+        if (self.rst_stream_count > max_rst_streams_floor) {
+            // Client-initiated streams are odd ids 1,3,5,…; count ≈ (id+1)/2.
+            const opened: u32 = (self.last_stream_id + 1) / 2;
+            if (self.rst_stream_count *| 2 > opened) {
+                return .{ .state = .err, .error_code = .enhance_your_calm, .event_count = 0 };
+            }
+        }
+
         const stream = self.findStream(frame.header.stream_id) orelse
             return .{ .state = .complete, .error_code = .none, .event_count = 0 };
         stream.state = .closed;

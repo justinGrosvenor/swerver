@@ -788,6 +788,39 @@ test "http2 stack handles continuation frames" {
     }
 }
 
+test "http2 rapid reset triggers ENHANCE_YOUR_CALM" {
+    var stack = http2.Stack.init();
+    var frames: [8]http2.Frame = undefined;
+    var events: [8]http2.Event = undefined;
+
+    // Preface + SETTINGS.
+    var pbuf: [http2.Preface.len + 9]u8 = undefined;
+    @memcpy(pbuf[0..http2.Preface.len], http2.Preface);
+    _ = try http2.writeFrame(pbuf[http2.Preface.len..], .settings, 0, 0, &[_]u8{});
+    _ = stack.ingest(pbuf[0..], frames[0..], events[0..]);
+
+    var header_block: [64]u8 = undefined;
+    const hb = buildHeaderBlockAuthority(header_block[0..], "example.com");
+
+    // HEADERS(END_STREAM) immediately followed by RST_STREAM, repeated — the
+    // rapid-reset DoS signature. The stack must trip ENHANCE_YOUR_CALM.
+    var sid: u32 = 1;
+    var tripped = false;
+    var iter: usize = 0;
+    while (iter < 300) : (iter += 1) {
+        var buf: [128]u8 = undefined;
+        const hlen = try http2.writeFrame(buf[0..], .headers, 0x5, sid, hb);
+        const rlen = try http2.writeRstStream(buf[hlen..], sid, 0x8); // CANCEL
+        const res = stack.ingest(buf[0 .. hlen + rlen], frames[0..], events[0..]);
+        if (res.state == .err and res.error_code == .enhance_your_calm) {
+            tripped = true;
+            break;
+        }
+        sid += 2;
+    }
+    try std.testing.expect(tripped);
+}
+
 test "http2 stack rejects even stream id" {
     var stack = http2.Stack.init();
     var frames: [2]http2.Frame = undefined;
