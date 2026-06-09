@@ -554,6 +554,27 @@ test "cache does not store responses to authenticated requests" {
     try std.testing.expect(cache.lookup(.GET, "/cookied", &.{}, &.{}, 2000) == .miss);
 }
 
+test "cache keys on accept-encoding so compressed entries are not mis-served" {
+    var cache = try ResponseCache.init(std.testing.allocator, 16);
+    defer cache.deinit();
+
+    const vary = [_][]const u8{"accept-encoding"};
+    const gzip_req = [_]request_mod.Header{
+        .{ .name = "Accept-Encoding", .value = "gzip" },
+    };
+    const resp_headers = [_]response_mod.Header{
+        .{ .name = "Content-Encoding", .value = "gzip" },
+    };
+    // Store a gzipped entry for a gzip-accepting client.
+    cache.store("/asset", &gzip_req, &vary, 200, &resp_headers, "\x1f\x8b...", 60_000, 1000);
+    // A gzip client hits it.
+    try std.testing.expect(cache.lookup(.GET, "/asset", &gzip_req, &vary, 2000) == .hit);
+    // A client that does not accept gzip must miss (different key), not get
+    // served the gzipped body.
+    const plain_req = [_]request_mod.Header{};
+    try std.testing.expect(cache.lookup(.GET, "/asset", &plain_req, &vary, 2000) == .miss);
+}
+
 test "cache does not store Vary:* responses" {
     var cache = try ResponseCache.init(std.testing.allocator, 16);
     defer cache.deinit();

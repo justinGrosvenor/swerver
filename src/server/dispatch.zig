@@ -1101,7 +1101,19 @@ pub fn handleRead(server: *Server, index: u32) !void {
 
                 // Response cache: check before forwarding to upstream
                 const cache_cfg = matched_route.cache;
-                const vary_keys: []const []const u8 = if (cache_cfg) |cc| cc.vary else &.{};
+                // The proxy may gzip/deflate the response based on the client's
+                // Accept-Encoding (proxy.maybeCompress), and that happens before
+                // the cache store below — so the cached body can be compressed.
+                // Include accept-encoding in the cache key so a client that does
+                // not accept that encoding cannot hit a compressed entry.
+                var vary_buf: [16][]const u8 = undefined;
+                const vary_keys: []const []const u8 = blk: {
+                    const base_vary: []const []const u8 = if (cache_cfg) |cc| cc.vary else &.{};
+                    const n = @min(base_vary.len, vary_buf.len - 1);
+                    for (base_vary[0..n], 0..) |v, vi| vary_buf[vi] = v;
+                    vary_buf[n] = "accept-encoding";
+                    break :blk vary_buf[0 .. n + 1];
+                };
                 if (cache_cfg != null) {
                     if (proxy.route_caches[route_idx]) |*rc| {
                         switch (rc.lookup(parse.view.method, parse.view.path, parse.view.headers, vary_keys, server.now_ms)) {
