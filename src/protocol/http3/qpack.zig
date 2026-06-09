@@ -705,32 +705,39 @@ pub const Decoder = struct {
     fn decodeLiteral(self: *Decoder, buf: []const u8) Error!usize {
         var offset: usize = 0;
 
-        // First byte: 0010 H N N N — name length is a 3-bit prefix integer.
-        // The H bit on the name is at position 0x08 (RFC 9204 §4.5.6).
-        // For now we treat the name as a non-Huffman literal because the
-        // tested clients (curl/ngtcp2) only Huffman-encode header values
-        // when the encoder is in static-only mode like ours. We'll harden
-        // this once we see a Huffman-encoded literal name in the wild.
+        // First byte: 0010 H N N N — name length is a 3-bit prefix integer
+        // and the H bit (0x08) marks a Huffman-encoded name (RFC 9204 §4.5.6).
+        if (buf.len == 0) return error.UnexpectedEnd;
+        const huffman_name = (buf[0] & 0x08) != 0;
         const name_int = try decodeInteger(buf, 3);
         offset += name_int.len;
-        const name_len: usize = @intCast(name_int.value);
+        const name_enc_len: usize = @intCast(name_int.value);
 
-        if (buf.len < offset + name_len) return error.UnexpectedEnd;
-        if (name_len > MAX_HEADER_NAME_LEN) return error.StringTooLong;
-        const name_data = buf[offset .. offset + name_len];
-        offset += name_len;
+        if (buf.len < offset + name_enc_len) return error.UnexpectedEnd;
+        const name_encoded = buf[offset .. offset + name_enc_len];
+        offset += name_enc_len;
 
         if (self.header_count >= 64) return error.BufferTooSmall;
+
+        const name_dest = &self.name_storage[self.header_count];
+        const name_len: usize = if (huffman_name)
+            huffman.decodeInto(name_encoded, name_dest) catch |err| switch (err) {
+                error.InvalidHuffman => return error.HuffmanDecodeFailed,
+                error.OutputTooSmall => return error.StringTooLong,
+            }
+        else blk: {
+            if (name_enc_len > MAX_HEADER_NAME_LEN) return error.StringTooLong;
+            @memcpy(name_dest[0..name_enc_len], name_encoded);
+            break :blk name_enc_len;
+        };
 
         // Decode value directly into per-header storage so the slice stays
         // valid; handles Huffman-encoded values.
         const value_result = try decodeStringInto(buf[offset..], &self.value_storage[self.header_count]);
         offset += value_result.len;
 
-        @memcpy(self.name_storage[self.header_count][0..name_data.len], name_data);
-
         self.headers[self.header_count] = .{
-            .name = self.name_storage[self.header_count][0..name_data.len],
+            .name = self.name_storage[self.header_count][0..name_len],
             .value = self.value_storage[self.header_count][0..value_result.str_len],
         };
         self.header_count += 1;

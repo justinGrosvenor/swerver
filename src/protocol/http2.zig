@@ -385,6 +385,9 @@ pub const HpackDecoder = struct {
             if ((b & 0x20) != 0) {
                 if (out_count > 0) return error.Protocol;
                 const new_size = try decodeInt(block, &idx, 5);
+                // RFC 7541 §6.3: a size update exceeding the limit the decoder
+                // advertised is a decoding error, not something to clamp.
+                if (new_size > MaxDynamicBytes) return error.TableSizeUpdateTooLarge;
                 self.setMaxSize(new_size);
                 continue;
             }
@@ -442,6 +445,7 @@ pub const HpackDecoder = struct {
             if ((b & 0x20) != 0) {
                 if (out_count > 0) return error.Protocol;
                 const new_size = try decodeInt(block, &idx, 5);
+                if (new_size > MaxDynamicBytes) return error.TableSizeUpdateTooLarge;
                 self.setMaxSize(new_size);
                 continue;
             }
@@ -663,7 +667,8 @@ fn decodeHuffman(decoder: *HpackDecoder, input: []const u8) ![]const u8 {
     if (pending_len > 0) {
         const eos_len: u8 = HuffmanCodeLengths[HuffmanEosSymbol];
         const eos_code: u32 = HuffmanCodes[HuffmanEosSymbol] >> @as(u5, @intCast(32 - eos_len));
-        if (pending_len > eos_len) return error.InvalidHuffman;
+        // RFC 7541 §5.2: padding strictly longer than 7 bits is a decode error.
+        if (pending_len > 7) return error.InvalidHuffman;
         const prefix = eos_code >> @as(u5, @intCast(eos_len - pending_len));
         if (pending_bits != prefix) return error.InvalidHuffman;
     }
@@ -1063,14 +1068,17 @@ pub const Stack = struct {
         // RFC 9113 §6.9.1: flow control counts the entire DATA frame payload
         // (including Pad Length and Padding), not just the application data.
         const flow_len: usize = frame.header.length;
-        if (self.conn_recv_window <= 0) {
+        // A zero-length DATA frame consumes no flow-control credit (RFC 9113
+        // §6.9.1), so an empty DATA must not be rejected just because the
+        // window has reached 0.
+        if (flow_len > 0 and self.conn_recv_window <= 0) {
             return .{ .state = .err, .error_code = .flow_control_error, .event_count = 0 };
         }
-        const conn_window: usize = @intCast(self.conn_recv_window);
+        const conn_window: usize = if (self.conn_recv_window > 0) @intCast(self.conn_recv_window) else 0;
         if (flow_len > conn_window) {
             return .{ .state = .err, .error_code = .flow_control_error, .event_count = 0 };
         }
-        if (stream.recv_window <= 0 or flow_len > @as(usize, @intCast(stream.recv_window))) {
+        if (flow_len > 0 and (stream.recv_window <= 0 or flow_len > @as(usize, @intCast(stream.recv_window)))) {
             stream.state = .closed;
             self.conn_recv_window -= @intCast(flow_len);
             if (events.len > 0) {
@@ -1435,7 +1443,7 @@ const FrameHandle = struct {
 fn mapHeaderError(err: anyerror) FrameHandle {
     return switch (err) {
         error.HeaderListTooLarge => .{ .state = .err, .error_code = .header_list_too_large, .event_count = 0 },
-        error.InvalidHuffman, error.InvalidIndex, error.Truncated => .{ .state = .err, .error_code = .compression_error, .event_count = 0 },
+        error.InvalidHuffman, error.InvalidIndex, error.Truncated, error.TableSizeUpdateTooLarge => .{ .state = .err, .error_code = .compression_error, .event_count = 0 },
         error.MissingPseudo, error.Protocol => .{ .state = .err, .error_code = .protocol_error, .event_count = 0 },
         else => .{ .state = .err, .error_code = .protocol_error, .event_count = 0 },
     };

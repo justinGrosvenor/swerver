@@ -65,7 +65,8 @@ pub fn decodeInto(input: []const u8, dest: []u8) Error!usize {
     if (pending_len > 0) {
         const eos_len: u8 = HuffmanCodeLengths[EosSymbol];
         const eos_code: u32 = HuffmanCodes[EosSymbol] >> @as(u5, @intCast(32 - eos_len));
-        if (pending_len > eos_len) return error.InvalidHuffman;
+        // RFC 7541 §5.2: padding strictly longer than 7 bits is a decode error.
+        if (pending_len > 7) return error.InvalidHuffman;
         const prefix = eos_code >> @as(u5, @intCast(eos_len - pending_len));
         if (pending_bits != prefix) return error.InvalidHuffman;
     }
