@@ -146,6 +146,11 @@ pub const ResponseCache = struct {
     ) void {
         if (resp_status != 200) return;
         if (!isCacheable(resp_headers)) return;
+        // RFC 7234 §3.2: a shared cache must not store a response to a request
+        // with Authorization (or one carrying credentials via Cookie) absent
+        // an explicit allowance, and must never replay a Set-Cookie to other
+        // clients. Both are checked in isCacheable/requestPreventsCaching.
+        if (requestPreventsCaching(req_headers)) return;
 
         const key = computeKey(path, vary_keys, req_headers);
         const effective_ttl = extractMaxAge(resp_headers) orelse ttl_ms;
@@ -390,10 +395,32 @@ fn isCacheable(headers: []const response_mod.Header) bool {
     for (headers) |hdr| {
         if (std.ascii.eqlIgnoreCase(hdr.name, "Cache-Control")) {
             if (std.mem.indexOf(u8, hdr.value, "no-store") != null) return false;
+            if (std.mem.indexOf(u8, hdr.value, "no-cache") != null) return false;
             if (std.mem.indexOf(u8, hdr.value, "private") != null) return false;
+        }
+        // Never store a personalized cookie in a shared cache — it would be
+        // replayed to every other client (session fixation / leakage).
+        if (std.ascii.eqlIgnoreCase(hdr.name, "Set-Cookie")) return false;
+        // Vary: * means the response is uncacheable (RFC 9110 §12.5.5). We
+        // only key on operator-configured vary headers, so any other Vary
+        // value we cannot honor is treated conservatively as uncacheable.
+        if (std.ascii.eqlIgnoreCase(hdr.name, "Vary")) {
+            const v = std.mem.trim(u8, hdr.value, " \t");
+            if (std.mem.eql(u8, v, "*")) return false;
         }
     }
     return true;
+}
+
+/// A shared cache must not store responses to requests that carry
+/// credentials, since the cached representation would be served to other
+/// (unauthenticated) clients.
+fn requestPreventsCaching(req_headers: []const request_mod.Header) bool {
+    for (req_headers) |hdr| {
+        if (std.ascii.eqlIgnoreCase(hdr.name, "Authorization")) return true;
+        if (std.ascii.eqlIgnoreCase(hdr.name, "Cookie")) return true;
+    }
+    return false;
 }
 
 fn extractMaxAge(headers: []const response_mod.Header) ?u64 {
@@ -491,6 +518,52 @@ test "cache respects no-store" {
     cache.store("/private", &req_headers, &.{}, 200, &resp_headers, "secret", 60_000, 1000);
     const result = cache.lookup(.GET, "/private", &req_headers, &.{}, 2000);
     try std.testing.expect(result == .miss);
+}
+
+test "cache does not store Set-Cookie responses" {
+    var cache = try ResponseCache.init(std.testing.allocator, 16);
+    defer cache.deinit();
+
+    const req_headers = [_]request_mod.Header{};
+    const resp_headers = [_]response_mod.Header{
+        .{ .name = "Content-Type", .value = "text/plain" },
+        .{ .name = "Set-Cookie", .value = "session=abc; HttpOnly" },
+    };
+    cache.store("/setcookie", &req_headers, &.{}, 200, &resp_headers, "hi", 60_000, 1000);
+    try std.testing.expect(cache.lookup(.GET, "/setcookie", &req_headers, &.{}, 2000) == .miss);
+}
+
+test "cache does not store responses to authenticated requests" {
+    var cache = try ResponseCache.init(std.testing.allocator, 16);
+    defer cache.deinit();
+
+    const resp_headers = [_]response_mod.Header{
+        .{ .name = "Content-Type", .value = "text/plain" },
+    };
+    const auth_req = [_]request_mod.Header{
+        .{ .name = "Authorization", .value = "Bearer xyz" },
+    };
+    cache.store("/authed", &auth_req, &.{}, 200, &resp_headers, "secret", 60_000, 1000);
+    // Even an anonymous lookup must miss — the authed response was not stored.
+    try std.testing.expect(cache.lookup(.GET, "/authed", &.{}, &.{}, 2000) == .miss);
+
+    const cookie_req = [_]request_mod.Header{
+        .{ .name = "Cookie", .value = "session=abc" },
+    };
+    cache.store("/cookied", &cookie_req, &.{}, 200, &resp_headers, "secret", 60_000, 1000);
+    try std.testing.expect(cache.lookup(.GET, "/cookied", &.{}, &.{}, 2000) == .miss);
+}
+
+test "cache does not store Vary:* responses" {
+    var cache = try ResponseCache.init(std.testing.allocator, 16);
+    defer cache.deinit();
+
+    const req_headers = [_]request_mod.Header{};
+    const resp_headers = [_]response_mod.Header{
+        .{ .name = "Vary", .value = "*" },
+    };
+    cache.store("/vary", &req_headers, &.{}, 200, &resp_headers, "x", 60_000, 1000);
+    try std.testing.expect(cache.lookup(.GET, "/vary", &req_headers, &.{}, 2000) == .miss);
 }
 
 test "cache conditional 304 with ETag" {
