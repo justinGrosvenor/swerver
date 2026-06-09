@@ -99,6 +99,18 @@ pub const Handler = struct {
     ) Error!ProcessResult {
         var result = ProcessResult{};
 
+        // KNOWN LIMITATION (follow-up): coalesced packets. RFC 9000 §12.2
+        // permits multiple QUIC packets in one UDP datagram (e.g.
+        // Initial+Handshake, Initial+0-RTT). We process only the first packet
+        // here; `parse_result.consumed` is not used to iterate the remaining
+        // datagram, and `packet.parseHeader` currently treats payload_length
+        // as extending to the end of the datagram rather than honoring the
+        // long-header Length field. Supporting coalescing requires teaching
+        // the parser to delimit each packet by its Length field and looping
+        // over the datagram before building one response flight. Deferred
+        // because it changes core handshake packet handling and needs a real
+        // QUIC client to validate.
+
         // Parse packet header
         const parse_result = packet.parseHeader(data, connection.OUR_CID_LEN);
         if (parse_result.state != .complete) {
