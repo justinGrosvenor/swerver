@@ -66,7 +66,7 @@ pub const Extra = struct {
 /// Prevents the same payment header from being reused within max_timeout_seconds.
 /// Note: per-process (not shared across workers), so effective capacity scales with worker count.
 const ReplayGuard = struct {
-    const SLOTS = 65536;
+    const SLOTS = 16384;
     const MASK = SLOTS - 1;
     const PROBE_LIMIT = 8;
 

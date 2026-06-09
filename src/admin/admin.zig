@@ -63,17 +63,9 @@ pub fn pollAdmin(server: *Server) void {
     setTimeouts(client);
 
     var req_buf: [MAX_REQUEST]u8 = undefined;
-    var total_read: usize = 0;
-    while (total_read < req_buf.len) {
-        const n = std.posix.read(client, req_buf[total_read..]) catch break;
-        if (n == 0) break;
-        total_read += n;
-        if (std.mem.indexOf(u8, req_buf[0..total_read], "\r\n\r\n")) |hdr_end| {
-            const cl = findContentLength(req_buf[0..hdr_end]);
-            if (total_read >= hdr_end + 4 + cl) break;
-        }
-    }
-    if (total_read == 0) return;
+    const n = std.posix.read(client, &req_buf) catch return;
+    if (n == 0) return;
+    const total_read = n;
 
     const req = parseHttpRequest(req_buf[0..total_read]) orelse {
         _ = writeHttpResponse(client, 400, "{\"error\":\"bad request\"}");
