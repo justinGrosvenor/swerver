@@ -452,9 +452,32 @@ const ResponseParser = struct {
     };
 
     fn parse(self: *ResponseParser) ParseError!ParsedResponse {
-        // Parse status line: HTTP/1.1 200 OK\r\n
-        const status_line_end = std.mem.indexOf(u8, self.buf, "\r\n") orelse return error.IncompleteResponse;
-        const status_line = self.buf[0..status_line_end];
+        // Skip any interim 1xx responses (e.g. 100 Continue, 103 Early Hints),
+        // which are body-less and precede the final response (RFC 9110 §15.2).
+        // 101 Switching Protocols is terminal (upgrade) and is not skipped.
+        var base: usize = 0;
+        while (true) {
+            const rel_end = std.mem.indexOf(u8, self.buf[base..], "\r\n") orelse return error.IncompleteResponse;
+            const sline = self.buf[base .. base + rel_end];
+            if (sline.len < 12) return error.InvalidResponse;
+            if (!std.mem.startsWith(u8, sline, "HTTP/1.")) return error.InvalidResponse;
+            if (sline.len < 9 + 3) return error.InvalidResponse;
+            const code = std.fmt.parseInt(u16, sline[9 .. 9 + 3], 10) catch return error.InvalidResponse;
+            if (code >= 100 and code < 200 and code != 101) {
+                // Interim response: advance past its (body-less) block, which
+                // ends at the blank-line terminator. For a header-less 1xx the
+                // status line's own CRLF is the first half of that terminator,
+                // so search from `base`.
+                const term = std.mem.indexOf(u8, self.buf[base..], "\r\n\r\n") orelse return error.IncompleteResponse;
+                base = base + term + 4;
+                continue;
+            }
+            break;
+        }
+
+        // Parse the final status line: HTTP/1.1 200 OK\r\n
+        const status_line_end = base + (std.mem.indexOf(u8, self.buf[base..], "\r\n") orelse return error.IncompleteResponse);
+        const status_line = self.buf[base..status_line_end];
 
         // Minimum valid: "HTTP/1.1 200"
         if (status_line.len < 12) return error.InvalidResponse;
@@ -1161,6 +1184,25 @@ test "parseUpstreamResponse basic" {
     try std.testing.expectEqual(@as(u16, 200), parsed.status);
     try std.testing.expect(parsed.keep_alive);
     try std.testing.expect(!parsed.is_chunked);
+}
+
+test "parseUpstreamResponse skips interim 1xx responses" {
+    // 100 Continue then the real 200.
+    const cont = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+    const p1 = try parseUpstreamResponse(cont, false);
+    try std.testing.expectEqual(@as(u16, 200), p1.status);
+    try std.testing.expectEqualStrings("hello", cont[p1.body_start..p1.body_end]);
+
+    // 103 Early Hints (with headers) then 200.
+    const eh = "HTTP/1.1 103 Early Hints\r\nLink: </s.css>; rel=preload\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+    const p2 = try parseUpstreamResponse(eh, false);
+    try std.testing.expectEqual(@as(u16, 200), p2.status);
+    try std.testing.expectEqualStrings("hi", eh[p2.body_start..p2.body_end]);
+
+    // 101 Switching Protocols is terminal — not skipped.
+    const sw = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n";
+    const p3 = try parseUpstreamResponse(sw, false);
+    try std.testing.expectEqual(@as(u16, 101), p3.status);
 }
 
 test "parseUpstreamResponse waits for complete chunked body" {
