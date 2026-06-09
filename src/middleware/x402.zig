@@ -281,7 +281,7 @@ threadlocal var reject_402_headers: [2]response.Header = undefined;
 
 pub fn rejectWith(reason: RejectReason, policy: RoutePaymentConfig) RejectInfo {
     const status: u16 = switch (reason) {
-        .missing_header, .facilitator_rejected => 402,
+        .missing_header, .facilitator_rejected, .unverifiable => 402,
         .malformed_header, .invalid_signature => 400,
         .facilitator_error => 500,
     };
@@ -303,6 +303,7 @@ pub fn rejectWith(reason: RejectReason, policy: RoutePaymentConfig) RejectInfo {
         .invalid_signature => "Invalid payment signature",
         .facilitator_rejected => "Payment verification failed",
         .facilitator_error => "Payment processing error",
+        .unverifiable => "Payment required",
     };
     return .{
         .reason = reason,
@@ -344,6 +345,11 @@ pub const SettleResult = struct {
 pub const PaymentContext = struct {
     payment_header: []const u8,
     needs_settlement: bool,
+    /// True when the local EIP-712/EIP-3009 pre-filter actually ran and
+    /// passed (signature, recipient, amount, and validity window all
+    /// checked). Used by callers on the no-facilitator path to fail closed
+    /// rather than grant free access on a structural-only check.
+    verified_locally: bool = false,
 };
 
 pub const RejectReason = enum {
@@ -352,6 +358,10 @@ pub const RejectReason = enum {
     invalid_signature,
     facilitator_rejected,
     facilitator_error,
+    /// The route requires payment but the gateway has no way to verify it
+    /// (no facilitator, and the route lacks the EIP-712 domain config /
+    /// crypto support for local verification). Fail closed.
+    unverifiable,
 };
 
 pub const EvaluateResult = union(enum) {
@@ -400,7 +410,7 @@ pub fn evaluateWithFacilitator(
     policy: RoutePaymentConfig,
     facilitator: ?FacilitatorConfig,
 ) EvaluateResult {
-    if (!policy.require_payment) return .{ .allow = .{ .payment_header = "", .needs_settlement = false } };
+    if (!policy.require_payment) return .{ .allow = .{ .payment_header = "", .needs_settlement = false, .verified_locally = true } };
 
     const payment_header = findValidPaymentHeader(req) orelse {
         const has_any = for (req.headers) |hdr| {
@@ -431,9 +441,10 @@ pub fn evaluateWithFacilitator(
     // when the route is fully configured with the token's EIP-712 domain
     // (asset = verifyingContract, network → chainId, extra_name/version),
     // reconstruct the TransferWithAuthorization digest, recover the signer,
-    // and reject forgeries (or a wrong recipient) before a facilitator
-    // round-trip. If any domain input is missing we cannot verify safely, so
-    // we defer to the facilitator rather than risk rejecting a valid payment.
+    // verify the authorized amount covers the price and the validity window
+    // is current, and reject forgeries (or a wrong recipient) before a
+    // facilitator round-trip.
+    var locally_verified = false;
     if (build_options.enable_x402_crypto and
         policy.pay_to.len > 0 and
         std.mem.eql(u8, policy.scheme, "exact") and
@@ -450,8 +461,11 @@ pub fn evaluateWithFacilitator(
                 .chain_id = chain_id,
                 .verifying_contract = policy.asset,
                 .merchant = policy.pay_to,
+                .min_value = policy.price,
+                .now_unix = @divTrunc(@as(i64, @intCast(now_ms)), 1000),
             });
             if (!ok) return .{ .reject = rejectWith(.invalid_signature, policy) };
+            locally_verified = true;
         }
     }
 
@@ -460,10 +474,30 @@ pub fn evaluateWithFacilitator(
         if (!result.is_valid) {
             return .{ .reject = rejectWith(.facilitator_rejected, policy) };
         }
-        return .{ .allow = .{ .payment_header = payment_header, .needs_settlement = true } };
+        return .{ .allow = .{ .payment_header = payment_header, .needs_settlement = true, .verified_locally = locally_verified } };
     }
 
-    return .{ .allow = .{ .payment_header = payment_header, .needs_settlement = false } };
+    // No synchronous facilitator. The caller decides what happens next: it
+    // may kick off an asynchronous facilitator verify (route_fac), or — if
+    // there is no facilitator at all — it must fail closed unless we
+    // verified the payment locally. We surface `verified_locally` so the
+    // caller can enforce that without re-running the crypto. See
+    // `failClosedOnUnverified`.
+    return .{ .allow = .{ .payment_header = payment_header, .needs_settlement = false, .verified_locally = locally_verified } };
+}
+
+/// Caller-side fail-closed guard for the no-facilitator path. A paid route
+/// that will not consult any facilitator (synchronous or asynchronous) must
+/// reject unless the payment was verified locally; otherwise a client gets
+/// free access on a structural-only check. Returns a reject result to send,
+/// or null to allow. On allow it records the payment for replay protection.
+pub fn failClosedOnUnverified(policy: RoutePaymentConfig, ctx: PaymentContext) ?RejectInfo {
+    if (!policy.require_payment) return null;
+    if (!ctx.verified_locally) return rejectWith(.unverifiable, policy);
+    if (ctx.payment_header.len > 0) {
+        recordPayment(ctx.payment_header, policy.max_timeout_seconds);
+    }
+    return null;
 }
 
 /// Parse an EVM chain id from a network identifier. Accepts CAIP-2
@@ -1138,7 +1172,11 @@ test "x402: buildVerifyRequestJson V2 format" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"payTo\":\"0xRecv\"") != null);
 }
 
-test "x402: evaluateWithFacilitator allows without facilitator" {
+test "x402: evaluateWithFacilitator fails closed without facilitator or local verification" {
+    // A paid route with no facilitator AND no verifiable EIP-712 domain
+    // config must reject — granting access on a structural-only check
+    // would let any client pay nothing. (Regression for the no-facilitator
+    // free-access bug.)
     const policy = RoutePaymentConfig{
         .require_payment = true,
         .payment_required_b64 = "dGVzdA==",
@@ -1151,10 +1189,17 @@ test "x402: evaluateWithFacilitator allows without facilitator" {
         .{ .name = "X-Payment", .value = b64_buf[0..b64_len] },
     };
     const req = makeRequest("/", &headers);
-    switch (evaluateWithFacilitator(req, policy, null)) {
-        .allow => |ctx| try std.testing.expect(!ctx.needs_settlement),
+    const res = evaluateWithFacilitator(req, policy, null);
+    // evaluate itself allows (an async facilitator may still run), but marks
+    // the payment as not locally verified...
+    switch (res) {
+        .allow => |ctx| try std.testing.expect(!ctx.verified_locally),
         .reject => return error.TestUnexpectedResult,
     }
+    // ...so the caller's fail-closed guard must reject it (no facilitator).
+    const reject = failClosedOnUnverified(policy, res.allow) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u16, 402), reject.resp.status);
+    try std.testing.expectEqual(RejectReason.unverifiable, reject.reason);
 }
 
 test "x402: evaluateWithFacilitator rejects without header" {
@@ -1241,10 +1286,12 @@ test "x402: local crypto verification rejects a forged signature" {
     }
 }
 
-test "x402: local crypto skipped when pay_to is empty" {
+test "x402: fails closed when local crypto cannot run and no facilitator" {
     if (!build_options.enable_x402_crypto) return error.SkipZigTest;
-    // Structurally valid payment header with garbage signature — passes because
-    // pay_to is empty, so local crypto verification is skipped.
+    // pay_to empty → local crypto verification cannot run. With no
+    // facilitator the gateway has no way to verify the payment, so it must
+    // reject rather than grant free access. (Regression for the bug where a
+    // structurally valid header with a garbage signature was allowed.)
     const json = "{\"signature\":\"0xabc\",\"payload\":{\"amount\":\"100\"}}";
     const policy = RoutePaymentConfig{
         .require_payment = true,
@@ -1255,10 +1302,14 @@ test "x402: local crypto skipped when pay_to is empty" {
         .{ .name = "X-Payment", .value = encodeJson(json) },
     };
     const req = makeRequest("/", &headers);
-    switch (evaluateWithFacilitator(req, policy, null)) {
-        .allow => {},
+    const res = evaluateWithFacilitator(req, policy, null);
+    switch (res) {
+        .allow => |ctx| try std.testing.expect(!ctx.verified_locally),
         .reject => return error.TestUnexpectedResult,
     }
+    const reject = failClosedOnUnverified(policy, res.allow) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u16, 402), reject.resp.status);
+    try std.testing.expectEqual(RejectReason.unverifiable, reject.reason);
 }
 
 test "x402: buildReceiptB64 encodes settlement" {

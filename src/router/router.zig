@@ -842,6 +842,15 @@ pub const Router = struct {
                     return .{ .resp = result_resp };
                 },
             }
+            // No facilitator configured: fail closed unless the payment was
+            // verified locally (otherwise a structural-only header grants
+            // free access).
+            if (self.facilitator == null) {
+                if (x402.failClosedOnUnverified(effective_policy, x402_result.allow)) |info| {
+                    result_resp = info.resp;
+                    return .{ .resp = result_resp };
+                }
+            }
             if (r.middleware_chain) |chain| {
                 switch (chain.executePre(mw_ctx, req)) {
                     .allow => {},

@@ -1005,6 +1005,14 @@ pub fn handleRead(server: *Server, index: u32) !void {
                                 });
                                 if (conn.read_buffered_bytes == 0) break;
                                 continue;
+                            } else if (x402_mod.failClosedOnUnverified(x402_policy, ctx)) |reject_info| {
+                                // No facilitator will be consulted and the
+                                // payment was not verified locally — fail
+                                // closed instead of granting free access.
+                                if (parse.view.method == .POST or parse.view.method == .PUT or parse.view.method == .PATCH) conn.close_after_write = true;
+                                try http1_mod.queueResponse(server, conn, reject_info.resp);
+                                if (conn.read_buffered_bytes == 0) break;
+                                continue;
                             }
                         },
                     }

@@ -89,10 +89,11 @@ pub const Event = union(enum) {
 /// - `headers` slices point into the Stack's fixed-size owned storage
 ///   (`header_name_storage` / `header_value_storage`). They are valid
 ///   until the Stack's next `ingest()` call on this connection.
-/// - `body` is a slice into the caller's input buffer passed to
-///   `ingest()` (typically the decrypted QUIC STREAM frame payload).
-///   It is valid for the duration of the synchronous handler
-///   invocation that processes this event.
+/// - `body` slices point into the Stack's per-packet owned storage
+///   (`body_storage`), copied from the input so the slice survives
+///   after the caller's input buffer (a handler-local decrypted STREAM
+///   frame, or a Stream recv buffer) is reclaimed. Valid until the next
+///   `resetPerPacketScratch` / `ingest()` on this Stack.
 ///
 /// Both slices must be consumed / copied before the next `ingest()`
 /// call on the same Stack.
@@ -207,6 +208,16 @@ pub const Stack = struct {
     header_value_storage: [64][4096]u8 = undefined,
     /// Number of headers currently stored
     header_count: usize = 0,
+    /// Request body storage. `RequestReadyEvent.body` slices point here,
+    /// not into the caller's input buffer — the input (a decrypted QUIC
+    /// STREAM frame in a handler-local buffer, or a Stream recv buffer)
+    /// is reclaimed before the event is dispatched. Like the header
+    /// storage, bodies are APPENDED at `body_used` so multiple request
+    /// streams in one QUIC packet hold stable slices simultaneously; the
+    /// cursor resets once per packet via `resetPerPacketScratch`.
+    body_storage: [MAX_H3_BODY_CONCAT]u8 = undefined,
+    /// Bytes of `body_storage` currently in use (per-packet cursor).
+    body_used: usize = 0,
     /// Is server?
     is_server: bool,
     /// Cached IMF-fixdate string for the Date response header,
@@ -289,6 +300,7 @@ pub const Stack = struct {
     /// dispatch loop.
     pub fn resetPerPacketScratch(self: *Stack) void {
         self.header_count = 0;
+        self.body_used = 0;
     }
 
     pub fn deinit(self: *Stack) void {
@@ -432,10 +444,10 @@ pub const Stack = struct {
     ///   the HEADERS into the Stack's fixed-size owned header storage,
     ///   capture the DATA frame payload (if any) as a direct slice
     ///   into the caller's input, and emit one `RequestReadyEvent`.
-    /// - Multi-DATA-frame request bodies are rejected with
-    ///   `error.ConnectionError`. The RFC allows them, but this path
-    ///   focuses on zero-copy single-frame bodies; concatenation is
-    ///   tracked as a follow-up.
+    /// - DATA frame payloads (single or multiple) are copied into the
+    ///   Stack's per-packet `body_storage` so the emitted
+    ///   `RequestReadyEvent.body` outlives the caller's input buffer,
+    ///   which is reclaimed before dispatch.
     /// - Zero heap allocations on the hot path: no hashmap, no
     ///   ArrayList grow past capacity after warmup, no slab acquire.
     ///   The only allocations are the `self.events.append` calls,
@@ -457,12 +469,11 @@ pub const Stack = struct {
         }
 
         var owned_headers: []const Header = &.{};
-        var body: []const u8 = "";
         var have_headers = false;
-        var data_frame_count: usize = 0;
-        var concat_storage: [MAX_H3_BODY_CONCAT]u8 = undefined;
-        var concat_buf: ?*[MAX_H3_BODY_CONCAT]u8 = null;
-        var concat_len: usize = 0;
+        // Bodies are copied into the Stack's per-packet body_storage so the
+        // emitted slice survives the caller's input buffer. Append at the
+        // shared cursor; multiple request streams in one packet coexist.
+        const body_start = self.body_used;
 
         var offset: usize = 0;
         while (offset < data.len) {
@@ -486,22 +497,9 @@ pub const Stack = struct {
                     have_headers = true;
                 },
                 .data => |d| {
-                    data_frame_count += 1;
-                    if (data_frame_count == 1) {
-                        body = d.data;
-                    } else {
-                        if (concat_buf == null) {
-                            if (body.len + d.data.len > MAX_H3_BODY_CONCAT) return error.BufferTooSmall;
-                            @memcpy(concat_storage[0..body.len], body);
-                            @memcpy(concat_storage[body.len..][0..d.data.len], d.data);
-                            concat_len = body.len + d.data.len;
-                            concat_buf = &concat_storage;
-                        } else {
-                            if (concat_len + d.data.len > MAX_H3_BODY_CONCAT) return error.BufferTooSmall;
-                            @memcpy(concat_storage[concat_len..][0..d.data.len], d.data);
-                            concat_len += d.data.len;
-                        }
-                    }
+                    if (self.body_used + d.data.len > self.body_storage.len) return error.BufferTooSmall;
+                    @memcpy(self.body_storage[self.body_used..][0..d.data.len], d.data);
+                    self.body_used += d.data.len;
                 },
                 else => {
                     // Ignore trailers, reserved/grease frame types, and
@@ -520,7 +518,7 @@ pub const Stack = struct {
             return error.InvalidFrame;
         }
 
-        const final_body = if (concat_buf != null) concat_storage[0..concat_len] else body;
+        const final_body = self.body_storage[body_start..self.body_used];
         self.events.append(self.allocator, .{
             .request_ready = .{
                 .stream_id = stream_id,
@@ -1217,7 +1215,7 @@ test "request stream: single-STREAM-frame GET dispatches RequestReadyEvent" {
     try std.testing.expect(saw_path);
 }
 
-test "request stream: HEADERS + single DATA frame body is zero-copy slice" {
+test "request stream: single DATA frame body survives input buffer reuse" {
     const allocator = std.testing.allocator;
     var stack = Stack.init(allocator, true);
     defer stack.deinit();
@@ -1233,12 +1231,17 @@ test "request stream: HEADERS + single DATA frame body is zero-copy slice" {
     const req = result.events[0].request_ready;
     try std.testing.expectEqualStrings(body_payload, req.body);
 
-    // Zero-copy invariant: body.ptr must point INTO the input `buf`,
-    // not into an internal Stack buffer.
+    // Lifetime invariant (regression for the dangling-body bug): the
+    // emitted body must NOT alias the input buffer, since in production
+    // that buffer (a handler-local decrypted STREAM frame) is reclaimed
+    // before the event is dispatched. Clobbering `buf` must not corrupt
+    // the body.
     const body_ptr_addr = @intFromPtr(req.body.ptr);
     const buf_start = @intFromPtr(&buf[0]);
     const buf_end = buf_start + buf.len;
-    try std.testing.expect(body_ptr_addr >= buf_start and body_ptr_addr < buf_end);
+    try std.testing.expect(body_ptr_addr < buf_start or body_ptr_addr >= buf_end);
+    @memset(&buf, 0xAA);
+    try std.testing.expectEqualStrings(body_payload, req.body);
 }
 
 test "request stream: multi-DATA-frame body concatenated" {
@@ -1256,6 +1259,11 @@ test "request stream: multi-DATA-frame body concatenated" {
     try std.testing.expect(!result.need_more);
     try std.testing.expect(result.events.len == 1);
     const evt = result.events[0].request_ready;
+    try std.testing.expectEqualStrings("part1part2", evt.body);
+
+    // Body must survive the input buffer being reused (regression for
+    // the dangling-stack-slice bug).
+    @memset(&buf, 0xAA);
     try std.testing.expectEqualStrings("part1part2", evt.body);
 }
 

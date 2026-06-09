@@ -303,7 +303,41 @@ pub const VerifyParams = struct {
     verifying_contract: []const u8,
     /// Expected authorization.to (the configured merchant / pay_to).
     merchant: []const u8,
+    /// Minimum acceptable authorization.value (decimal token base units).
+    /// Empty disables the amount check (e.g. unit tests of the signature
+    /// path only). The full gateway always sets this to the route price.
+    min_value: []const u8 = "",
+    /// Current Unix time (seconds) for the validAfter/validBefore window
+    /// check. Zero disables the window check.
+    now_unix: i64 = 0,
 };
+
+/// Compare two non-negative decimal integer strings. Returns true when
+/// `a < b`. Arbitrary precision (token amounts can exceed u64); compares
+/// by significant-digit length then lexicographically. Non-digit input
+/// is treated as larger-than-everything so callers reject it via the
+/// surrounding logic (an unparseable value never satisfies `value >= min`).
+fn decimalLessThan(a_in: []const u8, b_in: []const u8) bool {
+    const a = stripLeadingZeros(a_in);
+    const b = stripLeadingZeros(b_in);
+    if (!allDigits(a) or !allDigits(b)) return false;
+    if (a.len != b.len) return a.len < b.len;
+    return std.mem.lessThan(u8, a, b);
+}
+
+fn stripLeadingZeros(s: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i + 1 < s.len and s[i] == '0') : (i += 1) {}
+    return s[i..];
+}
+
+fn allDigits(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| {
+        if (c < '0' or c > '9') return false;
+    }
+    return true;
+}
 
 fn stripHex(s: []const u8) []const u8 {
     return if (std.mem.startsWith(u8, s, "0x") or std.mem.startsWith(u8, s, "0X")) s[2..] else s;
@@ -447,6 +481,21 @@ pub fn verifyPaymentSignature(payment_json: []const u8, params: VerifyParams) bo
 
     // authorization.to must be the configured merchant.
     if (!std.ascii.eqlIgnoreCase(a.to, params.merchant)) return false;
+
+    // Amount: the authorized value must cover the required price. Without
+    // this a client can sign a valid transfer for "1" and pass the filter.
+    if (params.min_value.len > 0) {
+        if (decimalLessThan(a.value, params.min_value)) return false;
+    }
+
+    // Validity window (EIP-3009 validAfter/validBefore, decimal Unix
+    // seconds). Reject expired or not-yet-valid authorizations, and reject
+    // unparseable bounds when a window check was requested.
+    if (params.now_unix > 0) {
+        const va = std.fmt.parseInt(i64, a.validAfter, 10) catch return false;
+        const vb = std.fmt.parseInt(i64, a.validBefore, 10) catch return false;
+        if (params.now_unix < va or params.now_unix > vb) return false;
+    }
 
     const digest = eip712Digest(.{
         .name = params.name,
@@ -742,4 +791,40 @@ test "verifyPaymentSignature: rejects empty / malformed / missing fields" {
     try std.testing.expect(!verifyPaymentSignature(
         \\{"payload":{"authorization":{"from":"0xb2BA25C6A5d758a6599A400FFA8810e68b2Ac4Db","to":"0x000000000000000000000000000000000000dEaD"}}}
     , VEC_PARAMS));
+}
+
+test "verifyPaymentSignature: rejects an underpaid authorization" {
+    if (!has_crypto) return error.SkipZigTest;
+    var params = VEC_PARAMS;
+    // VEC value is 10000; require more than that.
+    params.min_value = "10001";
+    try std.testing.expect(!verifyPaymentSignature(VEC_ENVELOPE, params));
+    // Exact and over-payment are accepted.
+    params.min_value = "10000";
+    try std.testing.expect(verifyPaymentSignature(VEC_ENVELOPE, params));
+    params.min_value = "9999";
+    try std.testing.expect(verifyPaymentSignature(VEC_ENVELOPE, params));
+}
+
+test "verifyPaymentSignature: rejects outside the validity window" {
+    if (!has_crypto) return error.SkipZigTest;
+    var params = VEC_PARAMS;
+    // VEC window is validAfter=0, validBefore=1900000000.
+    params.now_unix = 1900000001; // expired
+    try std.testing.expect(!verifyPaymentSignature(VEC_ENVELOPE, params));
+    params.now_unix = 1_000_000; // within window
+    try std.testing.expect(verifyPaymentSignature(VEC_ENVELOPE, params));
+}
+
+test "decimalLessThan: arbitrary-precision decimal comparison" {
+    try std.testing.expect(decimalLessThan("9", "10"));
+    try std.testing.expect(!decimalLessThan("10", "9"));
+    try std.testing.expect(!decimalLessThan("100", "100"));
+    try std.testing.expect(decimalLessThan("00099", "100")); // leading zeros
+    try std.testing.expect(!decimalLessThan(
+        "999999999999999999999999999",
+        "1000000000000000000000000",
+    ));
+    // Non-digit input never compares as less (so value >= min fails).
+    try std.testing.expect(!decimalLessThan("12a", "100"));
 }

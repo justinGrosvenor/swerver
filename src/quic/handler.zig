@@ -586,9 +586,11 @@ pub const Handler = struct {
                 };
 
                 // Feed directly to h3 stack — no Stream object needed.
-                // The data slice points into the decrypted packet buffer
-                // and stays valid for the duration of this synchronous
-                // call chain (processPacket → handleDatagram → handler).
+                // The data slice points into the decrypted packet buffer,
+                // which is a frame local to handleShortPacket and is gone
+                // before events are dispatched. The Stack copies any DATA
+                // payload into its own per-packet body_storage, so the
+                // emitted RequestReadyEvent.body does not alias this slice.
                 _ = conn.processHttp3Stream(
                     stream_frame.stream_id,
                     stream_frame.data,

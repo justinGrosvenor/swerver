@@ -126,6 +126,11 @@ pub fn buildUpstreamRequest(
         if (std.ascii.eqlIgnoreCase(hdr.name, "host")) continue;
         // Skip Via (handled separately in addProxyHeaders chaining logic)
         if (std.ascii.eqlIgnoreCase(hdr.name, "via")) continue;
+        // Skip client Content-Length: the body may have been re-framed
+        // (e.g. chunked decoded), so the original value can disagree with
+        // what we forward — a request-smuggling vector. We always emit a
+        // computed Content-Length below.
+        if (std.ascii.eqlIgnoreCase(hdr.name, "content-length")) continue;
 
         // Check if header should be removed
         var should_remove = false;
@@ -155,9 +160,10 @@ pub fn buildUpstreamRequest(
         pos = try addProxyHeaders(buf, pos, ctx);
     }
 
-    // Ensure Content-Length is present when forwarding a body (e.g., after stripping Transfer-Encoding)
+    // Content-Length computed from the body we actually forward (the client's
+    // header was skipped above)
     const body_len = ctx.client_request.body.len();
-    if (body_len > 0 and ctx.client_request.getHeader("Content-Length") == null) {
+    if (body_len > 0) {
         pos += (std.fmt.bufPrint(buf[pos..], "Content-Length: {d}\r\n", .{body_len}) catch return error.BufferFull).len;
     }
 
@@ -1035,6 +1041,63 @@ test "buildUpstreamRequest basic" {
     try std.testing.expect(std.mem.indexOf(u8, result, "X-Forwarded-For: 192.168.1.100\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "X-Forwarded-Proto: http\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "Via: 1.1 swerver\r\n") != null);
+}
+
+test "buildUpstreamRequest replaces client Content-Length with computed body length" {
+    var buf: [4096]u8 = undefined;
+
+    // Client sent TE: chunked + CL: 100; the front-end parser decoded the
+    // chunked body (5 bytes) but the raw Content-Length header survives in
+    // view.headers. Forwarding it verbatim is a CL.TE smuggling vector.
+    const headers = [_]request.Header{
+        .{ .name = "Content-Length", .value = "100" },
+        .{ .name = "Transfer-Encoding", .value = "chunked" },
+    };
+
+    const req = request.RequestView{
+        .method = .POST,
+        .path = "/api/upload",
+        .headers = &headers,
+        .body = .{ .slice = "hello" },
+    };
+
+    const server = upstream.Server{
+        .address = "10.0.0.1",
+        .port = 8080,
+    };
+
+    const route = upstream.ProxyRoute{
+        .path_prefix = "/api/",
+        .upstream = "backend",
+    };
+
+    const ctx = ForwardContext{
+        .client_request = req,
+        .client_ip = "192.168.1.100",
+        .client_tls = false,
+        .route = &route,
+        .server = &server,
+        .upstream_conn = undefined,
+        .request_buf = &buf,
+        .response_buf = undefined,
+    };
+
+    const len = try buildUpstreamRequest(&buf, &ctx);
+    const result = buf[0..len];
+    const header_end = std.mem.indexOf(u8, result, "\r\n\r\n").? + 4;
+    const header_area = result[0..header_end];
+
+    // Transfer-Encoding is hop-by-hop and must not be forwarded
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(header_area, "transfer-encoding") == null);
+
+    // Exactly one Content-Length, matching the decoded body, not the client's value
+    try std.testing.expect(std.mem.indexOf(u8, header_area, "Content-Length: 5\r\n") != null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(header_area, "content-length: 100") == null);
+    const first_cl = std.ascii.indexOfIgnoreCase(header_area, "content-length").?;
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(header_area[first_cl + 1 ..], "content-length") == null);
+
+    // Body appended unchanged
+    try std.testing.expectEqualStrings("hello", result[header_end..]);
 }
 
 test "parseUpstreamResponse basic" {
