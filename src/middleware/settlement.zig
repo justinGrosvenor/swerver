@@ -29,13 +29,12 @@ pub const SettlementConfig = struct {
     token: []const u8 = "",
 };
 
-var queue: [QUEUE_SIZE]Record = undefined;
-// Reactor-thread-only: enqueue() and flush() are both called from the
-// single-threaded event loop.  No synchronization needed.
-var head: usize = 0;
-var tail: usize = 0;
-var count: usize = 0;
+// SPSC ring: reactor writes via enqueue(), background thread reads.
+var ring: [QUEUE_SIZE]Record = undefined;
+var write_pos: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+var read_pos: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
 var active_config: SettlementConfig = .{};
+var sender_started: bool = false;
 
 pub fn configure(url: []const u8, token: []const u8) void {
     if (url.len == 0) {
@@ -54,6 +53,7 @@ pub fn configure(url: []const u8, token: []const u8) void {
         .use_tls = parsed.use_tls,
         .token = token,
     };
+    startSender();
 }
 
 pub fn isConfigured() bool {
@@ -106,7 +106,10 @@ pub fn enqueue(
     asset: []const u8,
     amount: []const u8,
 ) void {
-    if (count >= QUEUE_SIZE) {
+    const wp = write_pos.load(.acquire);
+    const rp = read_pos.load(.acquire);
+    const used = wp -% rp;
+    if (used >= QUEUE_SIZE) {
         std.log.warn("settlement queue full, dropping record", .{});
         return;
     }
@@ -121,20 +124,36 @@ pub fn enqueue(
     @memcpy(rec.asset[0..rec.asset_len], asset[0..rec.asset_len]);
     rec.amount_len = @intCast(@min(amount.len, 32));
     @memcpy(rec.amount[0..rec.amount_len], amount[0..rec.amount_len]);
-    queue[tail] = rec;
-    tail = (tail + 1) % QUEUE_SIZE;
-    count += 1;
+    ring[wp % QUEUE_SIZE] = rec;
+    write_pos.store(wp +% 1, .release);
 }
 
-pub fn flush() void {
-    if (count == 0) return;
-    if (active_config.url.len == 0) return;
+/// Called from housekeeping — now a no-op since the background thread
+/// handles flushing. Kept for API compatibility.
+pub fn flush() void {}
 
-    while (count > 0) {
-        const rec = &queue[head];
-        postRecord(active_config, rec);
-        head = (head + 1) % QUEUE_SIZE;
-        count -= 1;
+fn startSender() void {
+    if (sender_started) return;
+    sender_started = true;
+    _ = std.Thread.spawn(.{}, senderLoop, .{}) catch {
+        std.log.warn("settlement: failed to start background sender", .{});
+        sender_started = false;
+        return;
+    };
+}
+
+fn senderLoop() void {
+    const config = active_config;
+    while (true) {
+        const wp = write_pos.load(.acquire);
+        const rp = read_pos.load(.acquire);
+        if (wp == rp) {
+            sleepNs(1_000_000);
+            continue;
+        }
+        const rec = &ring[rp % QUEUE_SIZE];
+        postRecord(config, rec);
+        read_pos.store(rp +% 1, .release);
     }
 }
 
@@ -273,6 +292,16 @@ fn jsonEscape(dst: []u8, src: []const u8) usize {
     return escaped.len;
 }
 
+fn sleepNs(ns: u64) void {
+    var ts = std.posix.timespec{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
+    var rem: std.posix.timespec = .{ .sec = 0, .nsec = 0 };
+    while (true) {
+        const rc = std.posix.system.nanosleep(&ts, &rem);
+        if (rc == 0) return;
+        ts = rem;
+    }
+}
+
 // --- Tests ---
 
 test "buildJson: produces valid settlement JSON" {
@@ -304,17 +333,14 @@ test "buildJson: produces valid settlement JSON" {
 }
 
 test "enqueue and count" {
-    head = 0;
-    tail = 0;
-    count = 0;
+    write_pos = std.atomic.Value(u32).init(0);
+    read_pos = std.atomic.Value(u32).init(0);
     enqueue("gw1", "tx1", "eip155:1", "0xasset", "100");
-    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqual(@as(u32, 1), write_pos.load(.acquire));
     enqueue("gw2", "tx2", "eip155:1", "0xasset", "200");
-    try std.testing.expectEqual(@as(usize, 2), count);
-    // Reset for other tests
-    head = 0;
-    tail = 0;
-    count = 0;
+    try std.testing.expectEqual(@as(u32, 2), write_pos.load(.acquire));
+    write_pos = std.atomic.Value(u32).init(0);
+    read_pos = std.atomic.Value(u32).init(0);
 }
 
 test "buildPost: includes auth header when token present" {

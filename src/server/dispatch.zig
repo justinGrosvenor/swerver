@@ -207,112 +207,19 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
         server.now_ms = now_ms;
         server.refreshCachedDate();
 
-        // Housekeeping (timeout enforcement, QUIC cleanup, proxy
-        // maintenance) runs at most every 100ms. Under high load
-        // the event loop processes thousands of requests between
-        // housekeeping passes. This eliminates per-tick O(active)
-        // connection scans that dominated CPU at high core counts.
+        // Housekeeping runs at most every 100ms. Poll with timeout=0
+        // when housekeeping is due so we don't block while work waits.
         const housekeeping_interval_ms: u64 = 100;
         const needs_housekeeping = (now_ms -% last_housekeeping_ms) >= housekeeping_interval_ms;
         const timeout_ms: u32 = if (needs_housekeeping) 0 else 10;
         const events = try server.io.pollWithTimeout(timeout_ms);
 
-        if (needs_housekeeping) {
-            last_housekeeping_ms = now_ms;
-            // Enforce timeouts and close timed-out connections.
-            // Loop until all timed-out connections are drained (the fixed-size
-            // result array can only hold 64 per call).
-            while (true) {
-                const timeout_result = server.io.enforceTimeouts(now_ms);
-                for (timeout_result.to_close[0..timeout_result.count]) |conn_index| {
-                    if (server.io.getConnection(conn_index)) |conn| {
-                        server.closeConnection(conn);
-                    }
-                }
-                if (timeout_result.count < timeout_result.to_close.len) break;
-            }
-            // Periodic QUIC cleanup
-            if (server.quic) |*q| {
-                q.cleanup();
-            }
-            // Periodic proxy maintenance (pool eviction + health checks)
-            if (server.proxy) |proxy| {
-                proxy.runMaintenance(now_ms);
-            }
-            // OpenTelemetry flush
-            if (server.otel) |otel_exp| {
-                otel_exp.tick(now_ms);
-            }
-            // Poll admin API (non-blocking accept + handle)
-            admin_mod.pollAdmin(server);
-            // Flush settlement reports (non-blocking batch POST)
-            settlement_mod.flush();
-        }
-        // Drain async x402 facilitator results. The 10ms poll timeout
-        // bounds delivery latency without needing an eventfd wakeup.
-        while (x402_client.pollResult()) |result| {
-            switch (result.kind) {
-                .verify => {
-                    const rconn = server.io.getConnection(result.conn_index) orelse continue;
-                    if (rconn.id != result.conn_id) continue;
-                    if (rconn.x402 != .pending) continue;
-                    rconn.x402 = if (result.is_valid) .resolved_allow else .resolved_reject;
-                    if (rconn.isAccumulatingBody()) {
-                        http1_mod.dispatchWithAccumulatedBody(server, rconn) catch {};
-                    } else {
-                        handleRead(server, result.conn_index) catch {};
-                    }
-                    const postconn = server.io.getConnection(result.conn_index) orelse continue;
-                    if (postconn.id == result.conn_id and postconn.state != .closed) {
-                        if (postconn.write_count > 0 or postconn.hasPendingH2Streams()) {
-                            handleWrite(server, result.conn_index) catch {};
-                        }
-                        if (!postconn.close_after_write and postconn.x402 == .none) {
-                            if (postconn.fd) |pfd| server.io.rearmRecv(result.conn_index, pfd);
-                        }
-                    }
-                },
-                .settle => {
-                    const sconn = server.io.getConnection(result.conn_index);
-                    const is_parked = if (sconn) |sc| sc.id == result.conn_id and sc.x402 == .settle_pending else false;
-
-                    if (is_parked) {
-                        resumeSettlePark(server, sconn.?, &result);
-                        handleRead(server, result.conn_index) catch {};
-                        const postconn = server.io.getConnection(result.conn_index) orelse continue;
-                        if (postconn.id == result.conn_id and postconn.state != .closed) {
-                            if (postconn.write_count > 0 or postconn.hasPendingH2Streams()) {
-                                handleWrite(server, result.conn_index) catch {};
-                            }
-                            if (!postconn.close_after_write and postconn.x402 == .none) {
-                                if (postconn.fd) |pfd| server.io.rearmRecv(result.conn_index, pfd);
-                            }
-                        }
-                    }
-
-                    if (result.success and result.has_settlement_url) {
-                        settlement_mod.enqueue(
-                            result.gateway_id[0..result.gateway_id_len],
-                            result.transaction[0..result.transaction_len],
-                            result.settle_network[0..result.settle_network_len],
-                            result.settle_asset[0..result.settle_asset_len],
-                            result.settle_amount[0..result.settle_amount_len],
-                        );
-                    } else if (!result.success) {
-                        std.log.warn("x402 async settlement failed: {s}", .{result.error_reason[0..result.error_reason_len]});
-                        x402_client.spillSettle(
-                            result.gateway_id[0..result.gateway_id_len],
-                            result.settle_network[0..result.settle_network_len],
-                            result.settle_asset[0..result.settle_asset_len],
-                            result.settle_amount[0..result.settle_amount_len],
-                            result.error_reason[0..result.error_reason_len],
-                        );
-                    }
-                },
-            }
-        }
-
-        if (events.len == 0) continue;
+        // Process I/O events BEFORE housekeeping so that requests
+        // buffered during the poll are dispatched with minimal latency.
+        // Housekeeping (timeout scans, proxy maintenance, admin poll)
+        // can add milliseconds of work; deferring it avoids penalizing
+        // requests that arrived while we were waiting.
+        if (events.len == 0 and !needs_housekeeping) continue;
         for (events) |event| {
             switch (event.kind) {
                 .accept => {
@@ -472,6 +379,95 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
                             std.log.debug("handleError conn={} failed: {}", .{ index, err });
                         },
                         .accept, .datagram => unreachable,
+                    }
+                },
+            }
+        }
+
+        // Housekeeping runs AFTER event dispatch so that requests
+        // already sitting in the completion queue (io_uring) or
+        // signalled by epoll are served first.
+        if (needs_housekeeping) {
+            last_housekeeping_ms = now_ms;
+            while (true) {
+                const timeout_result = server.io.enforceTimeouts(now_ms);
+                for (timeout_result.to_close[0..timeout_result.count]) |conn_index| {
+                    if (server.io.getConnection(conn_index)) |conn| {
+                        server.closeConnection(conn);
+                    }
+                }
+                if (timeout_result.count < timeout_result.to_close.len) break;
+            }
+            if (server.quic) |*q| {
+                q.cleanup();
+            }
+            if (server.proxy) |proxy| {
+                proxy.runMaintenance(now_ms);
+            }
+            if (server.otel) |otel_exp| {
+                otel_exp.tick(now_ms);
+            }
+            admin_mod.pollAdmin(server);
+            settlement_mod.flush();
+        }
+        // Drain async x402 facilitator results.
+        while (x402_client.pollResult()) |result| {
+            switch (result.kind) {
+                .verify => {
+                    const rconn = server.io.getConnection(result.conn_index) orelse continue;
+                    if (rconn.id != result.conn_id) continue;
+                    if (rconn.x402 != .pending) continue;
+                    rconn.x402 = if (result.is_valid) .resolved_allow else .resolved_reject;
+                    if (rconn.isAccumulatingBody()) {
+                        http1_mod.dispatchWithAccumulatedBody(server, rconn) catch {};
+                    } else {
+                        handleRead(server, result.conn_index) catch {};
+                    }
+                    const postconn = server.io.getConnection(result.conn_index) orelse continue;
+                    if (postconn.id == result.conn_id and postconn.state != .closed) {
+                        if (postconn.write_count > 0 or postconn.hasPendingH2Streams()) {
+                            handleWrite(server, result.conn_index) catch {};
+                        }
+                        if (!postconn.close_after_write and postconn.x402 == .none) {
+                            if (postconn.fd) |pfd| server.io.rearmRecv(result.conn_index, pfd);
+                        }
+                    }
+                },
+                .settle => {
+                    const sconn = server.io.getConnection(result.conn_index);
+                    const is_parked = if (sconn) |sc| sc.id == result.conn_id and sc.x402 == .settle_pending else false;
+
+                    if (is_parked) {
+                        resumeSettlePark(server, sconn.?, &result);
+                        handleRead(server, result.conn_index) catch {};
+                        const postconn = server.io.getConnection(result.conn_index) orelse continue;
+                        if (postconn.id == result.conn_id and postconn.state != .closed) {
+                            if (postconn.write_count > 0 or postconn.hasPendingH2Streams()) {
+                                handleWrite(server, result.conn_index) catch {};
+                            }
+                            if (!postconn.close_after_write and postconn.x402 == .none) {
+                                if (postconn.fd) |pfd| server.io.rearmRecv(result.conn_index, pfd);
+                            }
+                        }
+                    }
+
+                    if (result.success and result.has_settlement_url) {
+                        settlement_mod.enqueue(
+                            result.gateway_id[0..result.gateway_id_len],
+                            result.transaction[0..result.transaction_len],
+                            result.settle_network[0..result.settle_network_len],
+                            result.settle_asset[0..result.settle_asset_len],
+                            result.settle_amount[0..result.settle_amount_len],
+                        );
+                    } else if (!result.success) {
+                        std.log.warn("x402 async settlement failed: {s}", .{result.error_reason[0..result.error_reason_len]});
+                        x402_client.spillSettle(
+                            result.gateway_id[0..result.gateway_id_len],
+                            result.settle_network[0..result.settle_network_len],
+                            result.settle_asset[0..result.settle_asset_len],
+                            result.settle_amount[0..result.settle_amount_len],
+                            result.error_reason[0..result.error_reason_len],
+                        );
                     }
                 },
             }
