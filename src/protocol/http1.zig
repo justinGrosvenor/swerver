@@ -506,9 +506,14 @@ fn scanHeaderArea(area: []const u8) HeaderAreaScan {
             continue;
         }
         const name = area[pos..colon];
-        if (std.ascii.eqlIgnoreCase(name, "content-length")) return .{ .has_body = true, .has_connection = false };
-        if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) return .{ .has_body = true, .has_connection = false };
-        if (std.ascii.eqlIgnoreCase(name, "connection")) has_connection = true;
+        switch (name.len) {
+            14 => if (std.ascii.eqlIgnoreCase(name, "content-length")) return .{ .has_body = true, .has_connection = false },
+            17 => if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) return .{ .has_body = true, .has_connection = false },
+            10 => if (std.ascii.eqlIgnoreCase(name, "connection")) {
+                has_connection = true;
+            },
+            else => {},
+        }
         pos = line_end + 2;
     }
     return .{ .has_body = false, .has_connection = has_connection };
