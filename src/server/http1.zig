@@ -539,9 +539,22 @@ pub fn queueResponse(server: *Server, conn: *connection.Connection, resp: respon
         return;
     }
 
-    // Small response - write everything in one buffer
+    // Small response — try to coalesce into the last write-queue buffer
+    // before using the newly acquired one. Pipelined router responses
+    // (~400 bytes each) pack ~150 per 64KB buffer, reducing pool churn.
+    if (conn.peekLastWrite()) |last| {
+        if (last.offset == 0) {
+            const tail = last.handle.bytes[last.len..];
+            if (encodeResponse(tail, resp, alt_svc, conn.close_after_write, date_str)) |n| {
+                last.len += n;
+                server.io.releaseBuffer(buf);
+                server.io.onWriteBuffered(conn, n);
+                server.io.setTimeoutPhase(conn, .write);
+                return;
+            } else |_| {}
+        }
+    }
     const written = encodeResponse(buf.bytes, resp, alt_svc, conn.close_after_write, date_str) catch {
-        // Cannot encode response - close connection
         server.io.releaseBuffer(buf);
         server.closeConnection(conn);
         return;
