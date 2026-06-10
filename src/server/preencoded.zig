@@ -104,9 +104,6 @@ pub const PreencodedH3Response = struct {
 /// every second. `findAndRefreshPreencodedH1` rebuilds the entry
 /// the first time it's hit in a new epoch second.
 ///
-/// Only valid for keep-alive responses (connection_close = false).
-/// Requests with `close_after_write = true` bypass the cache and
-/// fall through to the router path.
 pub const PreencodedH1Response = struct {
     method: []const u8,
     path: []const u8,
@@ -115,6 +112,8 @@ pub const PreencodedH1Response = struct {
     body: []const u8,
     bytes: [H1_PREENCODED_BUF_SIZE]u8 = undefined,
     len: usize = 0,
+    close_bytes: [H1_PREENCODED_BUF_SIZE]u8 = undefined,
+    close_len: usize = 0,
     epoch: u64 = 0,
 };
 
@@ -382,6 +381,7 @@ fn rebuildPreencodedH1(server: *Server, entry: *PreencodedH1Response) void {
         null;
     const date_str = server.getCachedDate();
     entry.len = http1.encodeResponse(&entry.bytes, resp, alt_svc, false, date_str) catch 0;
+    entry.close_len = http1.encodeResponse(&entry.close_bytes, resp, alt_svc, true, date_str) catch 0;
     entry.epoch = server.cached_date_epoch;
 }
 
@@ -411,11 +411,15 @@ pub fn findAndRefreshPreencodedH1(server: *Server, method: []const u8, path: []c
 /// for large POST/PUT (which always misses the cache since
 /// those aren't GET).
 pub fn tryDispatchPreencodedH1(server: *Server, conn: *connection.Connection, req_view: request.RequestView) PreencodedResult {
-    if (conn.close_after_write) return .not_cached;
     if (req_view.method != .GET) return .not_cached;
     if (server.app_router.has_any_paid_routes) return .not_cached;
     if (findAndRefreshPreencodedH1(server, "GET", req_view.path)) |entry| {
-        if (sendH1PreencodedBytes(server, conn, entry.bytes[0..entry.len]))
+        const resp_bytes = if (conn.close_after_write)
+            entry.close_bytes[0..entry.close_len]
+        else
+            entry.bytes[0..entry.len];
+        if (resp_bytes.len == 0) return .not_cached;
+        if (sendH1PreencodedBytes(server, conn, resp_bytes))
             return .dispatched
         else
             return .pool_exhausted;

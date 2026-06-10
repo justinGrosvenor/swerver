@@ -828,11 +828,17 @@ pub fn handleRead(server: *Server, index: u32) !void {
             if (http1.extractQuickLine(buf_slice)) |ql| {
                 if (ql.method == .GET) {
                     if (preencoded.findAndRefreshPreencodedH1(server, "GET", ql.path)) |entry| {
-                        if (preencoded.sendH1PreencodedBytes(server, conn, entry.bytes[0..entry.len])) {
-                            if (!ql.is_http11) conn.close_after_write = true;
+                        const resp_bytes = if (ql.has_connection_close)
+                            entry.close_bytes[0..entry.close_len]
+                        else
+                            entry.bytes[0..entry.len];
+                        if (resp_bytes.len > 0 and preencoded.sendH1PreencodedBytes(server, conn, resp_bytes)) {
+                            if (ql.has_connection_close) conn.close_after_write = true;
                             server.io.onReadConsumed(conn, ql.consumed);
                             if (conn.read_buffered_bytes == 0) break;
                             continue;
+                        } else if (resp_bytes.len == 0) {
+                            // fall through to full parse
                         } else {
                             break; // pool exhausted
                         }

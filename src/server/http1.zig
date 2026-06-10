@@ -349,7 +349,7 @@ pub fn queueResponse(server: *Server, conn: *connection.Connection, resp: respon
     // (no managed/scattered body), and status in the error cache.
     // We don't check headers.len — the pre-encoded template
     // includes its own headers (Content-Type etc.).
-    if (!conn.close_after_write and resp.status >= 400) {
+    if (resp.status >= 400) {
         const is_simple_body = switch (resp.body) {
             .bytes, .none => true,
             else => false,
@@ -362,7 +362,11 @@ pub fn queueResponse(server: *Server, conn: *connection.Connection, resp: respon
                     else => false,
                 };
                 if (body_matches) {
-                    if (preencoded.sendH1PreencodedBytes(server, conn, entry.bytes[0..entry.len])) return;
+                    const resp_bytes = if (conn.close_after_write)
+                        entry.close_bytes[0..entry.close_len]
+                    else
+                        entry.bytes[0..entry.len];
+                    if (resp_bytes.len > 0 and preencoded.sendH1PreencodedBytes(server, conn, resp_bytes)) return;
                 }
             }
         }

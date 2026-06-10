@@ -458,6 +458,7 @@ pub const QuickLine = struct {
     method: request.Method,
     path: []const u8,
     is_http11: bool,
+    has_connection_close: bool,
     consumed: usize,
 };
 
@@ -475,19 +476,42 @@ pub fn extractQuickLine(bytes: []const u8) ?QuickLine {
     if (!is_http11 and !(version.len == 8 and std.mem.eql(u8, version, "HTTP/1.0"))) return null;
     const header_end = std.mem.indexOfPos(u8, bytes, line_end + 2, "\r\n\r\n") orelse return null;
     const header_area = bytes[line_end + 2 .. header_end];
-    // Header names are case-insensitive (RFC 9110 §5.1). A case-sensitive
-    // match here would let a lowercase `content-length:` slip past the body
-    // detector, leaving the body in the buffer to be parsed as the next
-    // pipelined request — a request-smuggling desync on the cached-GET path.
-    if (std.ascii.indexOfIgnoreCase(header_area, "content-length") != null) return null;
-    if (std.ascii.indexOfIgnoreCase(header_area, "transfer-encoding") != null) return null;
-    if (std.ascii.indexOfIgnoreCase(header_area, "connection") != null) return null;
+    const scan = scanHeaderArea(header_area);
+    if (scan.has_body) return null;
     return .{
         .method = method,
         .path = path,
         .is_http11 = is_http11,
+        .has_connection_close = scan.has_connection or !is_http11,
         .consumed = header_end + 4,
     };
+}
+
+const HeaderAreaScan = struct {
+    has_body: bool,
+    has_connection: bool,
+};
+
+fn scanHeaderArea(area: []const u8) HeaderAreaScan {
+    var has_connection = false;
+    var pos: usize = 0;
+    while (pos < area.len) {
+        const line_end = std.mem.indexOfPos(u8, area, pos, "\r\n") orelse area.len;
+        const colon = std.mem.indexOfScalarPos(u8, area, pos, ':') orelse {
+            pos = line_end + 2;
+            continue;
+        };
+        if (colon >= line_end) {
+            pos = line_end + 2;
+            continue;
+        }
+        const name = area[pos..colon];
+        if (std.ascii.eqlIgnoreCase(name, "content-length")) return .{ .has_body = true, .has_connection = false };
+        if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) return .{ .has_body = true, .has_connection = false };
+        if (std.ascii.eqlIgnoreCase(name, "connection")) has_connection = true;
+        pos = line_end + 2;
+    }
+    return .{ .has_body = false, .has_connection = has_connection };
 }
 
 pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
@@ -1116,6 +1140,41 @@ test "extractQuickLine: bails on body headers regardless of case" {
     // No body headers — fast path applies.
     const ql = extractQuickLine("GET /x HTTP/1.1\r\nHost: a\r\n\r\n") orelse return error.UnexpectedNull;
     try std.testing.expectEqual(request.Method.GET, ql.method);
+    try std.testing.expect(!ql.has_connection_close);
+}
+
+test "extractQuickLine: Connection header sets close flag" {
+    const ql1 = extractQuickLine("GET / HTTP/1.1\r\nConnection: close\r\n\r\n") orelse return error.UnexpectedNull;
+    try std.testing.expect(ql1.has_connection_close);
+    const ql2 = extractQuickLine("GET / HTTP/1.1\r\nconnection: keep-alive\r\n\r\n") orelse return error.UnexpectedNull;
+    try std.testing.expect(ql2.has_connection_close);
+    // HTTP/1.0 without Connection header implies close
+    const ql3 = extractQuickLine("GET / HTTP/1.0\r\nHost: a\r\n\r\n") orelse return error.UnexpectedNull;
+    try std.testing.expect(ql3.has_connection_close);
+}
+
+test "extractQuickLine: large header values don't false-positive" {
+    const big_val = "X" ** 256;
+    const req = "GET /x HTTP/1.1\r\nX-Big: " ++ big_val ++ "\r\nHost: a\r\n\r\n";
+    const ql = extractQuickLine(req) orelse return error.UnexpectedNull;
+    try std.testing.expectEqual(request.Method.GET, ql.method);
+    try std.testing.expect(!ql.has_connection_close);
+}
+
+test "scanHeaderArea" {
+    const body = scanHeaderArea("Content-Length: 5\r\n");
+    try std.testing.expect(body.has_body);
+    const body2 = scanHeaderArea("Host: a\r\nTransfer-Encoding: chunked\r\n");
+    try std.testing.expect(body2.has_body);
+    const conn_hdr = scanHeaderArea("Host: a\r\nconnection: close\r\n");
+    try std.testing.expect(!conn_hdr.has_body);
+    try std.testing.expect(conn_hdr.has_connection);
+    const clean = scanHeaderArea("Host: a\r\nAccept: */*\r\n");
+    try std.testing.expect(!clean.has_body);
+    try std.testing.expect(!clean.has_connection);
+    const val_only = scanHeaderArea("X-Big: connection-pool-reuse\r\n");
+    try std.testing.expect(!val_only.has_body);
+    try std.testing.expect(!val_only.has_connection);
 }
 
 test "parseContentLengthValue: valid lengths" {
