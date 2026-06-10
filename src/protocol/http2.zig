@@ -628,9 +628,22 @@ const HuffmanNode = struct {
 const MaxHuffmanNodes = 1024;
 const HuffmanEosSymbol: usize = 256;
 
-fn decodeHuffman(decoder: *HpackDecoder, input: []const u8) ![]const u8 {
+/// The HPACK Huffman code table is fixed by RFC 7541 Appendix B, so the
+/// decode tree is a compile-time constant. It used to be rebuilt on every
+/// decoded string, which dominated h2 request processing: perf showed the
+/// rebuild + per-bit walk at ~65% of ALL cycles under a baseline-h2 load.
+/// Building it once at comptime moves it to rodata.
+const huffman_tree: [MaxHuffmanNodes]HuffmanNode = blk: {
+    @setEvalBranchQuota(1_000_000);
     var nodes: [MaxHuffmanNodes]HuffmanNode = undefined;
-    const root = buildHuffmanTree(&nodes);
+    for (&nodes) |*n| n.* = .{ .left = -1, .right = -1, .symbol = -1 };
+    _ = buildHuffmanTree(&nodes);
+    break :blk nodes;
+};
+
+fn decodeHuffman(decoder: *HpackDecoder, input: []const u8) ![]const u8 {
+    const nodes = &huffman_tree;
+    const root: usize = 0;
     var node: usize = root;
     var pending_bits: u32 = 0;
     var pending_len: u8 = 0;
