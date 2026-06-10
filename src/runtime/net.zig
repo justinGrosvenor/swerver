@@ -404,13 +404,17 @@ pub fn supportsGso() bool {
     const fd = std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP);
     if (fd < 0) return false;
     defer clock.closeFd(fd);
-    var val: u16 = 1280;
+    // The UDP_SEGMENT *setsockopt* takes an `int` (4 bytes). Probing with a
+    // 2-byte value returns EINVAL even on kernels that fully support GSO,
+    // which silently disabled the GSO send path entirely. (The per-message
+    // cmsg payload, by contrast, is a u16 — see sendGsoLinux.)
+    var val: c_int = 1280;
     const rc = std.posix.system.setsockopt(
         fd,
         SOL_UDP,
         UDP_SEGMENT,
         @ptrCast(&val),
-        @sizeOf(u16),
+        @sizeOf(c_int),
     );
     return rc == 0;
 }
