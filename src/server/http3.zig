@@ -70,7 +70,9 @@ pub fn handleDatagram(server: *Server) !void {
     // toward recvmmsg batching (PR PERF-2 follow-up).
     var drained: usize = 0;
     while (drained < MAX_DATAGRAMS_PER_DRAIN) : (drained += 1) {
-        const recv_result = net.recvfrom(udp_fd, &server.udp_recv_buf) catch |err| {
+        // recvmsg variant reads the UDP_GRO cmsg so the kernel can
+        // hand us several coalesced same-flow datagrams in one syscall.
+        const recv_result = net.recvmsgGro(udp_fd, &server.udp_recv_buf) catch |err| {
             switch (err) {
                 error.WouldBlock => return,
                 else => return,
@@ -78,13 +80,40 @@ pub fn handleDatagram(server: *Server) !void {
         };
         if (recv_result.bytes_read == 0) return;
 
-        processOneDatagram(
+        processDatagramBuf(
             server,
             udp_fd,
             quic,
             server.udp_recv_buf[0..recv_result.bytes_read],
+            recv_result.gso_size,
             recv_result.peer_addr,
         );
+    }
+}
+
+/// Split a (possibly GRO-coalesced) receive buffer into individual QUIC
+/// datagrams and process each. When `gso_size` is 0 the buffer is a single
+/// datagram; otherwise it holds back-to-back `gso_size`-byte datagrams
+/// from one flow (the last may be shorter). All segments share `net_peer`
+/// since GRO only coalesces datagrams of the same 4-tuple.
+fn processDatagramBuf(
+    server: *Server,
+    udp_fd: std.posix.fd_t,
+    quic: *quic_handler.Handler,
+    buf: []const u8,
+    gso_size: u16,
+    net_peer: net.SockAddrStorage,
+) void {
+    if (gso_size == 0 or buf.len <= gso_size) {
+        processOneDatagram(server, udp_fd, quic, buf, net_peer);
+        return;
+    }
+    const seg: usize = gso_size;
+    var off: usize = 0;
+    while (off < buf.len) {
+        const end = @min(off + seg, buf.len);
+        processOneDatagram(server, udp_fd, quic, buf[off..end], net_peer);
+        off = end;
     }
 }
 
@@ -93,7 +122,7 @@ pub fn handleDatagram(server: *Server) !void {
 /// kernel wrote the sockaddr into the provided buffer's reserved
 /// name area; we reinterpret those bytes as SockAddrIn/SockAddrIn6
 /// based on the family field so the QUIC stack can use it.
-pub fn handleInlineDatagram(server: *Server, payload: []const u8, peer_bytes: []const u8) void {
+pub fn handleInlineDatagram(server: *Server, payload: []const u8, peer_bytes: []const u8, gso_size: u16) void {
     const udp_fd = server.udp_fd orelse return;
     const quic = &(server.quic orelse return);
     // The sockaddr family lives at offset 0 (u16 on Linux; we only
@@ -117,7 +146,7 @@ pub fn handleInlineDatagram(server: *Server, payload: []const u8, peer_bytes: []
             return;
         }
     };
-    processOneDatagram(server, udp_fd, quic, payload, net_peer);
+    processDatagramBuf(server, udp_fd, quic, payload, gso_size, net_peer);
 }
 
 /// Process a single received UDP datagram through the QUIC stack,

@@ -434,6 +434,12 @@ pub const Event = struct {
     /// own `SockAddrStorage` union in `handleDatagram`.
     datagram_peer: [28]u8 = undefined,
     datagram_peer_len: u8 = 0,
+    /// For `.datagram` events: UDP_GRO segment size if the kernel
+    /// coalesced multiple same-flow datagrams into this one buffer (0 if
+    /// not coalesced). When non-zero the server splits `data` into
+    /// `datagram_gso_size`-byte packets (last may be shorter) before
+    /// feeding the QUIC stack.
+    datagram_gso_size: u16 = 0,
 };
 
 pub const EventKind = enum {
@@ -851,6 +857,7 @@ fn translateIoUringNativeEvents(
                 };
                 e.datagram_peer_len = ev.datagram_peer_len;
                 @memcpy(e.datagram_peer[0..ev.datagram_peer_len], ev.datagram_peer[0..ev.datagram_peer_len]);
+                e.datagram_gso_size = ev.datagram_gso_size;
                 out[count] = e;
                 count += 1;
             },

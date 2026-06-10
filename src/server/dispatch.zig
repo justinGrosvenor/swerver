@@ -252,7 +252,7 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
                     // backends deliver a readiness event and we
                     // drain the UDP fd via recvfrom.
                     if (event.data) |payload| {
-                        http3_mod.handleInlineDatagram(server, payload, event.datagram_peer[0..event.datagram_peer_len]);
+                        http3_mod.handleInlineDatagram(server, payload, event.datagram_peer[0..event.datagram_peer_len], event.datagram_gso_size);
                         if (event.kernel_buffer) |kb| kb.release();
                     } else {
                         try http3_mod.handleDatagram(server);

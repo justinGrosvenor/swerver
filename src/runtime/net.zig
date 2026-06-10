@@ -73,6 +73,12 @@ pub const UdpError = error{
 pub const RecvFromResult = struct {
     bytes_read: usize,
     peer_addr: SockAddrStorage,
+    /// UDP_GRO segment size when the kernel coalesced multiple same-flow
+    /// datagrams into one buffer (Linux only). 0 means the buffer holds a
+    /// single datagram. When non-zero, `bytes_read` covers several
+    /// back-to-back datagrams of `gso_size` bytes each (the last may be
+    /// shorter) and the caller must split before feeding the QUIC stack.
+    gso_size: u16 = 0,
 };
 
 pub const PeerAddress = struct {
@@ -187,6 +193,19 @@ pub fn bindUdp(address: []const u8, port: u16) UdpError!std.posix.fd_t {
     };
     if (std.posix.system.bind(fd, sockaddr_ptr, addr_len) != 0) return error.BindFailed;
 
+    // Linux UDP GRO (Generic Receive Offload): ask the kernel to coalesce
+    // consecutive same-flow datagrams into one recvmsg, reporting the
+    // per-segment size via a UDP_GRO control message. Best-effort — on
+    // older kernels (or non-Linux) the setsockopt fails harmlessly and we
+    // simply receive one datagram per call. The receive paths only split
+    // when a UDP_GRO cmsg is actually present, so a no-op here is safe.
+    if (comptime builtin.os.tag == .linux) {
+        const SOL_UDP = 17;
+        const UDP_GRO = 104;
+        var on: c_int = 1;
+        _ = std.posix.system.setsockopt(fd, SOL_UDP, UDP_GRO, @ptrCast(&on), @sizeOf(c_int));
+    }
+
     return fd;
 }
 
@@ -223,6 +242,87 @@ pub fn recvfrom(fd: std.posix.fd_t, buf: []u8) UdpError!RecvFromResult {
     return .{
         .bytes_read = @intCast(rc),
         .peer_addr = peer_storage,
+    };
+}
+
+/// Parse a recvmsg control buffer for a UDP_GRO segment size.
+///
+/// Returns the per-segment size in bytes if the kernel reported one (the
+/// received buffer holds multiple coalesced same-flow datagrams), or 0 if
+/// no UDP_GRO cmsg is present (single datagram).
+///
+/// `cmsghdr` on Linux 64-bit: { usize cmsg_len; c_int cmsg_level;
+/// c_int cmsg_type; } followed by the payload (a c_int gso_size for
+/// UDP_GRO), each entry padded up to usize alignment. Parsed by hand to
+/// avoid depending on stdlib CMSG macros that vary across Zig versions —
+/// mirrors the manual layout in `sendGsoLinux`.
+pub fn parseGroSegmentSize(control: []const u8) u16 {
+    if (comptime builtin.os.tag != .linux) return 0;
+    const SOL_UDP = 17;
+    const UDP_GRO = 104;
+    const hdr_size = @sizeOf(usize) + @sizeOf(c_int) + @sizeOf(c_int);
+    const align_mask: usize = @alignOf(usize) - 1;
+
+    var off: usize = 0;
+    while (off + hdr_size <= control.len) {
+        const cmsg_len = std.mem.bytesToValue(usize, control[off..][0..@sizeOf(usize)]);
+        if (cmsg_len < hdr_size or off + cmsg_len > control.len) break;
+        const level = std.mem.bytesToValue(c_int, control[off + @sizeOf(usize) ..][0..@sizeOf(c_int)]);
+        const ctype = std.mem.bytesToValue(c_int, control[off + @sizeOf(usize) + @sizeOf(c_int) ..][0..@sizeOf(c_int)]);
+        const data_off = off + hdr_size;
+        if (level == SOL_UDP and ctype == UDP_GRO and data_off + @sizeOf(c_int) <= control.len) {
+            const sz = std.mem.bytesToValue(c_int, control[data_off..][0..@sizeOf(c_int)]);
+            if (sz > 0 and sz <= 65535) return @intCast(sz);
+        }
+        const advance = (cmsg_len + align_mask) & ~align_mask;
+        if (advance == 0) break;
+        off += advance;
+    }
+    return 0;
+}
+
+/// Receive a UDP datagram via `recvmsg`, reading any UDP_GRO control
+/// message so coalesced datagrams can be split by the caller. Behaves
+/// like `recvfrom` otherwise; on non-Linux platforms it delegates to
+/// `recvfrom` (gso_size stays 0).
+pub fn recvmsgGro(fd: std.posix.fd_t, buf: []u8) UdpError!RecvFromResult {
+    if (comptime builtin.os.tag != .linux) return recvfrom(fd, buf);
+    if (!isSupportedPlatform()) return error.RecvFailed;
+
+    var peer_storage: SockAddrStorage = .{ .ip6 = undefined };
+    var iov = [_]std.posix.iovec{.{ .base = buf.ptr, .len = buf.len }};
+    // Room for the UDP_GRO cmsg (and a little slack for any other small
+    // cmsg the kernel might attach). 64 bytes comfortably covers it.
+    var control: [64]u8 align(8) = undefined;
+
+    var msg = std.posix.msghdr{
+        .name = @ptrCast(&peer_storage.ip6),
+        .namelen = @sizeOf(SockAddrIn6),
+        .iov = &iov,
+        .iovlen = 1,
+        .control = &control,
+        .controllen = control.len,
+        .flags = 0,
+    };
+
+    const rc = std.posix.system.recvmsg(fd, &msg, 0);
+    if (rc < 0) {
+        switch (std.posix.errno(rc)) {
+            .AGAIN, .INTR => return error.WouldBlock,
+            else => return error.RecvFailed,
+        }
+    }
+
+    if (msg.name.?.family == std.posix.AF.INET) {
+        const ip4_ptr: *SockAddrIn = @ptrCast(&peer_storage.ip6);
+        peer_storage = .{ .ip4 = ip4_ptr.* };
+    }
+
+    const ctrl_used = @min(@as(usize, msg.controllen), control.len);
+    return .{
+        .bytes_read = @intCast(rc),
+        .peer_addr = peer_storage,
+        .gso_size = parseGroSegmentSize(control[0..ctrl_used]),
     };
 }
 
@@ -938,4 +1038,31 @@ test "isPrivateAddress blocks expanded special ranges" {
     try std.testing.expect(!isPrivateAddress(mk.v4(8, 8, 8, 8)));
     try std.testing.expect(!isPrivateAddress(mk.v4(100, 63, 0, 1))); // just below CGNAT
     try std.testing.expect(!isPrivateAddress(mk.v4(1, 1, 1, 1)));
+}
+
+test "parseGroSegmentSize reads UDP_GRO cmsg" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const SOL_UDP = 17;
+    const UDP_GRO = 104;
+    const hdr_size = @sizeOf(usize) + @sizeOf(c_int) + @sizeOf(c_int);
+
+    // Build one well-formed UDP_GRO cmsg carrying a 1200-byte segment.
+    var buf: [64]u8 align(8) = [_]u8{0} ** 64;
+    const cmsg_len: usize = hdr_size + @sizeOf(c_int);
+    @memcpy(buf[0..@sizeOf(usize)], std.mem.asBytes(&cmsg_len));
+    const level: c_int = SOL_UDP;
+    @memcpy(buf[@sizeOf(usize)..][0..@sizeOf(c_int)], std.mem.asBytes(&level));
+    const ctype: c_int = UDP_GRO;
+    @memcpy(buf[@sizeOf(usize) + @sizeOf(c_int) ..][0..@sizeOf(c_int)], std.mem.asBytes(&ctype));
+    const seg: c_int = 1200;
+    @memcpy(buf[hdr_size..][0..@sizeOf(c_int)], std.mem.asBytes(&seg));
+    try std.testing.expectEqual(@as(u16, 1200), parseGroSegmentSize(buf[0 .. hdr_size + @sizeOf(c_int)]));
+
+    // Empty control buffer -> not coalesced.
+    try std.testing.expectEqual(@as(u16, 0), parseGroSegmentSize(buf[0..0]));
+
+    // A non-GRO cmsg (different type) is ignored.
+    const other: c_int = 1; // arbitrary non-UDP_GRO type
+    @memcpy(buf[@sizeOf(usize) + @sizeOf(c_int) ..][0..@sizeOf(c_int)], std.mem.asBytes(&other));
+    try std.testing.expectEqual(@as(u16, 0), parseGroSegmentSize(buf[0 .. hdr_size + @sizeOf(c_int)]));
 }

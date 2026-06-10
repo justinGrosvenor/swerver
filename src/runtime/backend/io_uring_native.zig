@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const clock = @import("../clock.zig");
+const net = @import("../net.zig");
 
 const is_linux = builtin.os.tag == .linux;
 const linux = if (is_linux) std.os.linux else undefined;
@@ -68,6 +69,13 @@ const RECV_BUF_GROUP_ID: u16 = 0;
 /// is preferable because the kernel rounds the payload offset up by
 /// this amount on every datagram.
 const UDP_NAMELEN: u32 = 28;
+
+/// Reserved space for the recvmsg control area in each UDP provided
+/// buffer, sized for the UDP_GRO cmsg (cmsghdr + a c_int payload, padded)
+/// plus slack for any other small cmsg the kernel may attach. The kernel
+/// rounds the payload offset up by this amount on every datagram, so keep
+/// it tight. Must be usize-aligned for cmsg parsing.
+const UDP_CONTROLLEN: u32 = 64;
 
 // ─── Acceptor thread sizing ─────────────────────────────────────────
 // The acceptor runs on its own thread with its own io_uring ring,
@@ -391,6 +399,11 @@ pub const IoUringNativeEvent = struct {
     // the buffer's reserved name area.
     datagram_peer: [28]u8 = undefined,
     datagram_peer_len: u8 = 0,
+    // For .datagram events: UDP_GRO segment size when the kernel
+    // coalesced several same-flow datagrams into one buffer (0 if not
+    // coalesced). The server splits `data` into this many bytes per
+    // packet before feeding the QUIC stack.
+    datagram_gso_size: u16 = 0,
 
     pub const Kind = enum { accept, read, write, err, datagram };
 };
@@ -645,8 +658,13 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
             .namelen = UDP_NAMELEN,
             .iov = @ptrCast(&self.udp_iov),
             .iovlen = 0,
+            // Reserve a control area in each provided buffer so the kernel
+            // can attach the UDP_GRO cmsg (segment size for coalesced
+            // datagrams). `control` stays null — for multishot recvmsg the
+            // kernel carves the control region out of the provided buffer
+            // itself, sized by controllen.
             .control = null,
-            .controllen = 0,
+            .controllen = UDP_CONTROLLEN,
             .flags = 0,
         };
         try self.armMultishotRecvmsg();
@@ -1021,6 +1039,13 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
                     const name_off: usize = @sizeOf(linux.io_uring_recvmsg_out);
                     const cmsg_off: usize = name_off + UDP_NAMELEN;
                     const payload_off: usize = cmsg_off + self.udp_msghdr.controllen;
+                    // Parse the UDP_GRO cmsg (if any) so coalesced
+                    // datagrams get split before reaching the QUIC stack.
+                    var gso_size: u16 = 0;
+                    if (out.controllen > 0 and cmsg_off < total) {
+                        const ctrl_end = @min(cmsg_off + @as(usize, out.controllen), total);
+                        gso_size = net.parseGroSegmentSize(slab[cmsg_off..ctrl_end]);
+                    }
                     // Guard against truncation: o.payloadlen may
                     // exceed what fits in the buffer if the peer
                     // sent an oversized datagram. Clamp to what we
@@ -1036,6 +1061,7 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
                     };
                     @memcpy(ev.datagram_peer[0..namelen], slab[name_off .. name_off + namelen]);
                     ev.datagram_peer_len = @intCast(namelen);
+                    ev.datagram_gso_size = gso_size;
                     self.events[count] = ev;
                     count += 1;
                     // Multishot recvmsg stays armed until F_MORE is
