@@ -439,8 +439,11 @@ pub fn sendH1PreencodedBytes(server: *Server, conn: *connection.Connection, byte
     // instead of acquiring a new buffer. Pipelined pre-encoded
     // responses (~200-300 bytes each) can pack ~200 per 64KB
     // buffer, eliminating per-response buffer acquire/release.
+    // Never append while a sendfile body is pending: the last entry would
+    // be a static response's headers and these bytes would precede its
+    // file body on the wire (the dispatch pipeline loop also guards this).
     if (conn.peekLastWrite()) |entry| {
-        if (entry.offset == 0 and entry.len + bytes.len <= entry.handle.bytes.len) {
+        if (entry.offset == 0 and !conn.hasPendingFile() and entry.len + bytes.len <= entry.handle.bytes.len) {
             @memcpy(entry.handle.bytes[entry.len..][0..bytes.len], bytes);
             entry.len += bytes.len;
             server.io.onWriteBuffered(conn, bytes.len);

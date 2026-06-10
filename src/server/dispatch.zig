@@ -805,7 +805,20 @@ pub fn handleRead(server: *Server, index: u32) !void {
         }
     }
 
-    while (conn.state != .closed and conn.read_buffered_bytes > 0 and conn.canEnqueueWrite()) {
+    // The `!hasPendingFile()` guard is a wire-ordering invariant: a static
+    // (sendfile) response enqueues only its HEADERS as a write entry and
+    // pumps the file body later, once the queue drains (write_count == 0).
+    // Processing further pipelined requests now would put their response
+    // bytes on the wire BEFORE the file body — corrupting the stream. Break
+    // instead; handleWrite re-enters handleRead once the file is fully sent.
+    // Memoize the last preencoded cache hit across pipelined iterations.
+    // Pipelined batches almost always repeat one URL, so after the first
+    // lookup we can skip the linear scan on subsequent requests — just
+    // verify the path still matches.
+    var memo_entry: ?*preencoded.PreencodedH1Response = null;
+    var memo_path: []const u8 = "";
+
+    while (conn.state != .closed and conn.read_buffered_bytes > 0 and conn.canEnqueueWrite() and !conn.hasPendingFile()) {
         if (conn.x402 == .pending or conn.x402 == .settle_pending) break;
         // Opportunistic inline write drain: push enqueued responses
         // to the kernel while still processing pipelined requests.
@@ -837,11 +850,17 @@ pub fn handleRead(server: *Server, index: u32) !void {
         {
             if (http1.extractQuickLine(buf_slice)) |ql| {
                 if (ql.method == .GET) {
-                    if (preencoded.findAndRefreshPreencodedH1(server, "GET", ql.path)) |entry| {
+                    const entry = if (memo_entry) |me| blk: {
+                        break :blk if (ql.path.len == memo_path.len and std.mem.eql(u8, ql.path, memo_path)) me else preencoded.findAndRefreshPreencodedH1(server, "GET", ql.path);
+                    } else preencoded.findAndRefreshPreencodedH1(server, "GET", ql.path);
+
+                    if (entry) |e| {
+                        memo_entry = e;
+                        memo_path = ql.path;
                         const resp_bytes = if (ql.has_connection_close)
-                            entry.close_bytes[0..entry.close_len]
+                            e.close_bytes[0..e.close_len]
                         else
-                            entry.bytes[0..entry.len];
+                            e.bytes[0..e.len];
                         if (resp_bytes.len > 0 and preencoded.sendH1PreencodedBytes(server, conn, resp_bytes)) {
                             if (ql.has_connection_close) conn.close_after_write = true;
                             server.io.onReadConsumed(conn, ql.consumed);
@@ -1545,9 +1564,42 @@ fn setupWebSocketTunnel(
     }
 }
 
+/// Result of one drain pass — see handleWrite.
+const WritePass = enum { done, reenter_read };
+
 pub fn handleWrite(server: *Server, index: u32) !void {
-    const conn = server.io.getConnection(index) orelse return;
-    const socket_fd = conn.fd orelse return;
+    // Drive drain passes and pipelined-read re-entry as a LOOP, never
+    // recursion. A pipelined batch can interleave reads and writes many
+    // times (e.g. each static sendfile response breaks the pipeline loop),
+    // and all of that work comes from bytes that are already buffered — no
+    // kernel event will fire to resume it. Recursing handleWrite <->
+    // handleRead here would let a crafted batch of pipelined requests grow
+    // the stack without bound.
+    while (true) {
+        switch (try handleWritePass(server, index)) {
+            .done => return,
+            .reenter_read => {
+                handleRead(server, index) catch {};
+                const conn = server.io.getConnection(index) orelse return;
+                if (conn.state == .closed) return;
+                // Loop only while handleRead produces drainable work.
+                // Otherwise stop: either the batch is fully processed, or
+                // the request is parked (e.g. x402 pending) and an event
+                // will resume us.
+                if (conn.write_count == 0 and !conn.hasPendingFile() and
+                    !conn.hasPendingBody() and !conn.hasPendingH2Streams())
+                {
+                    if (conn.read_buffered_bytes == 0) server.io.setTimeoutPhase(conn, .idle);
+                    return;
+                }
+            },
+        }
+    }
+}
+
+fn handleWritePass(server: *Server, index: u32) !WritePass {
+    const conn = server.io.getConnection(index) orelse return .done;
+    const socket_fd = conn.fd orelse return .done;
 
     while (true) {
         if (conn.is_tls) {
@@ -1559,11 +1611,11 @@ pub fn handleWrite(server: *Server, index: u32) !void {
                 .done => {},
                 .again => {
                     server.io.armWritable(conn.index, socket_fd) catch {};
-                    return;
+                    return .done;
                 },
                 .err => {
                     server.closeConnection(conn);
-                    return;
+                    return .done;
                 },
             }
             // TLS: coalesce as many consecutive write-queue entries as fit
@@ -1623,16 +1675,16 @@ pub fn handleWrite(server: *Server, index: u32) !void {
                         // when the next writable event drains the carry.
                         if (conn.tls_cipher_carry_handle != null) {
                             server.io.armWritable(conn.index, socket_fd) catch {};
-                            return;
+                            return .done;
                         }
                     },
                     .again => {
                         server.io.armWritable(conn.index, socket_fd) catch {};
-                        return;
+                        return .done;
                     },
                     .err => {
                         server.closeConnection(conn);
-                        return;
+                        return .done;
                     },
                 }
             }
@@ -1643,7 +1695,7 @@ pub fn handleWrite(server: *Server, index: u32) !void {
                 http2_mod.drainPendingH2Streams(server, conn);
                 if (conn.write_count > 0) continue;
             }
-            if (conn.state == .closed) return;
+            if (conn.state == .closed) return .done;
         } else {
             // Plain TCP path.
             //
@@ -1658,7 +1710,7 @@ pub fn handleWrite(server: *Server, index: u32) !void {
             // the fd in the same dispatcher tick for close-mode
             // requests, and never blocks the reactor because the
             // socket is non-blocking.
-            if (conn.send_in_flight) return;
+            if (conn.send_in_flight) return .done;
             while (conn.write_count > 0) {
                 var iov: [16]std.posix.iovec_const = undefined;
                 var iov_count: u32 = 0;
@@ -1691,16 +1743,16 @@ pub fn handleWrite(server: *Server, index: u32) !void {
                             // through the standard dispatcher path
                             // so this call is a no-op for them.
                             server.io.armWritable(conn.index, socket_fd) catch {};
-                            return;
+                            return .done;
                         },
                         .INTR => continue,
                         else => {
                             server.closeConnection(conn);
-                            return;
+                            return .done;
                         },
                     }
                 }
-                if (bytes_written == 0) return;
+                if (bytes_written == 0) return .done;
                 var written: usize = @intCast(bytes_written);
                 conn.markActive(server.now_ms);
 
@@ -1736,15 +1788,15 @@ pub fn handleWrite(server: *Server, index: u32) !void {
             const file_fd = conn.pending_file_fd.?;
             const result = net.sendfile(socket_fd, file_fd, &conn.pending_file_offset, conn.pending_file_remaining) catch |err| {
                 switch (err) {
-                    error.WouldBlock => return,
+                    error.WouldBlock => return .done,
                     error.Closed, error.Failed => {
                         conn.cleanupPendingFile();
                         server.closeConnection(conn);
-                        return;
+                        return .done;
                     },
                 }
             };
-            if (result.bytes_sent == 0) return;
+            if (result.bytes_sent == 0) return .done;
             conn.pending_file_remaining -= result.bytes_sent;
             conn.markActive(server.now_ms);
 
@@ -1756,23 +1808,24 @@ pub fn handleWrite(server: *Server, index: u32) !void {
     }
 
     // Check if all writes are complete
-    if (conn.state == .closed) return;
+    if (conn.state == .closed) return .done;
     if (conn.write_count == 0 and !conn.hasPendingBody() and !conn.hasPendingFile() and !conn.hasPendingH2Streams()) {
         if (conn.close_after_write) {
             server.closeConnection(conn);
-            return;
+            return .done;
         }
         // If there's still data in the read buffer (from a pipelining
-        // backpressure break), re-enter the read handler now that
+        // backpressure or sendfile-ordering break), hand control back to
+        // handleWrite's driver loop to re-enter the read handler now that
         // writes have drained and buffers are free. With edge-triggered
         // epoll, no new read event will fire since the data is already
-        // buffered — we must process it explicitly here.
+        // buffered — it must be processed explicitly.
         if (conn.read_buffered_bytes > 0) {
-            handleRead(server, index) catch {};
-            return;
+            return .reenter_read;
         }
         server.io.setTimeoutPhase(conn, .idle);
     }
+    return .done;
 }
 
 /// Non-blocking writev drain for use inside the pipelining loop.

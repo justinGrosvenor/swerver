@@ -542,8 +542,11 @@ pub fn queueResponse(server: *Server, conn: *connection.Connection, resp: respon
     // Small response — try to coalesce into the last write-queue buffer
     // before using the newly acquired one. Pipelined router responses
     // (~400 bytes each) pack ~150 per 64KB buffer, reducing pool churn.
+    // Never append while a sendfile body is pending: the last entry would
+    // be the static response's headers and our bytes would precede its
+    // file body on the wire (the dispatch pipeline loop also guards this).
     if (conn.peekLastWrite()) |last| {
-        if (last.offset == 0) {
+        if (last.offset == 0 and !conn.hasPendingFile()) {
             const tail = last.handle.bytes[last.len..];
             if (encodeResponse(tail, resp, alt_svc, conn.close_after_write, date_str)) |n| {
                 last.len += n;
