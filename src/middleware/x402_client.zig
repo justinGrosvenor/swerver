@@ -245,7 +245,12 @@ fn workerLoop() void {
                 },
             }
         } else {
-            sleepNs(1_000_000);
+            // Idle backoff. 10ms (100 wakeups/s) instead of 1ms: on small
+            // CPU quotas (e.g. 0.5-vCPU Fargate tasks) a 1ms sleep loop per
+            // worker burns measurable background CPU. Worst case this adds
+            // 10ms pickup latency to the first verify after an idle period —
+            // noise next to the facilitator round-trip itself.
+            sleepNs(10_000_000);
         }
     }
 }

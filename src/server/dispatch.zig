@@ -148,7 +148,7 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
     // Initialize settlement reporting from proxy route config + auth token
     initSettlement(server);
 
-    // Start async x402 facilitator thread unconditionally. Idle-sleeps 1ms
+    // Start async x402 facilitator thread unconditionally. Idle-sleeps 10ms
     // when no work — negligible. Must be unconditional so a hot-reload that
     // adds a facilitator route doesn't leave paid requests unserviced.
     x402_client.start();

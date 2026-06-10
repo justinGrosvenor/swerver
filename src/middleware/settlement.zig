@@ -148,7 +148,10 @@ fn senderLoop() void {
         const wp = write_pos.load(.acquire);
         const rp = read_pos.load(.acquire);
         if (wp == rp) {
-            sleepNs(1_000_000);
+            // Idle backoff. 10ms (100 wakeups/s) instead of 1ms — settlement
+            // reports are fire-and-forget, so pickup latency is irrelevant,
+            // and the lower wakeup rate matters on small CPU quotas.
+            sleepNs(10_000_000);
             continue;
         }
         const rec = &ring[rp % QUEUE_SIZE];
