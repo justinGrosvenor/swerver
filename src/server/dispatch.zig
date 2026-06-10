@@ -1556,32 +1556,46 @@ pub fn handleWrite(server: *Server, index: u32) !void {
             // responses, or a static file split into DATA frames) become one
             // record + one socket write instead of one per entry.
             while (conn.write_count > 0) {
-                var gathered: usize = 0;
-                {
+                // Drain any leading empty entries.
+                while (conn.peekWrite()) |e| {
+                    if (e.len - e.offset != 0) break;
+                    server.io.releaseBuffer(e.handle);
+                    conn.popWrite();
+                }
+                if (conn.write_count == 0) break;
+
+                const cap = server_tls.TLS_PLAINTEXT_WRITE_CAP;
+                const first = conn.peekWrite() orelse break;
+                const s0 = first.handle.bytes[first.offset..first.len];
+
+                // Single queued entry (the common small-response case) — or a
+                // first entry that already fills a TLS record — is written
+                // directly, with NO staging copy. Coalescing only pays off when
+                // there are ≥2 small entries to merge into one record;
+                // copying a lone response into the staging buffer just adds an
+                // extra memcpy per response (measured ~9% loss on baseline-h2).
+                var to_write: []const u8 = undefined;
+                if (conn.write_count == 1 or s0.len >= cap) {
+                    to_write = s0[0..@min(s0.len, cap)];
+                } else {
+                    // Coalesce consecutive small entries into one record.
+                    var gathered: usize = 0;
                     var idx = conn.write_head;
                     var rem_entries = conn.write_count;
-                    while (rem_entries > 0 and gathered < server_tls.TLS_PLAINTEXT_WRITE_CAP) : (rem_entries -= 1) {
+                    while (rem_entries > 0 and gathered < cap) : (rem_entries -= 1) {
                         const e = &conn.write_queue[idx];
                         const s = e.handle.bytes[e.offset..e.len];
                         if (s.len > 0) {
-                            const take = @min(s.len, server_tls.TLS_PLAINTEXT_WRITE_CAP - gathered);
+                            const take = @min(s.len, cap - gathered);
                             @memcpy(server.tls_gather[gathered..][0..take], s[0..take]);
                             gathered += take;
                             if (take < s.len) break; // record cap reached mid-entry
                         }
                         idx = if (idx + 1 >= conn.write_queue.len) 0 else idx + 1;
                     }
+                    to_write = server.tls_gather[0..gathered];
                 }
-                if (gathered == 0) {
-                    // Only empty entries remain — drain and stop.
-                    while (conn.peekWrite()) |e| {
-                        if (e.len - e.offset != 0) break;
-                        server.io.releaseBuffer(e.handle);
-                        conn.popWrite();
-                    }
-                    break;
-                }
-                switch (connWrite(server, conn, server.tls_gather[0..gathered])) {
+                switch (connWrite(server, conn, to_write)) {
                     .bytes => |n| {
                         conn.markActive(server.now_ms);
                         consumeTlsWritten(server, conn, n);
