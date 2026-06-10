@@ -279,6 +279,28 @@ fn handleHttp3Request(
             .release = write_queue.releaseBufferOpaque,
         },
     };
+
+    // Reverse-proxy routing over HTTP/3: forward matching routes to the
+    // upstream and emit the response on this stream, so swerver works as an
+    // h3/QUIC edge gateway. Mirrors the H1/H2 proxy paths; guarded by
+    // `server.proxy` so non-proxy servers are unaffected. QUIC is always TLS.
+    if (server.proxy) |proxy| {
+        if (proxy.matchRoute(&req_view)) |_| {
+            var proxy_result = proxy.handle(
+                req_view,
+                &mw_ctx,
+                null,
+                true,
+                server.now_ms,
+                null,
+                null,
+            );
+            defer proxy_result.release();
+            sendHttp3ResponseFromResponse(server, udp_fd, conn, req.stream_id, peer_addr, proxy_result.resp);
+            return;
+        }
+    }
+
     var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
     var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
     const arena_handle = server.io.acquireBuffer();

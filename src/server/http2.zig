@@ -904,6 +904,34 @@ fn dispatchHttp2Request(
     var request_with_body = hdr_request;
     request_with_body.body = .{ .slice = body };
 
+    // Reverse-proxy routing over HTTP/2: if a configured proxy route matches,
+    // forward to the upstream and emit the response on this stream — mirrors
+    // the H1 proxy path in dispatch.zig so swerver works as an h2 edge gateway.
+    // Guarded by `server.proxy`, so non-proxy servers pay nothing. (Response
+    // cache / x402 / OTel remain H1-only for now.)
+    if (server.proxy) |proxy| {
+        if (proxy.matchRoute(&request_with_body)) |_| {
+            var ip_buf: [64]u8 = undefined;
+            var client_ip_str: ?[]const u8 = null;
+            if (conn.cached_peer_ip) |ip4| {
+                const l = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ ip4[0], ip4[1], ip4[2], ip4[3] }) catch "";
+                if (l.len > 0) client_ip_str = ip_buf[0..l.len];
+            }
+            var proxy_result = proxy.handle(
+                request_with_body,
+                &mw_ctx,
+                client_ip_str,
+                conn.tls_session != null,
+                server.now_ms,
+                null,
+                null,
+            );
+            defer proxy_result.release();
+            try queueHttp2Response(server, conn, stream_id, proxy_result.resp, hdr_request.method == .HEAD);
+            return;
+        }
+    }
+
     var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
     var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
     const needs_eager_arena = (hdr_request.method != .GET and hdr_request.method != .HEAD and hdr_request.method != .DELETE);
