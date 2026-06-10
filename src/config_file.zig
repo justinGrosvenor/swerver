@@ -147,6 +147,7 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
         if (h2.max_header_list_size) |v| cfg.http2.max_header_list_size = v;
         if (h2.initial_window_size) |v| cfg.http2.initial_window_size = v;
         if (h2.max_frame_size) |v| cfg.http2.max_frame_size = v;
+        if (h2.h2c_only) |v| cfg.http2.h2c_only = v;
     }
 
     // QUIC / HTTP/3
@@ -585,6 +586,7 @@ const Http2Json = struct {
     max_header_list_size: ?usize = null,
     initial_window_size: ?u32 = null,
     max_frame_size: ?u32 = null,
+    h2c_only: ?bool = null,
 };
 
 const QuicJson = struct {

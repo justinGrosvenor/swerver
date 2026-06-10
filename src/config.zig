@@ -154,6 +154,12 @@ pub const Http2Config = struct {
     max_frame_size: u32 = 16384,
     /// Maximum HPACK dynamic table size in bytes
     max_dynamic_table_size: usize = 4096,
+    /// h2c-only listener: when true, a plaintext connection MUST begin with
+    /// the HTTP/2 connection preface (prior-knowledge h2c). Connections that
+    /// start with anything else (e.g. an HTTP/1.1 request) are refused rather
+    /// than served as HTTP/1.1, so a dedicated h2c port can't silently fall
+    /// back to h1. Default false (opportunistic h1→h2 upgrade via sniff).
+    h2c_only: bool = false,
 };
 
 pub const TlsCertificate = struct {

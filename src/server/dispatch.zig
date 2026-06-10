@@ -689,7 +689,17 @@ pub fn handleRead(server: *Server, index: u32) !void {
         const end = conn.read_offset + conn.read_buffered_bytes;
         if (end <= buffer_handle.bytes.len) {
             const candidate = buffer_handle.bytes[0..end];
-            if (http2_mod.matchesHttp2Preface(candidate)) {
+            if (!http2_mod.matchesHttp2Preface(candidate)) {
+                // h2c-only listener: refuse anything that isn't the HTTP/2
+                // connection preface (i.e. an HTTP/1.1 request) so a dedicated
+                // h2c port can't silently serve h1. `matchesHttp2Preface` is a
+                // prefix match, so a partially-arrived preface still passes
+                // and we wait for more bytes via the branch below.
+                if (server.cfg.http2.h2c_only) {
+                    server.closeConnection(conn);
+                    return;
+                }
+            } else {
                 if (candidate.len < http2.Preface.len) return;
                 if (conn.http2_stack == null) {
                     const stack_ptr = try server.allocator.create(http2.Stack);
