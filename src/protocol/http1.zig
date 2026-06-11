@@ -33,6 +33,9 @@ pub const ErrorCode = enum {
     header_too_large,
     /// RFC 9110 §10.1.1: Expect header with unsupported expectation → 417
     expectation_failed,
+    /// RFC 9112 §6.1: a request carrying both Transfer-Encoding and
+    /// Content-Length is a request-smuggling vector → 400 + close.
+    conflicting_framing,
 };
 
 /// Header-only parse result: returned by parseHeaders() once \r\n\r\n is found.
@@ -87,6 +90,7 @@ fn parseHeadersInternal(_bytes: []u8, _limits: Limits) HeaderParseResult {
     if (_limits.headers_storage.len < _limits.max_header_count) {
         return headerErr(.header_too_large, true);
     }
+    if (overlongMethod(_bytes)) return headerErr(.invalid_method, true);
     const header_end = std.mem.indexOf(u8, _bytes, "\r\n\r\n") orelse {
         return .{
             .state = .partial,
@@ -261,10 +265,13 @@ fn parseHeadersInternal(_bytes: []u8, _limits: Limits) HeaderParseResult {
     if (std.mem.eql(u8, version, "HTTP/1.1") and host_count == 0 and !host_in_target) {
         return headerErr(.missing_host, keep_alive);
     }
-    // RFC 9112 §6.1: Transfer-Encoding overrides Content-Length
+    // RFC 9112 §6.1: a request with both Transfer-Encoding and
+    // Content-Length is a request-smuggling vector (the next hop may honor
+    // a different framing than we do). Reject with 400 and close the
+    // connection rather than silently dropping CL and guessing — closing is
+    // required because the read buffer may already hold a smuggled request.
     if (is_chunked and has_content_length) {
-        has_content_length = false;
-        content_length = 0;
+        return headerErr(.conflicting_framing, false);
     }
     const wants_body = is_chunked or (has_content_length and content_length > 0);
     if (!wants_body) expect_continue = false;
@@ -523,6 +530,7 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
     if (_limits.headers_storage.len < _limits.max_header_count) {
         return parseErr(.header_too_large, true);
     }
+    if (overlongMethod(_bytes)) return parseErr(.invalid_method, true);
     const header_end = std.mem.indexOf(u8, _bytes, "\r\n\r\n") orelse {
         return .{
             .state = .partial,
@@ -701,10 +709,10 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
     if (std.mem.eql(u8, version, "HTTP/1.1") and host_count == 0 and !host_in_target) {
         return parseErr(.missing_host, keep_alive);
     }
-    // RFC 9112 §6.1: Transfer-Encoding overrides Content-Length
+    // RFC 9112 §6.1: both Transfer-Encoding and Content-Length present is a
+    // smuggling vector — reject 400 + close (see parseHeaders above).
     if (is_chunked and has_content_length) {
-        has_content_length = false;
-        content_length = 0;
+        return parseErr(.conflicting_framing, false);
     }
     const wants_body = is_chunked or (has_content_length and content_length > 0);
     if (!wants_body) expect_continue = false;
@@ -781,6 +789,20 @@ pub const Limits = struct {
     max_header_count: usize,
     headers_storage: []request.Header,
 };
+
+/// The method token is bounded (longest standard method is ~11 chars; we
+/// allow 16). If the first 17 bytes contain no SP/CR/LF the method is
+/// already over-long, so reject 400 immediately — including on a partial
+/// read, so a megabyte-method request is refused without buffering it (a
+/// malformed request line should be a 400, not a 431 once it fills the
+/// header buffer).
+fn overlongMethod(bytes: []const u8) bool {
+    if (bytes.len < 17) return false;
+    const win = bytes[0..17];
+    return std.mem.indexOfScalar(u8, win, ' ') == null and
+        std.mem.indexOfScalar(u8, win, '\r') == null and
+        std.mem.indexOfScalar(u8, win, '\n') == null;
+}
 
 fn emptyView() request.RequestView {
     return .{
@@ -1241,6 +1263,42 @@ test "containsToken: comma list, case-insensitive, trimmed" {
     try std.testing.expect(containsToken("  close  ", "close")); // OWS trimmed
     try std.testing.expect(!containsToken("closely", "close")); // not a substring match
     try std.testing.expect(!containsToken("keep-alive", "close"));
+}
+
+test "parseHeaders: TE+CL conflict rejected with close (smuggling)" {
+    var storage: [32]request.Header = undefined;
+    const limits = Limits{
+        .max_header_bytes = 8192,
+        .max_body_bytes = 1 << 20,
+        .max_header_count = 32,
+        .headers_storage = &storage,
+    };
+    // The five malformed-TE variants the probe sends, all with Content-Length.
+    const cases = [_][]const u8{
+        "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\nhello",
+        "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked \r\nContent-Length: 5\r\n\r\nhello",
+        "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked, chunked\r\nContent-Length: 5\r\n\r\nhello",
+        "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: Chunked\r\nContent-Length: 5\r\n\r\nhello",
+        "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: , chunked\r\nContent-Length: 5\r\n\r\nhello",
+    };
+    for (cases) |raw| {
+        var buf: [256]u8 = undefined;
+        @memcpy(buf[0..raw.len], raw);
+        const r = parseHeaders(buf[0..raw.len], limits);
+        try std.testing.expectEqual(ParseState.err, r.state);
+        // Must close the connection so any smuggled request in the buffer
+        // can't be processed as a second message.
+        try std.testing.expect(!r.keep_alive);
+    }
+    // A clean chunked request (no Content-Length) is still accepted.
+    {
+        const ok = "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+        var buf: [256]u8 = undefined;
+        @memcpy(buf[0..ok.len], ok);
+        const r = parseHeaders(buf[0..ok.len], limits);
+        try std.testing.expect(r.state != .err);
+        try std.testing.expect(r.is_chunked);
+    }
 }
 
 test "lastToken: chunked must be final coding" {
