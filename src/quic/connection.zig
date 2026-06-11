@@ -1331,8 +1331,16 @@ pub const Connection = struct {
         var current_largest = ack.largest_acked;
         var current_smallest = ack.largest_acked -| ack.first_ack_range;
 
-        // Peer's ACK delay: encoded value << ack_delay_exponent, in microseconds (RFC 9000 §19.3)
-        const peer_ack_delay_us: u64 = ack.ack_delay << @intCast(self.peer_params.ack_delay_exponent);
+        // Peer's ACK delay: encoded value << ack_delay_exponent, in microseconds
+        // (RFC 9000 §19.3). Saturate on overflow: ack_delay is a varint (up to
+        // 2^62-1) and the peer's exponent can be up to 20, so a hostile ACK can
+        // overflow the shift. The RTT estimator clamps to max_ack_delay anyway,
+        // so saturation never changes a legitimate sample.
+        const ack_delay_exp: u6 = @intCast(self.peer_params.ack_delay_exponent);
+        const peer_ack_delay_us: u64 = if (ack.ack_delay > (@as(u64, std.math.maxInt(u64)) >> ack_delay_exp))
+            std.math.maxInt(u64)
+        else
+            ack.ack_delay << ack_delay_exp;
 
         // Mark packets in first range as acknowledged
         self.markPacketsAcked(space, current_smallest, current_largest, peer_ack_delay_us);
@@ -1738,6 +1746,29 @@ test "processAckFrame rejects ACK for never-sent packet" {
     conn.processAckFrame(bogus, .application);
     try std.testing.expectEqual(State.closing, conn.state);
     try std.testing.expectEqual(types.TransportError.protocol_violation, conn.close_error.?);
+}
+
+test "processAckFrame saturates a hostile ack_delay instead of overflowing" {
+    const allocator = std.testing.allocator;
+    const dcid = types.ConnectionId.init(&[_]u8{ 0x01, 0x02, 0x03, 0x04 });
+    var conn = Connection.init(allocator, true, dcid);
+    defer conn.deinit();
+
+    const space = conn.getPacketSpace(.application);
+    _ = space.allocatePacketNumber(); // pn 0
+
+    // Maximum varint ack_delay shifted by the peer's exponent overflows u64
+    // unless saturated. With overflow checks on (test builds) the old code
+    // panicked here.
+    const hostile = frame.AckFrame{
+        .largest_acked = 0,
+        .ack_delay = (@as(u64, 1) << 62) - 1,
+        .first_ack_range = 0,
+        .ranges = &.{},
+        .ecn = null,
+    };
+    conn.processAckFrame(hostile, .application);
+    try std.testing.expect(conn.state != .closing);
 }
 
 test "packet number space" {

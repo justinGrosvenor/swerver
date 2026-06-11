@@ -96,6 +96,8 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
         }
         if (s.workers) |w| cfg.workers = w;
         if (s.disable_middleware) |v| cfg.disable_middleware = v;
+        if (s.preencoded) |v| cfg.disable_preencoded = !v;
+        if (s.cache_static_files) |v| cfg.cache_static_files = v;
         if (s.static_root) |r| cfg.static_root = r;
         if (s.allowed_hosts) |hosts| cfg.allowed_hosts = hosts;
     }
@@ -584,6 +586,11 @@ const ServerJson = struct {
     max_connections: ?usize = null,
     workers: ?u16 = null,
     disable_middleware: ?bool = null,
+    /// Positive-sense public toggle for the pre-encoded response registry
+    /// (default on). Maps to the internal `disable_preencoded` flag. Set
+    /// false to serve every route through the normal pipeline.
+    preencoded: ?bool = null,
+    cache_static_files: ?bool = null,
     static_root: ?[]const u8 = null,
     allowed_hosts: ?[]const []const u8 = null,
 };
@@ -833,6 +840,27 @@ test "parse minimal config" {
     try std.testing.expectEqualStrings("0.0.0.0", loaded.server_config.address);
     try std.testing.expectEqual(@as(usize, 0), loaded.upstreams.len);
     try std.testing.expectEqual(@as(usize, 0), loaded.routes.len);
+}
+
+test "preencoded + cache_static_files map to server config" {
+    // Defaults: preencoded on (disable_preencoded false), cache off.
+    {
+        var loaded = try parseJsonFromBytes(std.testing.allocator,
+            \\{ "server": { "port": 9090 } }
+        );
+        defer loaded.deinit();
+        try std.testing.expectEqual(false, loaded.server_config.disable_preencoded);
+        try std.testing.expectEqual(false, loaded.server_config.cache_static_files);
+    }
+    // Tuned entry: positive preencoded:false disables the registry; cache on.
+    {
+        var loaded = try parseJsonFromBytes(std.testing.allocator,
+            \\{ "server": { "port": 9090, "preencoded": false, "cache_static_files": true } }
+        );
+        defer loaded.deinit();
+        try std.testing.expectEqual(true, loaded.server_config.disable_preencoded);
+        try std.testing.expectEqual(true, loaded.server_config.cache_static_files);
+    }
 }
 
 test "parse full config with upstreams and routes" {

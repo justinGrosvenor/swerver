@@ -34,6 +34,11 @@ pub const ServerConfig = struct {
     /// /health, /plaintext, /pipeline). Set true when user routes need
     /// those paths.
     disable_preencoded: bool = false,
+    /// Cache static files (and their precompressed siblings) in memory on
+    /// first serve, keyed by path + negotiated encoding. Removes the
+    /// per-request open/fstat/read syscalls. Per-worker, lazy-populated,
+    /// bounded; Date stays fresh (re-encoded per response, never cached).
+    cache_static_files: bool = false,
 
     pub fn default() ServerConfig {
         return .{

@@ -266,7 +266,13 @@ fn handleHttp3Request(
     if (server.cfg.static_root.len > 0 and std.mem.startsWith(u8, req_view.path, "/static/")) {
         const file_path = req_view.path[8..];
         const content_type = Server.guessContentType(file_path);
-        serveStaticFileH3(server, udp_fd, conn, req.stream_id, peer_addr, file_path, content_type);
+        const accept_encoding = req_view.getHeader("accept-encoding") orelse "";
+        if (server.staticCacheGetOrLoad(file_path, content_type, accept_encoding)) |entry| {
+            var hdrs: [3]response_mod.Header = undefined;
+            sendHttp3ResponseFromResponse(server, udp_fd, conn, req.stream_id, peer_addr, Server.staticCacheResponse(entry, &hdrs));
+        } else {
+            serveStaticFileH3(server, udp_fd, conn, req.stream_id, peer_addr, file_path, content_type, accept_encoding);
+        }
         return;
     }
 
@@ -332,6 +338,7 @@ fn serveStaticFileH3(
     peer_addr: net.SockAddrStorage,
     file_path: []const u8,
     content_type: []const u8,
+    accept_encoding: []const u8,
 ) void {
     if (std.mem.indexOfScalar(u8, file_path, '%') != null) return sendNotFoundH3(server, udp_fd, conn, stream_id, peer_addr);
     if (std.mem.indexOf(u8, file_path, "..") != null) return sendNotFoundH3(server, udp_fd, conn, stream_id, peer_addr);
@@ -340,7 +347,8 @@ fn serveStaticFileH3(
 
     const root_fd = server.static_root_fd orelse return sendNotFoundH3(server, udp_fd, conn, stream_id, peer_addr);
 
-    const file_fd = Server.safeOpenStatic(root_fd, file_path) orelse return sendNotFoundH3(server, udp_fd, conn, stream_id, peer_addr);
+    const variant = Server.resolveStaticVariant(root_fd, file_path, accept_encoding) orelse return sendNotFoundH3(server, udp_fd, conn, stream_id, peer_addr);
+    const file_fd = variant.fd;
     defer clock.closeFd(file_fd);
 
     const buf_handle = server.io.acquireBuffer() orelse return;
@@ -354,11 +362,21 @@ fn serveStaticFileH3(
         total_read += n;
     }
 
+    // Content-Type from the original path; advertise a chosen precompressed
+    // sibling via Content-Encoding + Vary.
+    var hdrs_buf: [3]response_mod.Header = undefined;
+    var nh: usize = 0;
+    hdrs_buf[nh] = .{ .name = "Content-Type", .value = content_type };
+    nh += 1;
+    if (variant.encoding != .identity) {
+        hdrs_buf[nh] = .{ .name = "Content-Encoding", .value = variant.encoding.token() };
+        nh += 1;
+        hdrs_buf[nh] = .{ .name = "Vary", .value = "Accept-Encoding" };
+        nh += 1;
+    }
     const resp: response_mod.Response = .{
         .status = 200,
-        .headers = &[_]response_mod.Header{
-            .{ .name = "Content-Type", .value = content_type },
-        },
+        .headers = hdrs_buf[0..nh],
         .body = .{ .managed = .{ .handle = buf_handle, .len = total_read } },
     };
     sendHttp3ResponseFromResponse(server, udp_fd, conn, stream_id, peer_addr, resp);

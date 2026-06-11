@@ -609,7 +609,7 @@ pub fn streamBodyChunks(server: *Server, conn: *connection.Connection, body: []c
 
 /// Queue a file response using sendfile for zero-copy transfer.
 /// Sends HTTP headers first, then sets up the connection for sendfile.
-pub fn queueFileResponse(server: *Server, conn: *connection.Connection, static_root: []const u8, file_path: []const u8, content_type: []const u8) !void {
+pub fn queueFileResponse(server: *Server, conn: *connection.Connection, static_root: []const u8, file_path: []const u8, content_type: []const u8, accept_encoding: []const u8) !void {
     _ = static_root; // No longer used at request time — we use the cached dirfd.
 
     // Reject paths containing percent-encoded sequences to prevent URL-encoded
@@ -642,10 +642,11 @@ pub fn queueFileResponse(server: *Server, conn: *connection.Connection, static_r
         return;
     };
 
-    const file_fd = Server.safeOpenStatic(root_fd, file_path) orelse {
+    const variant = Server.resolveStaticVariant(root_fd, file_path, accept_encoding) orelse {
         try queueResponse(server, conn, Server.notFoundResponse());
         return;
     };
+    const file_fd = variant.fd;
 
     // Get file size using lseek. Also rejects directories (can't seek on them).
     const end_pos = std.c.lseek(file_fd, 0, std.posix.SEEK.END);
@@ -673,12 +674,23 @@ pub fn queueFileResponse(server: *Server, conn: *connection.Connection, static_r
         return;
     };
 
-    const headers = [_]response_mod.Header{
-        .{ .name = "Content-Type", .value = content_type },
-        .{ .name = "Content-Length", .value = size_str },
-    };
+    // Content-Type is always derived from the original path; when a
+    // precompressed sibling was chosen, advertise it with Content-Encoding
+    // and Vary so caches key on Accept-Encoding (RFC 9110 §8.4 / §12.5.5).
+    var headers_buf: [4]response_mod.Header = undefined;
+    var nh: usize = 0;
+    headers_buf[nh] = .{ .name = "Content-Type", .value = content_type };
+    nh += 1;
+    headers_buf[nh] = .{ .name = "Content-Length", .value = size_str };
+    nh += 1;
+    if (variant.encoding != .identity) {
+        headers_buf[nh] = .{ .name = "Content-Encoding", .value = variant.encoding.token() };
+        nh += 1;
+        headers_buf[nh] = .{ .name = "Vary", .value = "Accept-Encoding" };
+        nh += 1;
+    }
 
-    const header_len = encodeFileHeaders(buf.bytes, 200, &headers, server.getCachedDate()) catch {
+    const header_len = encodeFileHeaders(buf.bytes, 200, headers_buf[0..nh], server.getCachedDate()) catch {
         server.io.releaseBuffer(buf);
         clock.closeFd(file_fd);
         server.closeConnection(conn);

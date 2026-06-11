@@ -1163,3 +1163,36 @@ test "http2 window update emits window_opened event" {
     }
     try std.testing.expect(found_window_opened);
 }
+
+test "http2 connection and stream send windows are independent (no conflation)" {
+    var stack = http2.Stack.init();
+    var frames: [4]http2.Frame = undefined;
+    var events: [4]http2.Event = undefined;
+    var header_block: [64]u8 = undefined;
+    const header_bytes = buildHeaderBlockAuthority(&header_block, "localhost");
+    var buf: [http2.Preface.len + 9 + 64]u8 = undefined;
+    @memcpy(buf[0..http2.Preface.len], http2.Preface);
+    const hdr_len = try http2.writeFrame(buf[http2.Preface.len..], .headers, 0x4, 1, header_bytes);
+    _ = stack.ingest(buf[0 .. http2.Preface.len + hdr_len], frames[0..], events[0..]);
+
+    // Exhaust both windows (consumeSendWindow debits connection AND stream).
+    stack.consumeSendWindow(1, 65535);
+    try std.testing.expectEqual(@as(usize, 0), stack.canSend(1, 1));
+
+    var wu_payload: [4]u8 = undefined;
+    var wu_buf: [9 + 4]u8 = undefined;
+
+    // A connection-level WINDOW_UPDATE must NOT credit the stream window:
+    // the stream is still exhausted, so nothing is sendable.
+    std.mem.writeInt(u32, &wu_payload, 32768, .big);
+    var wu_len = try http2.writeFrame(&wu_buf, .window_update, 0, 0, &wu_payload);
+    _ = stack.ingest(wu_buf[0..wu_len], frames[0..], events[0..]);
+    try std.testing.expectEqual(@as(usize, 0), stack.canSend(1, 100000));
+
+    // A stream-level WINDOW_UPDATE larger than the connection credit must
+    // still be capped by the connection window (min of the two).
+    std.mem.writeInt(u32, &wu_payload, 65535, .big);
+    wu_len = try http2.writeFrame(&wu_buf, .window_update, 0, 1, &wu_payload);
+    _ = stack.ingest(wu_buf[0..wu_len], frames[0..], events[0..]);
+    try std.testing.expectEqual(@as(usize, 32768), stack.canSend(1, 100000));
+}
