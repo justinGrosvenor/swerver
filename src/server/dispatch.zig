@@ -586,7 +586,33 @@ const PgRepark = struct {
             continuation,
         );
     }
+
+    fn reparkBatch(
+        ctx_ptr: *anyopaque,
+        sql: []const u8,
+        args_batch: []const []const ?[]const u8,
+        continuation: pg_handler_api.Continuation,
+    ) pg_handler_api.QueryError!response_mod.Response {
+        const self: *PgRepark = @ptrCast(@alignCast(ctx_ptr));
+        const pgc = self.server.pg_client orelse return error.NotConnected;
+        return pgc.queryBatch(
+            &self.server.io,
+            self.conn_index,
+            self.conn_id,
+            sql,
+            args_batch,
+            self.stash,
+            continuation,
+        );
+    }
 };
+
+/// Continuation response scratch. Larger than the handler path's 8KB:
+/// batch results (TFB /queries, /updates at 500 rows) render ~18KB of
+/// JSON, and continuations have no preencoded fast path to fall back
+/// on. Stack-allocated per resume, same lifetime discipline as
+/// dispatchToRouter's response_buf.
+const PG_RESUME_BUF_SIZE: usize = 24 * 1024;
 
 /// Park-resume hook (installed on PgClient at runLoop start). Runs on
 /// the reactor when a parked request's PG op completes — success,
@@ -606,7 +632,7 @@ fn pgResume(ctx: *anyopaque, outcome: *const pg_client_mod.Outcome) void {
     if (conn.x402 != .db_parked) return;
     conn.x402 = .none;
 
-    var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
+    var response_buf: [PG_RESUME_BUF_SIZE]u8 = undefined;
     var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
     const arena_handle = server.io.acquireBuffer();
     defer if (arena_handle) |h| server.io.releaseBuffer(h);
@@ -628,6 +654,7 @@ fn pgResume(ctx: *anyopaque, outcome: *const pg_client_mod.Outcome) void {
         .stash_bytes = outcome.stash,
         .repark_ctx = @ptrCast(&repark_state),
         .repark_fn = PgRepark.repark,
+        .repark_batch_fn = PgRepark.reparkBatch,
     };
     const resp = outcome.continuation(&rctx);
 

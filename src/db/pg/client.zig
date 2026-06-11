@@ -59,8 +59,12 @@ pub const OP_QUEUE_DEPTH = 16;
 pub const STMT_CACHE_SIZE = 32;
 const NO_CACHE: u8 = 0xFF;
 
-const RECV_BUF_SIZE = 16 * 1024;
-const SEND_BUF_SIZE = 8 * 1024;
+/// Sized for the worst-case TFB batch op (500 Bind/Execute pairs ≈
+/// 18KB out, ≈ 20KB of BindComplete/DataRow/CommandComplete back).
+const RECV_BUF_SIZE = 32 * 1024;
+const SEND_BUF_SIZE = 32 * 1024;
+/// Bind/Execute pairs allowed in one batch op (TFB clamps at 500).
+pub const MAX_BATCH = 500;
 /// Single deadline covering non-blocking connect + handshake.
 const CONNECT_TIMEOUT_MS: u64 = 10_000;
 const BACKOFF_INITIAL_MS: u64 = 1_000;
@@ -558,7 +562,29 @@ pub const PgClient = struct {
         stash_bytes: []const u8,
         continuation: handler_api.Continuation,
     ) handler_api.QueryError!response_mod.Response {
+        const batch = [1][]const ?[]const u8{args};
+        return self.queryBatch(io_rt, conn_index, conn_id, sql, &batch, stash_bytes, continuation);
+    }
+
+    /// Batch variant (design 9.0 phase 4): ONE op containing one Parse,
+    /// `args_batch.len` Bind/Execute pairs, and one Sync. All result
+    /// rows land in a single frames region, so the continuation's
+    /// `Result.rows()` iterates every execution's DataRows in order —
+    /// this is what makes TFB /queries and /updates one park instead of
+    /// N. Describe (column metadata) is emitted only for single-set
+    /// batches; multi-set results decode binary columns positionally.
+    pub fn queryBatch(
+        self: *PgClient,
+        io_rt: *io_mod.IoRuntime,
+        conn_index: u32,
+        conn_id: u64,
+        sql: []const u8,
+        args_batch: []const []const ?[]const u8,
+        stash_bytes: []const u8,
+        continuation: handler_api.Continuation,
+    ) handler_api.QueryError!response_mod.Response {
         std.debug.assert(stash_bytes.len <= handler_api.STASH_CAPACITY);
+        if (args_batch.len == 0 or args_batch.len > MAX_BATCH) return error.RequestTooLarge;
         if (conn_index >= self.conn_parks.len) return error.NotConnected;
         if (self.conn_parks[conn_index] != NO_PARK) return error.AlreadyParked;
 
@@ -636,9 +662,13 @@ pub const PgClient = struct {
         if (need_parse) {
             off += (protocol.writeParse(slot.send_buf[off..], stmt_name, sql, &.{}) catch return overflow).len;
         }
-        off += (protocol.writeBind(slot.send_buf[off..], "", stmt_name, args) catch return overflow).len;
-        off += (protocol.writeDescribePortal(slot.send_buf[off..], "") catch return overflow).len;
-        off += (protocol.writeExecute(slot.send_buf[off..], "", 0) catch return overflow).len;
+        for (args_batch) |args| {
+            off += (protocol.writeBind(slot.send_buf[off..], "", stmt_name, args) catch return overflow).len;
+            if (args_batch.len == 1) {
+                off += (protocol.writeDescribePortal(slot.send_buf[off..], "") catch return overflow).len;
+            }
+            off += (protocol.writeExecute(slot.send_buf[off..], "", 0) catch return overflow).len;
+        }
         off += (protocol.writeSync(slot.send_buf[off..]) catch return overflow).len;
 
         const now_ms = io_rt.nowMs();
@@ -1236,6 +1266,7 @@ test "integration: reactor-driven connection bring-up (PG_TEST_DSN)" {
                 .stash_bytes = outcome.stash,
                 .repark_ctx = undefined,
                 .repark_fn = undefined,
+                .repark_batch_fn = undefined,
             };
             ran = true;
             if (outcome.result) |res| {

@@ -424,6 +424,30 @@ pub const PgHandle = struct {
             continuation,
         );
     }
+
+    /// Batch variant: one op, N Bind/Execute pairs of the same SQL, all
+    /// result rows in one continuation Result (design 9.0 phase 4).
+    pub fn queryBatch(
+        self: PgHandle,
+        sql: []const u8,
+        args_batch: []const []const ?[]const u8,
+        comptime StashT: type,
+        stash_init: StashT,
+        continuation: pg_handler_api.Continuation,
+    ) pg_handler_api.QueryError!response.Response {
+        comptime pg_handler_api.assertPlainData(StashT);
+        comptime std.debug.assert(@sizeOf(StashT) <= pg_handler_api.STASH_CAPACITY);
+        const client = self.binding.client orelse return error.NotConnected;
+        return client.queryBatch(
+            self.binding.io_rt.?,
+            self.binding.conn_index,
+            self.binding.conn_id,
+            sql,
+            args_batch,
+            std.mem.asBytes(&stash_init),
+            continuation,
+        );
+    }
 };
 
 pub const RouterLimits = struct {

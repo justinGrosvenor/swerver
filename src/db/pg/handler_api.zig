@@ -202,6 +202,18 @@ pub const ReparkFn = *const fn (
     continuation: Continuation,
 ) QueryError!response.Response;
 
+/// Batch variant: one op carrying N Bind/Execute pairs (see
+/// PgClient.queryBatch). Argument slices are serialized into the wire
+/// buffer during the call, so they may safely borrow the CURRENT
+/// result's memory (ids read from step 0's rows can feed step 1's
+/// update batch directly).
+pub const ReparkBatchFn = *const fn (
+    ctx: *anyopaque,
+    sql: []const u8,
+    args_batch: []const []const ?[]const u8,
+    continuation: Continuation,
+) QueryError!response.Response;
+
 /// What a continuation gets. Mirrors the scratch surface of
 /// `HandlerContext` (fresh response_buf / headers / arena) but carries
 /// NO request fields: the read buffer was recycled while parked, and
@@ -217,6 +229,7 @@ pub const ResumeContext = struct {
     stash_bytes: *[STASH_CAPACITY]u8,
     repark_ctx: *anyopaque,
     repark_fn: ReparkFn,
+    repark_batch_fn: ReparkBatchFn,
 
     /// Typed view of the stash written by `query()` in phase 1. Same
     /// comptime plain-data enforcement as the write side.
@@ -241,6 +254,18 @@ pub const ResumeContext = struct {
         continuation: Continuation,
     ) QueryError!response.Response {
         return self.repark_fn(self.repark_ctx, sql, args, continuation);
+    }
+
+    /// Batch chain: one op, N Bind/Execute pairs, all rows in one
+    /// Result. Argument slices may borrow the current result's memory
+    /// (serialized into the wire buffer before this call returns).
+    pub fn queryBatch(
+        self: *ResumeContext,
+        sql: []const u8,
+        args_batch: []const []const ?[]const u8,
+        continuation: Continuation,
+    ) QueryError!response.Response {
+        return self.repark_batch_fn(self.repark_ctx, sql, args_batch, continuation);
     }
 };
 
@@ -294,6 +319,7 @@ test "stash round-trips a typed value" {
         .stash_bytes = &bytes,
         .repark_ctx = undefined,
         .repark_fn = undefined,
+        .repark_batch_fn = undefined,
     };
     const st = rctx.stash(Stash);
     st.user_id = 42;
