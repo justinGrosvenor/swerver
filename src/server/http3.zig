@@ -267,7 +267,12 @@ fn handleHttp3Request(
         const file_path = req_view.path[8..];
         const content_type = Server.guessContentType(file_path);
         const accept_encoding = req_view.getHeader("accept-encoding") orelse "";
-        serveStaticFileH3(server, udp_fd, conn, req.stream_id, peer_addr, file_path, content_type, accept_encoding);
+        if (server.staticCacheGetOrLoad(file_path, content_type, accept_encoding)) |entry| {
+            var hdrs: [3]response_mod.Header = undefined;
+            sendHttp3ResponseFromResponse(server, udp_fd, conn, req.stream_id, peer_addr, Server.staticCacheResponse(entry, &hdrs));
+        } else {
+            serveStaticFileH3(server, udp_fd, conn, req.stream_id, peer_addr, file_path, content_type, accept_encoding);
+        }
         return;
     }
 

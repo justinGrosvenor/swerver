@@ -180,9 +180,15 @@ pub fn handleHttp2Read(server: *Server, conn: *connection.Connection) !void {
                             const file_path = hdr.request.path[8..];
                             const content_type = Server.guessContentType(file_path);
                             const accept_encoding = hdr.request.getHeader("accept-encoding") orelse "";
-                            queueFileResponseH2(server, conn, hdr.stream_id, server.cfg.static_root, file_path, content_type, accept_encoding) catch {
-                                try queueHttp2Response(server, conn, hdr.stream_id, Server.notFoundResponse(), false);
-                            };
+                            if (server.staticCacheGetOrLoad(file_path, content_type, accept_encoding)) |entry| {
+                                var hdrs: [3]response_mod.Header = undefined;
+                                const is_head = hdr.request.method == .HEAD;
+                                try queueHttp2Response(server, conn, hdr.stream_id, Server.staticCacheResponse(entry, &hdrs), is_head);
+                            } else {
+                                queueFileResponseH2(server, conn, hdr.stream_id, server.cfg.static_root, file_path, content_type, accept_encoding) catch {
+                                    try queueHttp2Response(server, conn, hdr.stream_id, Server.notFoundResponse(), false);
+                                };
+                            }
                         } else {
                             try dispatchHttp2Request(server, conn, hdr.stream_id, hdr.request, "");
                         }

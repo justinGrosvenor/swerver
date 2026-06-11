@@ -95,6 +95,8 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
         }
         if (s.workers) |w| cfg.workers = w;
         if (s.disable_middleware) |v| cfg.disable_middleware = v;
+        if (s.disable_preencoded) |v| cfg.disable_preencoded = v;
+        if (s.cache_static_files) |v| cfg.cache_static_files = v;
         if (s.static_root) |r| cfg.static_root = r;
         if (s.allowed_hosts) |hosts| cfg.allowed_hosts = hosts;
     }
@@ -544,6 +546,8 @@ const ServerJson = struct {
     max_connections: ?usize = null,
     workers: ?u16 = null,
     disable_middleware: ?bool = null,
+    disable_preencoded: ?bool = null,
+    cache_static_files: ?bool = null,
     static_root: ?[]const u8 = null,
     allowed_hosts: ?[]const []const u8 = null,
 };

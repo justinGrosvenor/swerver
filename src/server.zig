@@ -181,6 +181,12 @@ pub const Server = struct {
     /// lazily once per second to pick up Date header changes.
     h3_preencoded: [preencoded.MAX_H3_PREENCODED]preencoded.PreencodedH3Response = undefined,
     h3_preencoded_count: usize = 0,
+    /// In-memory static file cache (cfg.cache_static_files). Per-worker,
+    /// lazy-populated on first serve, keyed by "<path>\x00<accept-class>".
+    /// null when the flag is off. Bodies are owned; freed in deinit.
+    static_cache: ?std.StringHashMap(StaticCacheEntry) = null,
+    /// Total bytes of cached static bodies, bounded by STATIC_CACHE_MAX_BYTES.
+    static_cache_bytes: usize = 0,
     /// Pre-encoded HTTP/1.1 response cache for the same hot static
     /// endpoints. Same shape as `h3_preencoded` but the bytes are
     /// raw HTTP/1.1 (status line + headers + body). Refresh is
@@ -326,6 +332,10 @@ pub const Server = struct {
             .tls_cipher_scratch = undefined,
         };
 
+        if (cfg.cache_static_files) {
+            self.static_cache = std.StringHashMap(StaticCacheEntry).init(allocator);
+        }
+
         // Wire the (now stable-addressed) tls_provider into the QUIC handler
         // so each new connection can bootstrap a TLS session via initTls.
         // This must happen after self.* assignment so we can take a pointer
@@ -376,6 +386,14 @@ pub const Server = struct {
         if (self.listener_fd) |fd| clock.closeFd(fd);
         if (self.udp_fd) |fd| clock.closeFd(fd);
         if (self.static_root_fd) |fd| clock.closeFd(fd);
+        if (self.static_cache) |*cache| {
+            var it = cache.iterator();
+            while (it.next()) |kv| {
+                self.allocator.free(kv.key_ptr.*);
+                self.allocator.free(kv.value_ptr.body);
+            }
+            cache.deinit();
+        }
         if (self.admin_listener_fd) |fd| clock.closeFd(fd);
         if (self.otel) |otel_ptr| self.allocator.destroy(otel_ptr);
         if (self.pending_reload.swap(null, .acq_rel)) |pr| {
@@ -951,6 +969,123 @@ pub const Server = struct {
             return .{ .fd = fd, .encoding = .identity };
         }
         return null;
+    }
+
+    /// An in-memory cached static file: the owned body bytes plus the
+    /// metadata needed to re-emit a response. content_type points at a
+    /// guessContentType string literal (static, not owned).
+    pub const StaticCacheEntry = struct {
+        body: []u8,
+        content_type: []const u8,
+        encoding: StaticEncoding,
+    };
+
+    /// Total cached static body bytes never exceed this (per worker). The
+    /// benchmark/static set is tiny; we never evict, just stop caching.
+    const STATIC_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+    /// The Accept-Encoding facts that change which file gets served. Cached
+    /// entries are keyed by this so every distinct negotiation outcome is
+    /// stored separately and correctly — a client is only ever handed an
+    /// encoding it actually accepts.
+    const AcceptClass = enum(u8) { none = 0, gzip = 1, br = 2, both = 3 };
+
+    fn classifyAccept(accept_encoding: []const u8) AcceptClass {
+        const br = acceptsEncoding(accept_encoding, "br");
+        const gz = acceptsEncoding(accept_encoding, "gzip");
+        if (br and gz) return .both;
+        if (br) return .br;
+        if (gz) return .gzip;
+        return .none;
+    }
+
+    /// Cache-aware static lookup. Returns a cached entry to serve, reading
+    /// and storing the resolved file on first miss. Returns null when the
+    /// cache is off, the file is missing, or it's too large to cache — in
+    /// which case the caller falls back to the normal open+serve path.
+    /// `content_type` is supplied by the caller (derived from file_path).
+    pub fn staticCacheGetOrLoad(
+        self: *Server,
+        file_path: []const u8,
+        content_type: []const u8,
+        accept_encoding: []const u8,
+    ) ?*const StaticCacheEntry {
+        const cache = if (self.static_cache) |*c| c else return null;
+
+        // Key = "<path>\x00<class>". The class byte captures (accepts_br,
+        // accepts_gzip) so the lookup key always matches the store key even
+        // when a sibling is absent and resolution falls back.
+        var key_buf: [4098]u8 = undefined;
+        if (file_path.len + 2 > key_buf.len) return null;
+        @memcpy(key_buf[0..file_path.len], file_path);
+        key_buf[file_path.len] = 0;
+        key_buf[file_path.len + 1] = @intFromEnum(classifyAccept(accept_encoding));
+        const key = key_buf[0 .. file_path.len + 2];
+
+        if (cache.getPtr(key)) |entry| return entry;
+
+        // Miss: resolve the variant, read it fully into an owned buffer.
+        const root_fd = self.static_root_fd orelse return null;
+        const variant = resolveStaticVariant(root_fd, file_path, accept_encoding) orelse return null;
+        defer clock.closeFd(variant.fd);
+
+        const end_pos = std.c.lseek(variant.fd, 0, std.posix.SEEK.END);
+        if (end_pos < 0) return null;
+        _ = std.c.lseek(variant.fd, 0, std.posix.SEEK.SET);
+        const size: usize = @intCast(end_pos);
+
+        // Too large to cache → tell the caller to serve it uncached.
+        if (self.static_cache_bytes + size > STATIC_CACHE_MAX_BYTES) return null;
+
+        const body = self.allocator.alloc(u8, size) catch return null;
+        var off: usize = 0;
+        while (off < size) {
+            const n = std.c.pread(variant.fd, body.ptr + off, size - off, @intCast(off));
+            if (n < 0) {
+                switch (std.posix.errno(n)) {
+                    .INTR => continue,
+                    else => {
+                        self.allocator.free(body);
+                        return null;
+                    },
+                }
+            }
+            if (n == 0) break;
+            off += @intCast(n);
+        }
+        if (off != size) {
+            self.allocator.free(body);
+            return null;
+        }
+
+        const owned_key = self.allocator.dupe(u8, key) catch {
+            self.allocator.free(body);
+            return null;
+        };
+        cache.put(owned_key, .{ .body = body, .content_type = content_type, .encoding = variant.encoding }) catch {
+            self.allocator.free(owned_key);
+            self.allocator.free(body);
+            return null;
+        };
+        self.static_cache_bytes += size;
+        return cache.getPtr(owned_key);
+    }
+
+    /// Build a Response that serves a cached static entry. The caller owns
+    /// `hdrs` (stack storage); the returned Response borrows it and the
+    /// entry body, so both must outlive the response-encoding call. Date,
+    /// Content-Length, and HEAD handling come from the normal response path.
+    pub fn staticCacheResponse(entry: *const StaticCacheEntry, hdrs: *[3]response_mod.Header) response_mod.Response {
+        var nh: usize = 0;
+        hdrs[nh] = .{ .name = "Content-Type", .value = entry.content_type };
+        nh += 1;
+        if (entry.encoding != .identity) {
+            hdrs[nh] = .{ .name = "Content-Encoding", .value = entry.encoding.token() };
+            nh += 1;
+            hdrs[nh] = .{ .name = "Vary", .value = "Accept-Encoding" };
+            nh += 1;
+        }
+        return .{ .status = 200, .headers = hdrs[0..nh], .body = .{ .bytes = entry.body } };
     }
 
     pub fn closeConnection(self: *Server, conn: *connection.Connection) void {
