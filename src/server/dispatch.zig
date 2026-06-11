@@ -1260,9 +1260,19 @@ pub fn handleRead(server: *Server, index: u32) !void {
                 }
 
                 try http1_mod.queueResponse(server, conn, proxy_result.resp);
-                // Materialize pending_body before proxy_result.release() frees the upstream buffer
                 if (conn.pending_body.len > 0) {
-                    http1_mod.materializePendingBody(server, conn);
+                    if (proxy_result.takeOwnedBuf()) |owned| {
+                        // Large proxied response: the unsent tail points into
+                        // the proxy's heap buffer. Take ownership so it
+                        // outlives proxy_result.release(); freed when the
+                        // tail drains (handleWrite) or the connection closes.
+                        std.debug.assert(conn.pending_body_owned == null);
+                        conn.pending_body_owned = owned;
+                    } else {
+                        // Pool-buffer response: copy the tail out before
+                        // proxy_result.release() frees the upstream buffer.
+                        http1_mod.materializePendingBody(server, conn);
+                    }
                 }
                 if (conn.read_buffered_bytes == 0) break;
                 continue;
@@ -1567,6 +1577,18 @@ fn setupWebSocketTunnel(
 /// Result of one drain pass — see handleWrite.
 const WritePass = enum { done, reenter_read };
 
+/// Free the heap buffer backing a large proxied response once its queued
+/// tail (conn.pending_body) has fully drained. No-op otherwise. The buffer
+/// is also freed by closeConnection if the connection dies first.
+fn freePendingBodyOwnedIfDrained(server: *Server, conn: *connection.Connection) void {
+    if (conn.pending_body_owned) |owned| {
+        if (!conn.hasPendingBody()) {
+            server.allocator.free(owned);
+            conn.pending_body_owned = null;
+        }
+    }
+}
+
 pub fn handleWrite(server: *Server, index: u32) !void {
     // Drive drain passes and pipelined-read re-entry as a LOOP, never
     // recursion. A pipelined batch can interleave reads and writes many
@@ -1670,6 +1692,7 @@ fn handleWritePass(server: *Server, index: u32) !WritePass {
                         if (conn.hasPendingBody()) {
                             http1_mod.streamBodyChunks(server, conn, conn.pending_body);
                         }
+                        freePendingBodyOwnedIfDrained(server, conn);
                         // If connWrite populated the carry (socket write only
                         // partially absorbed the record), pause — we resume
                         // when the next writable event drains the carry.
@@ -1767,6 +1790,7 @@ fn handleWritePass(server: *Server, index: u32) !WritePass {
                         if (conn.hasPendingBody()) {
                             http1_mod.streamBodyChunks(server, conn, conn.pending_body);
                         }
+                        freePendingBodyOwnedIfDrained(server, conn);
                     } else {
                         entry.offset += written;
                         server.io.onWriteCompleted(conn, written);

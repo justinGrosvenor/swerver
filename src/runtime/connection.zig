@@ -194,6 +194,12 @@ pub const Connection = struct {
     h2_pending_files: ?*[MAX_PENDING_H2_FILES]PendingH2File = null,
     h2_pending_responses: ?*[MAX_PENDING_H2_RESPONSES]PendingH2Response = null,
     pending_body: []const u8,
+    /// Heap allocation that backs `pending_body` when a proxied response
+    /// outgrew the proxy's pool buffers and its unsent tail is still
+    /// queued. Ownership is transferred from ProxyResult at dispatch time;
+    /// freed (with the server allocator) once pending_body drains or the
+    /// connection closes.
+    pending_body_owned: ?[]u8 = null,
     pending_file_fd: ?std.posix.fd_t,
     pending_file_offset: u64,
     pending_file_remaining: u64,
@@ -306,6 +312,8 @@ pub const Connection = struct {
         self.h2_pending_files = null;
         self.h2_pending_responses = null;
         self.pending_body = &[_]u8{};
+        // pending_body_owned is freed by closeConnection before reset
+        self.pending_body_owned = null;
         self.cleanupPendingFile();
         self.cached_peer_ip = null;
         self.cached_peer_ip6 = null;

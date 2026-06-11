@@ -907,6 +907,11 @@ pub const Server = struct {
             self.allocator.destroy(stack);
             conn.http2_stack = null;
         }
+        if (conn.pending_body_owned) |owned| {
+            self.allocator.free(owned);
+            conn.pending_body_owned = null;
+            conn.pending_body = &[_]u8{};
+        }
         if (conn.h2_pending) |pending| {
             for (pending) |*slot| {
                 if (slot.body_handle) |bh| {

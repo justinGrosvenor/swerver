@@ -113,6 +113,11 @@ pub const ProxyRoute = struct {
     headers: HeaderRules = .{},
     /// Timeout configuration for this route
     timeouts: ProxyTimeouts = .{},
+    /// Maximum upstream response size (headers + body) the proxy will
+    /// buffer for this route. Responses that fit the fixed pool buffer are
+    /// served with zero allocation; larger ones grow into a bounded heap
+    /// allocation. Above the cap the proxy answers 502.
+    max_response_bytes: usize = 32 * 1024 * 1024,
     /// Retry configuration
     retry: RetryConfig = .{},
     /// Per-route x402 payment gating

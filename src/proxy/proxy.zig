@@ -90,6 +90,9 @@ pub const Proxy = struct {
             else => return,
         };
         if (body_bytes.len < 256) return;
+        // Output must fit the 64KB scratch; don't burn CPU deflating large
+        // bodies whose compressed form can't possibly fit.
+        if (body_bytes.len > compress_scratch.len) return;
         if (compress_mod.alreadyEncoded(resp.headers)) return;
 
         var accept_enc: ?[]const u8 = null;
@@ -364,6 +367,77 @@ pub const Proxy = struct {
         };
     }
 
+    const UpstreamRead = struct {
+        /// Full response bytes read so far (headers + body).
+        data: []u8,
+        /// Non-null when the response outgrew the fixed buffer and `data`
+        /// is backed by this heap allocation (data.ptr == owned.ptr).
+        owned: ?[]u8,
+    };
+
+    const UpstreamReadError = error{ ReadFailed, Empty, TooLarge };
+
+    /// Read a complete upstream HTTP response. Fast path reads entirely
+    /// into `fixed` (zero allocation — unchanged from the historical
+    /// behavior for responses that fit). If the response is larger, the
+    /// bytes are moved into a heap allocation that doubles as needed, up
+    /// to `cap` bytes (route.max_response_bytes). Completion is decided
+    /// the same way at every step: a successful parse that is not
+    /// close-delimited, or EOF.
+    fn readUpstreamResponse(
+        self: *Proxy,
+        fd: std.posix.fd_t,
+        fixed: []u8,
+        is_head: bool,
+        cap: usize,
+    ) UpstreamReadError!UpstreamRead {
+        var total: usize = 0;
+        while (total < fixed.len) {
+            const n = net.recvBlocking(fd, fixed[total..]) catch return error.ReadFailed;
+            if (n == 0) break; // EOF
+            total += n;
+            if (forward.parseUpstreamResponse(fixed[0..total], is_head)) |parsed| {
+                if (!parsed.close_delimited) return .{ .data = fixed[0..total], .owned = null };
+            } else |_| {}
+        }
+        if (total == 0) return error.Empty;
+        if (total < fixed.len) {
+            // EOF before the buffer filled — close-delimited response.
+            return .{ .data = fixed[0..total], .owned = null };
+        }
+        // Buffer is full. The response may be exactly complete (parse
+        // succeeded above and returned), complete-but-close-delimited, or
+        // (the common case for large bodies) incomplete: grow to the heap.
+        var capacity: usize = @min(@max(fixed.len * 4, fixed.len), cap);
+        if (capacity <= fixed.len) return error.TooLarge;
+        var owned = self.allocator.alloc(u8, capacity) catch return error.ReadFailed;
+        @memcpy(owned[0..total], fixed[0..total]);
+        while (true) {
+            if (total == capacity) {
+                if (capacity >= cap) {
+                    self.allocator.free(owned);
+                    return error.TooLarge;
+                }
+                const new_capacity = @min(capacity * 2, cap);
+                owned = self.allocator.realloc(owned, new_capacity) catch {
+                    self.allocator.free(owned);
+                    return error.ReadFailed;
+                };
+                capacity = new_capacity;
+            }
+            const n = net.recvBlocking(fd, owned[total..capacity]) catch {
+                self.allocator.free(owned);
+                return error.ReadFailed;
+            };
+            if (n == 0) break; // EOF — close-delimited end or truncation (parse decides)
+            total += n;
+            if (forward.parseUpstreamResponse(owned[0..total], is_head)) |parsed| {
+                if (!parsed.close_delimited) break;
+            } else |_| {}
+        }
+        return .{ .data = owned[0..total], .owned = owned };
+    }
+
     /// Handle a proxy request with real upstream I/O.
     /// Connects to the selected backend, sends the request, reads the response,
     /// and returns it to the client. Supports connection reuse and retry.
@@ -535,43 +609,44 @@ pub const Proxy = struct {
                     continue;
                 };
 
-                // Read response from upstream
-                var total_read: usize = 0;
-                var read_failed = false;
-                while (total_read < RESPONSE_BUF_SIZE) {
-                    const n = net.recvBlocking(c.fd, self.response_bufs[resp_buf_idx][total_read..]) catch {
+                // Read response from upstream. Fits-in-pool-buffer responses
+                // stay zero-allocation; larger ones grow into a heap buffer
+                // bounded by route.max_response_bytes.
+                const is_head = req.method == .HEAD;
+                const ur = self.readUpstreamResponse(
+                    c.fd,
+                    self.response_bufs[resp_buf_idx][0..],
+                    is_head,
+                    route.max_response_bytes,
+                ) catch |err| switch (err) {
+                    error.Empty => {
                         pool.markConnectionFailed(c, now_ms, connect_server.max_fails);
-                        read_failed = true;
-                        break;
-                    };
-                    if (n == 0) break; // EOF
-                    total_read += n;
-
-                    // Try to parse — if we have a complete response, stop reading
-                    // For close-delimited responses, keep reading until EOF
-                    const head = req.method == .HEAD;
-                    if (forward.parseUpstreamResponse(self.response_bufs[resp_buf_idx][0..total_read], head)) |parsed_check| {
-                        if (!parsed_check.close_delimited) break;
-                    } else |_| {}
-                }
-
-                if (read_failed) {
-                    // RFC 9110 §9.2.2: Don't retry non-idempotent after body sent
-                    if (body_sent and !forward.isIdempotent(req.method)) {
+                        continue;
+                    },
+                    error.ReadFailed => {
+                        pool.markConnectionFailed(c, now_ms, connect_server.max_fails);
+                        // RFC 9110 §9.2.2: Don't retry non-idempotent after body sent
+                        if (body_sent and !forward.isIdempotent(req.method)) {
+                            self.releaseResponseBuffer(resp_buf_idx);
+                            return .{ .resp = forward.createErrorResponse(502), .proxy = self };
+                        }
+                        continue;
+                    },
+                    error.TooLarge => {
+                        // Deterministic for this route config — retrying would
+                        // produce the same result, and the upstream isn't
+                        // unhealthy. The connection was abandoned mid-body,
+                        // so it can't go back to the keep-alive pool.
+                        std.log.warn("proxy: upstream response for {s} exceeded max_response_bytes ({d})", .{ req.path, route.max_response_bytes });
+                        pool.release(c, now_ms, false);
                         self.releaseResponseBuffer(resp_buf_idx);
                         return .{ .resp = forward.createErrorResponse(502), .proxy = self };
-                    }
-                    continue;
-                }
-
-                if (total_read == 0) {
-                    pool.markConnectionFailed(c, now_ms, connect_server.max_fails);
-                    continue;
-                }
+                    },
+                };
 
                 // Parse the upstream response
-                const is_head = req.method == .HEAD;
-                const parsed = forward.parseUpstreamResponse(self.response_bufs[resp_buf_idx][0..total_read], is_head) catch {
+                const parsed = forward.parseUpstreamResponse(ur.data, is_head) catch {
+                    if (ur.owned) |ob| self.allocator.free(ob);
                     pool.markConnectionFailed(c, now_ms, connect_server.max_fails);
                     continue;
                 };
@@ -581,17 +656,22 @@ pub const Proxy = struct {
                     forward.isMethodRetryable(req.method, &retry_config) and
                     attempts < max_attempts)
                 {
+                    if (ur.owned) |ob| self.allocator.free(ob);
                     pool.release(c, now_ms, parsed.keep_alive);
                     continue;
                 }
 
+                // The parse offsets index into ur.data; pass the full backing
+                // region so normalize has tail room for the Via append.
+                const backing: []u8 = if (ur.owned) |ob| ob else self.response_bufs[resp_buf_idx][0..];
                 var normalized = forward.normalizeUpstreamResponse(
                     &parsed,
-                    self.response_bufs[resp_buf_idx][0..],
+                    backing,
                     route,
                     self.response_header_bufs[resp_buf_idx][0..],
                     is_head,
                 ) catch {
+                    if (ur.owned) |ob| self.allocator.free(ob);
                     pool.markConnectionFailed(c, now_ms, connect_server.max_fails);
                     continue;
                 };
@@ -606,6 +686,7 @@ pub const Proxy = struct {
                     .resp = normalized,
                     .proxy = self,
                     .resp_buf_idx = resp_buf_idx,
+                    .owned_buf = ur.owned,
                 };
             }
         }
@@ -794,39 +875,37 @@ pub const Proxy = struct {
                     continue;
                 }
 
-                // Read response from upstream
-                var total_read: usize = 0;
-                var read_failed = false;
-                while (total_read < RESPONSE_BUF_SIZE) {
-                    const n = net.recvBlocking(c.fd, self.response_bufs[resp_buf_idx][total_read..]) catch {
+                // Read response from upstream (grows to heap beyond the
+                // fixed buffer — see readUpstreamResponse).
+                const is_head_b = req.method == .HEAD;
+                const ur = self.readUpstreamResponse(
+                    c.fd,
+                    self.response_bufs[resp_buf_idx][0..],
+                    is_head_b,
+                    route.max_response_bytes,
+                ) catch |err| switch (err) {
+                    error.Empty => {
                         pool.markConnectionFailed(c, now_ms, connect_server_b.max_fails);
-                        read_failed = true;
-                        break;
-                    };
-                    if (n == 0) break;
-                    total_read += n;
-
-                    const head_b = req.method == .HEAD;
-                    if (forward.parseUpstreamResponse(self.response_bufs[resp_buf_idx][0..total_read], head_b)) |parsed_check| {
-                        if (!parsed_check.close_delimited) break;
-                    } else |_| {}
-                }
-
-                if (read_failed) {
-                    if (!forward.isIdempotent(req.method)) {
+                        continue;
+                    },
+                    error.ReadFailed => {
+                        pool.markConnectionFailed(c, now_ms, connect_server_b.max_fails);
+                        if (!forward.isIdempotent(req.method)) {
+                            self.releaseResponseBuffer(resp_buf_idx);
+                            return .{ .resp = forward.createErrorResponse(502), .proxy = self };
+                        }
+                        continue;
+                    },
+                    error.TooLarge => {
+                        std.log.warn("proxy: upstream response for {s} exceeded max_response_bytes ({d})", .{ req.path, route.max_response_bytes });
+                        pool.release(c, now_ms, false);
                         self.releaseResponseBuffer(resp_buf_idx);
                         return .{ .resp = forward.createErrorResponse(502), .proxy = self };
-                    }
-                    continue;
-                }
+                    },
+                };
 
-                if (total_read == 0) {
-                    pool.markConnectionFailed(c, now_ms, connect_server_b.max_fails);
-                    continue;
-                }
-
-                const is_head_b = req.method == .HEAD;
-                const parsed = forward.parseUpstreamResponse(self.response_bufs[resp_buf_idx][0..total_read], is_head_b) catch {
+                const parsed = forward.parseUpstreamResponse(ur.data, is_head_b) catch {
+                    if (ur.owned) |ob| self.allocator.free(ob);
                     pool.markConnectionFailed(c, now_ms, connect_server_b.max_fails);
                     continue;
                 };
@@ -835,17 +914,20 @@ pub const Proxy = struct {
                     forward.isMethodRetryable(req.method, &retry_config) and
                     attempts < max_attempts)
                 {
+                    if (ur.owned) |ob| self.allocator.free(ob);
                     pool.release(c, now_ms, parsed.keep_alive);
                     continue;
                 }
 
+                const backing_b: []u8 = if (ur.owned) |ob| ob else self.response_bufs[resp_buf_idx][0..];
                 var normalized_b = forward.normalizeUpstreamResponse(
                     &parsed,
-                    self.response_bufs[resp_buf_idx][0..],
+                    backing_b,
                     route,
                     self.response_header_bufs[resp_buf_idx][0..],
                     is_head_b,
                 ) catch {
+                    if (ur.owned) |ob| self.allocator.free(ob);
                     pool.markConnectionFailed(c, now_ms, connect_server_b.max_fails);
                     continue;
                 };
@@ -860,6 +942,7 @@ pub const Proxy = struct {
                     .resp = normalized_b,
                     .proxy = self,
                     .resp_buf_idx = resp_buf_idx,
+                    .owned_buf = ur.owned,
                 };
             }
         }
@@ -992,12 +1075,30 @@ pub const ProxyResult = struct {
     proxy: *Proxy,
     /// Response buffer index to release, or null if none held.
     resp_buf_idx: ?usize = null,
+    /// Heap allocation backing `resp` when the upstream response outgrew
+    /// the fixed pool buffer. Freed by release() unless the caller takes
+    /// ownership via takeOwnedBuf() (needed when part of the body remains
+    /// queued as conn.pending_body after the response is enqueued).
+    owned_buf: ?[]u8 = null,
 
     pub fn release(self: *ProxyResult) void {
         if (self.resp_buf_idx) |idx| {
             self.proxy.releaseResponseBuffer(idx);
             self.resp_buf_idx = null;
         }
+        if (self.owned_buf) |buf| {
+            self.proxy.allocator.free(buf);
+            self.owned_buf = null;
+        }
+    }
+
+    /// Transfer ownership of the heap-backed response buffer to the caller
+    /// (who must free it with the proxy's allocator once the body bytes are
+    /// no longer referenced). Returns null for pool-buffer responses.
+    pub fn takeOwnedBuf(self: *ProxyResult) ?[]u8 {
+        const buf = self.owned_buf;
+        self.owned_buf = null;
+        return buf;
     }
 };
 
