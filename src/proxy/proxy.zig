@@ -657,7 +657,12 @@ pub const Proxy = struct {
                     attempts < max_attempts)
                 {
                     if (ur.owned) |ob| self.allocator.free(ob);
-                    pool.release(c, now_ms, parsed.keep_alive);
+                    // Close (don't keep-alive) so the retry opens a fresh
+                    // connection: under SO_REUSEPORT that can land on a
+                    // different upstream worker, which is the whole point of
+                    // retrying a transient 5xx (the original worker just told
+                    // us it couldn't serve this request).
+                    pool.release(c, now_ms, false);
                     continue;
                 }
 
@@ -915,7 +920,9 @@ pub const Proxy = struct {
                     attempts < max_attempts)
                 {
                     if (ur.owned) |ob| self.allocator.free(ob);
-                    pool.release(c, now_ms, parsed.keep_alive);
+                    // Fresh connection on retry — see handle(); lands on a
+                    // different SO_REUSEPORT worker.
+                    pool.release(c, now_ms, false);
                     continue;
                 }
 

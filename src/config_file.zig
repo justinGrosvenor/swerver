@@ -445,6 +445,7 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
             .cache = route_cache,
             .body_schema = route_body_schema,
             .mirror = r.mirror,
+            .retry = if (r.retry) |rt| .{ .max_retries = rt.max_retries orelse 1 } else .{},
         };
     }
 
@@ -801,6 +802,14 @@ const RouteJson = struct {
     body_schema: ?std.json.Value = null,
     mirror: ?[]const u8 = null,
     upstream_headers: ?[]const HeaderJson = null,
+    retry: ?RetryJson = null,
+};
+
+const RetryJson = struct {
+    /// Number of retry attempts on a connection failure or a retryable
+    /// upstream status (502/503/504 by default). Each retry connects fresh,
+    /// so under SO_REUSEPORT it can land on a different upstream worker.
+    max_retries: ?u8 = null,
 };
 
 const CacheJson = struct {
