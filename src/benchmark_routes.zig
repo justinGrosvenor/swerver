@@ -42,6 +42,8 @@ pub fn registerRoutes(app_router: *router.Router) !void {
     // tables); without a configured client they answer 503.
     try app_router.get("/db", handleTfbDb);
     try app_router.get("/fortunes", handleTfbFortunes);
+    try app_router.get("/queries", handleTfbQueries);
+    try app_router.get("/updates", handleTfbUpdates);
 
     // Throughput and pipelining benchmark endpoints. /pipeline returns
     // a fixed "ok". /baseline11 and /baseline2 sum the ?a= and ?b=
@@ -401,6 +403,136 @@ fn onTfbFortunes(rctx: *pg_api.ResumeContext) response_mod.Response {
         },
         .body = .{ .bytes = buf[0..w] },
     };
+}
+
+/// TFB query-count parameter: ?queries=N clamped to 1..500; absent or
+/// non-numeric values clamp to 1 (TFB verifier requirement).
+const TFB_MAX_QUERIES = 500;
+
+fn tfbParseQueries(path: []const u8) usize {
+    const q = std.mem.indexOfScalar(u8, path, '?') orelse return 1;
+    var it = std.mem.splitScalar(u8, path[q + 1 ..], '&');
+    while (it.next()) |pair| {
+        if (std.mem.startsWith(u8, pair, "queries=")) {
+            const n = std.fmt.parseInt(usize, pair["queries=".len..], 10) catch return 1;
+            return @min(@max(n, 1), TFB_MAX_QUERIES);
+        }
+    }
+    return 1;
+}
+
+/// Render rows of (id int4, randomnumber int4) as the TFB JSON array.
+fn tfbRenderRowsJson(rctx: *pg_api.ResumeContext) response_mod.Response {
+    const res = rctx.result catch return tfbDbFailed();
+    var w: usize = 0;
+    const buf = rctx.response_buf;
+    w = appendBytes(buf, w, "[") orelse return tfbDbFailed();
+    var rows = res.rows();
+    var first = true;
+    while (rows.next()) |row| {
+        const id = row.int4(0) catch return tfbDbFailed();
+        const rn = row.int4(1) catch return tfbDbFailed();
+        var item: [64]u8 = undefined;
+        const s = std.fmt.bufPrint(&item, "{s}{{\"id\":{d},\"randomNumber\":{d}}}", .{
+            if (first) @as([]const u8, "") else ",", id, rn,
+        }) catch return tfbDbFailed();
+        first = false;
+        w = appendBytes(buf, w, s) orelse return tfbDbFailed();
+    }
+    w = appendBytes(buf, w, "]") orelse return tfbDbFailed();
+    return .{
+        .status = 200,
+        .headers = &[_]response_mod.Header{
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .body = .{ .bytes = buf[0..w] },
+    };
+}
+
+/// GET /queries?queries=N — TFB multi-query test: N random World rows
+/// via ONE batched op (one Parse, N Bind/Execute, one Sync).
+fn handleTfbQueries(ctx: *router.HandlerContext) response_mod.Response {
+    const n = tfbParseQueries(ctx.request.path);
+    var id_bufs: [TFB_MAX_QUERIES][8]u8 = undefined;
+    var arg_sets: [TFB_MAX_QUERIES][1]?[]const u8 = undefined;
+    var batch: [TFB_MAX_QUERIES][]const ?[]const u8 = undefined;
+    for (0..n) |i| {
+        const a = std.fmt.bufPrint(&id_bufs[i], "{d}", .{tfbRandomId()}) catch unreachable;
+        arg_sets[i] = .{a};
+        batch[i] = arg_sets[i][0..];
+    }
+    return ctx.pg.queryBatch(
+        "select id, randomnumber from world where id = $1",
+        batch[0..n],
+        TfbStash,
+        .{},
+        tfbRenderRowsJson,
+    ) catch tfbDbUnavailable();
+}
+
+/// GET /updates?queries=N — TFB updates test: read N random rows (per
+/// the TFB rules), then a second batched op updates each with a fresh
+/// random value. The UPDATE uses RETURNING so the final continuation
+/// renders straight from the op's rows — nothing needs to survive the
+/// park in the stash. Ids are sorted ascending before the update batch
+/// to avoid deadlocks between concurrent /updates requests (all N
+/// updates share one implicit transaction via the single Sync).
+const TfbUpdateStash = struct { n: u16 = 0 };
+
+fn handleTfbUpdates(ctx: *router.HandlerContext) response_mod.Response {
+    const n = tfbParseQueries(ctx.request.path);
+    var id_bufs: [TFB_MAX_QUERIES][8]u8 = undefined;
+    var arg_sets: [TFB_MAX_QUERIES][1]?[]const u8 = undefined;
+    var batch: [TFB_MAX_QUERIES][]const ?[]const u8 = undefined;
+    for (0..n) |i| {
+        const a = std.fmt.bufPrint(&id_bufs[i], "{d}", .{tfbRandomId()}) catch unreachable;
+        arg_sets[i] = .{a};
+        batch[i] = arg_sets[i][0..];
+    }
+    return ctx.pg.queryBatch(
+        "select id, randomnumber from world where id = $1",
+        batch[0..n],
+        TfbUpdateStash,
+        .{ .n = @intCast(n) },
+        onTfbUpdatesSelect,
+    ) catch tfbDbUnavailable();
+}
+
+fn onTfbUpdatesSelect(rctx: *pg_api.ResumeContext) response_mod.Response {
+    const st = rctx.stash(TfbUpdateStash);
+    const res = rctx.result catch return tfbDbFailed();
+
+    // Collect the read ids, sort ascending (deadlock avoidance), pair
+    // each with a fresh random value, and fire the update batch. The
+    // argument strings live on this frame — queryBatch serializes them
+    // into the wire buffer before returning, so that's safe.
+    var ids: [TFB_MAX_QUERIES]i32 = undefined;
+    var count: usize = 0;
+    var rows = res.rows();
+    while (rows.next()) |row| {
+        if (count >= st.n) break;
+        ids[count] = row.int4(0) catch return tfbDbFailed();
+        count += 1;
+    }
+    if (count == 0) return tfbDbFailed();
+    std.mem.sort(i32, ids[0..count], {}, std.sort.asc(i32));
+
+    var id_bufs: [TFB_MAX_QUERIES][8]u8 = undefined;
+    var rn_bufs: [TFB_MAX_QUERIES][8]u8 = undefined;
+    var arg_sets: [TFB_MAX_QUERIES][2]?[]const u8 = undefined;
+    var batch: [TFB_MAX_QUERIES][]const ?[]const u8 = undefined;
+    for (0..count) |i| {
+        arg_sets[i] = .{
+            std.fmt.bufPrint(&id_bufs[i], "{d}", .{ids[i]}) catch unreachable,
+            std.fmt.bufPrint(&rn_bufs[i], "{d}", .{tfbRandomId()}) catch unreachable,
+        };
+        batch[i] = arg_sets[i][0..];
+    }
+    return rctx.queryBatch(
+        "update world set randomnumber = $2 where id = $1 returning id, randomnumber",
+        batch[0..count],
+        tfbRenderRowsJson,
+    ) catch tfbDbUnavailable();
 }
 
 fn appendBytes(buf: []u8, w: usize, bytes: []const u8) ?usize {
