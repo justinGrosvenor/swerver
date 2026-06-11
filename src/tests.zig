@@ -84,6 +84,7 @@ const pg_protocol = @import("db/pg/protocol.zig");
 const pg_scram = @import("db/pg/scram.zig");
 const pg_types = @import("db/pg/types.zig");
 const pg_client = @import("db/pg/client.zig");
+const pg_handler_api = @import("db/pg/handler_api.zig");
 
 // Proxy
 const proxy_upstream = @import("proxy/upstream.zig");
@@ -195,6 +196,7 @@ comptime {
     _ = pg_scram;
     _ = pg_types;
     _ = pg_client;
+    _ = pg_handler_api;
 
     // Proxy
     _ = proxy_cache;

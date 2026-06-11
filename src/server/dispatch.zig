@@ -839,7 +839,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
     var memo_path: []const u8 = "";
 
     while (conn.state != .closed and conn.read_buffered_bytes > 0 and conn.canEnqueueWrite() and !conn.hasPendingFile()) {
-        if (conn.x402 == .pending or conn.x402 == .settle_pending) break;
+        if (conn.x402 == .pending or conn.x402 == .settle_pending or conn.x402 == .db_parked) break;
         // Opportunistic inline write drain: push enqueued responses
         // to the kernel while still processing pipelined requests.
         // At low connection counts (e.g. 512 conns / 64 workers =
