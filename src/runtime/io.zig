@@ -530,11 +530,20 @@ pub const UDP_SOCKET_ID: u64 = std.math.maxInt(u64) - 1;
 /// Bit 62 tags conn ids that belong to external (non-Connection-pool)
 /// file descriptors — PostgreSQL client sockets today; proxy upstream
 /// streaming (design 5.0) will reuse the same plumbing. The low 32 bits
-/// carry a module-defined slot number. The tag cannot collide with the
-/// listener (0), connection-pool indexes (u32), or UDP_SOCKET_ID
-/// (maxInt(u64) - 1), and the kqueue/epoll ±1 registration offset only
-/// perturbs the low bits, so bit 62 survives the round trip.
+/// carry a module-defined slot number. The kqueue/epoll ±1 registration
+/// offset only perturbs the low bits, so bit 62 survives the round trip.
+///
+/// Membership MUST be tested with `isExternalId`, not `& EXTERNAL_ID_BIT`:
+/// UDP_SOCKET_ID (maxInt(u64) - 1) has bit 62 set too, so a bare bit test
+/// misroutes UDP error events into the external handler.
 pub const EXTERNAL_ID_BIT: u64 = 1 << 62;
+
+/// True only for well-formed external tokens: bit 62 set, every other
+/// high bit clear, slot in the low 32 bits. Excludes UDP_SOCKET_ID and
+/// any future high-bit magic ids by construction.
+pub fn isExternalId(conn_id: u64) bool {
+    return (conn_id >> 32) == (EXTERNAL_ID_BIT >> 32);
+}
 
 fn pickBackend(_: config.ServerConfig) Backend {
     // Diagnostic / opt-in override: SWERVER_BACKEND=epoll|poll|native
@@ -931,13 +940,21 @@ test "external id token survives the kqueue/epoll ±1 offset and avoids reserved
     const token = EXTERNAL_ID_BIT | @as(u64, slot);
     const registered = token + 1; // register path offset
     const translated = registered - 1; // translate path reversal
-    try std.testing.expect(translated & EXTERNAL_ID_BIT != 0);
+    try std.testing.expect(isExternalId(translated));
     try std.testing.expectEqual(@as(u64, slot), translated & 0xFFFF_FFFF);
     // Reserved-id collisions: listener (0), UDP magic, pool indexes (u32).
     try std.testing.expect(token != 0);
     try std.testing.expect(token != UDP_SOCKET_ID);
     try std.testing.expect(registered != UDP_SOCKET_ID);
     try std.testing.expect(token > std.math.maxInt(u32));
+    // UDP_SOCKET_ID has bit 62 set — a bare `& EXTERNAL_ID_BIT` test
+    // would misroute UDP error events. isExternalId must reject it,
+    // along with the other non-external ids.
+    try std.testing.expect(UDP_SOCKET_ID & EXTERNAL_ID_BIT != 0); // the trap is real
+    try std.testing.expect(!isExternalId(UDP_SOCKET_ID));
+    try std.testing.expect(!isExternalId(0));
+    try std.testing.expect(!isExternalId(std.math.maxInt(u32)));
+    try std.testing.expect(!isExternalId(std.math.maxInt(u64)));
 }
 
 fn sleepMs(timeout_ms: u32) void {

@@ -262,11 +262,14 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
                 .read, .write, .err => {
                     // External-fd events (PostgreSQL client sockets) are
                     // tagged with EXTERNAL_ID_BIT and routed to their
-                    // owner instead of the connection table. The
-                    // kernel_buffer is always null on the readiness
-                    // backends that support external fds, but release
-                    // defensively in case that ever changes.
-                    if (event.conn_id & io_mod.EXTERNAL_ID_BIT != 0) {
+                    // owner instead of the connection table. Exact
+                    // high-bits match (isExternalId), NOT a bare bit
+                    // test: UDP_SOCKET_ID also has bit 62 set and its
+                    // .err events must not land here. The kernel_buffer
+                    // is always null on the readiness backends that
+                    // support external fds, but release defensively in
+                    // case that ever changes.
+                    if (io_mod.isExternalId(event.conn_id)) {
                         if (event.kernel_buffer) |kb| kb.release();
                         if (server.pg_client) |pgc| {
                             pgc.onEvent(&server.io, @intCast(event.conn_id & 0xFFFF_FFFF), event.kind);
