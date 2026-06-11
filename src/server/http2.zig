@@ -179,7 +179,8 @@ pub fn handleHttp2Read(server: *Server, conn: *connection.Connection) !void {
                             // goes through queueHttp2Response.
                             const file_path = hdr.request.path[8..];
                             const content_type = Server.guessContentType(file_path);
-                            queueFileResponseH2(server, conn, hdr.stream_id, server.cfg.static_root, file_path, content_type) catch {
+                            const accept_encoding = hdr.request.getHeader("accept-encoding") orelse "";
+                            queueFileResponseH2(server, conn, hdr.stream_id, server.cfg.static_root, file_path, content_type, accept_encoding) catch {
                                 try queueHttp2Response(server, conn, hdr.stream_id, Server.notFoundResponse(), false);
                             };
                         } else {
@@ -330,6 +331,7 @@ fn queueFileResponseH2(
     static_root: []const u8,
     file_path: []const u8,
     content_type: []const u8,
+    accept_encoding: []const u8,
 ) !void {
     _ = static_root;
     if (std.mem.indexOfScalar(u8, file_path, '%') != null) return error.NotFound;
@@ -339,7 +341,8 @@ fn queueFileResponseH2(
 
     const root_fd = server.static_root_fd orelse return error.NotFound;
 
-    const file_fd = Server.safeOpenStatic(root_fd, file_path) orelse return error.NotFound;
+    const variant = Server.resolveStaticVariant(root_fd, file_path, accept_encoding) orelse return error.NotFound;
+    const file_fd = variant.fd;
 
     const end_pos = std.c.lseek(file_fd, 0, std.posix.SEEK.END);
     if (end_pos < 0) {
@@ -359,10 +362,19 @@ fn queueFileResponseH2(
     // Encode HEADERS frame
     const hpack_start: usize = 9;
     const date_str = server.getCachedDate();
-    const hdrs = [_]response_mod.Header{
-        .{ .name = "Content-Type", .value = content_type },
-    };
-    const header_block_len = http2.encodeResponseHeaders(buf.bytes[hpack_start..], 200, &hdrs, file_size, date_str) catch {
+    // Content-Type from the original path; advertise a chosen precompressed
+    // sibling via Content-Encoding + Vary (Content-Length is `file_size`).
+    var hdrs_buf: [3]response_mod.Header = undefined;
+    var nh: usize = 0;
+    hdrs_buf[nh] = .{ .name = "Content-Type", .value = content_type };
+    nh += 1;
+    if (variant.encoding != .identity) {
+        hdrs_buf[nh] = .{ .name = "Content-Encoding", .value = variant.encoding.token() };
+        nh += 1;
+        hdrs_buf[nh] = .{ .name = "Vary", .value = "Accept-Encoding" };
+        nh += 1;
+    }
+    const header_block_len = http2.encodeResponseHeaders(buf.bytes[hpack_start..], 200, hdrs_buf[0..nh], file_size, date_str) catch {
         server.io.releaseBuffer(buf);
         clock.closeFd(file_fd);
         sendRstStream(server, conn, stream_id, 0x2);

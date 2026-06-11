@@ -879,6 +879,81 @@ pub const Server = struct {
         return null;
     }
 
+    /// Encoding of a static file actually served — `identity` for the raw
+    /// file, or a precompressed sibling the client accepts.
+    pub const StaticEncoding = enum {
+        identity,
+        gzip,
+        br,
+
+        /// The `Content-Encoding` token for this encoding ("" for identity).
+        pub fn token(self: StaticEncoding) []const u8 {
+            return switch (self) {
+                .identity => "",
+                .gzip => "gzip",
+                .br => "br",
+            };
+        }
+    };
+
+    pub const StaticVariant = struct {
+        fd: std.posix.fd_t,
+        encoding: StaticEncoding,
+    };
+
+    /// True if `token` (e.g. "br", "gzip") appears in an Accept-Encoding
+    /// header value with a non-zero qvalue. Case-insensitive; tolerates
+    /// q-params. Mirrors the q=0 handling in middleware/compress.zig.
+    fn acceptsEncoding(header_value: []const u8, token: []const u8) bool {
+        var it = std.mem.splitScalar(u8, header_value, ',');
+        while (it.next()) |raw| {
+            const trimmed = std.mem.trim(u8, raw, " \t");
+            const semi = std.mem.indexOfScalar(u8, trimmed, ';');
+            const name = if (semi) |s| std.mem.trim(u8, trimmed[0..s], " \t") else trimmed;
+            if (!std.ascii.eqlIgnoreCase(name, token)) continue;
+            if (semi) |s| {
+                const params = std.mem.trim(u8, trimmed[s + 1 ..], " \t");
+                if (std.ascii.startsWithIgnoreCase(params, "q=")) {
+                    const qval = std.mem.trim(u8, params[2..], " \t");
+                    if (std.mem.eql(u8, qval, "0") or std.mem.eql(u8, qval, "0.0") or
+                        std.mem.eql(u8, qval, "0.00") or std.mem.eql(u8, qval, "0.000")) return false;
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+
+    /// Resolve a static file to the best precompressed sibling the client
+    /// accepts: tries `<path>.br` then `<path>.gz` (when the matching token
+    /// is present and not q=0 in `accept_encoding`), falling back to the
+    /// identity file. Returns the open fd + which encoding it is, or null if
+    /// nothing opened. The caller derives Content-Type from the ORIGINAL
+    /// `file_path`, never the `.br`/`.gz` suffix.
+    pub fn resolveStaticVariant(root_fd: std.posix.fd_t, file_path: []const u8, accept_encoding: []const u8) ?StaticVariant {
+        // Need room for a 3-byte ".br"/".gz" suffix within safeOpenStatic's cap.
+        if (file_path.len > 0 and file_path.len + 3 < 4096) {
+            var buf: [4096]u8 = undefined;
+            @memcpy(buf[0..file_path.len], file_path);
+            if (acceptsEncoding(accept_encoding, "br")) {
+                @memcpy(buf[file_path.len..][0..3], ".br");
+                if (safeOpenStatic(root_fd, buf[0 .. file_path.len + 3])) |fd| {
+                    return .{ .fd = fd, .encoding = .br };
+                }
+            }
+            if (acceptsEncoding(accept_encoding, "gzip")) {
+                @memcpy(buf[file_path.len..][0..3], ".gz");
+                if (safeOpenStatic(root_fd, buf[0 .. file_path.len + 3])) |fd| {
+                    return .{ .fd = fd, .encoding = .gzip };
+                }
+            }
+        }
+        if (safeOpenStatic(root_fd, file_path)) |fd| {
+            return .{ .fd = fd, .encoding = .identity };
+        }
+        return null;
+    }
+
     pub fn closeConnection(self: *Server, conn: *connection.Connection) void {
         if (conn.is_tunnel) {
             if (conn.tunnel_peer_index) |pi| {
