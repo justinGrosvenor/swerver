@@ -9,6 +9,7 @@ const dns_mod = @import("proxy/dns.zig");
 const consul_mod = @import("proxy/consul.zig");
 const body_schema_mod = @import("middleware/body_schema.zig");
 const clock = @import("runtime/clock.zig");
+const pg_client_mod = @import("db/pg/client.zig");
 
 /// Config file schema version. Bump the minor component when fields are
 /// added (backward-compatible), the major component when a field is
@@ -186,6 +187,36 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
         if (o.sample_rate) |v| cfg.otel.sample_rate = v;
         if (o.max_batch_size) |v| cfg.otel.max_batch_size = v;
         if (o.headers) |v| cfg.otel.headers = v;
+    }
+
+    // PostgreSQL client (design 9.0, phase 2.1)
+    if (file_cfg.postgres) |p| {
+        if (p.url) |url| {
+            const parsed = pg_client_mod.parseUrl(url) catch return error.ConfigParseError;
+            cfg.postgres.enabled = true;
+            cfg.postgres.host = parsed.host;
+            cfg.postgres.port = parsed.port;
+            cfg.postgres.user = parsed.user;
+            cfg.postgres.database = parsed.database;
+            // TLS client mode lands in phase 3; until then only an
+            // explicit sslmode=disable is accepted.
+            const sslmode = parsed.sslmode orelse "";
+            if (!std.mem.eql(u8, sslmode, "disable")) {
+                std.log.warn("postgres: TLS not yet supported, refusing (set sslmode=disable to opt in to plaintext); client disabled", .{});
+                cfg.postgres.enabled = false;
+            }
+            if (parsed.password.len > 0) {
+                // Passwords belong in password_env, never the config file.
+                std.log.warn("postgres: password in URL ignored; use password_env", .{});
+            }
+        }
+        if (p.password_env) |v| cfg.postgres.password_env = v;
+        if (p.pool_size_per_worker) |v| {
+            if (v == 0 or v > pg_client_mod.MAX_SLOTS) return error.ConfigParseError;
+            cfg.postgres.pool_size_per_worker = v;
+        }
+        if (p.statement_timeout_ms) |v| cfg.postgres.statement_timeout_ms = v;
+        if (p.allow_cleartext_password) |v| cfg.postgres.allow_cleartext_password = v;
     }
 
     // Upstreams
@@ -534,6 +565,7 @@ const FileConfig = struct {
     x402: ?X402Json = null,
     admin: ?AdminJson = null,
     otel: ?OtelJson = null,
+    postgres: ?PostgresJson = null,
     upstreams: ?[]const UpstreamJson = null,
     routes: ?[]const RouteJson = null,
 };
@@ -622,6 +654,14 @@ const OtelJson = struct {
     sample_rate: ?u16 = null,
     max_batch_size: ?u16 = null,
     headers: ?[]const u8 = null,
+};
+
+const PostgresJson = struct {
+    url: ?[]const u8 = null,
+    password_env: ?[]const u8 = null,
+    pool_size_per_worker: ?u8 = null,
+    statement_timeout_ms: ?u32 = null,
+    allow_cleartext_password: ?bool = null,
 };
 
 const RouteX402Json = struct {
@@ -1041,6 +1081,69 @@ test "parse otel config" {
     try std.testing.expectEqual(@as(u32, 10), loaded.server_config.otel.flush_interval_s);
     try std.testing.expectEqual(@as(u16, 50), loaded.server_config.otel.sample_rate);
     try std.testing.expectEqual(@as(u16, 128), loaded.server_config.otel.max_batch_size);
+}
+
+test "parse postgres config" {
+    const json =
+        \\{
+        \\  "postgres": {
+        \\    "url": "postgres://app@db.internal:6432/orders?sslmode=disable",
+        \\    "password_env": "PG_PASSWORD",
+        \\    "pool_size_per_worker": 3,
+        \\    "statement_timeout_ms": 2500
+        \\  }
+        \\}
+    ;
+    var loaded = try parseJsonFromBytes(std.testing.allocator, json);
+    defer loaded.deinit();
+    const p = loaded.server_config.postgres;
+    try std.testing.expect(p.enabled);
+    try std.testing.expectEqualStrings("db.internal", p.host);
+    try std.testing.expectEqual(@as(u16, 6432), p.port);
+    try std.testing.expectEqualStrings("app", p.user);
+    try std.testing.expectEqualStrings("orders", p.database);
+    try std.testing.expectEqualStrings("PG_PASSWORD", p.password_env);
+    try std.testing.expectEqual(@as(u8, 3), p.pool_size_per_worker);
+    try std.testing.expectEqual(@as(u32, 2500), p.statement_timeout_ms);
+    try std.testing.expect(!p.allow_cleartext_password);
+}
+
+test "postgres config refuses non-disable sslmode (TLS not yet supported)" {
+    // The refusal logs at warn; keep the test runner's stderr clean.
+    const saved_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = saved_log_level;
+
+    const json =
+        \\{
+        \\  "postgres": { "url": "postgres://app@db.internal/orders?sslmode=verify-full" }
+        \\}
+    ;
+    var loaded = try parseJsonFromBytes(std.testing.allocator, json);
+    defer loaded.deinit();
+    try std.testing.expect(!loaded.server_config.postgres.enabled);
+
+    // sslmode absent → also refused (fail closed until TLS lands).
+    const json2 =
+        \\{
+        \\  "postgres": { "url": "postgres://app@db.internal/orders" }
+        \\}
+    ;
+    var loaded2 = try parseJsonFromBytes(std.testing.allocator, json2);
+    defer loaded2.deinit();
+    try std.testing.expect(!loaded2.server_config.postgres.enabled);
+}
+
+test "postgres config rejects bad url and bad pool size" {
+    const bad_url =
+        \\{ "postgres": { "url": "mysql://app@db/orders" } }
+    ;
+    try std.testing.expectError(error.ConfigParseError, parseJsonFromBytes(std.testing.allocator, bad_url));
+
+    const bad_pool =
+        \\{ "postgres": { "url": "postgres://a@h/d?sslmode=disable", "pool_size_per_worker": 9 } }
+    ;
+    try std.testing.expectError(error.ConfigParseError, parseJsonFromBytes(std.testing.allocator, bad_pool));
 }
 
 test "parse route with body_schema" {

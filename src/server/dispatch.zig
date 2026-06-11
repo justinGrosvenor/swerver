@@ -27,6 +27,7 @@ const Server = server_mod.Server;
 
 const connection = @import("../runtime/connection.zig");
 const clock = @import("../runtime/clock.zig");
+const io_mod = @import("../runtime/io.zig");
 const net = @import("../runtime/net.zig");
 const request_mod = @import("../protocol/request.zig");
 const http1 = @import("../protocol/http1.zig");
@@ -259,6 +260,19 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
                     }
                 },
                 .read, .write, .err => {
+                    // External-fd events (PostgreSQL client sockets) are
+                    // tagged with EXTERNAL_ID_BIT and routed to their
+                    // owner instead of the connection table. The
+                    // kernel_buffer is always null on the readiness
+                    // backends that support external fds, but release
+                    // defensively in case that ever changes.
+                    if (event.conn_id & io_mod.EXTERNAL_ID_BIT != 0) {
+                        if (event.kernel_buffer) |kb| kb.release();
+                        if (server.pg_client) |pgc| {
+                            pgc.onEvent(&server.io, @intCast(event.conn_id & 0xFFFF_FFFF), event.kind);
+                        }
+                        continue;
+                    }
                     // Validate conn_id fits in u32 before casting
                     if (event.conn_id > std.math.maxInt(u32)) {
                         if (event.kernel_buffer) |kb| kb.release();
@@ -403,6 +417,9 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
             }
             if (server.proxy) |proxy| {
                 proxy.runMaintenance(now_ms);
+            }
+            if (server.pg_client) |pgc| {
+                pgc.tick(&server.io, now_ms);
             }
             if (server.otel) |otel_exp| {
                 otel_exp.tick(now_ms);

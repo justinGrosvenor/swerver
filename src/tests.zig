@@ -78,11 +78,12 @@ const usage = @import("middleware/usage.zig");
 // Admin
 const admin = @import("admin/admin.zig");
 
-// Database (PostgreSQL client, phase 1: protocol core)
+// Database (PostgreSQL client: protocol core + reactor connection driver)
 const pg = @import("db/pg/pg.zig");
 const pg_protocol = @import("db/pg/protocol.zig");
 const pg_scram = @import("db/pg/scram.zig");
 const pg_types = @import("db/pg/types.zig");
+const pg_client = @import("db/pg/client.zig");
 
 // Proxy
 const proxy_upstream = @import("proxy/upstream.zig");
@@ -193,6 +194,7 @@ comptime {
     _ = pg_protocol;
     _ = pg_scram;
     _ = pg_types;
+    _ = pg_client;
 
     // Proxy
     _ = proxy_cache;

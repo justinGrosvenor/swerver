@@ -32,6 +32,7 @@ const http2_mod = @import("server/http2.zig");
 const http1_mod = @import("server/http1.zig");
 const dispatch = @import("server/dispatch.zig");
 const write_queue = @import("server/write_queue.zig");
+const pg_client_mod = @import("db/pg/client.zig");
 
 // ============================================================
 // Pre-encoded response cache (PR PERF-3)
@@ -129,6 +130,9 @@ pub const Server = struct {
     quic: ?quic_handler.Handler,
     /// Reverse proxy handler (null if proxy not configured)
     proxy: ?*proxy_mod.Proxy = null,
+    /// Native PostgreSQL client (null unless the "postgres" config block
+    /// is present). Phase 2.1: connection bring-up only — no query API.
+    pg_client: ?*pg_client_mod.PgClient = null,
     /// Admin API listener (null if admin API not enabled)
     admin_listener_fd: ?std.posix.fd_t = null,
     /// Spare FD for EMFILE recovery — closed temporarily to accept+close one connection
@@ -359,6 +363,42 @@ pub const Server = struct {
             self.otel = otel_ptr;
         }
 
+        // PostgreSQL client (design 9.0, phase 2.1: connection bring-up
+        // only). DNS resolves once here at startup — never on the
+        // reactor — so an unreachable resolver can't stall the loop.
+        // The actual non-blocking connects start from the housekeeping
+        // tick once the event loop runs.
+        if (cfg.postgres.enabled) pg_blk: {
+            const password: []const u8 = pwd: {
+                if (cfg.postgres.password_env.len == 0) break :pwd "";
+                var name_z: [256]u8 = undefined;
+                if (cfg.postgres.password_env.len >= name_z.len) break :pwd "";
+                @memcpy(name_z[0..cfg.postgres.password_env.len], cfg.postgres.password_env);
+                name_z[cfg.postgres.password_env.len] = 0;
+                const name_z_ptr: [*:0]const u8 = @ptrCast(&name_z);
+                const v = std.c.getenv(name_z_ptr) orelse break :pwd "";
+                break :pwd std.mem.sliceTo(v, 0);
+            };
+            const pgc = allocator.create(pg_client_mod.PgClient) catch break :pg_blk;
+            pgc.* = pg_client_mod.PgClient.init(.{
+                .host = cfg.postgres.host,
+                .port = cfg.postgres.port,
+                .user = cfg.postgres.user,
+                .database = cfg.postgres.database,
+                .password = password,
+                .pool_size = cfg.postgres.pool_size_per_worker,
+                .allow_cleartext_password = cfg.postgres.allow_cleartext_password,
+            }) catch |err| {
+                std.log.warn("postgres: client init failed: {}; client disabled", .{err});
+                allocator.destroy(pgc);
+                break :pg_blk;
+            };
+            self.pg_client = pgc;
+            std.log.info("postgres: client configured for {s}:{d} (pool {d})", .{
+                cfg.postgres.host, cfg.postgres.port, cfg.postgres.pool_size_per_worker,
+            });
+        }
+
         // Skip getpeername on accept when nothing needs the peer IP.
         self.needs_peer_ip = self.proxy != null or
             app_router.middleware_chain.post.len > 0;
@@ -385,6 +425,10 @@ pub const Server = struct {
             std.heap.page_allocator.destroy(pr);
         }
         if (self.reload_arena) |*a| a.deinit();
+        if (self.pg_client) |pgc| {
+            pgc.deinit(&self.io);
+            self.allocator.destroy(pgc);
+        }
         self.io.deinit();
     }
 

@@ -389,6 +389,57 @@ pub const IoRuntime = struct {
             else => {},
         }
     }
+
+    /// Register an external (non-connection-pool) fd — e.g. a PostgreSQL
+    /// client socket — for read events. Events for it arrive with
+    /// `conn_id == EXTERNAL_ID_BIT | slot`; the dispatcher routes them to
+    /// the owning module instead of the connection table.
+    ///
+    /// Only the readiness backends (kqueue, epoll) support external fds
+    /// today: both treat the registered id as fully opaque, so the tag
+    /// bit rides through registration and translation untouched. The
+    /// io_uring backends pack conn ids into 32-bit user_data fields and
+    /// need their own encoding — wiring them up is an explicit follow-up
+    /// step (do NOT register external fds there until it lands).
+    pub fn registerExternalFd(self: *IoRuntime, slot: u32, fd: std.posix.fd_t) !void {
+        const token = EXTERNAL_ID_BIT | @as(u64, slot);
+        return switch (self.backend_state) {
+            // +1 matches registerConnection's listener-collision offset;
+            // the translate paths subtract it back out. The offset only
+            // touches the low bits (slots are tiny), so bit 62 survives.
+            .bsd_kqueue => |*kq| kq.registerConnection(token + 1, fd),
+            .linux_epoll => |*ep| ep.registerConnection(token + 1, fd),
+            .linux_io_uring_poll, .linux_io_uring_native => error.UnsupportedBackend,
+            else => error.UnsupportedBackend,
+        };
+    }
+
+    /// Arm a writable wake for an external fd (connect-in-progress or a
+    /// partial write that hit EAGAIN). kqueue needs the explicit one-shot
+    /// EVFILT_WRITE; epoll already delivers edge-triggered EPOLLOUT from
+    /// `registerExternalFd` (EPOLLIN | EPOLLOUT | EPOLLET), so re-arming
+    /// is a no-op there.
+    pub fn armExternalWritable(self: *IoRuntime, slot: u32, fd: std.posix.fd_t) !void {
+        const token = EXTERNAL_ID_BIT | @as(u64, slot);
+        switch (self.backend_state) {
+            .bsd_kqueue => |*kq| try kq.armWritable(token + 1, fd),
+            .linux_epoll => {},
+            .linux_io_uring_poll, .linux_io_uring_native => return error.UnsupportedBackend,
+            else => return error.UnsupportedBackend,
+        }
+    }
+
+    /// Remove an external fd from the event loop. Both readiness
+    /// backends key unregistration on the fd itself, so this delegates
+    /// to the existing unregister paths.
+    pub fn unregisterExternalFd(self: *IoRuntime, fd: std.posix.fd_t) !void {
+        return switch (self.backend_state) {
+            .bsd_kqueue => |*kq| kq.unregister(fd),
+            .linux_epoll => |*ep| ep.unregister(fd),
+            .linux_io_uring_poll, .linux_io_uring_native => error.UnsupportedBackend,
+            else => error.UnsupportedBackend,
+        };
+    }
 };
 
 pub const Backend = enum {
@@ -475,6 +526,15 @@ pub const Capabilities = struct {
 
 /// Magic identifier for UDP socket events to distinguish from TCP listener (0) and connections
 pub const UDP_SOCKET_ID: u64 = std.math.maxInt(u64) - 1;
+
+/// Bit 62 tags conn ids that belong to external (non-Connection-pool)
+/// file descriptors — PostgreSQL client sockets today; proxy upstream
+/// streaming (design 5.0) will reuse the same plumbing. The low 32 bits
+/// carry a module-defined slot number. The tag cannot collide with the
+/// listener (0), connection-pool indexes (u32), or UDP_SOCKET_ID
+/// (maxInt(u64) - 1), and the kqueue/epoll ±1 registration offset only
+/// perturbs the low bits, so bit 62 survives the round trip.
+pub const EXTERNAL_ID_BIT: u64 = 1 << 62;
 
 fn pickBackend(_: config.ServerConfig) Backend {
     // Diagnostic / opt-in override: SWERVER_BACKEND=epoll|poll|native
@@ -864,6 +924,20 @@ fn translateIoUringNativeEvents(
         }
     }
     return count;
+}
+
+test "external id token survives the kqueue/epoll ±1 offset and avoids reserved ids" {
+    const slot: u32 = 3;
+    const token = EXTERNAL_ID_BIT | @as(u64, slot);
+    const registered = token + 1; // register path offset
+    const translated = registered - 1; // translate path reversal
+    try std.testing.expect(translated & EXTERNAL_ID_BIT != 0);
+    try std.testing.expectEqual(@as(u64, slot), translated & 0xFFFF_FFFF);
+    // Reserved-id collisions: listener (0), UDP magic, pool indexes (u32).
+    try std.testing.expect(token != 0);
+    try std.testing.expect(token != UDP_SOCKET_ID);
+    try std.testing.expect(registered != UDP_SOCKET_ID);
+    try std.testing.expect(token > std.math.maxInt(u32));
 }
 
 fn sleepMs(timeout_ms: u32) void {
