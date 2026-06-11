@@ -146,11 +146,6 @@ pub const Slot = struct {
     /// Diagnostic: why the last TLS bring-up failed (sticky across the
     /// retry backoff; reset when the next connect attempt starts).
     tls_fail: TlsFailure = .none,
-    /// Set once the slot has run its one-time discard query after first
-    /// reaching `.ready`. Works around a first-query readiness gap on the
-    /// native io_uring one-shot external poll (epoll's persistent
-    /// registration masks it). Reset on every (re)connect. See primeSlot.
-    primed: bool = false,
 
     fn opAt(self: *Slot, i: u8) *InFlightOp {
         return &self.ops[(self.op_head +% i) % OP_QUEUE_DEPTH];
@@ -422,7 +417,6 @@ pub const PgClient = struct {
     fn startConnect(self: *PgClient, io_rt: *io_mod.IoRuntime, idx: u32, now_ms: u64) void {
         const slot = &self.slots[idx];
         slot.tls_fail = .none;
-        slot.primed = false;
         const domain: c_uint = switch (self.addr.storage) {
             .ip4 => @intCast(std.posix.AF.INET),
             .ip6 => @intCast(std.posix.AF.INET6),
@@ -882,59 +876,11 @@ pub const PgClient = struct {
             }
             switch (ingest(slot, idx)) {
                 .more => {},
-                .ready => {
-                    if (!slot.primed) {
-                        slot.primed = true;
-                        self.primeSlot(io_rt, idx, now_ms);
-                    }
-                    return;
-                },
+                .ready => return,
                 .failed => return self.failSlot(io_rt, idx, now_ms, "handshake failed"),
             }
             // The handshake may have queued a response (SASL round trip).
             self.pumpSend(io_rt, idx, now_ms);
-        }
-    }
-
-    /// Run one discard query ("select 1") the first time a slot reaches
-    /// `.ready`, so the first *real* query is never the connection's very
-    /// first. Works around a first-query readiness gap on the native
-    /// io_uring one-shot external poll: epoll's persistent registration
-    /// masks it, so there it just exercises a harmless extra round-trip at
-    /// startup. The op carries no park, so `drainOpResponses` discards its
-    /// result. Mirrors `queryBatch`'s serialization (unnamed statement, no
-    /// params, no Describe — the result is thrown away).
-    fn primeSlot(self: *PgClient, io_rt: *io_mod.IoRuntime, idx: u32, now_ms: u64) void {
-        const slot = &self.slots[idx];
-        if (slot.state != .ready or slot.op_count != 0) return;
-
-        const no_args: []const ?[]const u8 = &.{};
-        const tls_active = slot.tls != null;
-        if (!tls_active and slot.send_off > 0) {
-            std.mem.copyForwards(u8, slot.send_buf[0 .. slot.send_len - slot.send_off], slot.send_buf[slot.send_off..slot.send_len]);
-            slot.send_len -= slot.send_off;
-            slot.send_off = 0;
-        }
-        var plain_scratch: [SEND_BUF_SIZE]u8 = undefined;
-        const out_buf: []u8 = if (tls_active) plain_scratch[0..] else slot.send_buf[0..];
-        var off: usize = if (tls_active) 0 else slot.send_len;
-        const op_start = off;
-        off += (protocol.writeParse(out_buf[off..], "", "select 1", &.{}) catch return).len;
-        off += (protocol.writeBind(out_buf[off..], "", "", no_args) catch return).len;
-        off += (protocol.writeExecute(out_buf[off..], "", 0) catch return).len;
-        off += (protocol.writeSync(out_buf[off..]) catch return).len;
-
-        const tail = slot.opAt(slot.op_count);
-        tail.* = .{ .park = NO_PARK, .cache_slot = NO_CACHE };
-        slot.op_count += 1;
-        slot.state = .busy;
-        if (tls_active) {
-            if (!self.stageTls(io_rt, idx, now_ms, out_buf[op_start..off])) return;
-        } else {
-            slot.send_len = off;
-        }
-        switch (self.flushOut(io_rt, idx, now_ms)) {
-            .drained, .blocked, .failed => {},
         }
     }
 
