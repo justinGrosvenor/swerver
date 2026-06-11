@@ -115,6 +115,12 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
     if (server.pg_client) |pgc| pgc.installResume(@ptrCast(server), pgResume);
 
     try server.io.start();
+    // Eagerly start PG pool connects at worker boot. Otherwise the pool
+    // relies on the first housekeeping tick, which is wall-clock gated and
+    // can be delayed for a worker that receives no traffic under CPU
+    // oversubscription — its slots stay .closed and the first request
+    // routed to it (via SO_REUSEPORT) 503s with NotConnected.
+    if (server.pg_client) |pgc| pgc.tick(&server.io, server.io.nowMs());
     server.refreshCachedDate();
     if (server.listener_fd == null) {
         const fd = try net.listen(server.cfg.address, server.cfg.port, 4096);
