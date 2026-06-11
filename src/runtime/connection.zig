@@ -259,7 +259,13 @@ pub const Connection = struct {
     tunnel_peer_id: u64 = 0,
     /// True when this connection is in bidirectional tunnel mode (WebSocket).
     is_tunnel: bool = false,
-    /// Async x402 facilitator verify state (H1 only — H2/H3 needs per-stream state).
+    /// Async park state (H1 only — H2/H3 needs per-stream state).
+    /// Historically x402-specific; `.db_parked` reuses the same byte for
+    /// PostgreSQL park-and-resume (design 9.0) because every dispatch
+    /// gate that must pause on an x402 park (pipeline loop, recv re-arm)
+    /// must pause identically on a DB park. Same type and offset — the
+    /// Connection auto-layout is load-bearing (see the struct-level
+    /// NOTE), so extending this enum is free where a new field is not.
     x402: X402State = .none,
     /// Settle-park: pool buffer holding packed upstream response (headers + body).
     x402_held_buf: ?buffer_pool.BufferHandle = null,
@@ -268,7 +274,17 @@ pub const Connection = struct {
     x402_held_body_offset: u16 = 0,
     x402_held_body_len: u32 = 0,
 
-    pub const X402State = enum(u8) { none, pending, resolved_allow, resolved_reject, settle_pending };
+    pub const X402State = enum(u8) {
+        none,
+        pending,
+        resolved_allow,
+        resolved_reject,
+        settle_pending,
+        /// Request parked awaiting a PostgreSQL op (design 9.0). The
+        /// park entry (continuation, stash, deadline, generation) lives
+        /// in the per-worker PgClient, not on the Connection.
+        db_parked,
+    };
 
     pub fn init(index: u32) Connection {
         return .{

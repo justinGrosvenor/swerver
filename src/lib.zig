@@ -141,6 +141,14 @@ pub const proxy = struct {
 /// Admin API for runtime route/upstream management
 pub const admin = @import("admin/admin.zig");
 
+/// Native PostgreSQL client (design 9.0). **Experimental** — phase 1
+/// ships only the pure protocol layer (wire codec, SCRAM-SHA-256,
+/// binary type decoders, socket-free handshake state machine); reactor
+/// integration and the handler API land in later phases.
+pub const db = struct {
+    pub const pg = @import("db/pg/pg.zig");
+};
+
 /// Benchmark route handlers (HttpArena / TechEmpower). **Not part of
 /// the stable API** — this namespace exists so benchmark-oriented
 /// consumers (the bundled `src/main.zig` binary, `examples/httparena/`,

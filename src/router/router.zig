@@ -6,6 +6,9 @@ const settlement = @import("../middleware/settlement.zig");
 const middleware = @import("../middleware/middleware.zig");
 const buffer_pool = @import("../runtime/buffer_pool.zig");
 const clock = @import("../runtime/clock.zig");
+const io_runtime = @import("../runtime/io.zig");
+const pg_client_mod = @import("../db/pg/client.zig");
+const pg_handler_api = @import("../db/pg/handler_api.zig");
 
 /// Per-thread scratch for merging handler-returned headers with
 /// middleware-accumulated headers (security, CORS, etc.) before the
@@ -112,6 +115,8 @@ pub const HandlerContext = struct {
     arena: std.heap.FixedBufferAllocator,
     /// Actual charge amount for x402 `upto` scheme (set by handler)
     charge_amount: []const u8 = "",
+    /// PostgreSQL query surface (design 9.0): `ctx.pg.query(...)`.
+    pg: PgHandle = .{},
 
     pub const Param = struct {
         name: []const u8,
@@ -375,6 +380,74 @@ pub const HandlerScratch = struct {
     arena_buf: []u8,
     arena_handle: ?buffer_pool.BufferHandle = null,
     buffer_ops: ?middleware.BufferOps = null,
+    /// PostgreSQL park-and-resume binding (design 9.0). Set by the H1
+    /// dispatch layer when a PG client is configured; the zero value
+    /// makes `ctx.pg.query()` fail with error.NotConnected.
+    pg: PgBinding = .{},
+};
+
+/// Connection identity + per-worker PG client, threaded from the
+/// dispatch layer into `ctx.pg`. conn_id is the connection generation,
+/// checked at resume time.
+pub const PgBinding = struct {
+    client: ?*pg_client_mod.PgClient = null,
+    io_rt: ?*io_runtime.IoRuntime = null,
+    conn_index: u32 = 0,
+    conn_id: u64 = 0,
+};
+
+/// `ctx.pg` — the handler-facing query surface (design 9.0 Handler
+/// API). `query()` issues one parameterized statement, parks the
+/// request, and returns the park sentinel Response, which the handler
+/// must return. See docs/design/9.0-postgres-client.md.
+pub const PgHandle = struct {
+    binding: PgBinding = .{},
+
+    pub fn query(
+        self: PgHandle,
+        sql: []const u8,
+        args: []const ?[]const u8,
+        comptime StashT: type,
+        stash_init: StashT,
+        continuation: pg_handler_api.Continuation,
+    ) pg_handler_api.QueryError!response.Response {
+        comptime pg_handler_api.assertPlainData(StashT);
+        comptime std.debug.assert(@sizeOf(StashT) <= pg_handler_api.STASH_CAPACITY);
+        const client = self.binding.client orelse return error.NotConnected;
+        return client.query(
+            self.binding.io_rt.?,
+            self.binding.conn_index,
+            self.binding.conn_id,
+            sql,
+            args,
+            std.mem.asBytes(&stash_init),
+            continuation,
+        );
+    }
+
+    /// Batch variant: one op, N Bind/Execute pairs of the same SQL, all
+    /// result rows in one continuation Result (design 9.0 phase 4).
+    pub fn queryBatch(
+        self: PgHandle,
+        sql: []const u8,
+        args_batch: []const []const ?[]const u8,
+        comptime StashT: type,
+        stash_init: StashT,
+        continuation: pg_handler_api.Continuation,
+    ) pg_handler_api.QueryError!response.Response {
+        comptime pg_handler_api.assertPlainData(StashT);
+        comptime std.debug.assert(@sizeOf(StashT) <= pg_handler_api.STASH_CAPACITY);
+        const client = self.binding.client orelse return error.NotConnected;
+        return client.queryBatch(
+            self.binding.io_rt.?,
+            self.binding.conn_index,
+            self.binding.conn_id,
+            sql,
+            args_batch,
+            std.mem.asBytes(&stash_init),
+            continuation,
+        );
+    }
 };
 
 pub const RouterLimits = struct {
@@ -806,6 +879,7 @@ pub const Router = struct {
             .response_headers = scratch.response_headers,
             .response_header_count = 0,
             .arena = std.heap.FixedBufferAllocator.init(scratch.arena_buf),
+            .pg = .{ .binding = scratch.pg },
         };
 
         // Only capture request start time if post-response hooks exist

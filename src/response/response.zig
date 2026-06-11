@@ -90,6 +90,22 @@ pub const Response = struct {
     body: Body = .none,
     body_type: BodyType = .fixed,
 
+    /// Reserved park sentinel (design 9.0 Handler API). Status 0 is not
+    /// a real HTTP status; the dispatch layer intercepts it and parks
+    /// the connection instead of serializing. Handlers obtain it ONLY
+    /// as the return value of `ctx.pg.query(...)` — constructing it by
+    /// hand parks nothing and is a bug.
+    pub const parked: Response = .{
+        .status = 0,
+        .headers = &[_]Header{},
+        .body = .none,
+        .body_type = .none,
+    };
+
+    pub fn isParked(self: Response) bool {
+        return self.status == 0;
+    }
+
     pub fn ok() Response {
         return .{
             .status = 200,

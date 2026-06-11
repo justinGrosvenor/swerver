@@ -24,6 +24,7 @@ pub const IoRuntime = struct {
 
     pub fn init(allocator: std.mem.Allocator, cfg: config.ServerConfig) !IoRuntime {
         const backend = pickBackend(cfg);
+        std.log.debug("io: selected backend {s}", .{@tagName(backend)});
         var connections = try connection.ConnectionPool.init(allocator, cfg.max_connections);
         errdefer connections.deinit();
         var buffers = try buffer_pool.BufferPool.init(allocator, cfg.buffer_pool);
@@ -389,6 +390,68 @@ pub const IoRuntime = struct {
             else => {},
         }
     }
+
+    /// Register an external (non-connection-pool) fd — e.g. a PostgreSQL
+    /// client socket — for read events. Events for it arrive with
+    /// `conn_id == EXTERNAL_ID_BIT | slot`; the dispatcher routes them to
+    /// the owning module instead of the connection table.
+    ///
+    /// All four production backends support external fds. kqueue/epoll
+    /// treat the registered id as fully opaque, so the tagged token rides
+    /// through registration and translation untouched. The io_uring
+    /// backends keep external fds in a small slot-keyed side table and
+    /// drive them with one-shot POLL_ADDs, re-armed after every read
+    /// wake (poll-driven readiness only — never the native recv/send
+    /// machinery): the poll backend carries the full tagged token in
+    /// user_data, the native backend packs (.external_poll, gen, slot)
+    /// and `translateIoUringNativeEvents` re-applies the tag bit.
+    pub fn registerExternalFd(self: *IoRuntime, slot: u32, fd: std.posix.fd_t) !void {
+        const token = EXTERNAL_ID_BIT | @as(u64, slot);
+        return switch (self.backend_state) {
+            // +1 matches registerConnection's listener-collision offset;
+            // the translate paths subtract it back out. The offset only
+            // touches the low bits (slots are tiny), so bit 62 survives.
+            .bsd_kqueue => |*kq| kq.registerConnection(token + 1, fd),
+            .linux_epoll => |*ep| ep.registerConnection(token + 1, fd),
+            .linux_io_uring_poll => |*ur| ur.registerExternalFd(slot, fd),
+            .linux_io_uring_native => |*ur| ur.registerExternalFd(slot, @intCast(fd)),
+            else => error.UnsupportedBackend,
+        };
+    }
+
+    /// Arm a writable wake for an external fd (connect-in-progress or a
+    /// partial write that hit EAGAIN). One-shot wherever it's explicit:
+    /// kqueue uses one-shot EVFILT_WRITE, both io_uring backends submit
+    /// a one-shot POLLOUT POLL_ADD alongside the standing POLLIN poll.
+    /// epoll already delivers edge-triggered EPOLLOUT from
+    /// `registerExternalFd` (EPOLLIN | EPOLLOUT | EPOLLET), so re-arming
+    /// is a no-op there.
+    pub fn armExternalWritable(self: *IoRuntime, slot: u32, fd: std.posix.fd_t) !void {
+        const token = EXTERNAL_ID_BIT | @as(u64, slot);
+        switch (self.backend_state) {
+            .bsd_kqueue => |*kq| try kq.armWritable(token + 1, fd),
+            .linux_epoll => {},
+            .linux_io_uring_poll => |*ur| try ur.armExternalWritable(slot, fd),
+            .linux_io_uring_native => |*ur| try ur.armExternalWritable(slot, @intCast(fd)),
+            else => return error.UnsupportedBackend,
+        }
+    }
+
+    /// Remove an external fd from the event loop; no further events for
+    /// its slot will surface. Every backend keys this on the fd itself.
+    /// kqueue/epoll delegate to the existing unregister paths; the
+    /// io_uring backends additionally cancel in-flight POLL_ADDs and
+    /// drop any straggler CQEs (the native backend bumps the slot's
+    /// generation, the poll backend deactivates the table entry).
+    pub fn unregisterExternalFd(self: *IoRuntime, fd: std.posix.fd_t) !void {
+        return switch (self.backend_state) {
+            .bsd_kqueue => |*kq| kq.unregister(fd),
+            .linux_epoll => |*ep| ep.unregister(fd),
+            .linux_io_uring_poll => |*ur| ur.unregisterExternalFd(fd),
+            .linux_io_uring_native => |*ur| ur.unregisterExternalFd(@intCast(fd)),
+            else => error.UnsupportedBackend,
+        };
+    }
 };
 
 pub const Backend = enum {
@@ -475,6 +538,24 @@ pub const Capabilities = struct {
 
 /// Magic identifier for UDP socket events to distinguish from TCP listener (0) and connections
 pub const UDP_SOCKET_ID: u64 = std.math.maxInt(u64) - 1;
+
+/// Bit 62 tags conn ids that belong to external (non-Connection-pool)
+/// file descriptors — PostgreSQL client sockets today; proxy upstream
+/// streaming (design 5.0) will reuse the same plumbing. The low 32 bits
+/// carry a module-defined slot number. The kqueue/epoll ±1 registration
+/// offset only perturbs the low bits, so bit 62 survives the round trip.
+///
+/// Membership MUST be tested with `isExternalId`, not `& EXTERNAL_ID_BIT`:
+/// UDP_SOCKET_ID (maxInt(u64) - 1) has bit 62 set too, so a bare bit test
+/// misroutes UDP error events into the external handler.
+pub const EXTERNAL_ID_BIT: u64 = 1 << 62;
+
+/// True only for well-formed external tokens: bit 62 set, every other
+/// high bit clear, slot in the low 32 bits. Excludes UDP_SOCKET_ID and
+/// any future high-bit magic ids by construction.
+pub fn isExternalId(conn_id: u64) bool {
+    return (conn_id >> 32) == (EXTERNAL_ID_BIT >> 32);
+}
 
 fn pickBackend(_: config.ServerConfig) Backend {
     // Diagnostic / opt-in override: SWERVER_BACKEND=epoll|poll|native
@@ -705,6 +786,30 @@ fn translateIoUringEvents(events: []const io_uring_poll_backend.IoUringEvent, ou
         if (count >= out.len) break;
         const raw_id = ev.data.u64;
 
+        // External-fd readiness (PG sockets): the backend registered
+        // the full tagged token as user_data, so it passes through
+        // verbatim — no ±1 offset to reverse. Error takes priority
+        // (matches the epoll translate path), then read, then the
+        // one-shot writable wake.
+        if (isExternalId(raw_id)) {
+            const kind: EventKind = if ((ev.events & 0x018) != 0) // POLLERR | POLLHUP
+                .err
+            else if ((ev.events & 0x001) != 0) // POLLIN
+                .read
+            else if ((ev.events & 0x004) != 0) // POLLOUT
+                .write
+            else
+                continue; // e.g. a POLL_REMOVE completion's empty mask
+            out[count] = .{
+                .kind = kind,
+                .conn_id = raw_id,
+                .bytes = 0,
+                .handle = null,
+            };
+            count += 1;
+            continue;
+        }
+
         // Check for error conditions
         if ((ev.events & 0x008) != 0 or (ev.events & 0x010) != 0) { // POLLERR | POLLHUP
             const conn_id: u64 = if (raw_id == 0)
@@ -780,6 +885,15 @@ fn translateIoUringNativeEvents(
     var count: usize = 0;
     for (events) |ev| {
         if (count >= out.len) break;
+        // External-fd readiness events carry an external SLOT in the
+        // backend's u32 conn_id field (flagged, because slots and pool
+        // conn ids overlap). This is the single place the
+        // EXTERNAL_ID_BIT tag gets applied for the native backend —
+        // the backend's event struct stays 32-bit.
+        const conn_id: u64 = if (ev.external)
+            EXTERNAL_ID_BIT | @as(u64, ev.conn_id)
+        else
+            ev.conn_id;
         switch (ev.kind) {
             .accept => {
                 out[count] = .{
@@ -804,7 +918,7 @@ fn translateIoUringNativeEvents(
                 } else null;
                 out[count] = .{
                     .kind = .read,
-                    .conn_id = ev.conn_id,
+                    .conn_id = conn_id,
                     .bytes = if (ev.data) |d| d.len else 0,
                     .handle = null,
                     .data = ev.data,
@@ -819,7 +933,7 @@ fn translateIoUringNativeEvents(
                 // The server uses it to advance the write queue.
                 out[count] = .{
                     .kind = .write,
-                    .conn_id = ev.conn_id,
+                    .conn_id = conn_id,
                     .bytes = ev.bytes_written,
                     .handle = null,
                 };
@@ -828,7 +942,7 @@ fn translateIoUringNativeEvents(
             .err => {
                 out[count] = .{
                     .kind = .err,
-                    .conn_id = ev.conn_id,
+                    .conn_id = conn_id,
                     .bytes = 0,
                     .handle = null,
                 };
@@ -864,6 +978,101 @@ fn translateIoUringNativeEvents(
         }
     }
     return count;
+}
+
+test "external id token survives the kqueue/epoll ±1 offset and avoids reserved ids" {
+    const slot: u32 = 3;
+    const token = EXTERNAL_ID_BIT | @as(u64, slot);
+    const registered = token + 1; // register path offset
+    const translated = registered - 1; // translate path reversal
+    try std.testing.expect(isExternalId(translated));
+    try std.testing.expectEqual(@as(u64, slot), translated & 0xFFFF_FFFF);
+    // Reserved-id collisions: listener (0), UDP magic, pool indexes (u32).
+    try std.testing.expect(token != 0);
+    try std.testing.expect(token != UDP_SOCKET_ID);
+    try std.testing.expect(registered != UDP_SOCKET_ID);
+    try std.testing.expect(token > std.math.maxInt(u32));
+    // UDP_SOCKET_ID has bit 62 set — a bare `& EXTERNAL_ID_BIT` test
+    // would misroute UDP error events. isExternalId must reject it,
+    // along with the other non-external ids.
+    try std.testing.expect(UDP_SOCKET_ID & EXTERNAL_ID_BIT != 0); // the trap is real
+    try std.testing.expect(!isExternalId(UDP_SOCKET_ID));
+    try std.testing.expect(!isExternalId(0));
+    try std.testing.expect(!isExternalId(std.math.maxInt(u32)));
+    try std.testing.expect(!isExternalId(std.math.maxInt(u64)));
+}
+
+test "io_uring_poll external tag constant matches io.zig and tokens pass through translate" {
+    // The poll backend can't import io.zig (cycle), so it mirrors
+    // EXTERNAL_ID_BIT locally — pin the two constants together, and the
+    // membership predicates with them.
+    try std.testing.expectEqual(EXTERNAL_ID_BIT, io_uring_poll_backend.EXTERNAL_ID_BIT);
+    const token = EXTERNAL_ID_BIT | @as(u64, 2);
+    try std.testing.expect(io_uring_poll_backend.isExternalToken(token));
+    try std.testing.expect(!io_uring_poll_backend.isExternalToken(UDP_SOCKET_ID));
+    try std.testing.expect(!io_uring_poll_backend.isExternalToken(2));
+
+    // Tagged tokens ride user_data verbatim (no ±1 offset): POLLIN →
+    // .read, POLLOUT → .write, POLLERR/POLLHUP → .err, and an empty
+    // mask (POLL_REMOVE completion) emits nothing.
+    const urev = [_]io_uring_poll_backend.IoUringEvent{
+        .{ .events = 0x001, .data = .{ .u64 = token } }, // POLLIN
+        .{ .events = 0x004, .data = .{ .u64 = token } }, // POLLOUT
+        .{ .events = 0x011, .data = .{ .u64 = token } }, // POLLIN | POLLHUP
+        .{ .events = 0x000, .data = .{ .u64 = token } }, // empty mask
+    };
+    var out: [8]Event = undefined;
+    const count = translateIoUringEvents(&urev, &out);
+    try std.testing.expectEqual(@as(usize, 3), count);
+    try std.testing.expectEqual(EventKind.read, out[0].kind);
+    try std.testing.expectEqual(EventKind.write, out[1].kind);
+    try std.testing.expectEqual(EventKind.err, out[2].kind); // HUP wins over IN
+    for (out[0..count]) |ev| {
+        try std.testing.expectEqual(token, ev.conn_id);
+        try std.testing.expect(isExternalId(ev.conn_id));
+    }
+}
+
+test "io_uring_native packUserData round-trips external_poll with generation and slot" {
+    const pack = io_uring_native_backend.packUserData;
+    const ud = pack(.external_poll, 0xABCDEF1, 3);
+    try std.testing.expectEqual(io_uring_native_backend.Op.external_poll, io_uring_native_backend.unpackOp(ud));
+    try std.testing.expectEqual(@as(u28, 0xABCDEF1), io_uring_native_backend.unpackGen(ud));
+    try std.testing.expectEqual(@as(u32, 3), io_uring_native_backend.unpackConnId(ud));
+    // Saturated gen/slot don't bleed into each other or the op nibble.
+    const ud_max = pack(.external_poll, std.math.maxInt(u28), std.math.maxInt(u32));
+    try std.testing.expectEqual(io_uring_native_backend.Op.external_poll, io_uring_native_backend.unpackOp(ud_max));
+    try std.testing.expectEqual(std.math.maxInt(u28), io_uring_native_backend.unpackGen(ud_max));
+    try std.testing.expectEqual(std.math.maxInt(u32), io_uring_native_backend.unpackConnId(ud_max));
+    // A gen bump (unregister) makes the old user_data distinguishable —
+    // the staleness filter in the native poll() relies on exactly this.
+    const ud_next_gen = pack(.external_poll, 0xABCDEF1 + 1, 3);
+    try std.testing.expect(ud != ud_next_gen);
+}
+
+test "translate applies EXTERNAL_ID_BIT to flagged native events exactly once" {
+    const NativeEvent = io_uring_native_backend.IoUringNativeEvent;
+    const nev = [_]NativeEvent{
+        .{ .kind = .read, .conn_id = 3, .external = true },
+        .{ .kind = .write, .conn_id = 0, .external = true }, // slot 0 != pool conn 0
+        .{ .kind = .err, .conn_id = 1, .external = true },
+        .{ .kind = .read, .conn_id = 3 }, // pool conn — untouched
+    };
+    var out: [8]Event = undefined;
+    // The backend pointer is only dereferenced for kernel_buffer_id
+    // events; external readiness events never carry one.
+    const count = translateIoUringNativeEvents(undefined, &nev, &out);
+    try std.testing.expectEqual(@as(usize, 4), count);
+    try std.testing.expectEqual(EXTERNAL_ID_BIT | 3, out[0].conn_id);
+    try std.testing.expectEqual(EventKind.read, out[0].kind);
+    try std.testing.expectEqual(EXTERNAL_ID_BIT | 0, out[1].conn_id);
+    try std.testing.expectEqual(EventKind.write, out[1].kind);
+    try std.testing.expectEqual(EXTERNAL_ID_BIT | 1, out[2].conn_id);
+    try std.testing.expectEqual(EventKind.err, out[2].kind);
+    for (out[0..3]) |ev| try std.testing.expect(isExternalId(ev.conn_id));
+    // The unflagged pool event keeps its raw conn id.
+    try std.testing.expectEqual(@as(u64, 3), out[3].conn_id);
+    try std.testing.expect(!isExternalId(out[3].conn_id));
 }
 
 fn sleepMs(timeout_ms: u32) void {

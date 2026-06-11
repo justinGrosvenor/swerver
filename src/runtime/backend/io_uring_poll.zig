@@ -34,6 +34,24 @@ pub const IoUringEvent = extern struct {
     data: extern union { ptr: usize, fd: i32, u32_val: u32, u64: u64 } align(1),
 };
 
+/// Bit 62 tags user_data values that belong to external
+/// (non-Connection-pool) fds — PostgreSQL client sockets (design 9.0).
+/// MUST stay equal to io.zig's EXTERNAL_ID_BIT (io.zig pins the
+/// equality in a test; this module can't import io.zig without a cycle).
+pub const EXTERNAL_ID_BIT: u64 = 1 << 62;
+
+/// Hard cap on concurrently registered external fds. PgClient needs at
+/// most 4 per worker; 16 leaves room for the proxy-streaming consumer
+/// (design 5.0) without growing the table.
+pub const MAX_EXTERNAL_FDS = 16;
+
+/// True only for well-formed external tokens: bit 62 set, every other
+/// high bit clear, slot in the low 32 bits (mirror of io.zig's
+/// isExternalId — same UDP_SOCKET_ID trap applies).
+pub fn isExternalToken(user_data: u64) bool {
+    return (user_data >> 32) == (EXTERNAL_ID_BIT >> 32);
+}
+
 /// io_uring CQE for reading completions
 const IoUringCqe = extern struct {
     user_data: u64,
@@ -88,6 +106,12 @@ pub const IoUringPollBackend = struct {
     /// Track registered FDs for re-arming (POLL_ADD is one-shot)
     /// Layout: [0]=listener, [1]=UDP, [2..]=connections (indexed by conn_id + 2)
     registered_fds: []RegisteredFd,
+    /// External (non-Connection-pool) fds, keyed by external slot — the
+    /// low 32 bits of the EXTERNAL_ID_BIT-tagged token. Tagged tokens
+    /// can't index `registered_fds` (its slots are conn_id + 2), so
+    /// external fds live in their own small table and every CQE/re-arm
+    /// path branches on the tag bit before any conn_id arithmetic.
+    external_fds: [MAX_EXTERNAL_FDS]ExternalFd = [_]ExternalFd{.{}} ** MAX_EXTERNAL_FDS,
     /// Pending SQEs queued for submission on the next poll.
     pending_submits: u32 = 0,
     /// Whether DEFER_TASKRUN is active (requires GETEVENTS on every enter).
@@ -97,6 +121,15 @@ pub const IoUringPollBackend = struct {
         fd: i32 = -1,
         conn_id: u64 = 0,
         poll_mask: u32 = 0,
+    };
+
+    const ExternalFd = struct {
+        fd: i32 = -1,
+        active: bool = false,
+        /// A one-shot POLLOUT poll is in flight (armExternalWritable).
+        /// Tracked so unregister knows to cancel it alongside the
+        /// perpetual POLLIN poll.
+        want_write: bool = false,
     };
 
     pub fn init(allocator: std.mem.Allocator, max_events: usize, multi_worker: bool) !IoUringPollBackend {
@@ -218,6 +251,19 @@ pub const IoUringPollBackend = struct {
             const conn_id = cqe.user_data;
             const res = cqe.res;
 
+            // External-fd CQEs: drop after unregister so a cancelled or
+            // still-in-flight poll (POLL_REMOVE completions reuse the
+            // token as their own user_data, and -ENOENT misses land here
+            // too) can't surface a stale event for a slot that may have
+            // been re-registered with a new fd.
+            if (isExternalToken(conn_id)) {
+                const slot = conn_id & 0xFFFF_FFFF;
+                if (slot >= MAX_EXTERNAL_FDS or !self.external_fds[@intCast(slot)].active) {
+                    head +%= 1;
+                    continue;
+                }
+            }
+
             if (res < 0) {
                 self.events[count] = .{
                     .events = POLLERR,
@@ -242,6 +288,12 @@ pub const IoUringPollBackend = struct {
         var submitted: u32 = 0;
         // Re-read the events we just collected to get conn_ids for re-arm
         for (self.events[0..count]) |ev| {
+            if (isExternalToken(ev.data.u64)) {
+                if (self.queueExternalRearm(ev)) {
+                    submitted += 1;
+                }
+                continue;
+            }
             if (self.queuePollAdd(ev.data.u64)) {
                 submitted += 1;
             }
@@ -291,21 +343,51 @@ pub const IoUringPollBackend = struct {
         // Submit POLL_REMOVE to cancel any outstanding poll on this fd.
         // This prevents stale CQEs from arriving after the fd is closed/reused.
         if (conn_id_to_remove) |cid| {
-            if (self.sqRingHasSpace()) {
-                const tail = @atomicLoad(u32, self.sq_tail, .acquire);
-                const idx = tail & self.sq_mask;
+            self.submitPollRemove(cid);
+        }
+    }
 
-                var sqe = &self.sqes[idx];
-                sqe.* = std.mem.zeroes(IoUringSqe);
-                sqe.opcode = IORING_OP_POLL_REMOVE;
-                sqe.fd = -1;
-                sqe.addr_or_splice = cid; // user_data of the poll to cancel
-                sqe.user_data = cid;
+    /// Register an external fd for POLLIN readiness. The poll is
+    /// one-shot like every POLL_ADD on this ring, but the re-arm path
+    /// in `poll()` keeps it perpetually armed while the slot stays
+    /// registered — consumers drain to EAGAIN and rely on the next
+    /// readability producing another event.
+    pub fn registerExternalFd(self: *IoUringPollBackend, slot: u32, fd: std.posix.fd_t) !void {
+        if (!is_linux) return error.Unsupported;
+        if (slot >= MAX_EXTERNAL_FDS) return error.TooManyConnections;
+        self.external_fds[slot] = .{ .fd = fd, .active = true };
+        self.submitPollAdd(fd, EXTERNAL_ID_BIT | @as(u64, slot), POLLIN);
+    }
 
-                self.sq_array[idx] = idx;
-                @atomicStore(u32, self.sq_tail, tail +% 1, .release);
-                _ = io_uring_enter(self.ring_fd, 1, 0, 0, null);
-            }
+    /// One-shot POLLOUT wake for an external fd (connect-in-progress
+    /// or a partial write that hit EAGAIN). Runs as a second concurrent
+    /// POLL_ADD with the same tagged token; the CQE's poll mask is what
+    /// distinguishes it from the POLLIN poll. Never re-armed by the
+    /// backend — consumers re-arm on demand.
+    pub fn armExternalWritable(self: *IoUringPollBackend, slot: u32, fd: std.posix.fd_t) !void {
+        if (!is_linux) return error.Unsupported;
+        if (slot >= MAX_EXTERNAL_FDS) return error.TooManyConnections;
+        self.external_fds[slot].want_write = true;
+        self.submitPollAdd(fd, EXTERNAL_ID_BIT | @as(u64, slot), POLLOUT);
+    }
+
+    /// Remove an external fd: cancel the in-flight POLLIN poll (and the
+    /// one-shot POLLOUT poll if armed) and deactivate the slot so any
+    /// already-reaped or still-in-flight CQE for it is dropped in
+    /// `poll()` instead of surfacing after unregistration.
+    pub fn unregisterExternalFd(self: *IoUringPollBackend, fd: std.posix.fd_t) !void {
+        if (!is_linux) return;
+        for (&self.external_fds, 0..) |*ext, slot| {
+            if (!ext.active or ext.fd != fd) continue;
+            const token = EXTERNAL_ID_BIT | @as(u64, slot);
+            // POLL_REMOVE cancels ONE matching request per submission —
+            // submit a second when a one-shot POLLOUT poll is also in
+            // flight. An extra remove completes with -ENOENT; its CQE
+            // (and the cancelled polls') is dropped by the
+            // inactive-slot filter in poll().
+            self.submitPollRemove(token);
+            if (ext.want_write) self.submitPollRemove(token);
+            ext.* = .{};
         }
     }
 
@@ -334,30 +416,73 @@ pub const IoUringPollBackend = struct {
         _ = io_uring_enter(self.ring_fd, 1, 0, 0, null);
     }
 
+    /// Queue and immediately submit a POLL_REMOVE cancelling the poll
+    /// whose user_data matches `target`. The remove's own completion
+    /// reuses `target` as its user_data so the CQE routes through the
+    /// same drop/ignore paths as the poll it cancelled.
+    fn submitPollRemove(self: *IoUringPollBackend, target: u64) void {
+        if (!self.sqRingHasSpace()) return;
+        const tail = @atomicLoad(u32, self.sq_tail, .acquire);
+        const idx = tail & self.sq_mask;
+
+        var sqe = &self.sqes[idx];
+        sqe.* = std.mem.zeroes(IoUringSqe);
+        sqe.opcode = IORING_OP_POLL_REMOVE;
+        sqe.fd = -1;
+        sqe.addr_or_splice = target; // user_data of the poll to cancel
+        sqe.user_data = target;
+
+        self.sq_array[idx] = idx;
+        @atomicStore(u32, self.sq_tail, tail +% 1, .release);
+        _ = io_uring_enter(self.ring_fd, 1, 0, 0, null);
+    }
+
     /// Queue a POLL_ADD SQE without submitting (for batched submission).
     /// Returns true if successfully queued, false if SQ ring is full.
     fn queuePollAdd(self: *IoUringPollBackend, conn_id: u64) bool {
         // Find the registered fd for this conn_id
         for (self.registered_fds) |reg| {
             if (reg.conn_id == conn_id and reg.fd >= 0) {
-                if (!self.sqRingHasSpace()) return false;
-
-                const tail = @atomicLoad(u32, self.sq_tail, .acquire);
-                const idx = tail & self.sq_mask;
-
-                var sqe = &self.sqes[idx];
-                sqe.* = std.mem.zeroes(IoUringSqe);
-                sqe.opcode = IORING_OP_POLL_ADD;
-                sqe.fd = reg.fd;
-                sqe.op_flags = reg.poll_mask;
-                sqe.user_data = conn_id;
-
-                self.sq_array[idx] = idx;
-                @atomicStore(u32, self.sq_tail, tail +% 1, .release);
-                return true;
+                return self.queueRawPollAdd(reg.fd, conn_id, reg.poll_mask);
             }
         }
         return false;
+    }
+
+    /// Re-arm decision for an external-fd CQE. The POLLIN poll is
+    /// perpetual: re-armed after every read wake while the slot stays
+    /// registered. The one-shot POLLOUT poll is consumed here
+    /// (want_write cleared) and never re-armed. Error wakes don't
+    /// re-arm — the consumer fails the slot and unregisters.
+    fn queueExternalRearm(self: *IoUringPollBackend, ev: IoUringEvent) bool {
+        const slot = ev.data.u64 & 0xFFFF_FFFF;
+        if (slot >= MAX_EXTERNAL_FDS) return false;
+        const ext = &self.external_fds[@intCast(slot)];
+        if (!ext.active) return false;
+        if (ev.events & POLLOUT != 0) ext.want_write = false;
+        if (ev.events & (POLLERR | POLLHUP) != 0) return false;
+        if (ev.events & POLLIN == 0) return false;
+        return self.queueRawPollAdd(ext.fd, ev.data.u64, POLLIN);
+    }
+
+    /// Queue a POLL_ADD SQE for batched submission on the next poll().
+    /// Returns false (dropped) when the SQ ring is full.
+    fn queueRawPollAdd(self: *IoUringPollBackend, fd: i32, user_data: u64, poll_mask: u32) bool {
+        if (!self.sqRingHasSpace()) return false;
+
+        const tail = @atomicLoad(u32, self.sq_tail, .acquire);
+        const idx = tail & self.sq_mask;
+
+        var sqe = &self.sqes[idx];
+        sqe.* = std.mem.zeroes(IoUringSqe);
+        sqe.opcode = IORING_OP_POLL_ADD;
+        sqe.fd = fd;
+        sqe.op_flags = poll_mask;
+        sqe.user_data = user_data;
+
+        self.sq_array[idx] = idx;
+        @atomicStore(u32, self.sq_tail, tail +% 1, .release);
+        return true;
     }
 
     /// Check if the SQ ring has space for at least one more SQE

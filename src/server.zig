@@ -32,6 +32,7 @@ const http2_mod = @import("server/http2.zig");
 const http1_mod = @import("server/http1.zig");
 const dispatch = @import("server/dispatch.zig");
 const write_queue = @import("server/write_queue.zig");
+const pg_client_mod = @import("db/pg/client.zig");
 
 // ============================================================
 // Pre-encoded response cache (PR PERF-3)
@@ -78,7 +79,6 @@ const write_queue = @import("server/write_queue.zig");
 
 // TLS_PLAINTEXT_WRITE_CAP and TLS_CIPHER_SCRATCH_SIZE live in
 // `server/tls.zig` alongside the handshake + ciphertext pump helpers.
-
 
 /// Single-threaded event-loop HTTP server. One `Server` instance runs
 /// per worker process in the default multi-worker fork model, or one
@@ -129,6 +129,13 @@ pub const Server = struct {
     quic: ?quic_handler.Handler,
     /// Reverse proxy handler (null if proxy not configured)
     proxy: ?*proxy_mod.Proxy = null,
+    /// Native PostgreSQL client (null unless the "postgres" config block
+    /// is present). Phase 2.1: connection bring-up only — no query API.
+    pg_client: ?*pg_client_mod.PgClient = null,
+    /// Client-mode TLS provider for the PG client (null when sslmode is
+    /// disable or TLS is compiled out). Owned here — mirrors
+    /// tcp_tls_provider — and must outlive pg_client's slot sessions.
+    pg_tls_provider: ?tls.Provider = null,
     /// Admin API listener (null if admin API not enabled)
     admin_listener_fd: ?std.posix.fd_t = null,
     /// Spare FD for EMFILE recovery — closed temporarily to accept+close one connection
@@ -368,6 +375,67 @@ pub const Server = struct {
             self.otel = otel_ptr;
         }
 
+        // PostgreSQL client (design 9.0, phase 2.1: connection bring-up
+        // only). DNS resolves once here at startup — never on the
+        // reactor — so an unreachable resolver can't stall the loop.
+        // The actual non-blocking connects start from the housekeeping
+        // tick once the event loop runs.
+        if (cfg.postgres.enabled) pg_blk: {
+            const password: []const u8 = pwd: {
+                if (cfg.postgres.password_env.len == 0) break :pwd "";
+                var name_z: [256]u8 = undefined;
+                if (cfg.postgres.password_env.len >= name_z.len) break :pwd "";
+                @memcpy(name_z[0..cfg.postgres.password_env.len], cfg.postgres.password_env);
+                name_z[cfg.postgres.password_env.len] = 0;
+                const name_z_ptr: [*:0]const u8 = @ptrCast(&name_z);
+                const v = std.c.getenv(name_z_ptr) orelse break :pwd "";
+                break :pwd std.mem.sliceTo(v, 0);
+            };
+            // Client-mode TLS (design 9.0 phase 3): build the provider up
+            // front so a bad CA path or a TLS-less build fails the whole
+            // postgres block instead of every connect attempt.
+            if (cfg.postgres.sslmode != .disable) {
+                const ca: ?[:0]const u8 = if (cfg.postgres.ssl_root_cert.len > 0)
+                    cfg.postgres.ssl_root_cert
+                else
+                    null;
+                self.pg_tls_provider = tls.Provider.initTcpClient(
+                    allocator,
+                    cfg.postgres.sslmode == .verify_full,
+                    ca,
+                ) catch |err| {
+                    std.log.warn("postgres: client TLS init failed: {} (sslmode={s}); client disabled", .{
+                        err, @tagName(cfg.postgres.sslmode),
+                    });
+                    break :pg_blk;
+                };
+            }
+            const pgc = allocator.create(pg_client_mod.PgClient) catch break :pg_blk;
+            pgc.* = pg_client_mod.PgClient.init(allocator, cfg.max_connections, .{
+                .host = cfg.postgres.host,
+                .port = cfg.postgres.port,
+                .user = cfg.postgres.user,
+                .database = cfg.postgres.database,
+                .password = password,
+                .pool_size = cfg.postgres.pool_size_per_worker,
+                .allow_cleartext_password = cfg.postgres.allow_cleartext_password,
+                .statement_timeout_ms = cfg.postgres.statement_timeout_ms,
+                .sslmode = cfg.postgres.sslmode,
+            }) catch |err| {
+                std.log.warn("postgres: client init failed: {}; client disabled", .{err});
+                allocator.destroy(pgc);
+                break :pg_blk;
+            };
+            // The provider address is stable (it lives in self), so the
+            // client may keep the pointer for the server's lifetime.
+            if (self.pg_tls_provider) |*p| pgc.installTls(p);
+            self.pg_client = pgc;
+            std.log.info("postgres: client configured for {s}:{d} (pool {d}, sslmode={s})", .{
+                cfg.postgres.host,                 cfg.postgres.port,
+                cfg.postgres.pool_size_per_worker, @tagName(cfg.postgres.sslmode),
+            });
+        }
+
         // Skip getpeername on accept when nothing needs the peer IP.
         self.needs_peer_ip = self.proxy != null or
             app_router.middleware_chain.post.len > 0;
@@ -402,6 +470,13 @@ pub const Server = struct {
             std.heap.page_allocator.destroy(pr);
         }
         if (self.reload_arena) |*a| a.deinit();
+        if (self.pg_client) |pgc| {
+            pgc.deinit(&self.io);
+            self.allocator.destroy(pgc);
+        }
+        // After pg_client deinit: slot SSL sessions must be freed before
+        // their SSL_CTX.
+        if (self.pg_tls_provider) |*p| p.deinit();
         self.io.deinit();
     }
 
@@ -1089,6 +1164,11 @@ pub const Server = struct {
     }
 
     pub fn closeConnection(self: *Server, conn: *connection.Connection) void {
+        // Drop any PG park before the slot can be recycled: the
+        // in-flight op runs to completion and its outcome is discarded
+        // (generation-checked), so the continuation can never write
+        // into this slot's next occupant. O(1) when not parked.
+        if (self.pg_client) |pgc| pgc.cancelForConn(conn.index, conn.id);
         if (conn.is_tunnel) {
             if (conn.tunnel_peer_index) |pi| {
                 conn.tunnel_peer_index = null;
@@ -1179,8 +1259,6 @@ pub const Server = struct {
         conn.pending_body = &[_]u8{};
         self.io.releaseConnection(conn);
     }
-
-
 };
 
 test "metrics middleware response queued for http1" {

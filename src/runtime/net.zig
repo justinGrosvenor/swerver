@@ -671,12 +671,14 @@ extern "c" fn getaddrinfo(
 
 extern "c" fn freeaddrinfo(res: *addrinfo) void;
 
-const ResolvedAddr = struct {
+pub const ResolvedAddr = struct {
     storage: SockAddrStorage,
     len: std.posix.socklen_t,
 };
 
-fn resolveAddress(address: []const u8, port: u16) ConnectError!ResolvedAddr {
+/// Resolve an IP literal or hostname to a sockaddr. May block on DNS —
+/// call at startup only, never from the reactor.
+pub fn resolveAddress(address: []const u8, port: u16) ConnectError!ResolvedAddr {
     // Fast path: try IP literal parse
     if (std.Io.net.IpAddress.parse(address, port)) |ip_addr| {
         const storage = buildSockaddr(ip_addr);
