@@ -71,10 +71,6 @@ const RECV_BUF_SIZE = 32 * 1024;
 const SEND_BUF_SIZE = 32 * 1024;
 /// Bind/Execute pairs allowed in one batch op (TFB clamps at 500).
 pub const MAX_BATCH = 500;
-/// Max params a wait-queued single query can carry (args are copied into
-/// the park entry while it waits for a slot). Larger args fall back to error.
-const MAX_WAIT_PARAMS = 8;
-const WAIT_ARGS_BUF = 256;
 /// Single deadline covering non-blocking connect + handshake.
 const CONNECT_TIMEOUT_MS: u64 = 10_000;
 const BACKOFF_INITIAL_MS: u64 = 1_000;
@@ -200,16 +196,6 @@ const ParkedRequest = struct {
     /// under the current handler's stack frame. Deferring ALL failure
     /// deliveries to tick (≤100ms) makes that reentrancy impossible.
     pending_error: ?handler_api.PgError = null,
-    /// Wait-queue: set when query() found no ready slot (pool warming or
-    /// every slot busy). The query is held here and re-issued onto the
-    /// first slot that becomes ready, instead of erroring with NotConnected.
-    /// SQL borrows a static literal (stable); args are copied into wait_buf
-    /// because the request's buffers are recycled while parked.
-    waiting: bool = false,
-    wait_sql: []const u8 = "",
-    wait_buf: [WAIT_ARGS_BUF]u8 = undefined,
-    wait_args: [MAX_WAIT_PARAMS]?[]const u8 = [_]?[]const u8{null} ** MAX_WAIT_PARAMS,
-    wait_args_n: u8 = 0,
 };
 
 /// Everything the resume layer needs to run a continuation. Borrowed
@@ -409,12 +395,6 @@ pub const PgClient = struct {
         // never run beneath an in-progress handler's stack frame.
         for (&self.parked, 0..) |*entry, pi| {
             if (!entry.active) continue;
-            // A wait-queued request that never got a slot within the
-            // deadline times out like any other.
-            if (entry.waiting and now_ms >= entry.deadline_ms) {
-                entry.waiting = false;
-                entry.pending_error = error.Timeout;
-            }
             const err = entry.pending_error orelse continue;
             entry.pending_error = null;
             self.deliverOutcome(@intCast(pi), err);
@@ -896,9 +876,7 @@ pub const PgClient = struct {
             }
             switch (ingest(slot, idx)) {
                 .more => {},
-                // Newly connected: hand the slot any requests that queued
-                // while the pool was warming, instead of leaving it idle.
-                .ready => return self.pumpWaiting(io_rt, idx, now_ms),
+                .ready => return,
                 .failed => return self.failSlot(io_rt, idx, now_ms, "handshake failed"),
             }
             // The handshake may have queued a response (SASL round trip).
@@ -952,133 +930,6 @@ pub const PgClient = struct {
         return self.queryBatch(io_rt, conn_index, conn_id, sql, &batch, stash_bytes, continuation);
     }
 
-    /// Copy a wait-queued query's args into the park entry (request buffers
-    /// recycle while parked). Returns false if they don't fit, so the
-    /// caller falls back to erroring rather than queueing.
-    fn stashWaitArgs(entry: *ParkedRequest, sql: []const u8, args: []const ?[]const u8) bool {
-        if (args.len > entry.wait_args.len) return false;
-        var off: usize = 0;
-        for (args, 0..) |maybe, i| {
-            if (maybe) |bytes| {
-                if (off + bytes.len > entry.wait_buf.len) return false;
-                @memcpy(entry.wait_buf[off .. off + bytes.len], bytes);
-                entry.wait_args[i] = entry.wait_buf[off .. off + bytes.len];
-                off += bytes.len;
-            } else {
-                entry.wait_args[i] = null;
-            }
-        }
-        entry.wait_args_n = @intCast(args.len);
-        entry.wait_sql = sql;
-        return true;
-    }
-
-    /// Dispatch wait-queued requests onto a slot that just became ready.
-    /// Called from the .ready transitions (handshake complete, op complete).
-    fn pumpWaiting(self: *PgClient, io_rt: *io_mod.IoRuntime, idx: u32, now_ms: u64) void {
-        const slot = &self.slots[idx];
-        while (slot.state == .ready) {
-            var pk: ?u16 = null;
-            for (&self.parked, 0..) |*p, i| {
-                if (p.active and p.waiting) {
-                    pk = @intCast(i);
-                    break;
-                }
-            }
-            const park_idx = pk orelse return;
-            self.sendWaiting(io_rt, idx, park_idx, now_ms);
-            // sendWaiting clears .waiting on success (slot → .busy, loop
-            // exits) or stages an error (entry no longer waiting). If it
-            // somehow left the entry waiting, stop to avoid spinning.
-            if (self.parked[park_idx].waiting) return;
-        }
-    }
-
-    /// Serialize and send a single wait-queued query onto a ready slot.
-    /// Mirrors queryBatch's single-query path. Runs outside the issuing
-    /// handler, so failures stage pending_error for tick delivery rather
-    /// than returning.
-    fn sendWaiting(self: *PgClient, io_rt: *io_mod.IoRuntime, idx: u32, park_idx: u16, now_ms: u64) void {
-        const slot = &self.slots[idx];
-        const entry = &self.parked[park_idx];
-        const sql = entry.wait_sql;
-        const args = entry.wait_args[0..entry.wait_args_n];
-
-        const stmt_hash = std.hash.Wyhash.hash(0, sql);
-        var stmt_name: []const u8 = "";
-        var claim_slot: u8 = NO_CACHE;
-        var need_parse = true;
-        for (0..STMT_CACHE_SIZE) |ci| {
-            if (slot.stmt_valid & (@as(u32, 1) << @intCast(ci)) != 0 and slot.stmt_hashes[ci] == stmt_hash) {
-                stmt_name = &stmt_names[ci];
-                need_parse = false;
-                break;
-            }
-        }
-        if (need_parse) {
-            for (0..STMT_CACHE_SIZE) |ci| {
-                if (slot.stmt_valid & (@as(u32, 1) << @intCast(ci)) == 0) {
-                    claim_slot = @intCast(ci);
-                    stmt_name = &stmt_names[ci];
-                    break;
-                }
-            }
-        }
-
-        var plain_scratch: [SEND_BUF_SIZE]u8 = undefined;
-        const tls_active = slot.tls != null;
-        if (!tls_active and slot.send_off > 0) {
-            std.mem.copyForwards(u8, slot.send_buf[0 .. slot.send_len - slot.send_off], slot.send_buf[slot.send_off..slot.send_len]);
-            slot.send_len -= slot.send_off;
-            slot.send_off = 0;
-        }
-        const out_buf: []u8 = if (tls_active) plain_scratch[0..] else slot.send_buf[0..];
-        var off: usize = if (tls_active) 0 else slot.send_len;
-        const op_start = off;
-        // A fresh-ready slot has an empty send buffer, so overflow here is
-        // a too-large query — drop it as ConnectionLost (delivered at tick).
-        if (need_parse) {
-            off += (protocol.writeParse(out_buf[off..], stmt_name, sql, &.{}) catch return self.failWaiting(entry)).len;
-        }
-        off += (protocol.writeBind(out_buf[off..], "", stmt_name, args) catch return self.failWaiting(entry)).len;
-        off += (protocol.writeDescribePortal(out_buf[off..], "") catch return self.failWaiting(entry)).len;
-        off += (protocol.writeExecute(out_buf[off..], "", 0) catch return self.failWaiting(entry)).len;
-        off += (protocol.writeSync(out_buf[off..]) catch return self.failWaiting(entry)).len;
-
-        const tail = slot.opAt(slot.op_count);
-        tail.* = .{ .park = NO_PARK, .cache_slot = claim_slot };
-        slot.op_count += 1;
-        if (claim_slot != NO_CACHE) {
-            slot.stmt_hashes[claim_slot] = stmt_hash;
-            slot.stmt_valid |= @as(u32, 1) << @intCast(claim_slot);
-        }
-        slot.state = .busy;
-        entry.waiting = false;
-        entry.deadline_ms = now_ms + self.opts.statement_timeout_ms;
-        if (tls_active) {
-            if (!self.stageTls(io_rt, idx, now_ms, out_buf[op_start..off])) {
-                entry.pending_error = error.ConnectionLost;
-                return;
-            }
-        } else {
-            slot.send_len = off;
-        }
-        switch (self.flushOut(io_rt, idx, now_ms)) {
-            .drained, .blocked => {},
-            .failed => {
-                entry.pending_error = error.ConnectionLost;
-                return;
-            },
-        }
-        slot.opAt(slot.op_count - 1).park = park_idx;
-        // conn_parks[conn_index] was set when the request was queued.
-    }
-
-    fn failWaiting(_: *PgClient, entry: *ParkedRequest) void {
-        entry.waiting = false;
-        entry.pending_error = error.ConnectionLost;
-    }
-
     /// Batch variant (design 9.0 phase 4): ONE op containing one Parse,
     /// `args_batch.len` Bind/Execute pairs, and one Sync. All result
     /// rows land in a single frames region, so the continuation's
@@ -1117,36 +968,10 @@ pub const PgClient = struct {
                 else => {},
             }
         }
-        // No usable slot: pool still warming (no connected slot), or every
-        // connected slot's op queue is full. Rather than 503 the request,
-        // queue it and re-issue onto the first slot that becomes ready —
-        // covers cold-start warmup and transient saturation. Only single
-        // queries with small args are queued; batches/large args still error.
-        if (best == null or best_depth == OP_QUEUE_DEPTH) {
-            if (args_batch.len == 1) {
-                for (&self.parked, 0..) |*p, i| {
-                    if (p.active) continue;
-                    p.* = .{
-                        .active = true,
-                        .conn_index = conn_index,
-                        .conn_id = conn_id,
-                        .continuation = continuation,
-                        .deadline_ms = io_rt.nowMs() + self.opts.statement_timeout_ms,
-                        .waiting = true,
-                    };
-                    @memcpy(p.stash[0..stash_bytes.len], stash_bytes);
-                    if (stash_bytes.len < p.stash.len) @memset(p.stash[stash_bytes.len..], 0);
-                    if (stashWaitArgs(p, sql, args_batch[0])) {
-                        self.conn_parks[conn_index] = @intCast(i);
-                        return response_mod.Response.parked;
-                    }
-                    p.active = false; // args didn't fit — fall through to error
-                    break;
-                }
-            }
+        const idx = best orelse return error.NotConnected;
+        if (best_depth == OP_QUEUE_DEPTH) {
             return if (any_connected) error.QueueFull else error.NotConnected;
         }
-        const idx = best.?;
         const slot = &self.slots[idx];
 
         const park_idx: u16 = blk: {
@@ -1332,9 +1157,6 @@ pub const PgClient = struct {
             }
             if (!self.drainOpResponses(io_rt, idx, now_ms)) return;
         }
-        // The slot just went idle (op completed) — hand it any request
-        // that queued while every slot was busy.
-        if (slot.state == .ready) self.pumpWaiting(io_rt, idx, now_ms);
     }
 
     /// Deliver every complete response sitting in recv_buf to its FIFO
