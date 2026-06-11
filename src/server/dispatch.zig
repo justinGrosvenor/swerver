@@ -43,6 +43,8 @@ const usage_mod = @import("../middleware/usage.zig");
 const ws_mod = @import("../proxy/websocket.zig");
 const accept_mod = @import("accept.zig");
 const http1_mod = @import("http1.zig");
+const pg_client_mod = @import("../db/pg/client.zig");
+const pg_handler_api = @import("../db/pg/handler_api.zig");
 const http2_mod = @import("http2.zig");
 const http3_mod = @import("http3.zig");
 const preencoded = @import("preencoded.zig");
@@ -106,6 +108,11 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
         .flags = 0,
     };
     std.posix.sigaction(std.posix.SIG.HUP, &reload_sa, null);
+
+    // Install the PG park-resume hook here rather than at Server init:
+    // initWithRouter returns the Server by value, so `server` only has
+    // its stable address once the loop owns it.
+    if (server.pg_client) |pgc| pgc.installResume(@ptrCast(server), pgResume);
 
     try server.io.start();
     server.refreshCachedDate();
@@ -548,6 +555,103 @@ pub fn seedReadBuffer(server: *Server, conn: *connection.Connection, data: []con
     @memcpy(buf.bytes[end..][0..data.len], data);
     server.io.onReadBuffered(conn, data.len);
     conn.markActive(server.now_ms);
+}
+
+/// Chaining hook handed to continuations via ResumeContext.query():
+/// issues the next query on the same connection, carrying the previous
+/// stash forward (the blessed step-switch pattern mutates the stash
+/// BEFORE re-parking, so copying it into the new park entry preserves
+/// the chain's state).
+const PgRepark = struct {
+    server: *Server,
+    conn_index: u32,
+    conn_id: u64,
+    stash: *[pg_handler_api.STASH_CAPACITY]u8,
+
+    fn repark(
+        ctx_ptr: *anyopaque,
+        sql: []const u8,
+        args: []const ?[]const u8,
+        continuation: pg_handler_api.Continuation,
+    ) pg_handler_api.QueryError!response_mod.Response {
+        const self: *PgRepark = @ptrCast(@alignCast(ctx_ptr));
+        const pgc = self.server.pg_client orelse return error.NotConnected;
+        return pgc.query(
+            &self.server.io,
+            self.conn_index,
+            self.conn_id,
+            sql,
+            args,
+            self.stash,
+            continuation,
+        );
+    }
+};
+
+/// Park-resume hook (installed on PgClient at runLoop start). Runs on
+/// the reactor when a parked request's PG op completes — success,
+/// server error, timeout, or connection loss all arrive here exactly
+/// once per park. Mirrors dispatchToRouter's scratch environment around
+/// the continuation, then queues its response and restarts the
+/// connection's I/O (writes first, then any pipelined requests that
+/// were gated behind the park).
+fn pgResume(ctx: *anyopaque, outcome: *const pg_client_mod.Outcome) void {
+    const server: *Server = @ptrCast(@alignCast(ctx));
+    // Generation check: the HTTP connection may have been closed and
+    // its slot recycled while the op was in flight. cancelForConn on
+    // the close path makes this unreachable in practice; it stays as
+    // the load-bearing backstop.
+    const conn = server.io.getConnection(outcome.conn_index) orelse return;
+    if (conn.id != outcome.conn_id) return;
+    if (conn.x402 != .db_parked) return;
+    conn.x402 = .none;
+
+    var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
+    var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
+    const arena_handle = server.io.acquireBuffer();
+    defer if (arena_handle) |h| server.io.releaseBuffer(h);
+    var empty_arena: [0]u8 = undefined;
+    const arena_buf = if (arena_handle) |h| h.bytes else empty_arena[0..];
+
+    var repark_state = PgRepark{
+        .server = server,
+        .conn_index = outcome.conn_index,
+        .conn_id = outcome.conn_id,
+        .stash = outcome.stash,
+    };
+    var rctx = pg_handler_api.ResumeContext{
+        .result = outcome.result,
+        .server_error = outcome.server_error,
+        .response_buf = response_buf[0..],
+        .response_headers = response_headers[0..],
+        .arena = std.heap.FixedBufferAllocator.init(arena_buf),
+        .stash_bytes = outcome.stash,
+        .repark_ctx = @ptrCast(&repark_state),
+        .repark_fn = PgRepark.repark,
+    };
+    const resp = outcome.continuation(&rctx);
+
+    // Same sentinel discipline as the handler path (http1
+    // handleParkSentinel): a re-park flips the connection back to
+    // .db_parked and waits; anything else gets queued now.
+    if (http1_mod.handleParkSentinel(server, conn, resp)) {
+        if (conn.x402 == .db_parked) return; // re-parked; resume again later
+    } else {
+        http1_mod.queueResponse(server, conn, resp) catch {
+            conn.close_after_write = true;
+        };
+    }
+
+    // Restart the connection's I/O: flush the queued response, then
+    // process any pipelined requests that buffered behind the park
+    // (no new readiness event will fire for bytes already in the read
+    // buffer). Re-fetch the connection — the write path can close it.
+    if (conn.write_count > 0) handleWrite(server, outcome.conn_index) catch {};
+    const postconn = server.io.getConnection(outcome.conn_index) orelse return;
+    if (postconn.id != outcome.conn_id or postconn.state == .closed) return;
+    if (postconn.x402 == .none and postconn.read_buffered_bytes > 0) {
+        handleRead(server, outcome.conn_index) catch {};
+    }
 }
 
 pub fn handleRead(server: *Server, index: u32) !void {
@@ -1357,6 +1461,12 @@ pub fn handleRead(server: *Server, index: u32) !void {
             .arena_buf = arena_buf,
             .arena_handle = arena_handle,
             .buffer_ops = mw_ctx.buffer_ops,
+            .pg = .{
+                .client = server.pg_client,
+                .io_rt = &server.io,
+                .conn_index = conn.index,
+                .conn_id = conn.id,
+            },
         };
         const otel_start = if (server.otel != null) clock.realtimeNanos() orelse 0 else 0;
         const result = server.app_router.handle(parse.view, &mw_ctx, &scratch);
@@ -1364,6 +1474,12 @@ pub fn handleRead(server: *Server, index: u32) !void {
         if (result.pause_reads_ms) |pause_ms| {
             conn.setRateLimitPause(server.now_ms, pause_ms);
         }
+        // Park sentinel: the request parked for a PG op (or returned a
+        // bogus sentinel and got a 500). Either way stop the pipeline
+        // loop — same break semantics as the x402 .pending gate; any
+        // responses already enqueued this batch drain via the inline
+        // drain and write-readiness events.
+        if (http1_mod.handleParkSentinel(server, conn, result.resp)) break;
         try http1_mod.queueResponse(server, conn, result.resp);
         if (server.otel) |otel_exp| {
             otel_exp.recordSpan(parse.view.method, parse.view.path, result.resp.status, otel_start, clock.realtimeNanos() orelse 0);

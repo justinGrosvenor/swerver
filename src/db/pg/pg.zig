@@ -11,6 +11,10 @@ const std = @import("std");
 pub const protocol = @import("protocol.zig");
 pub const scram = @import("scram.zig");
 pub const types = @import("types.zig");
+/// Handler-facing park-and-resume types (ResumeContext, Result, Row…).
+pub const handler_api = @import("handler_api.zig");
+/// Per-worker reactor connection driver + query/park machinery.
+pub const client = @import("client.zig");
 
 /// The only SASL mechanism implemented (no channel binding in v1).
 pub const SASL_MECHANISM = "SCRAM-SHA-256";

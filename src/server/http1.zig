@@ -1191,6 +1191,12 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
         .arena_buf = arena_buf,
         .arena_handle = arena_handle,
         .buffer_ops = mw_ctx.buffer_ops,
+        .pg = .{
+            .client = server.pg_client,
+            .io_rt = &server.io,
+            .conn_index = conn.index,
+            .conn_id = conn.id,
+        },
     };
     const otel_start = if (server.otel != null) clock.realtimeNanos() orelse 0 else 0;
     const result = server.app_router.handle(req_view, &mw_ctx, &scratch);
@@ -1200,6 +1206,7 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
     }
 
     cleanupBodyAccumulation(server, conn);
+    if (handleParkSentinel(server, conn, result.resp)) return;
     queueResponse(server, conn, result.resp) catch {
         conn.close_after_write = true;
     };
@@ -1268,6 +1275,12 @@ pub fn dispatchToRouter(server: *Server, conn: *connection.Connection, req_view:
         .arena_buf = arena_buf,
         .arena_handle = arena_handle,
         .buffer_ops = mw_ctx.buffer_ops,
+        .pg = .{
+            .client = server.pg_client,
+            .io_rt = &server.io,
+            .conn_index = conn.index,
+            .conn_id = conn.id,
+        },
     };
     const otel_start = if (server.otel != null) clock.realtimeNanos() orelse 0 else 0;
     const result = server.app_router.handle(req_view, &mw_ctx, &scratch);
@@ -1275,12 +1288,48 @@ pub fn dispatchToRouter(server: *Server, conn: *connection.Connection, req_view:
     if (result.pause_reads_ms) |pause_ms| {
         conn.setRateLimitPause(server.now_ms, pause_ms);
     }
+    if (handleParkSentinel(server, conn, result.resp)) return;
     queueResponse(server, conn, result.resp) catch {
         conn.close_after_write = true;
     };
     if (server.otel) |otel_exp| {
         otel_exp.recordSpan(req_view.method, req_view.path, result.resp.status, otel_start, clock.realtimeNanos() orelse 0);
     }
+}
+
+/// Post-handler park handling (design 9.0 Handler API). Returns true
+/// when the caller must NOT queue the handler's response: either the
+/// request parked for a PG op (conn enters .db_parked; the resume path
+/// in dispatch.zig answers later), or the sentinel was returned without
+/// a live park (programmer error — a 500 was queued here). Also catches
+/// the inverse bug: a handler that issued a query but discarded the
+/// sentinel gets its orphaned park canceled so the continuation can
+/// never double-respond.
+pub fn handleParkSentinel(server: *Server, conn: *connection.Connection, resp: response_mod.Response) bool {
+    if (resp.isParked()) {
+        if (server.pg_client) |pgc| {
+            if (pgc.hasParkFor(conn.index, conn.id)) {
+                conn.x402 = .db_parked;
+                return true;
+            }
+        }
+        std.log.err("pg: handler returned the park sentinel without a live parked query; responding 500", .{});
+        queueResponse(server, conn, .{
+            .status = 500,
+            .headers = &.{},
+            .body = .{ .bytes = "Internal Server Error" },
+        }) catch {
+            conn.close_after_write = true;
+        };
+        return true;
+    }
+    if (server.pg_client) |pgc| {
+        if (pgc.hasParkFor(conn.index, conn.id)) {
+            std.log.err("pg: handler issued a query but discarded the park sentinel; canceling the orphaned park", .{});
+            pgc.cancelForConn(conn.index, conn.id);
+        }
+    }
+    return false;
 }
 
 /// Release all acquired body buffers and free BodyAccumState.

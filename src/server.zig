@@ -925,6 +925,11 @@ pub const Server = struct {
     }
 
     pub fn closeConnection(self: *Server, conn: *connection.Connection) void {
+        // Drop any PG park before the slot can be recycled: the
+        // in-flight op runs to completion and its outcome is discarded
+        // (generation-checked), so the continuation can never write
+        // into this slot's next occupant. O(1) when not parked.
+        if (self.pg_client) |pgc| pgc.cancelForConn(conn.index, conn.id);
         if (conn.is_tunnel) {
             if (conn.tunnel_peer_index) |pi| {
                 conn.tunnel_peer_index = null;

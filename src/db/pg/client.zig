@@ -563,6 +563,18 @@ pub const PgClient = struct {
         return response_mod.Response.parked;
     }
 
+    /// True when `conn_index` has a live park whose generation matches.
+    /// The dispatch layer uses this to validate the park sentinel: a
+    /// handler returning `Response.parked` without a matching live park
+    /// is a programmer error answered with a 500.
+    pub fn hasParkFor(self: *const PgClient, conn_index: u32, conn_id: u64) bool {
+        if (conn_index >= self.conn_parks.len) return false;
+        const park_idx = self.conn_parks[conn_index];
+        if (park_idx == NO_PARK) return false;
+        const entry = &self.parked[park_idx];
+        return entry.active and entry.conn_id == conn_id;
+    }
+
     /// The HTTP connection died (or was recycled) while parked: drop the
     /// park entry and detach any in-flight op. The op still runs to
     /// ReadyForQuery — its outcome is discarded — so the PG connection
