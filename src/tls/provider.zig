@@ -203,6 +203,42 @@ pub const Provider = struct {
         };
     }
 
+    /// Initialize a client-mode TLS provider for outbound TCP connections
+    /// (PostgreSQL client, design 9.0 phase 3).
+    ///
+    /// `verify` selects verify-full semantics: chain verification against
+    /// the trust store plus per-session hostname/IP verification (set up
+    /// in createTcpClientSession). The trust store is the system/OpenSSL
+    /// default verify paths unless `ca_file` points at a PEM bundle
+    /// (config `ssl_root_cert`), which replaces it.
+    ///
+    /// `verify == false` is sslmode=require: the channel is encrypted but
+    /// the peer is NOT authenticated — any certificate, including an
+    /// active MITM's, is accepted. Discouraged; exists for libpq parity.
+    pub fn initTcpClient(allocator: std.mem.Allocator, verify: bool, ca_file: ?[:0]const u8) Error!Provider {
+        const ctx = ffi.createTcpContext(false) catch return error.ContextCreationFailed;
+        errdefer ffi.freeContext(ctx);
+
+        if (verify) {
+            if (ca_file) |path| {
+                ffi.loadCaCert(ctx, path) catch return error.CertificateLoadFailed;
+            } else {
+                ffi.loadDefaultVerifyPaths(ctx) catch return error.CertificateLoadFailed;
+            }
+            // SSL_VERIFY_PEER: a client fails the handshake when the
+            // server chain doesn't verify (FAIL_IF_NO_PEER_CERT is a
+            // server-only flag, hence require=false).
+            ffi.setVerifyPeer(ctx, false);
+        }
+        // !verify: SSL_VERIFY_NONE is the context default — handshake
+        // succeeds regardless of the presented certificate.
+
+        return .{
+            .ctx = ctx,
+            .allocator = allocator,
+        };
+    }
+
     /// Initialize a TLS provider for client connections (no certificates needed).
     pub fn initClient(allocator: std.mem.Allocator) Error!Provider {
         const ctx = ffi.createContext(false) catch return error.ContextCreationFailed;
@@ -226,7 +262,10 @@ pub const Provider = struct {
                 if (entry.ctx == self.ctx) continue;
                 var already_freed = false;
                 for (freed[0..freed_count]) |f| {
-                    if (f == entry.ctx) { already_freed = true; break; }
+                    if (f == entry.ctx) {
+                        already_freed = true;
+                        break;
+                    }
                 }
                 if (!already_freed) {
                     ffi.freeContext(entry.ctx);
@@ -295,7 +334,51 @@ pub const Provider = struct {
         // Close_notify is skipped; TCP RST on connection teardown is fine.
         return Session{ .ssl = ssl, .is_socket = false };
     }
+
+    /// Create a client TLS session over memory BIOs, driven by readiness
+    /// events exactly like the server-side memory-BIO sessions (see
+    /// createTcpMemSession): feed inbound ciphertext via feedCryptoData,
+    /// drain outbound ciphertext via readCryptoData, advance with
+    /// doHandshake. No socket BIO, no blocking calls.
+    ///
+    /// `host` is sent as SNI (hostnames only — SNI forbids IP literals)
+    /// and, when `verify_host` (sslmode=verify-full), pinned for RFC 6125
+    /// verification: SSL_set1_host for names, X509_VERIFY_PARAM_set1_ip
+    /// for IP literals. The provider must have been built with
+    /// initTcpClient(verify=true) for verify_host to have teeth — chain
+    /// verification is a context property.
+    pub fn createTcpClientSession(self: *Provider, host: [:0]const u8, verify_host: bool) Error!Session {
+        const ssl = ffi.createSession(self.ctx, false) catch return error.SessionCreationFailed;
+        errdefer ffi.freeSession(ssl);
+
+        const is_ip = isIpLiteral(host);
+        if (!is_ip) {
+            if (!ffi.setSniHostname(ssl, host)) return error.SessionCreationFailed;
+        }
+        if (verify_host) {
+            const pinned = if (is_ip) ffi.setVerifyIp(ssl, host) else ffi.setHostnameVerification(ssl, host);
+            if (!pinned) return error.SessionCreationFailed;
+        }
+        // is_socket=false: skip SSL_shutdown in deinit (close_notify would
+        // land in the wbio and need a pump; TCP teardown is fine).
+        return Session{ .ssl = ssl, .is_socket = false };
+    }
 };
+
+/// Conservative IP-literal check for verification routing: anything with
+/// a colon is treated as IPv6, all-digits-and-dots as IPv4. Mixed
+/// strings fall through to hostname handling (where verification will
+/// simply fail to match — fail closed, never fail open).
+pub fn isIpLiteral(host: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, host, ':') != null) return true;
+    var saw_digit = false;
+    for (host) |c| switch (c) {
+        '0'...'9' => saw_digit = true,
+        '.' => {},
+        else => return false,
+    };
+    return saw_digit;
+}
 
 /// Represents a TLS session for a single connection.
 /// For QUIC, this handles the TLS 1.3 handshake and key derivation.
@@ -463,6 +546,24 @@ pub const Session = struct {
         return ffi.getPeerCertSubject(self.ssl, buf);
     }
 
+    /// Why a client handshake failed, for distinct log lines: hostname/IP
+    /// mismatch vs chain verification failure vs a non-verification TLS
+    /// failure (`.ok` — the X509 verifier had no complaint).
+    pub const VerifyCause = enum { ok, hostname_mismatch, chain };
+
+    pub fn verifyFailureCause(self: *const Session) VerifyCause {
+        const code = ffi.getVerifyResult(self.ssl);
+        if (code == ffi.X509_V_OK) return .ok;
+        if (code == ffi.X509_V_ERR_HOSTNAME_MISMATCH or
+            code == ffi.X509_V_ERR_IP_ADDRESS_MISMATCH) return .hostname_mismatch;
+        return .chain;
+    }
+
+    /// Human-readable verify-result string (static storage) for logs.
+    pub fn verifyErrorString(self: *const Session) []const u8 {
+        return ffi.verifyErrorString(ffi.getVerifyResult(self.ssl));
+    }
+
     /// Export keying material for QUIC packet protection.
     /// Used to derive Initial, Handshake, and Application keys.
     pub fn exportKeyingMaterial(self: *Session, out: []u8, label: []const u8, context: ?[]const u8) Error!void {
@@ -507,6 +608,18 @@ test "wildcard matching" {
     try std.testing.expect(!CertStore.matchWildcard("*.example.com", "sub.api.example.com"));
     try std.testing.expect(!CertStore.matchWildcard("*.example.com", "other.com"));
     try std.testing.expect(!CertStore.matchWildcard("api.example.com", "api.example.com"));
+}
+
+test "ip literal detection" {
+    try std.testing.expect(isIpLiteral("127.0.0.1"));
+    try std.testing.expect(isIpLiteral("10.0.0.5"));
+    try std.testing.expect(isIpLiteral("::1"));
+    try std.testing.expect(isIpLiteral("2001:db8::1"));
+    try std.testing.expect(!isIpLiteral("localhost"));
+    try std.testing.expect(!isIpLiteral("db.internal"));
+    try std.testing.expect(!isIpLiteral("1.2.3.4a"));
+    try std.testing.expect(!isIpLiteral(""));
+    try std.testing.expect(!isIpLiteral("..."));
 }
 
 test "config parsing with certificates" {

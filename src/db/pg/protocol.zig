@@ -70,6 +70,20 @@ const Cursor = struct {
     }
 };
 
+/// SSLRequest magic code (1234.5679 in PG's hi/lo-word convention).
+pub const SSLREQUEST_CODE: u32 = 80877103;
+
+/// SSLRequest: no type byte; length 8 + the magic code. Sent before the
+/// StartupMessage when sslmode != disable. The server answers with a
+/// single raw byte — 'S' (proceed with the TLS handshake on this
+/// socket) or 'N' (no TLS) — not a framed message.
+pub fn writeSslRequest(buf: []u8) WriteError![]u8 {
+    var cur = Cursor{ .buf = buf };
+    try cur.writeInt32(8);
+    try cur.writeInt32(SSLREQUEST_CODE);
+    return buf[0..cur.pos];
+}
+
 /// StartupMessage: no type byte; protocol version + key/value parameter
 /// pairs terminated by a single NUL. `database` defaults server-side to
 /// the user name when omitted.
@@ -527,6 +541,16 @@ fn putFrame(buf: []u8, off: usize, typ: u8, payload: []const u8) usize {
     std.mem.writeInt(u32, buf[off + 1 ..][0..4], @intCast(4 + payload.len), .big);
     @memcpy(buf[off + 5 .. off + 5 + payload.len], payload);
     return off + 5 + payload.len;
+}
+
+test "ssl request golden bytes" {
+    var buf: [8]u8 = undefined;
+    const msg = try writeSslRequest(&buf);
+    // length 8, code 80877103 (0x04D2162F), both big-endian.
+    try testing.expectEqualSlices(u8, "\x00\x00\x00\x08\x04\xd2\x16\x2f", msg);
+
+    var tiny: [7]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, writeSslRequest(&tiny));
 }
 
 test "startup message golden bytes" {
