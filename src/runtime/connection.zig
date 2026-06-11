@@ -156,43 +156,58 @@ pub const PendingH2Response = struct {
 pub const MAX_PENDING_H2_RESPONSES = 32;
 
 pub const Connection = struct {
-    // --- Tier 1: hot fields touched per pipelined H1 request (cache line 0) ---
-    state: State align(std.atomic.cache_line),
-    close_after_write: bool,
-    is_tls: bool,
-    send_in_flight: bool = false,
-    read_paused: bool,
-    write_paused: bool,
-    x402: X402State = .none,
-    protocol: Protocol,
-    write_count: u16,
-    write_head: u16,
-    write_tail: u16,
+    // NOTE: Zig auto-layout structs do NOT preserve declaration order, but the
+    // layout algorithm IS sensitive to it. This declaration order empirically
+    // produces a tight hot-field clustering (all per-request scalars within
+    // ~2 cache lines, write_queue[0] adjacent to the read/write counters).
+    // Do not reorder without re-measuring @offsetOf — see f980e43 revert.
+    index: u32,
+    id: u64,
+    state: State,
+    fd: ?std.posix.fd_t,
+    state_enter_ms: u64,
+    last_active_ms: u64,
+    phase_enter_ms: u64,
     read_offset: usize,
     read_buffered_bytes: usize,
     write_buffered_bytes: usize,
-    fd: ?std.posix.fd_t,
-    last_active_ms: u64,
-
-    // --- Tier 2: warm fields, per-event or alternate parse paths ---
-    read_buffer: ?buffer_pool.BufferHandle,
-    index: u32,
-    timeout_phase: TimeoutPhase,
-    is_head_request: bool,
+    write_queue: [write_queue_capacity]WriteEntry,
+    write_head: u16,
+    write_tail: u16,
+    write_count: u16,
+    close_after_write: bool,
     sent_continue: bool,
-    id: u64,
-    header_count: usize,
-    state_enter_ms: u64,
-    phase_enter_ms: u64,
-    ip_hash: u64,
-    active_list_pos: u32,
-
-    // --- Tier 3: cold scalar fields (setup/teardown, alternate protocols) ---
+    protocol: Protocol,
     http2_stack: ?*http2.Stack,
+    headers: [HeaderCapacity]request.Header,
+    header_count: usize,
+    read_paused: bool,
+    write_paused: bool,
+    /// Timestamp (ms) when reads should resume after rate limiting (0 = not rate limited)
+    resume_read_at_ms: u64,
+    timeout_phase: TimeoutPhase,
+    read_buffer: ?buffer_pool.BufferHandle,
+    // Position in active list for O(1) removal
+    active_list_pos: u32,
+    /// TLS session for encrypted connections
+    tls_session: ?tls.Session,
+    /// Whether this connection uses TLS
+    is_tls: bool,
+    /// Whether current request is HEAD (body suppressed in response per RFC 9110 §9.3.2)
+    is_head_request: bool,
+    /// Body accumulation state for large request bodies.
+    /// Heap-allocated lazily to avoid ~12KB per connection.
     body_accum: ?*BodyAccumState = null,
+    /// Pending H2 body-bearing requests (HEADERS received, waiting for DATA).
+    /// Heap-allocated lazily on HTTP/2 upgrade to avoid ~112KB per connection.
     h2_pending: ?*[MAX_PENDING_H2_BODIES]PendingH2Body = null,
+    /// Pending H2 file responses for lazy streaming (pread on demand).
+    /// Heap-allocated lazily on first H2 static file response.
     h2_pending_files: ?*[MAX_PENDING_H2_FILES]PendingH2File = null,
+    /// Pending H2 in-memory response bodies for deferred drain (fair scheduling).
+    /// Heap-allocated lazily on first large-body H2 response.
     h2_pending_responses: ?*[MAX_PENDING_H2_RESPONSES]PendingH2Response = null,
+    /// Pending response body for streaming large responses
     pending_body: []const u8,
     /// Heap allocation that backs `pending_body` when a proxied response
     /// outgrew the proxy's pool buffers and its unsent tail is still
@@ -200,32 +215,58 @@ pub const Connection = struct {
     /// freed (with the server allocator) once pending_body drains or the
     /// connection closes.
     pending_body_owned: ?[]u8 = null,
+    /// File descriptor for sendfile-based response (null = no file pending)
     pending_file_fd: ?std.posix.fd_t,
+    /// Current offset in pending file
     pending_file_offset: u64,
+    /// Bytes remaining to send from file
     pending_file_remaining: u64,
+    /// Cached peer IPv4 address (populated once at accept time)
     cached_peer_ip: ?[4]u8,
+    /// Cached peer IPv6 address (populated once at accept time)
     cached_peer_ip6: ?[16]u8,
-    tls_session: ?tls.Session,
-    /// Timestamp (ms) when reads should resume after rate limiting (0 = not rate limited)
-    resume_read_at_ms: u64,
+    ip_hash: u64,
+    /// Carryover ciphertext buffer for TLS connections using memory BIOs.
+    /// Populated when a TLS writev gets partial/EAGAIN mid-drain: the remaining
+    /// ciphertext (from the in-flight record plus anything still pending in wbio)
+    /// is copied here so the next handleWrite event can flush it before SSL_write
+    /// encrypts more plaintext. Null whenever there's nothing carried over.
     tls_cipher_carry_handle: ?buffer_pool.BufferHandle = null,
+    /// Offset into `tls_cipher_carry_handle.bytes` where unsent ciphertext starts.
     tls_cipher_carry_offset: usize = 0,
+    /// Total length of ciphertext in `tls_cipher_carry_handle.bytes` (from byte 0).
     tls_cipher_carry_len: usize = 0,
+    /// True while an async writev SQE is in flight for this connection.
+    /// Set when `handleWrite` submits the SQE, cleared when the matching
+    /// `.write` CQE arrives. While set, `handleWrite` MUST NOT submit
+    /// another send — the queue entries referenced by the in-flight
+    /// iovec must stay stable until the kernel acks them.
+    send_in_flight: bool = false,
+    /// Stable storage for the in-flight writev's iovec array. Points into
+    /// `write_queue[write_head..]` slices, so the array must outlive the
+    /// kernel's processing of the SQE — stored on the Connection (not on
+    /// the stack) for exactly that reason.
+    async_send_iov: [async_send_iov_capacity]std.posix.iovec_const = undefined,
+    /// Number of iovec entries submitted in the current in-flight send.
+    async_send_iov_count: u16 = 0,
+    /// Total bytes submitted in the current in-flight send (sum of iov lens).
+    /// Used only for diagnostics — the CQE's `res` carries the real
+    /// bytes-written count which the server trusts for queue advancement.
+    async_send_total_bytes: usize = 0,
+    /// WebSocket tunnel: index of the peer connection (client↔upstream).
     tunnel_peer_index: ?u32 = null,
+    /// WebSocket tunnel: generation ID of the peer connection for stale-reference detection.
     tunnel_peer_id: u64 = 0,
+    /// True when this connection is in bidirectional tunnel mode (WebSocket).
     is_tunnel: bool = false,
+    /// Async x402 facilitator verify state (H1 only — H2/H3 needs per-stream state).
+    x402: X402State = .none,
+    /// Settle-park: pool buffer holding packed upstream response (headers + body).
     x402_held_buf: ?buffer_pool.BufferHandle = null,
     x402_held_status: u16 = 0,
     x402_held_hdr_count: u8 = 0,
     x402_held_body_offset: u16 = 0,
     x402_held_body_len: u32 = 0,
-    async_send_iov_count: u16 = 0,
-    async_send_total_bytes: usize = 0,
-
-    // --- Tier 4: large arrays at end to avoid pushing hot fields apart ---
-    write_queue: [write_queue_capacity]WriteEntry,
-    headers: [HeaderCapacity]request.Header,
-    async_send_iov: [async_send_iov_capacity]std.posix.iovec_const = undefined,
 
     pub const X402State = enum(u8) { none, pending, resolved_allow, resolved_reject, settle_pending };
 
