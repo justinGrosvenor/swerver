@@ -111,6 +111,14 @@ pub const PendingReload = struct {
     new_hash: u64,
 };
 
+/// A bound TCP listener fd paired with the protocol config for its port.
+/// Connections accepted on `fd` resolve their config via getsockname → the
+/// matching ListenerConfig (see accept.zig).
+pub const BoundListener = struct {
+    fd: std.posix.fd_t,
+    cfg: config.ListenerConfig,
+};
+
 pub const Server = struct {
     allocator: std.mem.Allocator,
     cfg: config.ServerConfig,
@@ -118,6 +126,13 @@ pub const Server = struct {
     app_router: router.Router,
     listener_fd: ?std.posix.fd_t,
     udp_fd: ?std.posix.fd_t,
+    /// All bound TCP listeners with their per-port protocol config. In
+    /// multi-listener mode the process binds several ports (each via
+    /// SO_REUSEPORT on every worker); listener_fd points at listeners_buf[0]
+    /// for backward compat with the legacy drain path. Single-listener configs
+    /// still populate exactly one entry here.
+    listeners_buf: [8]BoundListener = undefined,
+    listeners_count: usize = 0,
     /// Directory fd for static_root, opened once at init. All per-request file
     /// lookups use openat() relative to this fd so the root cannot be moved out
     /// from under us, and so we don't pay realpath cost on the hot path.
@@ -327,6 +342,7 @@ pub const Server = struct {
             .io = io_runtime,
             .app_router = app_router,
             .listener_fd = null,
+            .listeners_count = 0,
             .udp_fd = null,
             .static_root_fd = static_root_fd,
             .tcp_tls_provider = tcp_tls_provider,
@@ -451,7 +467,18 @@ pub const Server = struct {
             self.allocator.destroy(p);
         }
         if (self.spare_fd) |fd| clock.closeFd(fd);
-        if (self.listener_fd) |fd| clock.closeFd(fd);
+        // Close every bound listener. listener_fd aliases listeners_buf[0].fd
+        // (multi-listener model), so we drive closing off the array only and do
+        // NOT close listener_fd separately to avoid a double-close. The drain
+        // path may have already closed and zeroed listeners_count, in which case
+        // this loop runs zero times.
+        var li: usize = 0;
+        while (li < self.listeners_count) : (li += 1) clock.closeFd(self.listeners_buf[li].fd);
+        // Fallback for paths that set listener_fd without populating the array
+        // (e.g. early error teardown before runLoop binds the listeners).
+        if (self.listeners_count == 0) {
+            if (self.listener_fd) |fd| clock.closeFd(fd);
+        }
         if (self.udp_fd) |fd| clock.closeFd(fd);
         if (self.static_root_fd) |fd| clock.closeFd(fd);
         if (self.static_cache) |*cache| {

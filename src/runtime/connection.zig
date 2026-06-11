@@ -193,6 +193,10 @@ pub const Connection = struct {
     tls_session: ?tls.Session,
     /// Whether this connection uses TLS
     is_tls: bool,
+    /// Listener-resolved flag: this connection arrived on an h2c-only port and
+    /// must reject anything that isn't the HTTP/2 preface. Set at accept from
+    /// the per-port ListenerConfig (multi-listener model).
+    h2c_only: bool = false,
     /// Whether current request is HEAD (body suppressed in response per RFC 9110 §9.3.2)
     is_head_request: bool,
     /// Body accumulation state for large request bodies.
@@ -316,6 +320,7 @@ pub const Connection = struct {
             .active_list_pos = 0,
             .tls_session = null,
             .is_tls = false,
+            .h2c_only = false,
             .is_head_request = false,
             .body_accum = null,
             .pending_body = &[_]u8{},
@@ -361,6 +366,7 @@ pub const Connection = struct {
         // TLS session is cleaned up before reset
         self.tls_session = null;
         self.is_tls = false;
+        self.h2c_only = false;
         self.is_head_request = false;
         // body_accum is cleaned up by the server before reset
         self.body_accum = null;

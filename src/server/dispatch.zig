@@ -29,6 +29,7 @@ const connection = @import("../runtime/connection.zig");
 const clock = @import("../runtime/clock.zig");
 const io_mod = @import("../runtime/io.zig");
 const net = @import("../runtime/net.zig");
+const config = @import("../config.zig");
 const request_mod = @import("../protocol/request.zig");
 const http1 = @import("../protocol/http1.zig");
 const http2 = @import("../protocol/http2.zig");
@@ -122,18 +123,48 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
     // routed to it (via SO_REUSEPORT) 503s with NotConnected.
     if (server.pg_client) |pgc| pgc.tick(&server.io, server.io.nowMs());
     server.refreshCachedDate();
-    if (server.listener_fd == null) {
-        const fd = try net.listen(server.cfg.address, server.cfg.port, 4096);
-        server.listener_fd = fd;
+    // Bind + register every effective listener. The effective set is the
+    // explicit `listeners` array when present, else a single synthesized
+    // listener from the legacy single-port fields (listenerForPort). Each
+    // worker binds all of them via SO_REUSEPORT. Config is resolved
+    // per-connection at accept (getsockname), so the backends stay unaware of
+    // which listener a connection arrived on.
+    if (server.listeners_count == 0) {
+        const synth_listener = server.cfg.listenerForPort(server.cfg.port);
+        const effective: []const config.ListenerConfig =
+            if (server.cfg.listeners.len > 0) server.cfg.listeners else &[_]config.ListenerConfig{synth_listener};
+        for (effective) |lcfg| {
+            if (server.listeners_count >= server.listeners_buf.len) {
+                std.log.warn("Too many listeners ({d} max); ignoring port {d}", .{ server.listeners_buf.len, lcfg.port });
+                continue;
+            }
+            const fd = try net.listen(lcfg.address, lcfg.port, 4096);
+            server.listeners_buf[server.listeners_count] = .{ .fd = fd, .cfg = lcfg };
+            server.listeners_count += 1;
+        }
+        // Keep listener_fd aliased to the first listener for the legacy drain
+        // path and any code that still reads it.
+        if (server.listeners_count > 0) server.listener_fd = server.listeners_buf[0].fd;
     }
-    try server.io.registerListener(server.listener_fd.?);
+    {
+        var li: usize = 0;
+        while (li < server.listeners_count) : (li += 1) try server.io.registerListener(server.listeners_buf[li].fd);
+    }
     if (server.spare_fd == null) {
         server.spare_fd = std.posix.openat(std.posix.AT.FDCWD, "/dev/null", .{}, 0) catch null;
     }
-    // Initialize UDP listener for QUIC if enabled
+    // Initialize UDP listener for QUIC if enabled. Only one QUIC listener is
+    // expected; use the configured quic_port (a listener entry's quic_port
+    // overrides it when one has quic_enabled).
     if (server.quic != null) {
         if (server.udp_fd == null) {
-            const quic_port = server.cfg.quic.port;
+            var quic_port = server.cfg.quic.port;
+            for (server.listeners_buf[0..server.listeners_count]) |bl| {
+                if (bl.cfg.quic_enabled and bl.cfg.quic_port > 0) {
+                    quic_port = bl.cfg.quic_port;
+                    break;
+                }
+            }
             if (quic_port > 0) {
                 server.udp_fd = net.bindUdp(server.cfg.address, quic_port) catch |err| {
                     std.log.warn("Failed to bind UDP port {}: {}", .{ quic_port, err });
@@ -183,11 +214,18 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
             is_draining = true;
             drain_deadline_ms = server.io.nowMs() + server.cfg.drain_timeout_ms;
             std.log.info("graceful shutdown: draining connections ({d}ms timeout)", .{server.cfg.drain_timeout_ms});
-            if (server.listener_fd) |lfd| {
+            // Unregister + close every bound listener so no new connections
+            // arrive while draining. listener_fd aliases listeners_buf[0].fd,
+            // so we drive everything off the array and zero listener_fd to
+            // prevent a later double-close in deinit.
+            var dli: usize = 0;
+            while (dli < server.listeners_count) : (dli += 1) {
+                const lfd = server.listeners_buf[dli].fd;
                 _ = server.io.unregister(lfd) catch {};
                 clock.closeFd(lfd);
-                server.listener_fd = null;
             }
+            server.listeners_count = 0;
+            server.listener_fd = null;
             if (server.admin_listener_fd) |afd| {
                 clock.closeFd(afd);
                 server.admin_listener_fd = null;
@@ -252,10 +290,17 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
                             std.log.warn("Pre-accepted setup failed: {}", .{err});
                         };
                     } else {
-                        const fd = server.listener_fd orelse continue;
-                        accept_mod.handleAccept(server, fd) catch |err| {
-                            std.log.warn("Accept failed: {}", .{err});
-                        };
+                        // Readiness model: the backend can't tell us WHICH
+                        // listener is ready (kqueue/epoll tag all listener fds
+                        // identically), so drain every bound listener. Each
+                        // handleAccept loops accept4() until WouldBlock, so a
+                        // non-ready fd just returns immediately.
+                        var li: usize = 0;
+                        while (li < server.listeners_count) : (li += 1) {
+                            accept_mod.handleAccept(server, server.listeners_buf[li].fd) catch |err| {
+                                std.log.warn("Accept failed: {}", .{err});
+                            };
+                        }
                     }
                 },
                 .datagram => {
@@ -863,7 +908,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
                 // h2c port can't silently serve h1. `matchesHttp2Preface` is a
                 // prefix match, so a partially-arrived preface still passes
                 // and we wait for more bytes via the branch below.
-                if (server.cfg.http2.h2c_only) {
+                if (conn.h2c_only) {
                     server.closeConnection(conn);
                     return;
                 }

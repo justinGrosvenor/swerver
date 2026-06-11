@@ -99,6 +99,13 @@ const ACCEPT_QUEUE_MASK: usize = ACCEPT_QUEUE_CAPACITY - 1;
 const ACCEPTOR_RING_ENTRIES: u16 = 16;
 const ACCEPTOR_CQE_BATCH: usize = 256;
 
+/// Max TCP listeners a single ring serves (multi-listener model). The
+/// inline-accept path arms one POLL_ADD per listener (distinct user_data so
+/// each re-arms independently); the threaded acceptor arms one multishot
+/// accept per listener on its shared ring. ACCEPTOR_RING_ENTRIES (16) must be
+/// ≥ this so all multishot SQEs fit in one submit.
+const MAX_LISTENERS = 8;
+
 /// Lock-free single-producer / single-consumer ring buffer of file
 /// descriptors. The acceptor thread is the sole producer; the reactor
 /// thread is the sole consumer. No locking — ordering is enforced by
@@ -154,7 +161,9 @@ const Acceptor = if (!is_linux) void else struct {
     /// drains the entire counter, which is exactly the coalescing
     /// behavior we want.
     eventfd_fd: i32 = -1,
-    listener_fd: i32 = -1,
+    /// All listener fds this acceptor arms a multishot accept on (shared ring).
+    listener_fds: [MAX_LISTENERS]i32 = [_]i32{-1} ** MAX_LISTENERS,
+    listener_count: usize = 0,
     /// Acceptor's own io_uring ring (independent of the reactor's).
     /// Plain init flags — DEFER_TASKRUN would defeat the whole point
     /// of running accept on its own thread (we *want* the kernel to
@@ -168,18 +177,24 @@ const Acceptor = if (!is_linux) void else struct {
     /// the client gets a TCP RST). Logged at deinit for visibility.
     overflow_drops: std.atomic.Value(u64) align(64) = std.atomic.Value(u64).init(0),
 
-    fn create(allocator: std.mem.Allocator, listener_fd: i32) !*Acceptor {
+    fn create(allocator: std.mem.Allocator, listener_fds: []const i32) !*Acceptor {
         const self = try allocator.create(Acceptor);
         errdefer allocator.destroy(self);
         self.* = .{
             .queue = .{},
             .eventfd_fd = -1,
-            .listener_fd = listener_fd,
+            .listener_fds = [_]i32{-1} ** MAX_LISTENERS,
+            .listener_count = 0,
             .ring = undefined,
             .thread = null,
             .shutdown = std.atomic.Value(bool).init(false),
             .overflow_drops = std.atomic.Value(u64).init(0),
         };
+        for (listener_fds, 0..) |lfd, idx| {
+            if (idx >= MAX_LISTENERS) break;
+            self.listener_fds[idx] = lfd;
+            self.listener_count += 1;
+        }
 
         // eventfd via raw syscall — std.posix.eventfd was removed
         // in newer 0.16-dev releases, and we only need the simple
@@ -201,20 +216,24 @@ const Acceptor = if (!is_linux) void else struct {
         };
         errdefer self.ring.deinit();
 
-        // Arm multishot accept on the acceptor's ring. The kernel will
-        // produce one CQE per incoming connection until F_MORE clears
-        // (kernel error / oom). user_data tag is irrelevant — this is
-        // the only op type on this ring.
-        _ = self.ring.accept_multishot(
-            1,
-            listener_fd,
-            null,
-            null,
-            std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC,
-        ) catch |err| {
-            std.log.err("io_uring_native acceptor: accept_multishot prep failed: {}", .{err});
-            return err;
-        };
+        // Arm one multishot accept per listener on the acceptor's ring. The
+        // kernel produces one CQE per incoming connection until F_MORE clears
+        // (kernel error / oom). user_data carries the listener INDEX so the
+        // re-arm path in run() can target the right fd — accept is the only op
+        // type on this ring, so the index is the entire user_data.
+        var li: usize = 0;
+        while (li < self.listener_count) : (li += 1) {
+            _ = self.ring.accept_multishot(
+                @intCast(li),
+                self.listener_fds[li],
+                null,
+                null,
+                std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC,
+            ) catch |err| {
+                std.log.err("io_uring_native acceptor: accept_multishot prep failed: {}", .{err});
+                return err;
+            };
+        }
         _ = self.ring.submit() catch |err| {
             std.log.err("io_uring_native acceptor: initial submit failed: {}", .{err});
             return err;
@@ -259,16 +278,20 @@ const Acceptor = if (!is_linux) void else struct {
                 const cqe = batch[i];
 
                 // Multishot accept terminated (kernel ENOMEM, etc.).
-                // Re-arm so we don't lose the listener.
+                // Re-arm the SAME listener (user_data carries its index) so we
+                // don't lose it.
                 if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
                     rearm_pending = true;
-                    _ = self.ring.accept_multishot(
-                        1,
-                        self.listener_fd,
-                        null,
-                        null,
-                        std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC,
-                    ) catch {};
+                    const idx: usize = @intCast(cqe.user_data);
+                    if (idx < self.listener_count) {
+                        _ = self.ring.accept_multishot(
+                            @intCast(idx),
+                            self.listener_fds[idx],
+                            null,
+                            null,
+                            std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC,
+                        ) catch {};
+                    }
                 }
 
                 if (cqe.res < 0) continue;
@@ -493,8 +516,18 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
     allocator: std.mem.Allocator,
     /// Output events produced by poll()
     events: []IoUringNativeEvent,
-    /// Registered listener fd (for multishot accept re-arming)
-    listener_fd: ?i32 = null,
+    /// All registered TCP listener fds (multi-listener model). The
+    /// inline-accept path arms one POLL_ADD per fd (re-armed by listener index
+    /// carried in the .accept CQE's conn_id); the threaded acceptor arms one
+    /// multishot accept per fd on its shared ring.
+    listener_fds: [MAX_LISTENERS]i32 = [_]i32{-1} ** MAX_LISTENERS,
+    listener_count: usize = 0,
+    /// Lazy threaded-acceptor bring-up: registerListener only COLLECTS fds (the
+    /// io_uring SQ is single-producer, so we must not submit the acceptor's
+    /// multishot accepts from this thread once it's running). The acceptor is
+    /// created + armed + started on the first poll() call, when all listeners
+    /// have been registered and only the reactor thread touches any ring.
+    acceptor_pending: bool = false,
     /// Registered UDP socket fd (for multishot recvmsg re-arming,
     /// used by QUIC). Null when QUIC isn't enabled on this process.
     udp_fd: ?i32 = null,
@@ -650,16 +683,44 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
     ///   eventfd. Reserved for very accept-heavy benchmarks that
     ///   want to fully saturate a single core with accept4 syscalls.
     pub fn registerListener(self: *IoUringNativeBackend, fd: i32) !void {
-        self.listener_fd = fd;
+        if (self.listener_count >= MAX_LISTENERS) return error.ConnIdOutOfRange;
+        const idx = self.listener_count;
+        self.listener_fds[idx] = fd;
+        self.listener_count += 1;
         if (envThreadedAccept()) {
-            const acc = try Acceptor.create(self.allocator, fd);
-            errdefer acc.destroy(self.allocator);
-            try acc.start();
-            self.acceptor = acc;
-            try self.armAcceptorWakeup(acc.eventfd_fd);
+            // Defer acceptor bring-up to the first poll() — the acceptor arms
+            // multishot accepts on its own ring, and io_uring SQs are
+            // single-producer. Collecting all fds first lets us arm them in one
+            // place (the reactor thread) before the acceptor thread spawns.
+            self.acceptor_pending = true;
             return;
         }
-        try self.armListenerPoll(fd);
+        // Inline-accept path: arm a POLL_ADD per listener. user_data carries the
+        // listener INDEX in conn_id so each one-shot poll re-arms independently
+        // (sharing 0 would lose the index and accumulate duplicate polls).
+        try self.armListenerPoll(idx, fd);
+    }
+
+    /// Bring up the threaded acceptor with every collected listener fd. Called
+    /// once, lazily, from poll() — never from registerListener, because the
+    /// acceptor's ring is single-producer and must be armed before its thread
+    /// runs.
+    fn ensureAcceptorStarted(self: *IoUringNativeBackend) void {
+        if (!self.acceptor_pending) return;
+        self.acceptor_pending = false;
+        const acc = Acceptor.create(self.allocator, self.listener_fds[0..self.listener_count]) catch |err| {
+            std.log.err("io_uring_native: acceptor create failed: {}", .{err});
+            return;
+        };
+        acc.start() catch |err| {
+            std.log.err("io_uring_native: acceptor start failed: {}", .{err});
+            acc.destroy(self.allocator);
+            return;
+        };
+        self.acceptor = acc;
+        self.armAcceptorWakeup(acc.eventfd_fd) catch |err| {
+            std.log.err("io_uring_native: acceptor wakeup arm failed: {}", .{err});
+        };
     }
 
     fn envThreadedAccept() bool {
@@ -668,9 +729,9 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
         return std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
     }
 
-    fn armListenerPoll(self: *IoUringNativeBackend, fd: i32) !void {
+    fn armListenerPoll(self: *IoUringNativeBackend, idx: usize, fd: i32) !void {
         _ = try self.ring.poll_add(
-            packUserData(.accept, 0, 0),
+            packUserData(.accept, 0, @intCast(idx)),
             @intCast(fd),
             linux.POLL.IN,
         );
@@ -915,6 +976,11 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
     pub fn poll(self: *IoUringNativeBackend, timeout_ms: u32) ![]IoUringNativeEvent {
         var count: usize = 0;
 
+        // ── Step 0: lazy threaded-acceptor bring-up ──────────────────
+        // Deferred from registerListener so all listener fds are armed in one
+        // place (this thread) before the acceptor thread starts producing.
+        if (self.acceptor_pending) self.ensureAcceptorStarted();
+
         // ── Step 1: drain the acceptor SPSC queue first ──────────────
         // The acceptor thread is the producer; we are the only
         // consumer. Drain unconditionally on every poll() — under
@@ -1008,13 +1074,15 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
                         }
                         self.armAcceptorWakeup(acc.eventfd_fd) catch {};
                     } else {
-                        // Inline-accept path: POLL_ADD readiness on
-                        // the listener itself. The res is a poll
-                        // mask; re-arm regardless and emit one
-                        // .accept event so the server's handleAccept
-                        // drains accept4 in userspace until EAGAIN.
-                        if (self.listener_fd) |lfd| {
-                            self.armListenerPoll(lfd) catch {};
+                        // Inline-accept path: POLL_ADD readiness on the
+                        // listener itself. conn_id carries the listener index
+                        // (set in armListenerPoll); re-arm THAT listener so each
+                        // poll re-arms independently, then emit one .accept
+                        // event so the dispatcher drains every bound listener's
+                        // accept4 in userspace until EAGAIN.
+                        const idx: usize = conn_id;
+                        if (idx < self.listener_count) {
+                            self.armListenerPoll(idx, self.listener_fds[idx]) catch {};
                         }
                         self.events[count] = .{
                             .kind = .accept,

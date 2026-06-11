@@ -160,6 +160,15 @@ fn setupAcceptedConnection(server: *Server, client_fd: std.posix.fd_t) !void {
         return;
     }
     conn.fd = client_fd;
+    // Resolve which listener this connection arrived on (multi-listener model):
+    // getsockname gives the local port, which maps to a ListenerConfig. Falls
+    // back to the legacy single-port config when the port can't be read or
+    // isn't in the listeners array.
+    const lcfg = if (net.getLocalPort(client_fd)) |lp|
+        server.cfg.listenerForPort(lp)
+    else
+        server.cfg.listenerForPort(server.cfg.port);
+    conn.h2c_only = lcfg.h2c_only;
     if (server.needs_peer_ip or server.cfg.per_ip_limit > 0) {
         if (net.getPeerAddress(client_fd)) |peer| {
             if (peer.getIp4Bytes()) |ip4| {
@@ -179,8 +188,12 @@ fn setupAcceptedConnection(server: *Server, client_fd: std.posix.fd_t) !void {
         }
         conn.ip_hash = h;
     }
-    // If TLS is configured, start handshake before going active
-    if (server.tcp_tls_provider) |*provider| {
+    // Start TLS only when this listener wants it AND a provider is built.
+    // tcp_tls_provider may exist solely to serve OTHER (TLS) listeners, so a
+    // plaintext listener must fall through to the plaintext branch even though
+    // the provider is non-null.
+    if (lcfg.use_tls and server.tcp_tls_provider != null) {
+        const provider = &server.tcp_tls_provider.?;
         conn.tls_session = provider.createTcpMemSession() catch {
             if (conn.read_buffer) |buf| server.io.releaseBuffer(buf);
             server.io.releaseConnection(conn);

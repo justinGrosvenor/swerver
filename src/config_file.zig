@@ -100,6 +100,20 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
         if (s.cache_static_files) |v| cfg.cache_static_files = v;
         if (s.static_root) |r| cfg.static_root = r;
         if (s.allowed_hosts) |hosts| cfg.allowed_hosts = hosts;
+        if (s.listeners) |json_listeners| {
+            const ls = try alloc.alloc(config_mod.ListenerConfig, json_listeners.len);
+            for (json_listeners, 0..) |jl, li| {
+                ls[li] = .{
+                    .address = jl.address orelse "0.0.0.0",
+                    .port = jl.port,
+                    .use_tls = jl.use_tls orelse false,
+                    .h2c_only = jl.h2c_only orelse false,
+                    .quic_enabled = jl.quic_enabled orelse false,
+                    .quic_port = jl.quic_port orelse 0,
+                };
+            }
+            cfg.listeners = ls;
+        }
     }
 
     // Timeouts
@@ -593,6 +607,19 @@ const ServerJson = struct {
     cache_static_files: ?bool = null,
     static_root: ?[]const u8 = null,
     allowed_hosts: ?[]const []const u8 = null,
+    /// Explicit per-port listeners. When present, the process binds each on
+    /// every worker (SO_REUSEPORT) and resolves protocol config per-connection
+    /// via the accepted local port. Absent → single-listener legacy mode.
+    listeners: ?[]const ListenerJson = null,
+};
+
+const ListenerJson = struct {
+    address: ?[]const u8 = null,
+    port: u16,
+    use_tls: ?bool = null,
+    h2c_only: ?bool = null,
+    quic_enabled: ?bool = null,
+    quic_port: ?u16 = null,
 };
 
 const TimeoutsJson = struct {
