@@ -342,15 +342,14 @@ pub const Server = struct {
             self.quic_gso = net.supportsGso();
         }
 
-        // Pre-encode the h3 response bytes for hot static endpoints
-        // (PR PERF-3). Requires http3_stack to be initialized.
-        if (build_options.enable_http3 and self.http3_stack != null) {
-            preencoded.initPreencodedH3(self);
-        }
-
         if (!self.cfg.disable_preencoded) {
             preencoded.initPreencodedH1(self);
             if (build_options.enable_http2) preencoded.initPreencodedH2(self);
+            // Pre-encode the h3 response bytes for hot static endpoints
+            // (PR PERF-3). Requires http3_stack to be initialized.
+            if (build_options.enable_http3 and self.http3_stack != null) {
+                preencoded.initPreencodedH3(self);
+            }
         }
 
         if (cfg.otel.enabled) {
