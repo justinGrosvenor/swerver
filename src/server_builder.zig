@@ -100,6 +100,12 @@ pub const ServerBuilder = struct {
         return next;
     }
 
+    pub fn cacheStaticFiles(self: ServerBuilder) ServerBuilder {
+        var next = self;
+        next.cfg.cache_static_files = true;
+        return next;
+    }
+
     /// Attach a reverse proxy instance to the server.
     /// The proxy will intercept matching requests before the router.
     pub fn withProxy(self: ServerBuilder, proxy: *proxy_mod.Proxy) ServerBuilder {

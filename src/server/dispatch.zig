@@ -973,7 +973,13 @@ pub fn handleRead(server: *Server, index: u32) !void {
         if (server.cfg.static_root.len > 0 and std.mem.startsWith(u8, parse.view.path, "/static/")) {
             const file_path = parse.view.path[8..]; // Skip "/static/"
             const content_type = Server.guessContentType(file_path);
-            try http1_mod.queueFileResponse(server, conn, server.cfg.static_root, file_path, content_type);
+            const accept_encoding = parse.view.getHeader("accept-encoding") orelse "";
+            if (server.staticCacheGetOrLoad(file_path, content_type, accept_encoding)) |entry| {
+                var hdrs: [3]response_mod.Header = undefined;
+                try http1_mod.queueResponse(server, conn, Server.staticCacheResponse(entry, &hdrs));
+            } else {
+                try http1_mod.queueFileResponse(server, conn, server.cfg.static_root, file_path, content_type, accept_encoding);
+            }
             if (conn.read_buffered_bytes == 0) break;
             continue;
         }
