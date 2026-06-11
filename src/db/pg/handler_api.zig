@@ -184,7 +184,7 @@ pub const ServerErrorInfo = struct {
 
     pub fn capture(info: protocol.ErrorInfo) ServerErrorInfo {
         var out = ServerErrorInfo{};
-        if (info.sqlstate.len >= 5) @memcpy(out.sqlstate[0..5], info.sqlstate[0..5]);
+        if (info.code.len >= 5) @memcpy(out.sqlstate[0..5], info.code[0..5]);
         const n = @min(info.message.len, out.message_buf.len);
         @memcpy(out.message_buf[0..n], info.message[0..n]);
         out.message_len = @intCast(n);

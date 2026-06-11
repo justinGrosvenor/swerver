@@ -380,7 +380,7 @@ pub const Server = struct {
                 break :pwd std.mem.sliceTo(v, 0);
             };
             const pgc = allocator.create(pg_client_mod.PgClient) catch break :pg_blk;
-            pgc.* = pg_client_mod.PgClient.init(.{
+            pgc.* = pg_client_mod.PgClient.init(allocator, cfg.max_connections, .{
                 .host = cfg.postgres.host,
                 .port = cfg.postgres.port,
                 .user = cfg.postgres.user,
@@ -388,6 +388,7 @@ pub const Server = struct {
                 .password = password,
                 .pool_size = cfg.postgres.pool_size_per_worker,
                 .allow_cleartext_password = cfg.postgres.allow_cleartext_password,
+                .statement_timeout_ms = cfg.postgres.statement_timeout_ms,
             }) catch |err| {
                 std.log.warn("postgres: client init failed: {}; client disabled", .{err});
                 allocator.destroy(pgc);

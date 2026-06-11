@@ -1,11 +1,14 @@
-//! Native PostgreSQL client — per-worker connection driver (design 9.0,
-//! phase 2.1).
+//! Native PostgreSQL client — per-worker connection driver and query
+//! park machinery (design 9.0, phases 2.1–2.2b).
 //!
-//! This step is connection bring-up ONLY: non-blocking connect, the
-//! phase-1 `pg.Handshake` driven by reactor readiness events, and
-//! reconnect with exponential backoff. There is deliberately NO query
-//! API, NO handler parking, and NO pipelining yet — those are later
-//! phase-2 steps layered on the `ready` state this module establishes.
+//! Connection bring-up: non-blocking connect, the phase-1
+//! `pg.Handshake` driven by reactor readiness events, reconnect with
+//! exponential backoff. Query side: `query()` issues one
+//! extended-protocol op per ready slot, parks the HTTP request in the
+//! bounded park table, and the installed resume hook runs the
+//! continuation when ReadyForQuery (or timeout / connection loss)
+//! delivers the outcome. NO pipelining yet — one op in flight per slot;
+//! the FIFO is a later phase-2 step.
 //!
 //! Reactor contract:
 //!   - PG sockets register via `IoRuntime.registerExternalFd(slot, fd)`;
@@ -21,21 +24,30 @@
 //!   - DNS resolves once in `init()` (server startup) — never on the
 //!     reactor. Picking up a new address requires a restart; config
 //!     hot-reload of the postgres block is out of scope for this step.
-//!   - io_uring backends are NOT supported yet: `registerExternalFd`
-//!     returns `error.UnsupportedBackend` there and the client disables
-//!     itself with a warning. Teaching the io_uring user_data encodings
-//!     about external fds is the explicit next step.
+//!   - All four backends host external fds as of phase 2.2a (kqueue,
+//!     epoll, io_uring_poll, io_uring_native). The `disabled` latch
+//!     remains as a guard for any future backend that can't.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../../runtime/io.zig");
 const net = @import("../../runtime/net.zig");
 const clock = @import("../../runtime/clock.zig");
+const response_mod = @import("../../response/response.zig");
 const pg = @import("pg.zig");
+const protocol = @import("protocol.zig");
+const handler_api = @import("handler_api.zig");
 
 /// Hard cap on per-worker connections (design 9.0: pool of 2–4).
 pub const MAX_SLOTS = 4;
 pub const DEFAULT_POOL_SIZE = 2;
+
+/// Bound on concurrently parked requests per worker. A parked request
+/// holds one table entry (continuation + stash + deadline); when the
+/// table is full, query() sheds load synchronously with ParkTableFull.
+pub const MAX_PARKED = 64;
+/// Sentinel for "no park" in slot.op_park and the per-conn token array.
+const NO_PARK: u16 = std.math.maxInt(u16);
 
 const RECV_BUF_SIZE = 16 * 1024;
 const SEND_BUF_SIZE = 4 * 1024;
@@ -47,7 +59,7 @@ const BACKOFF_MAX_MS: u64 = 30_000;
 const NONCE_RAW_LEN = 18;
 const NONCE_LEN = 24;
 
-pub const SlotState = enum { closed, connecting, handshaking, ready, failed };
+pub const SlotState = enum { closed, connecting, handshaking, ready, busy, failed };
 
 /// One pooled connection. All buffers are embedded — no allocator on
 /// the I/O path.
@@ -69,7 +81,49 @@ pub const Slot = struct {
     retry_at_ms: u64 = 0,
     /// Current backoff interval; doubles per failure, resets on ready.
     backoff_ms: u64 = 0,
+    /// Park-table index of the request whose op is in flight on this
+    /// slot (`.busy` only). NO_PARK when the requester vanished (client
+    /// disconnect while parked): the op still runs to ReadyForQuery so
+    /// the connection stays usable, but the outcome is discarded.
+    op_park: u16 = NO_PARK,
+    /// Rows-affected parsed from CommandComplete for the in-flight op.
+    op_rows: u64 = 0,
 };
+
+/// One parked HTTP request awaiting a PG op (design 9.0 Handler API).
+/// The continuation, stash, and generation check live here — the
+/// Connection carries only the `.db_parked` state byte.
+const ParkedRequest = struct {
+    active: bool = false,
+    conn_index: u32 = 0,
+    /// Connection generation (conn.id) captured at park time; checked
+    /// at resume so a recycled connection slot can't receive a stale
+    /// continuation's response.
+    conn_id: u64 = 0,
+    continuation: handler_api.Continuation = undefined,
+    stash: [handler_api.STASH_CAPACITY]u8 align(16) = undefined,
+    /// Absolute reactor-ms deadline (statement_timeout_ms from park).
+    deadline_ms: u64 = 0,
+    /// Server-reported error captured from ErrorResponse, if any.
+    server_error: ?handler_api.ServerErrorInfo = null,
+};
+
+/// Everything the resume layer needs to run a continuation. Borrowed
+/// fields (result frames, stash) are valid only inside the resume
+/// callback — the slot's recv buffer is reset when it returns.
+pub const Outcome = struct {
+    conn_index: u32,
+    conn_id: u64,
+    continuation: handler_api.Continuation,
+    stash: *[handler_api.STASH_CAPACITY]u8,
+    result: handler_api.PgError!handler_api.Result,
+    server_error: ?handler_api.ServerErrorInfo,
+};
+
+/// Installed by the server at init: runs the continuation against the
+/// (generation-checked) HTTP connection and enqueues its response.
+/// Opaque to keep client.zig free of http1/router imports.
+pub const ResumeFn = *const fn (ctx: *anyopaque, outcome: *const Outcome) void;
 
 pub const Options = struct {
     /// Hostname or IP literal; resolved once in `init`.
@@ -85,6 +139,11 @@ pub const Options = struct {
     /// (cleartext only over TLS) fails the connection instead. SCRAM is
     /// unaffected — it never reveals the password.
     allow_cleartext_password: bool = false,
+    /// Per-op deadline; expiry delivers error.Timeout to the
+    /// continuation and recycles the PG connection (a wire op cannot be
+    /// cancelled without a separate cancel-request connection — v1
+    /// kills and reconnects instead).
+    statement_timeout_ms: u32 = 5_000,
 };
 
 pub const PgClient = struct {
@@ -95,20 +154,41 @@ pub const PgClient = struct {
     /// now). The client stops trying rather than burning the backoff
     /// schedule on an error that will never clear.
     disabled: bool = false,
+    allocator: std.mem.Allocator,
+    /// Bounded park table; entries found by linear scan (64 max).
+    parked: [MAX_PARKED]ParkedRequest = [1]ParkedRequest{.{}} ** MAX_PARKED,
+    /// conn_index → park-table index (NO_PARK when not parked). Owned
+    /// here, sized to max_connections, so parking adds no Connection
+    /// fields — the Connection auto-layout is load-bearing.
+    conn_parks: []u16,
+    /// Resume hook installed by the server (see ResumeFn). Null in unit
+    /// tests: outcomes are then dropped with a debug log.
+    resume_ctx: ?*anyopaque = null,
+    resume_fn: ?ResumeFn = null,
 
-    pub const InitError = error{ ResolveFailed, InvalidPoolSize };
+    pub const InitError = error{ ResolveFailed, InvalidPoolSize, OutOfMemory };
 
     /// Resolve the server address (blocking DNS — startup only) and set
     /// up the slot pool. No sockets are opened here; `tick` brings the
     /// connections up once the reactor is running.
-    pub fn init(opts: Options) InitError!PgClient {
+    pub fn init(allocator: std.mem.Allocator, max_connections: usize, opts: Options) InitError!PgClient {
         if (opts.pool_size == 0 or opts.pool_size > MAX_SLOTS) return error.InvalidPoolSize;
         const addr = net.resolveAddress(opts.host, opts.port) catch return error.ResolveFailed;
+        const conn_parks = try allocator.alloc(u16, max_connections);
+        @memset(conn_parks, NO_PARK);
         return .{
             .opts = opts,
             .addr = addr,
             .slots = [1]Slot{.{}} ** MAX_SLOTS,
+            .allocator = allocator,
+            .conn_parks = conn_parks,
         };
+    }
+
+    /// Install the park-resume hook (server init, before the loop runs).
+    pub fn installResume(self: *PgClient, ctx: *anyopaque, f: ResumeFn) void {
+        self.resume_ctx = ctx;
+        self.resume_fn = f;
     }
 
     pub fn deinit(self: *PgClient, io_rt: *io_mod.IoRuntime) void {
@@ -120,6 +200,7 @@ pub const PgClient = struct {
             }
             slot.state = .closed;
         }
+        self.allocator.free(self.conn_parks);
     }
 
     /// Single entry point from the dispatch loop for events tagged with
@@ -134,6 +215,7 @@ pub const PgClient = struct {
             .write => switch (slot.state) {
                 .connecting => self.finishConnect(io_rt, slot_idx, now_ms),
                 .handshaking => self.pumpSend(io_rt, slot_idx, now_ms),
+                .busy => _ = self.flushSend(io_rt, slot_idx, now_ms),
                 else => {},
             },
             .read => switch (slot.state) {
@@ -145,6 +227,7 @@ pub const PgClient = struct {
                 },
                 .handshaking => self.handleReadable(io_rt, slot_idx, now_ms),
                 .ready => self.drainReady(io_rt, slot_idx, now_ms),
+                .busy => self.pumpBusyRead(io_rt, slot_idx, now_ms),
                 else => {},
             },
             .accept, .datagram => {},
@@ -166,6 +249,19 @@ pub const PgClient = struct {
                     self.failSlot(io_rt, idx, now_ms, "connect/handshake timeout");
                 },
                 .ready => {},
+                .busy => if (slot.op_park != NO_PARK and
+                    self.parked[slot.op_park].active and
+                    now_ms >= self.parked[slot.op_park].deadline_ms)
+                {
+                    // Deliver Timeout first, then recycle the PG
+                    // connection: the wire op can't be cancelled, and
+                    // detaching the park (op_park = NO_PARK below, via
+                    // deliverOutcome) keeps failSlot's ConnectionLost
+                    // path from double-firing.
+                    self.deliverOutcome(slot.op_park, error.Timeout);
+                    slot.op_park = NO_PARK;
+                    self.failSlot(io_rt, idx, now_ms, "statement timeout");
+                },
             }
         }
     }
@@ -273,38 +369,57 @@ pub const PgClient = struct {
 
     /// Serialize pending handshake messages into the slot's send buffer
     /// and write until done or EAGAIN (re-arming writable on a partial).
-    fn pumpSend(self: *PgClient, io_rt: *io_mod.IoRuntime, idx: u32, now_ms: u64) void {
+    const FlushResult = enum { drained, blocked, failed };
+
+    /// Write send_buf[send_off..send_len] until done or EAGAIN. Shared
+    /// by the handshake pump (which refills from takeSend) and the busy
+    /// query path (whose buffer is filled once at query() time).
+    fn flushSend(self: *PgClient, io_rt: *io_mod.IoRuntime, idx: u32, now_ms: u64) FlushResult {
         const slot = &self.slots[idx];
-        while (true) {
-            if (slot.send_off == slot.send_len) {
-                slot.send_off = 0;
-                slot.send_len = 0;
-                // TLS-only policy gate (design 9.0): never send a
-                // cleartext password over an unencrypted link unless the
-                // operator explicitly opted in. SCRAM proceeds normally.
-                if (slot.handshake.pending_send == .password and !self.opts.allow_cleartext_password) {
-                    return self.failSlot(io_rt, idx, now_ms, "server requested a cleartext password without TLS; refusing (set allow_cleartext_password to override)");
-                }
-                const maybe_msg = slot.handshake.takeSend(&slot.send_buf) catch {
-                    return self.failSlot(io_rt, idx, now_ms, "handshake send failed");
-                };
-                const msg = maybe_msg orelse break;
-                slot.send_len = msg.len; // msg aliases send_buf[0..len]
-            }
+        while (slot.send_off < slot.send_len) {
             const raw = std.c.write(slot.fd, slot.send_buf[slot.send_off..].ptr, slot.send_len - slot.send_off);
             if (raw < 0) {
                 switch (std.posix.errno(raw)) {
                     .AGAIN => {
                         io_rt.armExternalWritable(idx, slot.fd) catch {
-                            return self.failSlot(io_rt, idx, now_ms, "arm writable failed");
+                            self.failSlot(io_rt, idx, now_ms, "arm writable failed");
+                            return .failed;
                         };
-                        return;
+                        return .blocked;
                     },
                     .INTR => continue,
-                    else => return self.failSlot(io_rt, idx, now_ms, "socket write failed"),
+                    else => {
+                        self.failSlot(io_rt, idx, now_ms, "socket write failed");
+                        return .failed;
+                    },
                 }
             }
             slot.send_off += @intCast(raw);
+        }
+        slot.send_off = 0;
+        slot.send_len = 0;
+        return .drained;
+    }
+
+    fn pumpSend(self: *PgClient, io_rt: *io_mod.IoRuntime, idx: u32, now_ms: u64) void {
+        const slot = &self.slots[idx];
+        while (true) {
+            switch (self.flushSend(io_rt, idx, now_ms)) {
+                .blocked, .failed => return,
+                .drained => {},
+            }
+            if (slot.state != .handshaking) return;
+            // TLS-only policy gate (design 9.0): never send a
+            // cleartext password over an unencrypted link unless the
+            // operator explicitly opted in. SCRAM proceeds normally.
+            if (slot.handshake.pending_send == .password and !self.opts.allow_cleartext_password) {
+                return self.failSlot(io_rt, idx, now_ms, "server requested a cleartext password without TLS; refusing (set allow_cleartext_password to override)");
+            }
+            const maybe_msg = slot.handshake.takeSend(&slot.send_buf) catch {
+                return self.failSlot(io_rt, idx, now_ms, "handshake send failed");
+            };
+            const msg = maybe_msg orelse return;
+            slot.send_len = msg.len; // msg aliases send_buf[0..len]
         }
     }
 
@@ -338,10 +453,10 @@ pub const PgClient = struct {
         }
     }
 
-    /// Readable in `.ready`: no query API exists yet (phase 2.1), so
-    /// async backend messages (NoticeResponse, ParameterStatus) are read
-    /// and discarded — a level-triggered backend would otherwise spin on
-    /// the readiness. EOF means the server dropped us: reconnect.
+    /// Readable in `.ready` (no op in flight): async backend messages
+    /// (NoticeResponse, ParameterStatus) are read and discarded — a
+    /// level-triggered backend would otherwise spin on the readiness.
+    /// EOF means the server dropped us: reconnect.
     fn drainReady(self: *PgClient, io_rt: *io_mod.IoRuntime, idx: u32, now_ms: u64) void {
         const slot = &self.slots[idx];
         var scratch: [512]u8 = undefined;
@@ -360,8 +475,234 @@ pub const PgClient = struct {
         }
     }
 
+    // ── query / park (design 9.0 Handler API, phase 2.2b) ──────────
+
+    /// Issue one extended-protocol query (Parse/Bind/Describe/Execute/
+    /// Sync, unnamed statement, text params in, binary results out) on a
+    /// ready slot, park the HTTP request, and return the park sentinel.
+    /// One op per slot in flight (pipelining is a later step); one park
+    /// per HTTP request.
+    ///
+    /// The continuation NEVER runs synchronously inside this call — a
+    /// send failure here surfaces as error.NotConnected to the handler
+    /// instead, because at this point the handler is still on the stack
+    /// and the connection is not yet marked .db_parked.
+    pub fn query(
+        self: *PgClient,
+        io_rt: *io_mod.IoRuntime,
+        conn_index: u32,
+        conn_id: u64,
+        sql: []const u8,
+        args: []const ?[]const u8,
+        stash_bytes: []const u8,
+        continuation: handler_api.Continuation,
+    ) handler_api.QueryError!response_mod.Response {
+        std.debug.assert(stash_bytes.len <= handler_api.STASH_CAPACITY);
+        if (conn_index >= self.conn_parks.len) return error.NotConnected;
+        if (self.conn_parks[conn_index] != NO_PARK) return error.AlreadyParked;
+
+        var ready_idx: ?u32 = null;
+        var any_busy = false;
+        for (0..self.opts.pool_size) |i| {
+            switch (self.slots[i].state) {
+                .ready => {
+                    ready_idx = @intCast(i);
+                    break;
+                },
+                .busy => any_busy = true,
+                else => {},
+            }
+        }
+        const idx = ready_idx orelse return if (any_busy) error.QueueFull else error.NotConnected;
+        const slot = &self.slots[idx];
+
+        const park_idx: u16 = blk: {
+            for (&self.parked, 0..) |*p, i| {
+                if (!p.active) break :blk @intCast(i);
+            }
+            return error.ParkTableFull;
+        };
+
+        var off: usize = 0;
+        off += (protocol.writeParse(slot.send_buf[off..], "", sql, &.{}) catch return error.RequestTooLarge).len;
+        off += (protocol.writeBind(slot.send_buf[off..], "", "", args) catch return error.RequestTooLarge).len;
+        off += (protocol.writeDescribePortal(slot.send_buf[off..], "") catch return error.RequestTooLarge).len;
+        off += (protocol.writeExecute(slot.send_buf[off..], "", 0) catch return error.RequestTooLarge).len;
+        off += (protocol.writeSync(slot.send_buf[off..]) catch return error.RequestTooLarge).len;
+
+        const now_ms = io_rt.nowMs();
+        const entry = &self.parked[park_idx];
+        entry.* = .{
+            .active = true,
+            .conn_index = conn_index,
+            .conn_id = conn_id,
+            .continuation = continuation,
+            .deadline_ms = now_ms + self.opts.statement_timeout_ms,
+        };
+        @memcpy(entry.stash[0..stash_bytes.len], stash_bytes);
+        if (stash_bytes.len < entry.stash.len) @memset(entry.stash[stash_bytes.len..], 0);
+
+        slot.send_off = 0;
+        slot.send_len = off;
+        slot.recv_len = 0;
+        slot.op_rows = 0;
+        slot.state = .busy;
+        // Attach the park only after the initial flush: if the socket
+        // dies right here, failSlot must NOT deliver ConnectionLost to a
+        // continuation while the issuing handler is still running.
+        slot.op_park = NO_PARK;
+        switch (self.flushSend(io_rt, idx, now_ms)) {
+            .drained, .blocked => {},
+            .failed => {
+                entry.active = false;
+                return error.NotConnected;
+            },
+        }
+        slot.op_park = park_idx;
+        self.conn_parks[conn_index] = park_idx;
+        return response_mod.Response.parked;
+    }
+
+    /// The HTTP connection died (or was recycled) while parked: drop the
+    /// park entry and detach any in-flight op. The op still runs to
+    /// ReadyForQuery — its outcome is discarded — so the PG connection
+    /// survives its requester.
+    pub fn cancelForConn(self: *PgClient, conn_index: u32, conn_id: u64) void {
+        if (conn_index >= self.conn_parks.len) return;
+        const park_idx = self.conn_parks[conn_index];
+        if (park_idx == NO_PARK) return;
+        const entry = &self.parked[park_idx];
+        if (!entry.active or entry.conn_id != conn_id) return;
+        entry.active = false;
+        entry.server_error = null;
+        self.conn_parks[conn_index] = NO_PARK;
+        for (&self.slots) |*slot| {
+            if (slot.state == .busy and slot.op_park == park_idx) slot.op_park = NO_PARK;
+        }
+    }
+
+    /// Readable in `.busy`: accumulate backend frames until
+    /// ReadyForQuery, then deliver the outcome and return the slot to
+    /// `.ready`. Result frames borrow recv_buf — valid only inside the
+    /// resume callback; the region is poisoned (Debug) and reset after.
+    fn pumpBusyRead(self: *PgClient, io_rt: *io_mod.IoRuntime, idx: u32, now_ms: u64) void {
+        const slot = &self.slots[idx];
+        while (slot.state == .busy) {
+            if (slot.recv_len == slot.recv_buf.len) {
+                if (slot.op_park != NO_PARK) {
+                    self.deliverOutcome(slot.op_park, error.ResultTooLarge);
+                    slot.op_park = NO_PARK;
+                }
+                // The tail of the oversized result is still on the wire;
+                // v1 recycles the connection rather than resyncing.
+                return self.failSlot(io_rt, idx, now_ms, "result exceeded recv buffer");
+            }
+            const raw = std.posix.system.read(slot.fd, slot.recv_buf[slot.recv_len..].ptr, slot.recv_buf.len - slot.recv_len);
+            if (raw == 0) {
+                return self.failSlot(io_rt, idx, now_ms, "server closed connection mid-query");
+            }
+            if (raw < 0) {
+                switch (std.posix.errno(raw)) {
+                    .AGAIN => return,
+                    .INTR => continue,
+                    else => return self.failSlot(io_rt, idx, now_ms, "socket read failed"),
+                }
+            }
+            slot.recv_len += @intCast(raw);
+            if (!self.scanBusyFrames(io_rt, idx, now_ms)) return;
+        }
+    }
+
+    /// Walk the accumulated frames; returns true to keep reading (op
+    /// still in flight and parse is healthy), false when done or the
+    /// slot failed. On ReadyForQuery delivers the outcome inline.
+    fn scanBusyFrames(self: *PgClient, io_rt: *io_mod.IoRuntime, idx: u32, now_ms: u64) bool {
+        const slot = &self.slots[idx];
+        var it = protocol.FrameIter.init(slot.recv_buf[0..slot.recv_len]);
+        while (true) {
+            const frame_start = it.offset;
+            const maybe_frame = it.next() catch {
+                self.failSlot(io_rt, idx, now_ms, "malformed backend frame mid-query");
+                return false;
+            };
+            const frame = maybe_frame orelse return true; // need more bytes
+            switch (frame.typ) {
+                @intFromEnum(protocol.BackendType.error_response) => {
+                    if (slot.op_park != NO_PARK) {
+                        const info = protocol.parseErrorResponse(frame.payload) catch continue;
+                        self.parked[slot.op_park].server_error = handler_api.ServerErrorInfo.capture(info);
+                    }
+                },
+                @intFromEnum(protocol.BackendType.command_complete) => {
+                    const cc = protocol.parseCommandComplete(frame.payload) catch continue;
+                    slot.op_rows = cc.rows orelse 0;
+                },
+                @intFromEnum(protocol.BackendType.ready_for_query) => {
+                    const park = slot.op_park;
+                    slot.op_park = NO_PARK;
+                    if (park != NO_PARK) {
+                        if (self.parked[park].server_error != null) {
+                            self.deliverOutcome(park, error.ServerError);
+                        } else {
+                            self.deliverOutcome(park, handler_api.Result{
+                                .frames = slot.recv_buf[0..frame_start],
+                                .rows_affected = slot.op_rows,
+                            });
+                        }
+                    }
+                    if (builtin.mode == .Debug) {
+                        // Borrow-only contract: any Result slice that
+                        // escaped the continuation now reads 0xAA.
+                        @memset(slot.recv_buf[0..slot.recv_len], 0xAA);
+                    }
+                    slot.recv_len = 0;
+                    slot.op_rows = 0;
+                    slot.state = .ready;
+                    return false;
+                },
+                else => {},
+            }
+        }
+    }
+
+    /// Run the resume hook for a parked request and free the entry.
+    /// Reentrancy contract: conn_parks is cleared BEFORE the callback so
+    /// a chaining continuation can re-park the same connection, and the
+    /// entry stays allocated DURING the callback (the continuation's
+    /// stash pointer borrows it) — a re-park scans for a different free
+    /// entry because this one is still active.
+    fn deliverOutcome(self: *PgClient, park_idx: u16, result: handler_api.PgError!handler_api.Result) void {
+        const entry = &self.parked[park_idx];
+        if (!entry.active) return;
+        if (entry.conn_index < self.conn_parks.len and self.conn_parks[entry.conn_index] == park_idx) {
+            self.conn_parks[entry.conn_index] = NO_PARK;
+        }
+        if (self.resume_fn) |rf| {
+            const outcome = Outcome{
+                .conn_index = entry.conn_index,
+                .conn_id = entry.conn_id,
+                .continuation = entry.continuation,
+                .stash = &entry.stash,
+                .result = result,
+                .server_error = entry.server_error,
+            };
+            rf(self.resume_ctx.?, &outcome);
+        } else {
+            std.log.debug("pg: dropping op outcome (no resume hook installed)", .{});
+        }
+        entry.active = false;
+        entry.server_error = null;
+    }
+
     fn failSlot(self: *PgClient, io_rt: *io_mod.IoRuntime, idx: u32, now_ms: u64, reason: []const u8) void {
         const slot = &self.slots[idx];
+        if (slot.state == .busy and slot.op_park != NO_PARK) {
+            const park = slot.op_park;
+            slot.op_park = NO_PARK;
+            self.deliverOutcome(park, error.ConnectionLost);
+        }
+        slot.op_park = NO_PARK;
+        slot.op_rows = 0;
         if (slot.fd >= 0) {
             io_rt.unregisterExternalFd(slot.fd) catch {};
             clock.closeFd(slot.fd);
@@ -660,7 +1001,7 @@ test "integration: reactor-driven connection bring-up (PG_TEST_DSN)" {
         else => return error.SkipZigTest,
     }
 
-    var client = try PgClient.init(.{
+    var client = try PgClient.init(testing.allocator, cfg.max_connections, .{
         .host = dsn.host,
         .port = dsn.port,
         .user = dsn.user,
@@ -677,7 +1018,7 @@ test "integration: reactor-driven connection bring-up (PG_TEST_DSN)" {
         const events = try rt.pollWithTimeout(10);
         for (events) |ev| {
             // Mirror of the dispatch-loop external branch.
-            if (ev.conn_id & io_mod.EXTERNAL_ID_BIT == 0) continue;
+            if (!io_mod.isExternalId(ev.conn_id)) continue;
             client.onEvent(&rt, @intCast(ev.conn_id & 0xFFFF_FFFF), ev.kind);
         }
         all_ready = true;
@@ -690,4 +1031,136 @@ test "integration: reactor-driven connection bring-up (PG_TEST_DSN)" {
     for (client.slots[0..client.opts.pool_size]) |*slot| {
         try testing.expect(slot.handshake.backend_pid != 0);
     }
+
+    // ── Live query through the park machinery ──────────────────────
+    // The Hook mirrors what the http1 resume layer (phase 2.2b piece 2)
+    // does: build a ResumeContext from the Outcome, run the
+    // continuation, observe its Response.
+    const Stash = struct { magic: u64 = 0 };
+    const Hook = struct {
+        var ran: bool = false;
+        var status: u16 = 0;
+        var row_count: u64 = 0;
+        var sum: i64 = 0;
+        var rows_affected: u64 = 0;
+        var stash_magic: u64 = 0;
+
+        fn onResume(_: *anyopaque, outcome: *const Outcome) void {
+            var buf: [256]u8 = undefined;
+            var rctx = handler_api.ResumeContext{
+                .result = outcome.result,
+                .server_error = outcome.server_error,
+                .response_buf = &buf,
+                .response_headers = &.{},
+                .arena = std.heap.FixedBufferAllocator.init(&.{}),
+                .stash_bytes = outcome.stash,
+                .repark_ctx = undefined,
+                .repark_fn = undefined,
+            };
+            ran = true;
+            if (outcome.result) |res| {
+                rows_affected = res.rows_affected;
+            } else |_| {}
+            status = outcome.continuation(&rctx).status;
+        }
+
+        fn cont(rctx: *handler_api.ResumeContext) response_mod.Response {
+            stash_magic = rctx.stash(Stash).magic;
+            const res = rctx.result catch return .{ .status = 500, .headers = &.{}, .body = .none };
+            var rows = res.rows();
+            while (rows.next()) |row| {
+                sum += row.int4(0) catch -1_000_000;
+                row_count += 1;
+            }
+            return .{ .status = 200, .headers = &.{}, .body = .none };
+        }
+    };
+    var dummy: u8 = 0;
+    client.installResume(@ptrCast(&dummy), Hook.onResume);
+
+    const stash = Stash{ .magic = 0xDEAD_BEEF };
+    const sentinel = try client.query(&rt, 5, 777, "select generate_series(1, 3)", &.{}, std.mem.asBytes(&stash), Hook.cont);
+    try testing.expect(sentinel.isParked());
+
+    const q_deadline = rt.nowMs() + 5_000;
+    while (rt.nowMs() < q_deadline and !Hook.ran) {
+        client.tick(&rt, rt.nowMs());
+        const events = try rt.pollWithTimeout(10);
+        for (events) |ev| {
+            if (!io_mod.isExternalId(ev.conn_id)) continue;
+            client.onEvent(&rt, @intCast(ev.conn_id & 0xFFFF_FFFF), ev.kind);
+        }
+    }
+    try testing.expect(Hook.ran);
+    try testing.expectEqual(@as(u16, 200), Hook.status);
+    try testing.expectEqual(@as(u64, 3), Hook.row_count);
+    try testing.expectEqual(@as(i64, 6), Hook.sum);
+    try testing.expectEqual(@as(u64, 3), Hook.rows_affected);
+    try testing.expectEqual(@as(u64, 0xDEAD_BEEF), Hook.stash_magic);
+    // Park bookkeeping released; slot back to ready.
+    try testing.expectEqual(NO_PARK, client.conn_parks[5]);
+    try testing.expect(client.anyReady());
+
+    // Server-side error path: bad SQL must deliver error.ServerError
+    // with a captured SQLSTATE, and the slot must recover to ready.
+    const Hook2 = struct {
+        var ran: bool = false;
+        var got_server_error: bool = false;
+        var sqlstate: [5]u8 = undefined;
+
+        fn onResume(_: *anyopaque, outcome: *const Outcome) void {
+            ran = true;
+            if (outcome.result) |_| {} else |err| {
+                got_server_error = (err == error.ServerError);
+            }
+            if (outcome.server_error) |se| sqlstate = se.sqlstate;
+        }
+    };
+    client.installResume(@ptrCast(&dummy), Hook2.onResume);
+    _ = try client.query(&rt, 6, 778, "select bogus syntax here", &.{}, &.{}, Hook.cont);
+    const e_deadline = rt.nowMs() + 5_000;
+    while (rt.nowMs() < e_deadline and !Hook2.ran) {
+        client.tick(&rt, rt.nowMs());
+        const events = try rt.pollWithTimeout(10);
+        for (events) |ev| {
+            if (!io_mod.isExternalId(ev.conn_id)) continue;
+            client.onEvent(&rt, @intCast(ev.conn_id & 0xFFFF_FFFF), ev.kind);
+        }
+    }
+    try testing.expect(Hook2.ran);
+    try testing.expect(Hook2.got_server_error);
+    // 42601 = syntax_error
+    try testing.expectEqualSlices(u8, "42601", &Hook2.sqlstate);
+    try testing.expect(client.anyReady());
+}
+
+test "park table: cancelForConn generation check, detach, and hookless delivery" {
+    var client = try PgClient.init(testing.allocator, 8, .{ .host = "127.0.0.1", .user = "u" });
+    defer testing.allocator.free(client.conn_parks);
+
+    // Simulate a parked op in flight on slot 0.
+    client.slots[0].state = .busy;
+    client.slots[0].op_park = 0;
+    client.parked[0] = .{ .active = true, .conn_index = 3, .conn_id = 42, .continuation = undefined };
+    client.conn_parks[3] = 0;
+
+    // Wrong generation (recycled conn slot): must be a no-op.
+    client.cancelForConn(3, 41);
+    try testing.expect(client.parked[0].active);
+
+    // Right generation: entry freed, token cleared, op detached.
+    client.cancelForConn(3, 42);
+    try testing.expect(!client.parked[0].active);
+    try testing.expectEqual(NO_PARK, client.conn_parks[3]);
+    try testing.expectEqual(NO_PARK, client.slots[0].op_park);
+
+    // deliverOutcome on the now-inactive entry: harmless.
+    client.deliverOutcome(0, error.Timeout);
+
+    // Active entry with no resume hook installed: dropped and freed.
+    client.parked[1] = .{ .active = true, .conn_index = 2, .conn_id = 9, .continuation = undefined };
+    client.conn_parks[2] = 1;
+    client.deliverOutcome(1, error.Timeout);
+    try testing.expect(!client.parked[1].active);
+    try testing.expectEqual(NO_PARK, client.conn_parks[2]);
 }
