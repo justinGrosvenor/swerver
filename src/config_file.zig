@@ -189,7 +189,7 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
         if (o.headers) |v| cfg.otel.headers = v;
     }
 
-    // PostgreSQL client (design 9.0, phase 2.1)
+    // PostgreSQL client (design 9.0; TLS client mode since phase 3)
     if (file_cfg.postgres) |p| {
         if (p.url) |url| {
             const parsed = pg_client_mod.parseUrl(url) catch return error.ConfigParseError;
@@ -198,12 +198,19 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
             cfg.postgres.port = parsed.port;
             cfg.postgres.user = parsed.user;
             cfg.postgres.database = parsed.database;
-            // TLS client mode lands in phase 3; until then only an
-            // explicit sslmode=disable is accepted.
-            const sslmode = parsed.sslmode orelse "";
-            if (!std.mem.eql(u8, sslmode, "disable")) {
-                std.log.warn("postgres: TLS not yet supported, refusing (set sslmode=disable to opt in to plaintext); client disabled", .{});
-                cfg.postgres.enabled = false;
+            // sslmode: verify-full is the fail-safe default when the URL
+            // doesn't say otherwise; unknown values disable the client
+            // rather than guessing.
+            if (parsed.sslmode) |s| {
+                if (pg_client_mod.parseSslMode(s)) |mode| {
+                    cfg.postgres.sslmode = mode;
+                } else {
+                    std.log.warn("postgres: unknown sslmode '{s}' (expected disable|require|verify-full); client disabled", .{s});
+                    cfg.postgres.enabled = false;
+                }
+            }
+            if (cfg.postgres.sslmode == .require) {
+                std.log.warn("postgres: sslmode=require encrypts but does NOT verify the server certificate; verify-full is strongly recommended", .{});
             }
             if (parsed.password.len > 0) {
                 // Passwords belong in password_env, never the config file.
@@ -217,6 +224,7 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
         }
         if (p.statement_timeout_ms) |v| cfg.postgres.statement_timeout_ms = v;
         if (p.allow_cleartext_password) |v| cfg.postgres.allow_cleartext_password = v;
+        if (p.ssl_root_cert) |v| cfg.postgres.ssl_root_cert = v;
     }
 
     // Upstreams
@@ -662,6 +670,9 @@ const PostgresJson = struct {
     pool_size_per_worker: ?u8 = null,
     statement_timeout_ms: ?u32 = null,
     allow_cleartext_password: ?bool = null,
+    /// CA bundle (PEM path) replacing the system trust store for
+    /// sslmode=verify-full.
+    ssl_root_cert: ?[:0]const u8 = null,
 };
 
 const RouteX402Json = struct {
@@ -1106,32 +1117,62 @@ test "parse postgres config" {
     try std.testing.expectEqual(@as(u8, 3), p.pool_size_per_worker);
     try std.testing.expectEqual(@as(u32, 2500), p.statement_timeout_ms);
     try std.testing.expect(!p.allow_cleartext_password);
+    try std.testing.expectEqual(config_mod.PgSslMode.disable, p.sslmode);
+    try std.testing.expectEqualStrings("", p.ssl_root_cert);
 }
 
-test "postgres config refuses non-disable sslmode (TLS not yet supported)" {
-    // The refusal logs at warn; keep the test runner's stderr clean.
+test "postgres config sslmode: verify-full default, explicit modes, ssl_root_cert" {
+    // The sslmode=require warning logs at warn; keep stderr clean.
     const saved_log_level = std.testing.log_level;
     std.testing.log_level = .err;
     defer std.testing.log_level = saved_log_level;
 
+    // sslmode absent → verify-full (fail-safe default), client enabled.
     const json =
-        \\{
-        \\  "postgres": { "url": "postgres://app@db.internal/orders?sslmode=verify-full" }
-        \\}
-    ;
-    var loaded = try parseJsonFromBytes(std.testing.allocator, json);
-    defer loaded.deinit();
-    try std.testing.expect(!loaded.server_config.postgres.enabled);
-
-    // sslmode absent → also refused (fail closed until TLS lands).
-    const json2 =
         \\{
         \\  "postgres": { "url": "postgres://app@db.internal/orders" }
         \\}
     ;
+    var loaded = try parseJsonFromBytes(std.testing.allocator, json);
+    defer loaded.deinit();
+    try std.testing.expect(loaded.server_config.postgres.enabled);
+    try std.testing.expectEqual(config_mod.PgSslMode.verify_full, loaded.server_config.postgres.sslmode);
+
+    // Explicit verify-full with a CA override.
+    const json2 =
+        \\{
+        \\  "postgres": {
+        \\    "url": "postgres://app@db.internal/orders?sslmode=verify-full",
+        \\    "ssl_root_cert": "/etc/ssl/rds-ca.pem"
+        \\  }
+        \\}
+    ;
     var loaded2 = try parseJsonFromBytes(std.testing.allocator, json2);
     defer loaded2.deinit();
-    try std.testing.expect(!loaded2.server_config.postgres.enabled);
+    try std.testing.expect(loaded2.server_config.postgres.enabled);
+    try std.testing.expectEqual(config_mod.PgSslMode.verify_full, loaded2.server_config.postgres.sslmode);
+    try std.testing.expectEqualStrings("/etc/ssl/rds-ca.pem", loaded2.server_config.postgres.ssl_root_cert);
+
+    // require parses (with a logged warning — it skips verification).
+    const json3 =
+        \\{
+        \\  "postgres": { "url": "postgres://app@db.internal/orders?sslmode=require" }
+        \\}
+    ;
+    var loaded3 = try parseJsonFromBytes(std.testing.allocator, json3);
+    defer loaded3.deinit();
+    try std.testing.expect(loaded3.server_config.postgres.enabled);
+    try std.testing.expectEqual(config_mod.PgSslMode.require, loaded3.server_config.postgres.sslmode);
+
+    // Unknown sslmode values disable the client (fail closed).
+    const json4 =
+        \\{
+        \\  "postgres": { "url": "postgres://app@db.internal/orders?sslmode=verify-ca" }
+        \\}
+    ;
+    var loaded4 = try parseJsonFromBytes(std.testing.allocator, json4);
+    defer loaded4.deinit();
+    try std.testing.expect(!loaded4.server_config.postgres.enabled);
 }
 
 test "postgres config rejects bad url and bad pool size" {

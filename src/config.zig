@@ -213,11 +213,27 @@ pub const QuicConfig = struct {
     }
 };
 
-/// Native PostgreSQL client (design 9.0, phase 2.1: connection bring-up
-/// only — no query API yet). Populated from the config file's
-/// "postgres" block; host/port/user/database come from parsing the
-/// `url` field. The password is read from the environment variable
-/// named by `password_env` at server init — never from the config file.
+/// PostgreSQL client TLS policy (design 9.0 phase 3). The subset of
+/// libpq's sslmode values that have honest semantics: `prefer`/`allow`
+/// (opportunistic) and `verify-ca` (chain without hostname) are
+/// deliberately not offered.
+pub const PgSslMode = enum {
+    /// Plaintext; the SSLRequest is never sent.
+    disable,
+    /// Encrypt, but skip certificate verification entirely. Discouraged:
+    /// an active MITM can present any certificate. Exists for libpq
+    /// parity and broken-PKI escape hatches only — use verify_full.
+    require,
+    /// Chain verification against the trust store plus hostname/IP
+    /// verification (RFC 6125). The fail-safe default.
+    verify_full,
+};
+
+/// Native PostgreSQL client (design 9.0). Populated from the config
+/// file's "postgres" block; host/port/user/database/sslmode come from
+/// parsing the `url` field. The password is read from the environment
+/// variable named by `password_env` at server init — never from the
+/// config file.
 pub const PostgresConfig = struct {
     enabled: bool = false,
     host: []const u8 = "",
@@ -230,9 +246,16 @@ pub const PostgresConfig = struct {
     pool_size_per_worker: u8 = 2,
     /// Parsed and stored now; enforced by the query API (next step).
     statement_timeout_ms: u32 = 5_000,
-    /// Explicit opt-in for answering a cleartext-password request
-    /// without TLS (TLS client mode lands in phase 3).
+    /// Explicit opt-in for answering a cleartext-password request over a
+    /// PLAINTEXT connection. Cleartext over an established TLS channel
+    /// is always acceptable (the channel is encrypted and, under
+    /// verify_full, the server is authenticated).
     allow_cleartext_password: bool = false,
+    /// TLS policy; verify_full unless the URL's sslmode says otherwise.
+    sslmode: PgSslMode = .verify_full,
+    /// Optional CA bundle (PEM path) replacing the system trust store
+    /// for verify_full — e.g. a managed database's private root.
+    ssl_root_cert: [:0]const u8 = "",
 };
 
 pub const AdminConfig = struct {

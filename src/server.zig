@@ -80,7 +80,6 @@ const pg_client_mod = @import("db/pg/client.zig");
 // TLS_PLAINTEXT_WRITE_CAP and TLS_CIPHER_SCRATCH_SIZE live in
 // `server/tls.zig` alongside the handshake + ciphertext pump helpers.
 
-
 /// Single-threaded event-loop HTTP server. One `Server` instance runs
 /// per worker process in the default multi-worker fork model, or one
 /// per process in single-worker mode.
@@ -133,6 +132,10 @@ pub const Server = struct {
     /// Native PostgreSQL client (null unless the "postgres" config block
     /// is present). Phase 2.1: connection bring-up only — no query API.
     pg_client: ?*pg_client_mod.PgClient = null,
+    /// Client-mode TLS provider for the PG client (null when sslmode is
+    /// disable or TLS is compiled out). Owned here — mirrors
+    /// tcp_tls_provider — and must outlive pg_client's slot sessions.
+    pg_tls_provider: ?tls.Provider = null,
     /// Admin API listener (null if admin API not enabled)
     admin_listener_fd: ?std.posix.fd_t = null,
     /// Spare FD for EMFILE recovery — closed temporarily to accept+close one connection
@@ -379,6 +382,25 @@ pub const Server = struct {
                 const v = std.c.getenv(name_z_ptr) orelse break :pwd "";
                 break :pwd std.mem.sliceTo(v, 0);
             };
+            // Client-mode TLS (design 9.0 phase 3): build the provider up
+            // front so a bad CA path or a TLS-less build fails the whole
+            // postgres block instead of every connect attempt.
+            if (cfg.postgres.sslmode != .disable) {
+                const ca: ?[:0]const u8 = if (cfg.postgres.ssl_root_cert.len > 0)
+                    cfg.postgres.ssl_root_cert
+                else
+                    null;
+                self.pg_tls_provider = tls.Provider.initTcpClient(
+                    allocator,
+                    cfg.postgres.sslmode == .verify_full,
+                    ca,
+                ) catch |err| {
+                    std.log.warn("postgres: client TLS init failed: {} (sslmode={s}); client disabled", .{
+                        err, @tagName(cfg.postgres.sslmode),
+                    });
+                    break :pg_blk;
+                };
+            }
             const pgc = allocator.create(pg_client_mod.PgClient) catch break :pg_blk;
             pgc.* = pg_client_mod.PgClient.init(allocator, cfg.max_connections, .{
                 .host = cfg.postgres.host,
@@ -389,14 +411,19 @@ pub const Server = struct {
                 .pool_size = cfg.postgres.pool_size_per_worker,
                 .allow_cleartext_password = cfg.postgres.allow_cleartext_password,
                 .statement_timeout_ms = cfg.postgres.statement_timeout_ms,
+                .sslmode = cfg.postgres.sslmode,
             }) catch |err| {
                 std.log.warn("postgres: client init failed: {}; client disabled", .{err});
                 allocator.destroy(pgc);
                 break :pg_blk;
             };
+            // The provider address is stable (it lives in self), so the
+            // client may keep the pointer for the server's lifetime.
+            if (self.pg_tls_provider) |*p| pgc.installTls(p);
             self.pg_client = pgc;
-            std.log.info("postgres: client configured for {s}:{d} (pool {d})", .{
-                cfg.postgres.host, cfg.postgres.port, cfg.postgres.pool_size_per_worker,
+            std.log.info("postgres: client configured for {s}:{d} (pool {d}, sslmode={s})", .{
+                cfg.postgres.host,                 cfg.postgres.port,
+                cfg.postgres.pool_size_per_worker, @tagName(cfg.postgres.sslmode),
             });
         }
 
@@ -430,6 +457,9 @@ pub const Server = struct {
             pgc.deinit(&self.io);
             self.allocator.destroy(pgc);
         }
+        // After pg_client deinit: slot SSL sessions must be freed before
+        // their SSL_CTX.
+        if (self.pg_tls_provider) |*p| p.deinit();
         self.io.deinit();
     }
 
@@ -1020,8 +1050,6 @@ pub const Server = struct {
         conn.pending_body = &[_]u8{};
         self.io.releaseConnection(conn);
     }
-
-
 };
 
 test "metrics middleware response queued for http1" {

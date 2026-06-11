@@ -30,13 +30,19 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const io_mod = @import("../../runtime/io.zig");
 const net = @import("../../runtime/net.zig");
 const clock = @import("../../runtime/clock.zig");
+const config_mod = @import("../../config.zig");
+const tls_mod = @import("../../tls/provider.zig");
 const response_mod = @import("../../response/response.zig");
 const pg = @import("pg.zig");
 const protocol = @import("protocol.zig");
 const handler_api = @import("handler_api.zig");
+
+/// TLS policy — defined next to the rest of the config surface.
+pub const SslMode = config_mod.PgSslMode;
 
 /// Hard cap on per-worker connections (design 9.0: pool of 2–4).
 pub const MAX_SLOTS = 4;
@@ -59,7 +65,33 @@ const BACKOFF_MAX_MS: u64 = 30_000;
 const NONCE_RAW_LEN = 18;
 const NONCE_LEN = 24;
 
-pub const SlotState = enum { closed, connecting, handshaking, ready, busy, failed };
+pub const SlotState = enum {
+    closed,
+    connecting,
+    /// SSLRequest sent; awaiting the server's single-byte 'S'/'N' verdict.
+    ssl_request,
+    /// TLS handshake in flight over the memory-BIO session.
+    tls_handshaking,
+    handshaking,
+    ready,
+    busy,
+    failed,
+};
+
+/// Why the last TLS bring-up on a slot failed — gives the log lines (and
+/// the integration tests) distinct causes instead of one mushy
+/// "handshake failed".
+pub const TlsFailure = enum {
+    none,
+    /// Server answered 'N' to the SSLRequest.
+    refused,
+    /// Handshake failed without a certificate-verification complaint.
+    handshake,
+    /// Certificate chain did not verify against the trust store.
+    chain,
+    /// Chain verified but the certificate doesn't match the host.
+    hostname,
+};
 
 /// One pooled connection. All buffers are embedded — no allocator on
 /// the I/O path.
@@ -88,6 +120,13 @@ pub const Slot = struct {
     op_park: u16 = NO_PARK,
     /// Rows-affected parsed from CommandComplete for the in-flight op.
     op_rows: u64 = 0,
+    /// TLS session (memory BIOs) once the server accepts the SSLRequest;
+    /// null on the plaintext path. Every transport touchpoint branches
+    /// on this once — the sslmode=disable byte path is unchanged.
+    tls: ?tls_mod.Session = null,
+    /// Diagnostic: why the last TLS bring-up failed (sticky across the
+    /// retry backoff; reset when the next connect attempt starts).
+    tls_fail: TlsFailure = .none,
 };
 
 /// One parked HTTP request awaiting a PG op (design 9.0 Handler API).
@@ -135,10 +174,16 @@ pub const Options = struct {
     password: []const u8 = "",
     pool_size: u8 = DEFAULT_POOL_SIZE,
     /// Explicit opt-in for answering an AuthenticationCleartextPassword
-    /// request without TLS. Off by default: the spec's TLS-only policy
-    /// (cleartext only over TLS) fails the connection instead. SCRAM is
-    /// unaffected — it never reveals the password.
+    /// request over a PLAINTEXT link. Off by default: the spec's policy
+    /// (cleartext only over TLS) fails the connection instead. Over an
+    /// established TLS channel the request is always answered — the
+    /// channel is encrypted. SCRAM is unaffected either way.
     allow_cleartext_password: bool = false,
+    /// TLS policy (design 9.0 phase 3). verify_full — chain + hostname —
+    /// is the fail-safe default; `require` encrypts without verifying
+    /// (discouraged); `disable` never sends the SSLRequest. Anything
+    /// other than disable needs a client TLS provider via installTls.
+    sslmode: SslMode = .verify_full,
     /// Per-op deadline; expiry delivers error.Timeout to the
     /// continuation and recycles the PG connection (a wire op cannot be
     /// cancelled without a separate cancel-request connection — v1
@@ -165,6 +210,10 @@ pub const PgClient = struct {
     /// tests: outcomes are then dropped with a debug log.
     resume_ctx: ?*anyopaque = null,
     resume_fn: ?ResumeFn = null,
+    /// Client-mode TLS provider (server-owned, see Server.pg_tls_provider;
+    /// installed before the loop runs). Required when sslmode != disable —
+    /// slots fail closed without it.
+    tls_provider: ?*tls_mod.Provider = null,
 
     pub const InitError = error{ ResolveFailed, InvalidPoolSize, OutOfMemory };
 
@@ -191,8 +240,19 @@ pub const PgClient = struct {
         self.resume_fn = f;
     }
 
+    /// Install the client TLS provider (server init, before the loop
+    /// runs; mirrors installResume). The provider must outlive the
+    /// client — slot sessions borrow its SSL_CTX.
+    pub fn installTls(self: *PgClient, provider: *tls_mod.Provider) void {
+        self.tls_provider = provider;
+    }
+
     pub fn deinit(self: *PgClient, io_rt: *io_mod.IoRuntime) void {
         for (&self.slots) |*slot| {
+            if (slot.tls) |*sess| {
+                sess.deinit();
+                slot.tls = null;
+            }
             if (slot.fd >= 0) {
                 io_rt.unregisterExternalFd(slot.fd) catch {};
                 clock.closeFd(slot.fd);
@@ -214,8 +274,12 @@ pub const PgClient = struct {
             .err => self.failSlot(io_rt, slot_idx, now_ms, "socket error event"),
             .write => switch (slot.state) {
                 .connecting => self.finishConnect(io_rt, slot_idx, now_ms),
+                // .ssl_request: the 8-byte SSLRequest blocked mid-write
+                // (tls is still null there — flushOut is the raw path).
+                // .tls_handshaking: drain pending wbio ciphertext.
+                .ssl_request, .tls_handshaking => _ = self.flushOut(io_rt, slot_idx, now_ms),
                 .handshaking => self.pumpSend(io_rt, slot_idx, now_ms),
-                .busy => _ = self.flushSend(io_rt, slot_idx, now_ms),
+                .busy => _ = self.flushOut(io_rt, slot_idx, now_ms),
                 else => {},
             },
             .read => switch (slot.state) {
@@ -223,8 +287,14 @@ pub const PgClient = struct {
                 // treat a read in .connecting as connect completion.
                 .connecting => {
                     self.finishConnect(io_rt, slot_idx, now_ms);
-                    if (slot.state == .handshaking) self.handleReadable(io_rt, slot_idx, now_ms);
+                    switch (slot.state) {
+                        .handshaking => self.handleReadable(io_rt, slot_idx, now_ms),
+                        .ssl_request => self.handleSslReply(io_rt, slot_idx, now_ms),
+                        else => {},
+                    }
                 },
+                .ssl_request => self.handleSslReply(io_rt, slot_idx, now_ms),
+                .tls_handshaking => self.tlsHandshakeRead(io_rt, slot_idx, now_ms),
                 .handshaking => self.handleReadable(io_rt, slot_idx, now_ms),
                 .ready => self.drainReady(io_rt, slot_idx, now_ms),
                 .busy => self.pumpBusyRead(io_rt, slot_idx, now_ms),
@@ -245,7 +315,7 @@ pub const PgClient = struct {
             switch (slot.state) {
                 .closed => self.startConnect(io_rt, idx, now_ms),
                 .failed => if (now_ms >= slot.retry_at_ms) self.startConnect(io_rt, idx, now_ms),
-                .connecting, .handshaking => if (now_ms >= slot.deadline_ms) {
+                .connecting, .ssl_request, .tls_handshaking, .handshaking => if (now_ms >= slot.deadline_ms) {
                     self.failSlot(io_rt, idx, now_ms, "connect/handshake timeout");
                 },
                 .ready => {},
@@ -281,6 +351,7 @@ pub const PgClient = struct {
 
     fn startConnect(self: *PgClient, io_rt: *io_mod.IoRuntime, idx: u32, now_ms: u64) void {
         const slot = &self.slots[idx];
+        slot.tls_fail = .none;
         const domain: c_uint = switch (self.addr.storage) {
             .ip4 => @intCast(std.posix.AF.INET),
             .ip6 => @intCast(std.posix.AF.INET6),
@@ -324,7 +395,7 @@ pub const PgClient = struct {
             return self.failSlot(io_rt, idx, now_ms, "event-loop registration failed");
         };
         if (immediate) {
-            self.beginHandshake(io_rt, idx, now_ms);
+            self.afterConnect(io_rt, idx, now_ms);
         } else {
             slot.state = .connecting;
             io_rt.armExternalWritable(idx, fd) catch {
@@ -343,7 +414,172 @@ pub const PgClient = struct {
         if (rc != 0 or err_val != 0) {
             return self.failSlot(io_rt, idx, now_ms, "connect failed (SO_ERROR)");
         }
-        self.beginHandshake(io_rt, idx, now_ms);
+        self.afterConnect(io_rt, idx, now_ms);
+    }
+
+    /// TCP is up: plaintext goes straight to the PG startup exchange;
+    /// any TLS mode opens with the SSLRequest dance first.
+    fn afterConnect(self: *PgClient, io_rt: *io_mod.IoRuntime, idx: u32, now_ms: u64) void {
+        if (!wantsSslRequest(self.opts.sslmode)) {
+            return self.beginHandshake(io_rt, idx, now_ms);
+        }
+        self.sendSslRequest(io_rt, idx, now_ms);
+    }
+
+    /// sslmode=disable never sends the SSLRequest; require/verify-full
+    /// always do (and treat the 'N' refusal as fatal — there is no
+    /// opportunistic "prefer" mode, see SslMode).
+    fn wantsSslRequest(mode: SslMode) bool {
+        return mode != .disable;
+    }
+
+    /// Send the 8-byte SSLRequest (before the startup message) and wait
+    /// for the server's single-byte verdict.
+    fn sendSslRequest(self: *PgClient, io_rt: *io_mod.IoRuntime, idx: u32, now_ms: u64) void {
+        const slot = &self.slots[idx];
+        slot.state = .ssl_request;
+        slot.recv_len = 0;
+        slot.send_off = 0;
+        // send_buf is 4KB; an 8-byte message cannot fail to serialize.
+        const msg = protocol.writeSslRequest(&slot.send_buf) catch unreachable;
+        slot.send_len = msg.len;
+        // Raw flush — no TLS session exists yet.
+        _ = self.flushSend(io_rt, idx, now_ms);
+    }
+
+    const SslReply = enum { start_tls, refused, protocol_error };
+
+    /// The server's SSLRequest verdict: 'S' → TLS ClientHello next on
+    /// this same socket; 'N' → the server cannot/will not do TLS, which
+    /// is fatal under require/verify-full (the only modes that send the
+    /// SSLRequest at all); anything else is a protocol violation.
+    fn classifySslReply(b: u8) SslReply {
+        return switch (b) {
+            'S' => .start_tls,
+            'N' => .refused,
+            else => .protocol_error,
+        };
+    }
+
+    /// Readable in `.ssl_request`: read the one-byte verdict. Exactly one
+    /// byte — the server sends nothing further until our ClientHello, so
+    /// anything after it would be a protocol violation anyway.
+    fn handleSslReply(self: *PgClient, io_rt: *io_mod.IoRuntime, idx: u32, now_ms: u64) void {
+        const slot = &self.slots[idx];
+        var reply: [1]u8 = undefined;
+        while (true) {
+            const raw = std.posix.system.read(slot.fd, &reply, 1);
+            if (raw == 0) {
+                return self.failSlot(io_rt, idx, now_ms, "server closed connection awaiting SSLRequest reply");
+            }
+            if (raw < 0) {
+                switch (std.posix.errno(raw)) {
+                    .AGAIN => return,
+                    .INTR => continue,
+                    else => return self.failSlot(io_rt, idx, now_ms, "socket read failed"),
+                }
+            }
+            break;
+        }
+        switch (classifySslReply(reply[0])) {
+            .start_tls => self.beginTls(io_rt, idx, now_ms),
+            .refused => {
+                slot.tls_fail = .refused;
+                self.failSlot(io_rt, idx, now_ms, "server refused TLS ('N' SSLRequest reply) but sslmode requires it");
+            },
+            .protocol_error => self.failSlot(io_rt, idx, now_ms, "unexpected SSLRequest reply byte"),
+        }
+    }
+
+    /// 'S' received: build the client TLS session (memory BIOs) and kick
+    /// the handshake. verify-full pins the configured host into the
+    /// session for hostname/IP verification.
+    fn beginTls(self: *PgClient, io_rt: *io_mod.IoRuntime, idx: u32, now_ms: u64) void {
+        const slot = &self.slots[idx];
+        const provider = self.tls_provider orelse {
+            return self.failSlot(io_rt, idx, now_ms, "sslmode requires TLS but no client TLS provider is installed (TLS disabled in this build?)");
+        };
+        var host_z: [256]u8 = undefined;
+        if (self.opts.host.len >= host_z.len) {
+            return self.failSlot(io_rt, idx, now_ms, "host too long for TLS verification");
+        }
+        @memcpy(host_z[0..self.opts.host.len], self.opts.host);
+        host_z[self.opts.host.len] = 0;
+        const host: [:0]const u8 = host_z[0..self.opts.host.len :0];
+        // SSL_set1_host / SNI copy the name — host_z may be stack-local.
+        const session = provider.createTcpClientSession(host, self.opts.sslmode == .verify_full) catch {
+            return self.failSlot(io_rt, idx, now_ms, "TLS session creation failed");
+        };
+        slot.tls = session;
+        slot.state = .tls_handshaking;
+        slot.recv_len = 0;
+        self.driveTls(io_rt, idx, now_ms);
+    }
+
+    /// Advance the TLS handshake: SSL_do_handshake against the memory
+    /// BIOs, then drain wbio ciphertext to the socket. On completion the
+    /// PG startup exchange begins over the encrypted channel; on failure
+    /// the verify result splits the cause three ways for the log.
+    fn driveTls(self: *PgClient, io_rt: *io_mod.IoRuntime, idx: u32, now_ms: u64) void {
+        const slot = &self.slots[idx];
+        const sess = &slot.tls.?;
+        switch (sess.doHandshake()) {
+            .in_progress => _ = self.flushOut(io_rt, idx, now_ms),
+            .complete => {
+                sess.handshake_complete = true;
+                switch (self.flushOut(io_rt, idx, now_ms)) {
+                    .failed => return,
+                    // .blocked is fine: the client Finished flight sits
+                    // staged in send_buf and beginHandshake preserves it.
+                    .drained, .blocked => {},
+                }
+                self.beginHandshake(io_rt, idx, now_ms);
+            },
+            .failed => switch (sess.verifyFailureCause()) {
+                .chain => {
+                    slot.tls_fail = .chain;
+                    std.log.warn("postgres: slot {d}: certificate chain verification failed: {s}", .{ idx, sess.verifyErrorString() });
+                    self.failSlot(io_rt, idx, now_ms, "TLS certificate chain verification failed (set ssl_root_cert to the server's CA)");
+                },
+                .hostname_mismatch => {
+                    slot.tls_fail = .hostname;
+                    self.failSlot(io_rt, idx, now_ms, "TLS hostname verification failed (certificate does not match the configured host)");
+                },
+                .ok => {
+                    slot.tls_fail = .handshake;
+                    self.failSlot(io_rt, idx, now_ms, "TLS handshake failed");
+                },
+            },
+        }
+    }
+
+    /// Readable in `.tls_handshaking`: drain the socket into the rbio
+    /// (mandatory-to-EAGAIN for edge-triggered epoll), then advance.
+    fn tlsHandshakeRead(self: *PgClient, io_rt: *io_mod.IoRuntime, idx: u32, now_ms: u64) void {
+        const slot = &self.slots[idx];
+        const sess = &slot.tls.?;
+        while (true) {
+            var cbuf: [4096]u8 = undefined;
+            const raw = std.posix.system.read(slot.fd, &cbuf, cbuf.len);
+            if (raw == 0) {
+                return self.failSlot(io_rt, idx, now_ms, "server closed connection during TLS handshake");
+            }
+            if (raw < 0) {
+                switch (std.posix.errno(raw)) {
+                    .AGAIN => break,
+                    .INTR => continue,
+                    else => return self.failSlot(io_rt, idx, now_ms, "socket read failed"),
+                }
+            }
+            const n: usize = @intCast(raw);
+            var fed: usize = 0;
+            while (fed < n) {
+                fed += sess.feedCryptoData(cbuf[fed..n]) catch {
+                    return self.failSlot(io_rt, idx, now_ms, "TLS receive buffer feed failed");
+                };
+            }
+        }
+        self.driveTls(io_rt, idx, now_ms);
     }
 
     fn beginHandshake(self: *PgClient, io_rt: *io_mod.IoRuntime, idx: u32, now_ms: u64) void {
@@ -362,8 +598,13 @@ pub const PgClient = struct {
         });
         slot.state = .handshaking;
         slot.recv_len = 0;
-        slot.send_len = 0;
-        slot.send_off = 0;
+        // Don't clobber staged-but-unflushed bytes: on the TLS path the
+        // final handshake flight may still sit in send_buf if the socket
+        // blocked mid-flush (flushSend zeroes both fields once drained).
+        if (slot.send_off == slot.send_len) {
+            slot.send_len = 0;
+            slot.send_off = 0;
+        }
         self.pumpSend(io_rt, idx, now_ms);
     }
 
@@ -401,26 +642,157 @@ pub const PgClient = struct {
         return .drained;
     }
 
+    /// TLS-aware flush. Plaintext slots go straight to flushSend — the
+    /// raw fast path costs one null check. TLS slots alternate between
+    /// pulling ciphertext out of the session's wbio into send_buf and
+    /// writing it to the socket; a partial write leaves the remainder
+    /// staged in send_buf (flushSend's normal EAGAIN handling) and the
+    /// rest queued in the wbio for the next writable event.
+    fn flushOut(self: *PgClient, io_rt: *io_mod.IoRuntime, idx: u32, now_ms: u64) FlushResult {
+        const slot = &self.slots[idx];
+        if (slot.tls == null) return self.flushSend(io_rt, idx, now_ms);
+        while (true) {
+            switch (self.flushSend(io_rt, idx, now_ms)) {
+                .blocked => return .blocked,
+                .failed => return .failed,
+                .drained => {},
+            }
+            const n = slot.tls.?.readCryptoData(&slot.send_buf) catch {
+                self.failSlot(io_rt, idx, now_ms, "TLS send buffer drain failed");
+                return .failed;
+            };
+            if (n == 0) return .drained;
+            slot.send_off = 0;
+            slot.send_len = n;
+        }
+    }
+
+    /// Encrypt plaintext into the session's wbio (whence flushOut moves
+    /// it to the socket). SSL_write copies, so `plain` may alias
+    /// send_buf — which is then reclaimed as the ciphertext staging
+    /// area. Returns false after failing the slot.
+    fn stageTls(self: *PgClient, io_rt: *io_mod.IoRuntime, idx: u32, now_ms: u64, plain: []const u8) bool {
+        const slot = &self.slots[idx];
+        const sess = &slot.tls.?;
+        var off: usize = 0;
+        while (off < plain.len) {
+            const n = sess.write(plain[off..]) catch 0;
+            if (n == 0) {
+                self.failSlot(io_rt, idx, now_ms, "TLS write failed");
+                return false;
+            }
+            off += n;
+        }
+        slot.send_len = 0;
+        slot.send_off = 0;
+        return true;
+    }
+
+    /// Cleartext-password policy (design 9.0): always acceptable over an
+    /// established TLS channel (encrypted; server-authenticated under
+    /// verify-full). Over plaintext only with the explicit operator
+    /// opt-in. SCRAM never consults this — it never reveals the password.
+    fn cleartextPasswordAllowed(tls_active: bool, opt_in: bool) bool {
+        return tls_active or opt_in;
+    }
+
     fn pumpSend(self: *PgClient, io_rt: *io_mod.IoRuntime, idx: u32, now_ms: u64) void {
         const slot = &self.slots[idx];
         while (true) {
-            switch (self.flushSend(io_rt, idx, now_ms)) {
+            switch (self.flushOut(io_rt, idx, now_ms)) {
                 .blocked, .failed => return,
                 .drained => {},
             }
             if (slot.state != .handshaking) return;
-            // TLS-only policy gate (design 9.0): never send a
-            // cleartext password over an unencrypted link unless the
-            // operator explicitly opted in. SCRAM proceeds normally.
-            if (slot.handshake.pending_send == .password and !self.opts.allow_cleartext_password) {
+            if (slot.handshake.pending_send == .password and
+                !cleartextPasswordAllowed(slot.tls != null, self.opts.allow_cleartext_password))
+            {
                 return self.failSlot(io_rt, idx, now_ms, "server requested a cleartext password without TLS; refusing (set allow_cleartext_password to override)");
             }
             const maybe_msg = slot.handshake.takeSend(&slot.send_buf) catch {
                 return self.failSlot(io_rt, idx, now_ms, "handshake send failed");
             };
             const msg = maybe_msg orelse return;
-            slot.send_len = msg.len; // msg aliases send_buf[0..len]
+            if (slot.tls != null) {
+                // Encrypt into the wbio; the next loop iteration's
+                // flushOut pulls the ciphertext back through send_buf.
+                if (!self.stageTls(io_rt, idx, now_ms, msg)) return;
+            } else {
+                slot.send_len = msg.len; // msg aliases send_buf[0..len]
+            }
         }
+    }
+
+    const ReadStatus = enum { data, would_block, closed, failed };
+
+    /// Pull transport bytes into recv_buf[recv_len..]. Plaintext slots:
+    /// one read(2) per call — callers loop until .would_block, exactly
+    /// the pre-TLS shape. TLS slots: drain the socket into the rbio,
+    /// then drain decrypted plaintext out of the session.
+    fn fillRecv(self: *PgClient, idx: u32) ReadStatus {
+        const slot = &self.slots[idx];
+        if (slot.tls != null) return self.fillRecvTls(idx);
+        while (true) {
+            const raw = std.posix.system.read(slot.fd, slot.recv_buf[slot.recv_len..].ptr, slot.recv_buf.len - slot.recv_len);
+            if (raw == 0) return .closed;
+            if (raw < 0) {
+                switch (std.posix.errno(raw)) {
+                    .AGAIN => return .would_block,
+                    .INTR => continue,
+                    else => return .failed,
+                }
+            }
+            slot.recv_len += @intCast(raw);
+            return .data;
+        }
+    }
+
+    /// TLS arm of fillRecv. The socket MUST be drained to EAGAIN before
+    /// returning (edge-triggered epoll) — ciphertext parks in the rbio,
+    /// which grows as needed, so this never stalls on recv_buf space.
+    /// Post-handshake records the session absorbs without producing
+    /// plaintext (session tickets, key updates) are handled implicitly:
+    /// SSL_read consumes them and reports WANT_READ.
+    fn fillRecvTls(self: *PgClient, idx: u32) ReadStatus {
+        const slot = &self.slots[idx];
+        const sess = &slot.tls.?;
+        var got_eof = false;
+        while (true) {
+            var cbuf: [4096]u8 = undefined;
+            const raw = std.posix.system.read(slot.fd, &cbuf, cbuf.len);
+            if (raw == 0) {
+                got_eof = true;
+                break;
+            }
+            if (raw < 0) {
+                switch (std.posix.errno(raw)) {
+                    .AGAIN => break,
+                    .INTR => continue,
+                    else => return .failed,
+                }
+            }
+            const n: usize = @intCast(raw);
+            var fed: usize = 0;
+            while (fed < n) {
+                fed += sess.feedCryptoData(cbuf[fed..n]) catch return .failed;
+            }
+        }
+        var any = false;
+        while (slot.recv_len < slot.recv_buf.len) {
+            const n = sess.read(slot.recv_buf[slot.recv_len..]) catch |err| switch (err) {
+                error.WouldBlock => break,
+                error.ConnectionClosed => {
+                    got_eof = true;
+                    break;
+                },
+                else => return .failed,
+            };
+            if (n == 0) break;
+            slot.recv_len += n;
+            any = true;
+        }
+        if (any) return .data;
+        return if (got_eof) .closed else .would_block;
     }
 
     /// Readable in `.handshaking`: read until EAGAIN (required for
@@ -431,18 +803,12 @@ pub const PgClient = struct {
             if (slot.recv_len == slot.recv_buf.len) {
                 return self.failSlot(io_rt, idx, now_ms, "handshake frame exceeds recv buffer");
             }
-            const raw = std.posix.system.read(slot.fd, slot.recv_buf[slot.recv_len..].ptr, slot.recv_buf.len - slot.recv_len);
-            if (raw == 0) {
-                return self.failSlot(io_rt, idx, now_ms, "server closed connection during handshake");
+            switch (self.fillRecv(idx)) {
+                .would_block => return,
+                .closed => return self.failSlot(io_rt, idx, now_ms, "server closed connection during handshake"),
+                .failed => return self.failSlot(io_rt, idx, now_ms, "socket read failed"),
+                .data => {},
             }
-            if (raw < 0) {
-                switch (std.posix.errno(raw)) {
-                    .AGAIN => break,
-                    .INTR => continue,
-                    else => return self.failSlot(io_rt, idx, now_ms, "socket read failed"),
-                }
-            }
-            slot.recv_len += @intCast(raw);
             switch (ingest(slot, idx)) {
                 .more => {},
                 .ready => return,
@@ -456,21 +822,19 @@ pub const PgClient = struct {
     /// Readable in `.ready` (no op in flight): async backend messages
     /// (NoticeResponse, ParameterStatus) are read and discarded — a
     /// level-triggered backend would otherwise spin on the readiness.
-    /// EOF means the server dropped us: reconnect.
+    /// recv_buf is idle between ops and serves as the discard sink; on
+    /// the TLS path the bytes must still route through the session so
+    /// its record state stays coherent. EOF means the server dropped
+    /// us: reconnect.
     fn drainReady(self: *PgClient, io_rt: *io_mod.IoRuntime, idx: u32, now_ms: u64) void {
         const slot = &self.slots[idx];
-        var scratch: [512]u8 = undefined;
+        slot.recv_len = 0;
         while (true) {
-            const raw = std.posix.system.read(slot.fd, &scratch, scratch.len);
-            if (raw == 0) {
-                return self.failSlot(io_rt, idx, now_ms, "server closed idle connection");
-            }
-            if (raw < 0) {
-                switch (std.posix.errno(raw)) {
-                    .AGAIN => return,
-                    .INTR => continue,
-                    else => return self.failSlot(io_rt, idx, now_ms, "socket read failed"),
-                }
+            switch (self.fillRecv(idx)) {
+                .data => slot.recv_len = 0, // discard
+                .would_block => return,
+                .closed => return self.failSlot(io_rt, idx, now_ms, "server closed idle connection"),
+                .failed => return self.failSlot(io_rt, idx, now_ms, "socket read failed"),
             }
         }
     }
@@ -543,7 +907,6 @@ pub const PgClient = struct {
         if (stash_bytes.len < entry.stash.len) @memset(entry.stash[stash_bytes.len..], 0);
 
         slot.send_off = 0;
-        slot.send_len = off;
         slot.recv_len = 0;
         slot.op_rows = 0;
         slot.state = .busy;
@@ -551,7 +914,15 @@ pub const PgClient = struct {
         // dies right here, failSlot must NOT deliver ConnectionLost to a
         // continuation while the issuing handler is still running.
         slot.op_park = NO_PARK;
-        switch (self.flushSend(io_rt, idx, now_ms)) {
+        if (slot.tls != null) {
+            if (!self.stageTls(io_rt, idx, now_ms, slot.send_buf[0..off])) {
+                entry.active = false;
+                return error.NotConnected;
+            }
+        } else {
+            slot.send_len = off;
+        }
+        switch (self.flushOut(io_rt, idx, now_ms)) {
             .drained, .blocked => {},
             .failed => {
                 entry.active = false;
@@ -609,18 +980,12 @@ pub const PgClient = struct {
                 // v1 recycles the connection rather than resyncing.
                 return self.failSlot(io_rt, idx, now_ms, "result exceeded recv buffer");
             }
-            const raw = std.posix.system.read(slot.fd, slot.recv_buf[slot.recv_len..].ptr, slot.recv_buf.len - slot.recv_len);
-            if (raw == 0) {
-                return self.failSlot(io_rt, idx, now_ms, "server closed connection mid-query");
+            switch (self.fillRecv(idx)) {
+                .would_block => return,
+                .closed => return self.failSlot(io_rt, idx, now_ms, "server closed connection mid-query"),
+                .failed => return self.failSlot(io_rt, idx, now_ms, "socket read failed"),
+                .data => {},
             }
-            if (raw < 0) {
-                switch (std.posix.errno(raw)) {
-                    .AGAIN => return,
-                    .INTR => continue,
-                    else => return self.failSlot(io_rt, idx, now_ms, "socket read failed"),
-                }
-            }
-            slot.recv_len += @intCast(raw);
             if (!self.scanBusyFrames(io_rt, idx, now_ms)) return;
         }
     }
@@ -715,6 +1080,13 @@ pub const PgClient = struct {
         }
         slot.op_park = NO_PARK;
         slot.op_rows = 0;
+        if (slot.tls) |*sess| {
+            // Memory-BIO session: SSL_free only, no shutdown alert to
+            // pump (see createTcpClientSession). The provider's SSL_CTX
+            // is server-owned and survives.
+            sess.deinit();
+            slot.tls = null;
+        }
         if (slot.fd >= 0) {
             io_rt.unregisterExternalFd(slot.fd) catch {};
             clock.closeFd(slot.fd);
@@ -796,6 +1168,16 @@ pub const ParsedUrl = struct {
     /// Raw sslmode query-parameter value; null when absent.
     sslmode: ?[]const u8 = null,
 };
+
+/// Map a URL sslmode value onto the supported policies. libpq's
+/// opportunistic modes (allow/prefer) and verify-ca (chain without
+/// hostname) are refused — unknown values return null (fail closed).
+pub fn parseSslMode(s: []const u8) ?SslMode {
+    if (std.mem.eql(u8, s, "disable")) return .disable;
+    if (std.mem.eql(u8, s, "require")) return .require;
+    if (std.mem.eql(u8, s, "verify-full")) return .verify_full;
+    return null;
+}
 
 /// Parse a postgres:// (or postgresql://) URL. All slices borrow from
 /// `url`. Bare IPv6 literals are not supported (use a hostname or
@@ -887,6 +1269,43 @@ test "parseUrl: bad inputs fail closed" {
     // Bad port.
     try testing.expectError(error.InvalidUrl, parseUrl("postgres://u@h:notaport/db"));
     try testing.expectError(error.InvalidUrl, parseUrl("postgres://u@h:99999/db"));
+}
+
+test "parseSslMode: supported modes only, unknown values fail closed" {
+    try testing.expectEqual(@as(?SslMode, .disable), parseSslMode("disable"));
+    try testing.expectEqual(@as(?SslMode, .require), parseSslMode("require"));
+    try testing.expectEqual(@as(?SslMode, .verify_full), parseSslMode("verify-full"));
+    // libpq modes without honest semantics here are refused.
+    try testing.expectEqual(@as(?SslMode, null), parseSslMode("prefer"));
+    try testing.expectEqual(@as(?SslMode, null), parseSslMode("allow"));
+    try testing.expectEqual(@as(?SslMode, null), parseSslMode("verify-ca"));
+    try testing.expectEqual(@as(?SslMode, null), parseSslMode(""));
+    try testing.expectEqual(@as(?SslMode, null), parseSslMode("VERIFY-FULL"));
+}
+
+test "sslmode policy: SSLRequest send matrix and 'N'-reply handling" {
+    // disable never sends the SSLRequest; the TLS modes always do.
+    try testing.expect(!PgClient.wantsSslRequest(.disable));
+    try testing.expect(PgClient.wantsSslRequest(.require));
+    try testing.expect(PgClient.wantsSslRequest(.verify_full));
+
+    // Reply classification: 'S' proceeds, 'N' is the refusal (fatal in
+    // every mode that sent the request), anything else is a violation.
+    try testing.expectEqual(PgClient.SslReply.start_tls, PgClient.classifySslReply('S'));
+    try testing.expectEqual(PgClient.SslReply.refused, PgClient.classifySslReply('N'));
+    try testing.expectEqual(PgClient.SslReply.protocol_error, PgClient.classifySslReply('E'));
+    try testing.expectEqual(PgClient.SslReply.protocol_error, PgClient.classifySslReply(0));
+
+    // Options default is the fail-safe mode.
+    const defaults = Options{ .host = "h", .user = "u" };
+    try testing.expectEqual(SslMode.verify_full, defaults.sslmode);
+}
+
+test "cleartext password gate: TLS channel always passes, plaintext needs the opt-in" {
+    try testing.expect(PgClient.cleartextPasswordAllowed(true, false));
+    try testing.expect(PgClient.cleartextPasswordAllowed(true, true));
+    try testing.expect(PgClient.cleartextPasswordAllowed(false, true));
+    try testing.expect(!PgClient.cleartextPasswordAllowed(false, false));
 }
 
 test "backoff schedule: 1s doubling to a 30s cap, reset on ready" {
@@ -991,11 +1410,10 @@ test "ingest: server ErrorResponse fails the slot" {
 // PostgreSQL server, with the REAL IoRuntime backend doing the dispatch.
 // ---------------------------------------------------------------------------
 
-test "integration: reactor-driven connection bring-up (PG_TEST_DSN)" {
-    const dsn_z = std.c.getenv("PG_TEST_DSN") orelse return error.SkipZigTest;
-    const dsn = try parseUrl(std.mem.sliceTo(dsn_z, 0));
-
-    const config_mod = @import("../../config.zig");
+/// Shared scaffolding for the live integration tests: a small runtime
+/// config and the poll-dispatch-tick loop (mirror of the dispatch-loop
+/// external branch) that runs until `pred` holds or the timeout lapses.
+fn testRuntimeConfig() config_mod.ServerConfig {
     var cfg = config_mod.ServerConfig.default();
     cfg.max_connections = 16;
     cfg.buffer_pool = .{
@@ -1004,6 +1422,32 @@ test "integration: reactor-driven connection bring-up (PG_TEST_DSN)" {
         .body_buffer_size = 4096,
         .body_buffer_count = 2,
     };
+    return cfg;
+}
+
+fn pumpPg(client: *PgClient, rt: *io_mod.IoRuntime, timeout_ms: u64, comptime pred: fn (*const PgClient) bool) !bool {
+    const deadline = rt.nowMs() + timeout_ms;
+    while (rt.nowMs() < deadline) {
+        if (pred(client)) return true;
+        client.tick(rt, rt.nowMs());
+        const events = try rt.pollWithTimeout(10);
+        for (events) |ev| {
+            if (!io_mod.isExternalId(ev.conn_id)) continue;
+            client.onEvent(rt, @intCast(ev.conn_id & 0xFFFF_FFFF), ev.kind);
+        }
+    }
+    return pred(client);
+}
+
+fn predAnyReady(c: *const PgClient) bool {
+    return c.anyReady();
+}
+
+test "integration: reactor-driven connection bring-up (PG_TEST_DSN)" {
+    const dsn_z = std.c.getenv("PG_TEST_DSN") orelse return error.SkipZigTest;
+    const dsn = try parseUrl(std.mem.sliceTo(dsn_z, 0));
+
+    const cfg = testRuntimeConfig();
 
     var rt = try io_mod.IoRuntime.init(testing.allocator, cfg);
     defer rt.deinit();
@@ -1020,6 +1464,9 @@ test "integration: reactor-driven connection bring-up (PG_TEST_DSN)" {
         .database = dsn.database,
         .password = dsn.password,
         .pool_size = 2,
+        // This is the plaintext-server setup; TLS rows live in the
+        // PG_TLS_TEST_DSN matrix below.
+        .sslmode = .disable,
     });
     defer client.deinit(&rt);
 
@@ -1175,4 +1622,296 @@ test "park table: cancelForConn generation check, detach, and hookless delivery"
     client.deliverOutcome(1, error.Timeout);
     try testing.expect(!client.parked[1].active);
     try testing.expectEqual(NO_PARK, client.conn_parks[2]);
+}
+
+// ---------------------------------------------------------------------------
+// Live TLS integration matrix (gated on PG_TLS_TEST_DSN + PG_TLS_TEST_CA,
+// and on a TLS-enabled build). Server expectations:
+//   - PostgreSQL 16 with ssl=on; server certificate signed by the CA at
+//     PG_TLS_TEST_CA with SAN = IP:127.0.0.1 ONLY (no DNS names);
+//   - PG_TLS_TEST_DSN host must be 127.0.0.1 (matches the IP SAN); the
+//     hostname-mismatch row connects via "localhost" to the same port.
+// The plaintext-refusal row reuses the ssl=off server from PG_TEST_DSN.
+// ---------------------------------------------------------------------------
+
+const TlsTestEnv = struct {
+    dsn: ParsedUrl,
+    ca: [:0]const u8,
+};
+
+fn tlsTestEnv() ?TlsTestEnv {
+    const dsn_z = std.c.getenv("PG_TLS_TEST_DSN") orelse return null;
+    const ca_z = std.c.getenv("PG_TLS_TEST_CA") orelse return null;
+    const dsn = parseUrl(std.mem.sliceTo(dsn_z, 0)) catch return null;
+    return .{ .dsn = dsn, .ca = std.mem.sliceTo(ca_z, 0) };
+}
+
+fn predSlot0Chain(c: *const PgClient) bool {
+    return c.slots[0].tls_fail == .chain;
+}
+
+fn predSlot0Hostname(c: *const PgClient) bool {
+    return c.slots[0].tls_fail == .hostname;
+}
+
+fn predSlot0Refused(c: *const PgClient) bool {
+    return c.slots[0].tls_fail == .refused;
+}
+
+// Matrix row 1: verify-full against the matching private CA — slots
+// come up over TLS and a live query round-trips.
+test "integration: TLS verify-full with correct CA — ready and live query (PG_TLS_TEST_DSN)" {
+    if (!build_options.enable_tls) return error.SkipZigTest;
+    const env = tlsTestEnv() orelse return error.SkipZigTest;
+
+    var rt = try io_mod.IoRuntime.init(testing.allocator, testRuntimeConfig());
+    defer rt.deinit();
+    switch (rt.backend) {
+        .bsd_kqueue, .linux_epoll => {},
+        else => return error.SkipZigTest,
+    }
+
+    var provider = tls_mod.Provider.initTcpClient(testing.allocator, true, env.ca) catch
+        return error.SkipZigTest;
+    defer provider.deinit();
+
+    var client = try PgClient.init(testing.allocator, 16, .{
+        .host = env.dsn.host,
+        .port = env.dsn.port,
+        .user = env.dsn.user,
+        .database = env.dsn.database,
+        .password = env.dsn.password,
+        .pool_size = 1,
+        .sslmode = .verify_full,
+    });
+    defer client.deinit(&rt);
+    client.installTls(&provider);
+
+    try testing.expect(try pumpPg(&client, &rt, 10_000, predAnyReady));
+    try testing.expect(client.slots[0].tls != null);
+    try testing.expect(client.slots[0].tls.?.handshake_complete);
+
+    // Live query through the TLS transport.
+    const Hook = struct {
+        var ran: bool = false;
+        var status: u16 = 0;
+        var sum: i64 = 0;
+
+        fn onResume(_: *anyopaque, outcome: *const Outcome) void {
+            ran = true;
+            var buf: [256]u8 = undefined;
+            var rctx = handler_api.ResumeContext{
+                .result = outcome.result,
+                .server_error = outcome.server_error,
+                .response_buf = &buf,
+                .response_headers = &.{},
+                .arena = std.heap.FixedBufferAllocator.init(&.{}),
+                .stash_bytes = outcome.stash,
+                .repark_ctx = undefined,
+                .repark_fn = undefined,
+            };
+            status = outcome.continuation(&rctx).status;
+        }
+
+        fn cont(rctx: *handler_api.ResumeContext) response_mod.Response {
+            const res = rctx.result catch return .{ .status = 500, .headers = &.{}, .body = .none };
+            var rows = res.rows();
+            while (rows.next()) |row| {
+                sum += row.int4(0) catch -1_000_000;
+            }
+            return .{ .status = 200, .headers = &.{}, .body = .none };
+        }
+
+        fn done(_: *const PgClient) bool {
+            return ran;
+        }
+    };
+    var dummy: u8 = 0;
+    client.installResume(@ptrCast(&dummy), Hook.onResume);
+    const sentinel = try client.query(&rt, 3, 99, "select 20 + 22", &.{}, &.{}, Hook.cont);
+    try testing.expect(sentinel.isParked());
+    try testing.expect(try pumpPg(&client, &rt, 5_000, Hook.done));
+    try testing.expectEqual(@as(u16, 200), Hook.status);
+    try testing.expectEqual(@as(i64, 42), Hook.sum);
+    try testing.expect(client.anyReady());
+}
+
+// Matrix row 2: verify-full with the system trust store against the
+// self-signed test CA — must fail closed with the chain cause.
+test "integration: TLS verify-full with system CA fails closed on chain (PG_TLS_TEST_DSN)" {
+    if (!build_options.enable_tls) return error.SkipZigTest;
+    const env = tlsTestEnv() orelse return error.SkipZigTest;
+
+    const saved_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = saved_log_level;
+
+    var rt = try io_mod.IoRuntime.init(testing.allocator, testRuntimeConfig());
+    defer rt.deinit();
+    switch (rt.backend) {
+        .bsd_kqueue, .linux_epoll => {},
+        else => return error.SkipZigTest,
+    }
+
+    var provider = tls_mod.Provider.initTcpClient(testing.allocator, true, null) catch
+        return error.SkipZigTest;
+    defer provider.deinit();
+
+    var client = try PgClient.init(testing.allocator, 16, .{
+        .host = env.dsn.host,
+        .port = env.dsn.port,
+        .user = env.dsn.user,
+        .database = env.dsn.database,
+        .password = env.dsn.password,
+        .pool_size = 1,
+        .sslmode = .verify_full,
+    });
+    defer client.deinit(&rt);
+    client.installTls(&provider);
+
+    try testing.expect(try pumpPg(&client, &rt, 10_000, predSlot0Chain));
+    try testing.expect(!client.anyReady());
+}
+
+// Matrix row 3: verify-full with the correct CA but a host the
+// certificate doesn't cover (cert SAN is IP:127.0.0.1 only; we connect
+// via "localhost") — must fail closed with the hostname cause.
+test "integration: TLS verify-full hostname mismatch fails closed (PG_TLS_TEST_DSN)" {
+    if (!build_options.enable_tls) return error.SkipZigTest;
+    const env = tlsTestEnv() orelse return error.SkipZigTest;
+
+    const saved_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = saved_log_level;
+
+    var rt = try io_mod.IoRuntime.init(testing.allocator, testRuntimeConfig());
+    defer rt.deinit();
+    switch (rt.backend) {
+        .bsd_kqueue, .linux_epoll => {},
+        else => return error.SkipZigTest,
+    }
+
+    var provider = tls_mod.Provider.initTcpClient(testing.allocator, true, env.ca) catch
+        return error.SkipZigTest;
+    defer provider.deinit();
+
+    var client = try PgClient.init(testing.allocator, 16, .{
+        .host = "localhost", // resolves to the same server; not in the cert SAN
+        .port = env.dsn.port,
+        .user = env.dsn.user,
+        .database = env.dsn.database,
+        .password = env.dsn.password,
+        .pool_size = 1,
+        .sslmode = .verify_full,
+    });
+    defer client.deinit(&rt);
+    client.installTls(&provider);
+
+    try testing.expect(try pumpPg(&client, &rt, 10_000, predSlot0Hostname));
+    try testing.expect(!client.anyReady());
+}
+
+// Matrix row 4: sslmode=require (no CA, no verification) against the
+// self-signed server — connects and queries. Discouraged mode, but it
+// must work.
+test "integration: TLS require without CA — ready and live query (PG_TLS_TEST_DSN)" {
+    if (!build_options.enable_tls) return error.SkipZigTest;
+    const env = tlsTestEnv() orelse return error.SkipZigTest;
+
+    var rt = try io_mod.IoRuntime.init(testing.allocator, testRuntimeConfig());
+    defer rt.deinit();
+    switch (rt.backend) {
+        .bsd_kqueue, .linux_epoll => {},
+        else => return error.SkipZigTest,
+    }
+
+    var provider = tls_mod.Provider.initTcpClient(testing.allocator, false, null) catch
+        return error.SkipZigTest;
+    defer provider.deinit();
+
+    var client = try PgClient.init(testing.allocator, 16, .{
+        .host = env.dsn.host,
+        .port = env.dsn.port,
+        .user = env.dsn.user,
+        .database = env.dsn.database,
+        .password = env.dsn.password,
+        .pool_size = 1,
+        .sslmode = .require,
+    });
+    defer client.deinit(&rt);
+    client.installTls(&provider);
+
+    try testing.expect(try pumpPg(&client, &rt, 10_000, predAnyReady));
+    try testing.expect(client.slots[0].tls != null);
+
+    const Hook = struct {
+        var ran: bool = false;
+        var status: u16 = 0;
+
+        fn onResume(_: *anyopaque, outcome: *const Outcome) void {
+            ran = true;
+            var buf: [256]u8 = undefined;
+            var rctx = handler_api.ResumeContext{
+                .result = outcome.result,
+                .server_error = outcome.server_error,
+                .response_buf = &buf,
+                .response_headers = &.{},
+                .arena = std.heap.FixedBufferAllocator.init(&.{}),
+                .stash_bytes = outcome.stash,
+                .repark_ctx = undefined,
+                .repark_fn = undefined,
+            };
+            status = outcome.continuation(&rctx).status;
+        }
+
+        fn cont(rctx: *handler_api.ResumeContext) response_mod.Response {
+            _ = rctx.result catch return .{ .status = 500, .headers = &.{}, .body = .none };
+            return .{ .status = 200, .headers = &.{}, .body = .none };
+        }
+
+        fn done(_: *const PgClient) bool {
+            return ran;
+        }
+    };
+    var dummy: u8 = 0;
+    client.installResume(@ptrCast(&dummy), Hook.onResume);
+    _ = try client.query(&rt, 4, 100, "select 1", &.{}, &.{}, Hook.cont);
+    try testing.expect(try pumpPg(&client, &rt, 5_000, Hook.done));
+    try testing.expectEqual(@as(u16, 200), Hook.status);
+    try testing.expect(client.anyReady());
+}
+
+// Matrix row 5: sslmode=require against a plaintext-only server — the
+// 'N' SSLRequest reply must fail the slot closed (never silently
+// downgrade to plaintext).
+test "integration: sslmode=require against plaintext server fails closed (PG_TEST_DSN)" {
+    const dsn_z = std.c.getenv("PG_TEST_DSN") orelse return error.SkipZigTest;
+    const dsn = try parseUrl(std.mem.sliceTo(dsn_z, 0));
+
+    const saved_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = saved_log_level;
+
+    var rt = try io_mod.IoRuntime.init(testing.allocator, testRuntimeConfig());
+    defer rt.deinit();
+    switch (rt.backend) {
+        .bsd_kqueue, .linux_epoll => {},
+        else => return error.SkipZigTest,
+    }
+
+    // No TLS provider needed: the refusal arrives before any TLS state
+    // is built, and it must already be fatal.
+    var client = try PgClient.init(testing.allocator, 16, .{
+        .host = dsn.host,
+        .port = dsn.port,
+        .user = dsn.user,
+        .database = dsn.database,
+        .password = dsn.password,
+        .pool_size = 1,
+        .sslmode = .require,
+    });
+    defer client.deinit(&rt);
+
+    try testing.expect(try pumpPg(&client, &rt, 10_000, predSlot0Refused));
+    try testing.expect(!client.anyReady());
 }

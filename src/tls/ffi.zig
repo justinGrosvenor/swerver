@@ -142,7 +142,44 @@ const SSL_CTRL_SET_TLSEXT_HOSTNAME: c_int = 55;
 
 pub fn setSniHostname(ssl: *SSL, hostname: [:0]const u8) bool {
     if (!tls_enabled) return false;
-    return SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, @constCast(@ptrCast(hostname.ptr))) != 0;
+    return SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, @ptrCast(@constCast(hostname.ptr))) != 0;
+}
+
+// Client-side certificate verification (PG client, design 9.0 phase 3).
+// X509_VERIFY_PARAM_set1_ip_asc is needed because SSL_set1_host matches
+// dNSName SANs (and the CN fallback) only — an IP-literal peer must be
+// checked against iPAddress SANs instead, same split libpq makes.
+pub const X509_VERIFY_PARAM = opaque {};
+
+extern fn SSL_get0_param(ssl: *SSL) ?*X509_VERIFY_PARAM;
+extern fn X509_VERIFY_PARAM_set1_ip_asc(param: *X509_VERIFY_PARAM, ipasc: [*:0]const u8) c_int;
+extern fn SSL_get_verify_result(ssl: *const SSL) c_long;
+extern fn X509_verify_cert_error_string(n: c_long) [*:0]const u8;
+
+pub const X509_V_OK: c_long = 0;
+pub const X509_V_ERR_HOSTNAME_MISMATCH: c_long = 62;
+pub const X509_V_ERR_IP_ADDRESS_MISMATCH: c_long = 64;
+
+/// Pin certificate verification to an IP literal (dotted IPv4 or hex
+/// IPv6 string); matched against the peer cert's iPAddress SANs.
+pub fn setVerifyIp(ssl: *SSL, ip: [:0]const u8) bool {
+    if (!tls_enabled) return false;
+    const param = SSL_get0_param(ssl) orelse return false;
+    return X509_VERIFY_PARAM_set1_ip_asc(param, ip.ptr) == 1;
+}
+
+/// The chain-verification outcome of the last handshake (X509_V_OK when
+/// verification passed or was never attempted). Distinguishes hostname
+/// mismatch from chain failures after a failed client handshake.
+pub fn getVerifyResult(ssl: *const SSL) c_long {
+    if (!tls_enabled) return -1;
+    return SSL_get_verify_result(ssl);
+}
+
+/// Human-readable string for an X509_V_ERR_* code (static storage).
+pub fn verifyErrorString(code: c_long) []const u8 {
+    if (!tls_enabled) return "tls disabled";
+    return std.mem.sliceTo(X509_verify_cert_error_string(code), 0);
 }
 
 pub fn loadDefaultVerifyPaths(ctx: *SSL_CTX) !void {
