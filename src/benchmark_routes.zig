@@ -13,6 +13,7 @@ const middleware = @import("middleware/middleware.zig");
 const metrics_mw = @import("middleware/metrics_mw.zig");
 const clock = @import("runtime/clock.zig");
 const json_write = @import("runtime/json_write.zig");
+const pg_api = @import("db/pg/handler_api.zig");
 
 // ============================================================
 // Route registration
@@ -35,6 +36,12 @@ pub fn registerRoutes(app_router: *router.Router) !void {
 
     // TechEmpower Framework Benchmark endpoints
     try app_router.get("/plaintext", handleTfbPlaintext);
+
+    // TFB database rounds (design 9.0 phase 5). Require a "postgres"
+    // config block and the canonical TFB schema (World, Fortune
+    // tables); without a configured client they answer 503.
+    try app_router.get("/db", handleTfbDb);
+    try app_router.get("/fortunes", handleTfbFortunes);
 
     // Throughput and pipelining benchmark endpoints. /pipeline returns
     // a fixed "ok". /baseline11 and /baseline2 sum the ?a= and ?b=
@@ -262,6 +269,166 @@ fn handleTfbPlaintext(_: *router.HandlerContext) response_mod.Response {
         },
         .body = .{ .bytes = "Hello, World!" },
     };
+}
+
+// ── TFB database rounds (park-and-resume over the native PG client) ──
+
+/// Per-worker PRNG for TFB's random row ids. Lazily seeded from the
+/// monotonic clock; workers are single-threaded so no synchronization.
+var tfb_prng: ?std.Random.DefaultPrng = null;
+
+fn tfbRandomId() u32 {
+    if (tfb_prng == null) {
+        const seed: u64 = if (clock.realtimeNanos()) |ns| @truncate(@as(u128, @bitCast(ns))) else 0x9E37_79B9_7F4A_7C15;
+        tfb_prng = std.Random.DefaultPrng.init(seed);
+    }
+    return 1 + tfb_prng.?.random().uintLessThan(u32, 10_000);
+}
+
+fn tfbDbUnavailable() response_mod.Response {
+    return .{
+        .status = 503,
+        .headers = &[_]response_mod.Header{},
+        .body = .{ .bytes = "database not configured" },
+    };
+}
+
+fn tfbDbFailed() response_mod.Response {
+    return .{
+        .status = 500,
+        .headers = &[_]response_mod.Header{},
+        .body = .{ .bytes = "database query failed" },
+    };
+}
+
+const TfbStash = struct {};
+
+/// GET /db — TFB single-query test: one random World row as JSON,
+/// e.g. {"id":4174,"randomNumber":331}.
+fn handleTfbDb(ctx: *router.HandlerContext) response_mod.Response {
+    var id_buf: [8]u8 = undefined;
+    const arg = std.fmt.bufPrint(&id_buf, "{d}", .{tfbRandomId()}) catch unreachable;
+    return ctx.pg.query(
+        "select id, randomnumber from world where id = $1",
+        &.{arg},
+        TfbStash,
+        .{},
+        onTfbDb,
+    ) catch tfbDbUnavailable();
+}
+
+fn onTfbDb(rctx: *pg_api.ResumeContext) response_mod.Response {
+    const res = rctx.result catch return tfbDbFailed();
+    var rows = res.rows();
+    const row = rows.next() orelse return tfbDbFailed();
+    const id = row.int4(0) catch return tfbDbFailed();
+    const rn = row.int4(1) catch return tfbDbFailed();
+    const body = std.fmt.bufPrint(
+        rctx.response_buf,
+        "{{\"id\":{d},\"randomNumber\":{d}}}",
+        .{ id, rn },
+    ) catch return tfbDbFailed();
+    return .{
+        .status = 200,
+        .headers = &[_]response_mod.Header{
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .body = .{ .bytes = body },
+    };
+}
+
+/// GET /fortunes — TFB fortunes test: all Fortune rows plus one added
+/// at request time, sorted by message, rendered as an escaped HTML
+/// table.
+fn handleTfbFortunes(ctx: *router.HandlerContext) response_mod.Response {
+    return ctx.pg.query(
+        "select id, message from fortune",
+        &.{},
+        TfbStash,
+        .{},
+        onTfbFortunes,
+    ) catch tfbDbUnavailable();
+}
+
+const MAX_FORTUNES = 128;
+const EXTRA_FORTUNE = "Additional fortune added at request time.";
+
+const Fortune = struct {
+    id: i32,
+    message: []const u8, // borrows the result frames — continuation-scoped
+
+    fn lessThan(_: void, a: Fortune, b: Fortune) bool {
+        return std.mem.order(u8, a.message, b.message) == .lt;
+    }
+};
+
+fn onTfbFortunes(rctx: *pg_api.ResumeContext) response_mod.Response {
+    const res = rctx.result catch return tfbDbFailed();
+
+    var fortunes: [MAX_FORTUNES]Fortune = undefined;
+    var count: usize = 0;
+    fortunes[count] = .{ .id = 0, .message = EXTRA_FORTUNE };
+    count += 1;
+    var rows = res.rows();
+    while (rows.next()) |row| {
+        if (count == MAX_FORTUNES) return tfbDbFailed();
+        fortunes[count] = .{
+            .id = row.int4(0) catch return tfbDbFailed(),
+            .message = row.text(1) catch return tfbDbFailed(),
+        };
+        count += 1;
+    }
+    std.mem.sort(Fortune, fortunes[0..count], {}, Fortune.lessThan);
+
+    var w: usize = 0;
+    const buf = rctx.response_buf;
+    w = appendBytes(buf, w, "<!DOCTYPE html><html><head><title>Fortunes</title></head><body><table><tr><th>id</th><th>message</th></tr>") orelse return tfbDbFailed();
+    for (fortunes[0..count]) |f| {
+        var num_buf: [12]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&num_buf, "{d}", .{f.id}) catch return tfbDbFailed();
+        w = appendBytes(buf, w, "<tr><td>") orelse return tfbDbFailed();
+        w = appendBytes(buf, w, id_str) orelse return tfbDbFailed();
+        w = appendBytes(buf, w, "</td><td>") orelse return tfbDbFailed();
+        w = appendHtmlEscaped(buf, w, f.message) orelse return tfbDbFailed();
+        w = appendBytes(buf, w, "</td></tr>") orelse return tfbDbFailed();
+    }
+    w = appendBytes(buf, w, "</table></body></html>") orelse return tfbDbFailed();
+
+    return .{
+        .status = 200,
+        .headers = &[_]response_mod.Header{
+            .{ .name = "Content-Type", .value = "text/html; charset=utf-8" },
+        },
+        .body = .{ .bytes = buf[0..w] },
+    };
+}
+
+fn appendBytes(buf: []u8, w: usize, bytes: []const u8) ?usize {
+    if (buf.len - w < bytes.len) return null;
+    @memcpy(buf[w .. w + bytes.len], bytes);
+    return w + bytes.len;
+}
+
+/// Minimal OWASP HTML escaping (TFB fortunes requirement): & < > " '
+fn appendHtmlEscaped(buf: []u8, start: usize, text: []const u8) ?usize {
+    var w = start;
+    for (text) |c| {
+        const rep: []const u8 = switch (c) {
+            '&' => "&amp;",
+            '<' => "&lt;",
+            '>' => "&gt;",
+            '"' => "&quot;",
+            '\'' => "&#39;",
+            else => {
+                if (w == buf.len) return null;
+                buf[w] = c;
+                w += 1;
+                continue;
+            },
+        };
+        w = appendBytes(buf, w, rep) orelse return null;
+    }
+    return w;
 }
 
 /// GET|POST /baseline2?a=1&b=1 — h2/h3 throughput endpoint. Delegates to
