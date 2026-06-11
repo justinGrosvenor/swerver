@@ -348,7 +348,20 @@ pub const Op = enum(u4) {
     /// `bytes_written = 0` so the server's dispatcher re-enters
     /// handleWrite and retries the writev.
     poll_writable = 5,
+    /// POLL_ADD readiness wake on an external (non-Connection-pool)
+    /// fd — PostgreSQL client sockets (design 9.0). The conn_id field
+    /// carries the external SLOT number, a separate id space from pool
+    /// conn ids, and the gen field indexes `external_gens` (NOT
+    /// `generations`). External fds are poll-driven readiness only —
+    /// they never touch the recv/send/buffer-group machinery (design
+    /// 9.0 open question 4, decided poll-driven for v1).
+    external_poll = 6,
 };
+
+/// Hard cap on concurrently registered external fds. PgClient needs at
+/// most 4 per worker; 16 leaves room for the proxy-streaming consumer
+/// (design 5.0) without growing the table.
+pub const MAX_EXTERNAL_FDS = 16;
 
 pub fn packUserData(op: Op, gen: u28, conn_id: u32) u64 {
     return (@as(u64, @intFromEnum(op)) << 60) |
@@ -404,6 +417,12 @@ pub const IoUringNativeEvent = struct {
     // coalesced). The server splits `data` into this many bytes per
     // packet before feeding the QUIC stack.
     datagram_gso_size: u16 = 0,
+    // True when `conn_id` is an external-fd SLOT number (op
+    // .external_poll), not a pool conn id. The two id spaces overlap
+    // (both start at 0), so this flag is what keeps a PG-socket wake
+    // from being routed to pool conn 0 — io.zig's translate layer
+    // applies the EXTERNAL_ID_BIT tag (exactly once) based on it.
+    external: bool = false,
 
     pub const Kind = enum { accept, read, write, err, datagram };
 };
@@ -434,6 +453,13 @@ const StubBackend = struct {
     pub fn armWritable(_: *StubBackend, _: u32, _: i32) !void {
         return error.Unsupported;
     }
+    pub fn registerExternalFd(_: *StubBackend, _: u32, _: i32) !void {
+        return error.Unsupported;
+    }
+    pub fn armExternalWritable(_: *StubBackend, _: u32, _: i32) !void {
+        return error.Unsupported;
+    }
+    pub fn unregisterExternalFd(_: *StubBackend, _: i32) void {}
     pub fn rearmRecv(_: *StubBackend, _: u32, _: i32) void {}
     pub fn bumpGeneration(_: *StubBackend, _: u32) void {}
     pub fn releaseRecvBuffer(_: *StubBackend, _: u16) void {}
@@ -491,12 +517,28 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
     /// from the server's generic per-event rearm path when the
     /// multishot is still producing CQEs.
     recv_armed: []bool,
+    /// External (non-Connection-pool) fds — PostgreSQL client sockets
+    /// (design 9.0) — keyed by external slot. Poll-driven readiness
+    /// ONLY: external fds never touch the recv/send/buffer-group
+    /// machinery above.
+    external_fds: [MAX_EXTERNAL_FDS]ExternalFd = [_]ExternalFd{.{}} ** MAX_EXTERNAL_FDS,
+    /// Per-external-slot generation counters — the analogue of
+    /// `generations`, but for the SEPARATE external slot id space.
+    /// Bumped on unregister so an in-flight CQE from the previous
+    /// registration (unregister/reconnect raced a poll completion)
+    /// gets dropped in poll() instead of waking the new incarnation.
+    external_gens: [MAX_EXTERNAL_FDS]u28 = [_]u28{0} ** MAX_EXTERNAL_FDS,
 
     // ─── Acceptor thread state ──────────────────────────────────────
     // Heap-allocated so the acceptor thread can hold a stable pointer
     // to it for its entire lifetime, regardless of how the parent
     // backend struct gets moved/copied during init().
     acceptor: ?*Acceptor = null,
+
+    const ExternalFd = struct {
+        fd: i32 = -1,
+        active: bool = false,
+    };
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -750,6 +792,61 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
         );
     }
 
+    /// Register an external fd (PG client socket) for POLLIN readiness
+    /// wakes. The POLL_ADD is one-shot, but the CQE handler in `poll()`
+    /// re-arms it after every read wake while the slot stays registered
+    /// — consumers drain to EAGAIN and rely on the next readability
+    /// producing another event, exactly like kqueue/epoll deliver.
+    pub fn registerExternalFd(self: *IoUringNativeBackend, slot: u32, fd: i32) !void {
+        if (slot >= MAX_EXTERNAL_FDS) return error.ConnIdOutOfRange;
+        self.external_fds[slot] = .{ .fd = fd, .active = true };
+        try self.armExternalPoll(slot, fd, linux.POLL.IN);
+    }
+
+    /// One-shot POLLOUT wake for an external fd (connect-in-progress or
+    /// a partial write that hit EAGAIN). A second concurrent POLL_ADD
+    /// with the same user_data as the POLLIN poll; the CQE's returned
+    /// poll mask distinguishes them. Never re-armed by the backend —
+    /// consumers re-arm on demand.
+    pub fn armExternalWritable(self: *IoUringNativeBackend, slot: u32, fd: i32) !void {
+        if (slot >= MAX_EXTERNAL_FDS) return error.ConnIdOutOfRange;
+        try self.armExternalPoll(slot, fd, linux.POLL.OUT);
+    }
+
+    fn armExternalPoll(self: *IoUringNativeBackend, slot: u32, fd: i32, poll_mask: u32) !void {
+        _ = try self.ring.poll_add(
+            packUserData(.external_poll, self.external_gens[slot], slot),
+            @intCast(fd),
+            poll_mask,
+        );
+    }
+
+    /// Remove an external fd: deactivate the slot, cancel in-flight
+    /// polls, and bump the slot's generation so any CQE still in the
+    /// completion queue (or a re-arm already queued in the SQ ring) is
+    /// dropped in `poll()` instead of surfacing after unregistration.
+    ///
+    /// The cancels matter beyond hygiene: a pending POLL_ADD holds a
+    /// reference to the socket's file, so without POLL_REMOVE a closed
+    /// PG socket could linger inside the ring indefinitely.
+    pub fn unregisterExternalFd(self: *IoUringNativeBackend, fd: i32) void {
+        for (&self.external_fds, 0..) |*ext, slot_wide| {
+            if (!ext.active or ext.fd != fd) continue;
+            const slot: u32 = @intCast(slot_wide);
+            const target = packUserData(.external_poll, self.external_gens[slot], slot);
+            // Both the POLLIN poll and a possible one-shot POLLOUT poll
+            // carry the same user_data, and POLL_REMOVE cancels one
+            // match per submission — submit two. A miss completes with
+            // -ENOENT under a .close op user_data, which emits no
+            // event; SQ-full just skips the cancel (the gen bump still
+            // keeps any CQE from surfacing).
+            _ = self.ring.poll_remove(packUserData(.close, 0, 0), target) catch {};
+            _ = self.ring.poll_remove(packUserData(.close, 0, 0), target) catch {};
+            self.external_gens[slot] +%= 1;
+            ext.* = .{};
+        }
+    }
+
     /// Submit a send operation for a response. The completion arrives
     /// as a .write event once the kernel has transmitted the data.
     /// `data` must remain valid until the CQE is reaped.
@@ -876,6 +973,17 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
                             self.releaseRecvBuffer(bid);
                         } else |_| {}
                     }
+                    continue;
+                }
+            }
+            // External-fd polls have their own generation space: slots
+            // are NOT pool conn ids, so the check runs against
+            // `external_gens`, never `generations`. A mismatch means
+            // unregister (or unregister + reconnect) raced this CQE —
+            // drop it. Readiness polls never carry a provided buffer,
+            // so there's nothing to release.
+            if (op == .external_poll) {
+                if (conn_id >= MAX_EXTERNAL_FDS or self.external_gens[conn_id] != gen) {
                     continue;
                 }
             }
@@ -1069,6 +1177,56 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
                     // ENOBUFS / EINVAL).
                     if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
                         self.armMultishotRecvmsg() catch {};
+                    }
+                },
+                .external_poll => {
+                    // Readiness wake on an external fd (PG socket).
+                    // cqe.res is the returned poll mask or a negative
+                    // errno; no provided buffer is ever attached — the
+                    // consumer does its own read()/write() to EAGAIN.
+                    const ext = &self.external_fds[conn_id];
+                    if (cqe.res < 0) {
+                        self.events[count] = .{
+                            .kind = .err,
+                            .conn_id = conn_id,
+                            .external = true,
+                        };
+                        count += 1;
+                        continue;
+                    }
+                    const mask: u32 = @intCast(cqe.res);
+                    if (mask & (linux.POLL.ERR | linux.POLL.HUP) != 0) {
+                        self.events[count] = .{
+                            .kind = .err,
+                            .conn_id = conn_id,
+                            .external = true,
+                        };
+                        count += 1;
+                    } else if (mask & linux.POLL.IN != 0) {
+                        self.events[count] = .{
+                            .kind = .read,
+                            .conn_id = conn_id,
+                            .external = true,
+                        };
+                        count += 1;
+                        // The poll was one-shot: re-arm POLLIN while
+                        // the slot stays registered so readability
+                        // keeps producing events. The SQE rides the
+                        // next submit_and_wait, i.e. after the
+                        // consumer has drained to EAGAIN — no spurious
+                        // double-wake on the data it's about to read.
+                        if (ext.active) {
+                            self.armExternalPoll(conn_id, ext.fd, linux.POLL.IN) catch {};
+                        }
+                    } else if (mask & linux.POLL.OUT != 0) {
+                        // One-shot writable wake (armExternalWritable)
+                        // — consumed here, consumer re-arms on demand.
+                        self.events[count] = .{
+                            .kind = .write,
+                            .conn_id = conn_id,
+                            .external = true,
+                        };
+                        count += 1;
                     }
                 },
                 .close => {
