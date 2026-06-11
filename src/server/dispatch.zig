@@ -679,6 +679,17 @@ fn pgResume(ctx: *anyopaque, outcome: *const pg_client_mod.Outcome) void {
     if (postconn.x402 == .none and postconn.read_buffered_bytes > 0) {
         handleRead(server, outcome.conn_index) catch {};
     }
+    // Re-arm recv (same as the x402 drain): the native io_uring backend
+    // uses single-shot recv, and the normal read path's re-arm was
+    // skipped when the pipeline loop broke to park. Without this, a
+    // keep-alive connection goes silent after its first DB response —
+    // readiness backends don't need it (persistent registration) but it
+    // is harmless there.
+    const rconn = server.io.getConnection(outcome.conn_index) orelse return;
+    if (rconn.id != outcome.conn_id or rconn.state == .closed) return;
+    if (!rconn.close_after_write and rconn.x402 == .none) {
+        if (rconn.fd) |pfd| server.io.rearmRecv(outcome.conn_index, pfd);
+    }
 }
 
 pub fn handleRead(server: *Server, index: u32) !void {
