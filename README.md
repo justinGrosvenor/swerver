@@ -15,6 +15,8 @@ HTTP/3   ──┘      │
 
 > **Alpha release.** The public library API in `src/lib.zig` will change between alpha versions as it's iterated on. Breaking changes are announced in release notes. See [Known limitations](#known-limitations) for what's in and out of scope for the current release.
 
+📖 **Documentation: [justingrosvenor.github.io/swerver](https://justingrosvenor.github.io/swerver/)** — getting started, routing, handlers, middleware, configuration, the reverse proxy, and the PostgreSQL client.
+
 ## What
 
 Swerver is a bare-metal HTTP/1.1 + HTTP/2 + HTTP/3 server. It holds **#1 on JSON-over-TLS** on HttpArena's 64-core benchmark (1.95M req/s) and runs top-tier across baseline, pipelined, HTTP/2, and HTTP/3, carrying a full middleware chain, TLS termination, and routing.
@@ -66,9 +68,9 @@ zig build -Doptimize=ReleaseFast -Denable-tls=true -Denable-http2=true -Denable-
 Tagged alpha releases publish cross-compiled binaries for linux-{x86_64, aarch64} and macos-{x86_64, aarch64} on the [Releases page](https://github.com/justinGrosvenor/swerver/releases). Download, extract, and run:
 
 ```bash
-curl -LO https://github.com/justinGrosvenor/swerver/releases/download/v0.1.0-alpha.12/swerver-v0.1.0-alpha.12-linux-x86_64.tar.gz
-tar -xzf swerver-v0.1.0-alpha.12-linux-x86_64.tar.gz
-./swerver-v0.1.0-alpha.12-linux-x86_64 --config config.json
+curl -LO https://github.com/justinGrosvenor/swerver/releases/download/v0.1.0-alpha.23/swerver-v0.1.0-alpha.23-linux-x86_64.tar.gz
+tar -xzf swerver-v0.1.0-alpha.23-linux-x86_64.tar.gz
+./swerver-v0.1.0-alpha.23-linux-x86_64 --config config.json
 ```
 
 > **Release binaries are built without TLS, HTTP/2, or HTTP/3.** OpenSSL linking requires the host toolchain, so the cross-compiled binaries ship as HTTP/1.1-only. Build from source or use the Docker image for full protocol support.
@@ -89,7 +91,7 @@ In your downstream project's `build.zig.zon`:
     .version = "0.1.0",
     .dependencies = .{
         .swerver = .{
-            .url = "https://github.com/justinGrosvenor/swerver/archive/refs/tags/v0.1.0-alpha.12.tar.gz",
+            .url = "https://github.com/justinGrosvenor/swerver/archive/refs/tags/v0.1.0-alpha.23.tar.gz",
             // .hash will be filled in by `zig fetch --save`
         },
     },
