@@ -1,6 +1,6 @@
 site_name: swerver
 site_description: A bare-metal HTTP/1.1 + HTTP/2 + HTTP/3 server and framework written in pure Zig.
-site_url: https://justingrosvenor.github.io/swerver/
+site_url: https://docs.swerver.net/
 repo_url: https://github.com/justinGrosvenor/swerver
 repo_name: justinGrosvenor/swerver
 edit_uri: edit/main/docs/
