@@ -45,6 +45,19 @@ pub const EXTERNAL_ID_BIT: u64 = 1 << 62;
 /// (design 5.0) without growing the table.
 pub const MAX_EXTERNAL_FDS = 16;
 
+/// Max TCP listeners a single ring tracks (multi-listener model). Slots
+/// [0..MAX_LISTENERS) are reserved for listeners, slot MAX_LISTENERS for the
+/// UDP socket, and connections start at MAX_LISTENERS+1.
+///
+/// Listener user_data: slot 0 uses 0 (the legacy listener token); extra
+/// listeners use DISTINCT tokens LISTENER_ID_BASE+1, +2, … so each one-shot
+/// POLL_ADD re-arms independently via queuePollAdd's conn_id→fd lookup.
+/// io.zig translates 0 AND the LISTENER_ID_BASE range to `.accept`.
+/// These constants MUST stay equal to io.zig's LISTENER_ID_BASE /
+/// LISTENER_ID_COUNT (no import — would create a cycle, like EXTERNAL_ID_BIT).
+pub const MAX_LISTENERS = 8;
+const LISTENER_ID_BASE: u64 = std.math.maxInt(u64) - 16;
+
 /// True only for well-formed external tokens: bit 62 set, every other
 /// high bit clear, slot in the low 32 bits (mirror of io.zig's
 /// isExternalId — same UDP_SOCKET_ID trap applies).
@@ -104,8 +117,14 @@ pub const IoUringPollBackend = struct {
     /// Output events buffer
     events: []IoUringEvent,
     /// Track registered FDs for re-arming (POLL_ADD is one-shot)
-    /// Layout: [0]=listener, [1]=UDP, [2..]=connections (indexed by conn_id + 2)
+    /// Layout: [0..MAX_LISTENERS)=listeners, [MAX_LISTENERS]=UDP,
+    /// [MAX_LISTENERS+1..]=connections (indexed by conn_id + MAX_LISTENERS + 1).
+    /// All listener slots carry conn_id=0 so their CQEs translate to .accept.
     registered_fds: []RegisteredFd,
+    /// Number of listener slots in use ([0..listener_count) of registered_fds).
+    /// Re-arming a listener CQE (conn_id=0) re-arms every active listener slot
+    /// since a single CQE can't tell us which listener fired.
+    listener_count: usize = 0,
     /// External (non-Connection-pool) fds, keyed by external slot — the
     /// low 32 bits of the EXTERNAL_ID_BIT-tagged token. Tagged tokens
     /// can't index `registered_fds` (its slots are conn_id + 2), so
@@ -138,9 +157,10 @@ pub const IoUringPollBackend = struct {
         const events = try allocator.alloc(IoUringEvent, max_events);
         errdefer allocator.free(events);
 
-        // +3: slot 0 = listener, slot 1 = UDP, slots 2..max_events+2 = connections
-        // io.zig passes conn_id+1 as the conn_id, and we add +2 for the slot
-        const registered_fds = try allocator.alloc(RegisteredFd, max_events + 3);
+        // slots [0..MAX_LISTENERS) = listeners, slot MAX_LISTENERS = UDP,
+        // slots MAX_LISTENERS+1.. = connections. io.zig passes conn_id+1, and
+        // we add MAX_LISTENERS+1 for the slot, so reserve that many extra.
+        const registered_fds = try allocator.alloc(RegisteredFd, max_events + MAX_LISTENERS + 2);
         errdefer allocator.free(registered_fds);
         @memset(registered_fds, RegisteredFd{});
 
@@ -305,21 +325,28 @@ pub const IoUringPollBackend = struct {
 
     pub fn registerListener(self: *IoUringPollBackend, fd: std.posix.fd_t) !void {
         if (!is_linux) return error.Unsupported;
-        self.registered_fds[0] = .{ .fd = fd, .conn_id = 0, .poll_mask = POLLIN };
-        self.submitPollAdd(fd, 0, POLLIN);
+        // Append into the next free listener slot. Slot 0 keeps token 0 (legacy
+        // listener); extra listeners get distinct LISTENER_ID_BASE+slot tokens
+        // so each re-arms independently. Both translate to .accept in io.zig.
+        if (self.listener_count >= MAX_LISTENERS) return error.TooManyConnections;
+        const slot = self.listener_count;
+        const token: u64 = if (slot == 0) 0 else LISTENER_ID_BASE + slot;
+        self.registered_fds[slot] = .{ .fd = fd, .conn_id = token, .poll_mask = POLLIN };
+        self.listener_count += 1;
+        self.submitPollAdd(fd, token, POLLIN);
     }
 
     pub fn registerUdpSocket(self: *IoUringPollBackend, fd: std.posix.fd_t) !void {
         if (!is_linux) return error.Unsupported;
         const udp_id = std.math.maxInt(u64) - 1;
-        self.registered_fds[1] = .{ .fd = fd, .conn_id = udp_id, .poll_mask = POLLIN };
+        self.registered_fds[MAX_LISTENERS] = .{ .fd = fd, .conn_id = udp_id, .poll_mask = POLLIN };
         self.submitPollAdd(fd, udp_id, POLLIN);
     }
 
     pub fn registerConnection(self: *IoUringPollBackend, conn_id: u64, fd: std.posix.fd_t) !void {
         if (!is_linux) return error.Unsupported;
-        // Offset by 2 to skip listener (slot 0) and UDP (slot 1)
-        const slot = conn_id + 2;
+        // Offset past the listener slots (0..MAX_LISTENERS) and the UDP slot.
+        const slot = conn_id + MAX_LISTENERS + 1;
         if (slot >= self.registered_fds.len) return error.TooManyConnections;
         self.registered_fds[slot] = .{
             .fd = fd,

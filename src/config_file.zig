@@ -100,6 +100,20 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
         if (s.cache_static_files) |v| cfg.cache_static_files = v;
         if (s.static_root) |r| cfg.static_root = r;
         if (s.allowed_hosts) |hosts| cfg.allowed_hosts = hosts;
+        if (s.listeners) |json_listeners| {
+            const ls = try alloc.alloc(config_mod.ListenerConfig, json_listeners.len);
+            for (json_listeners, 0..) |jl, li| {
+                ls[li] = .{
+                    .address = jl.address orelse "0.0.0.0",
+                    .port = jl.port,
+                    .use_tls = jl.use_tls orelse false,
+                    .h2c_only = jl.h2c_only orelse false,
+                    .quic_enabled = jl.quic_enabled orelse false,
+                    .quic_port = jl.quic_port orelse 0,
+                };
+            }
+            cfg.listeners = ls;
+        }
     }
 
     // Timeouts
@@ -431,6 +445,7 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
             .cache = route_cache,
             .body_schema = route_body_schema,
             .mirror = r.mirror,
+            .retry = if (r.retry) |rt| .{ .max_retries = rt.max_retries orelse 1 } else .{},
         };
     }
 
@@ -593,6 +608,19 @@ const ServerJson = struct {
     cache_static_files: ?bool = null,
     static_root: ?[]const u8 = null,
     allowed_hosts: ?[]const []const u8 = null,
+    /// Explicit per-port listeners. When present, the process binds each on
+    /// every worker (SO_REUSEPORT) and resolves protocol config per-connection
+    /// via the accepted local port. Absent → single-listener legacy mode.
+    listeners: ?[]const ListenerJson = null,
+};
+
+const ListenerJson = struct {
+    address: ?[]const u8 = null,
+    port: u16,
+    use_tls: ?bool = null,
+    h2c_only: ?bool = null,
+    quic_enabled: ?bool = null,
+    quic_port: ?u16 = null,
 };
 
 const TimeoutsJson = struct {
@@ -774,6 +802,14 @@ const RouteJson = struct {
     body_schema: ?std.json.Value = null,
     mirror: ?[]const u8 = null,
     upstream_headers: ?[]const HeaderJson = null,
+    retry: ?RetryJson = null,
+};
+
+const RetryJson = struct {
+    /// Number of retry attempts on a connection failure or a retryable
+    /// upstream status (502/503/504 by default). Each retry connects fresh,
+    /// so under SO_REUSEPORT it can land on a different upstream worker.
+    max_retries: ?u8 = null,
 };
 
 const CacheJson = struct {

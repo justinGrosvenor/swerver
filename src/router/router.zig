@@ -254,7 +254,7 @@ pub const HandlerContext = struct {
         return null;
     }
 
-    /// Build a JSON response
+    /// Build a JSON response from an already-encoded body.
     pub fn json(_: *HandlerContext, status: u16, body: []const u8) response.Response {
         return .{
             .status = status,
@@ -262,6 +262,53 @@ pub const HandlerContext = struct {
                 .{ .name = "Content-Type", .value = "application/json" },
             },
             .body = .{ .bytes = body },
+        };
+    }
+
+    /// Build a JSON response by serializing any value with the standard
+    /// library's JSON encoder. This is the idiomatic way to return JSON from a
+    /// handler: define a struct (or slice/map) for the payload and hand it to
+    /// `jsonValue` instead of formatting the body by hand.
+    ///
+    /// The payload is encoded into the request arena when one is available, and
+    /// otherwise into a managed pool buffer (acquired via `respond`) so it
+    /// works on every protocol path — including HTTP/2 GETs, where the arena is
+    /// skipped. Returns 500 if no buffer is available or the value is too large
+    /// to encode.
+    pub fn jsonValue(self: *HandlerContext, status: u16, value: anytype) response.Response {
+        const json_err = response.Response{
+            .status = 500,
+            .headers = &[_]response.Header{
+                .{ .name = "Content-Type", .value = "application/json" },
+            },
+            .body = .{ .bytes = "{\"error\":\"json serialization failed\"}" },
+        };
+
+        // Fast path: encode into the request arena when it has backing storage.
+        if (self.arena.buffer.len > 0) {
+            var list = std.ArrayList(u8).empty;
+            var w = std.Io.Writer.Allocating.fromArrayList(self.arenaAllocator(), &list);
+            if (std.json.Stringify.value(value, .{}, &w.writer)) {
+                return self.json(status, w.toArrayList().items);
+            } else |_| {}
+            // Arena overflowed — fall through to a larger managed buffer.
+        }
+
+        // Fallback: a managed pool buffer (HTTP/2 GET has a 0-byte arena).
+        var rb = self.respond() catch return json_err;
+        var w = std.Io.Writer.fixed(rb.handle.bytes);
+        std.json.Stringify.value(value, .{}, &w) catch {
+            if (self.buffer_ops) |ops| ops.release(ops.ctx, rb.handle);
+            return json_err;
+        };
+        rb.used = true;
+        rb.len = w.buffered().len;
+        return .{
+            .status = status,
+            .headers = &[_]response.Header{
+                .{ .name = "Content-Type", .value = "application/json" },
+            },
+            .body = .{ .managed = .{ .handle = rb.handle, .len = rb.len } },
         };
     }
 
@@ -1367,4 +1414,32 @@ test "method mismatch" {
 
     const result = router.handle(req, &mw_ctx, &scratch);
     try std.testing.expectEqual(@as(u16, 405), result.resp.status);
+}
+
+test "jsonValue serializes a struct with std.json" {
+    var arena_buf: [4096]u8 = undefined;
+    var response_buf: [RESPONSE_BUF_SIZE]u8 = undefined;
+    var response_headers: [MAX_RESPONSE_HEADERS]response.Header = undefined;
+    var mw_ctx = middleware.Context{};
+    var ctx = HandlerContext{
+        .request = .{ .method = .GET, .path = "/", .headers = &.{}, .body = .{ .slice = "" } },
+        .middleware_ctx = &mw_ctx,
+        .params = undefined,
+        .response_buf = response_buf[0..],
+        .response_headers = response_headers[0..],
+        .arena = std.heap.FixedBufferAllocator.init(&arena_buf),
+    };
+
+    const Item = struct { id: i64, name: []const u8, active: bool, tags: []const []const u8 };
+    const resp = ctx.jsonValue(200, .{
+        .count = 1,
+        .items = &[_]Item{.{ .id = 7, .name = "Gear", .active = true, .tags = &[_][]const u8{ "a", "b" } }},
+    });
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("application/json", resp.headers[0].value);
+    try std.testing.expectEqualStrings(
+        "{\"count\":1,\"items\":[{\"id\":7,\"name\":\"Gear\",\"active\":true,\"tags\":[\"a\",\"b\"]}]}",
+        resp.body.bytes,
+    );
 }

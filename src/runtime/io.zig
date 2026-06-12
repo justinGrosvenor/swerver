@@ -539,6 +539,24 @@ pub const Capabilities = struct {
 /// Magic identifier for UDP socket events to distinguish from TCP listener (0) and connections
 pub const UDP_SOCKET_ID: u64 = std.math.maxInt(u64) - 1;
 
+/// Reserved user_data range for multi-listener accept polls in the
+/// io_uring_poll backend. The legacy single listener uses 0; additional
+/// listeners need DISTINCT tokens so each one's one-shot POLL_ADD can be
+/// re-armed independently (sharing 0 would lose the slot→fd mapping and
+/// accumulate duplicate polls). Tokens LISTENER_ID_BASE..LISTENER_ID_BASE+8
+/// all translate to `.accept`, exactly like 0. The base sits just below
+/// UDP_SOCKET_ID: its upper 32 bits are all-ones, so isExternalId (which
+/// requires upper bits == bit-62 only) rejects it, and it can't collide with
+/// connection ids (which are small: conn_id+1).
+pub const LISTENER_ID_BASE: u64 = std.math.maxInt(u64) - 16;
+pub const LISTENER_ID_COUNT: u64 = 8;
+
+/// True for the extra multi-listener accept tokens (NOT 0, which the translate
+/// paths already special-case as the first listener).
+pub fn isListenerId(id: u64) bool {
+    return id >= LISTENER_ID_BASE and id < LISTENER_ID_BASE + LISTENER_ID_COUNT;
+}
+
 /// Bit 62 tags conn ids that belong to external (non-Connection-pool)
 /// file descriptors — PostgreSQL client sockets today; proxy upstream
 /// streaming (design 5.0) will reuse the same plumbing. The low 32 bits
@@ -812,8 +830,8 @@ fn translateIoUringEvents(events: []const io_uring_poll_backend.IoUringEvent, ou
 
         // Check for error conditions
         if ((ev.events & 0x008) != 0 or (ev.events & 0x010) != 0) { // POLLERR | POLLHUP
-            const conn_id: u64 = if (raw_id == 0)
-                0
+            const conn_id: u64 = if (raw_id == 0 or isListenerId(raw_id))
+                0 // Listener error (extra listeners map to the same 0)
             else if (raw_id == UDP_SOCKET_ID)
                 UDP_SOCKET_ID
             else
@@ -830,7 +848,10 @@ fn translateIoUringEvents(events: []const io_uring_poll_backend.IoUringEvent, ou
 
         // Handle read events (POLLIN)
         if ((ev.events & 0x001) != 0) {
-            if (raw_id == 0) {
+            if (raw_id == 0 or isListenerId(raw_id)) {
+                // Any listener (legacy 0 or an extra multi-listener token)
+                // surfaces as a generic accept; the dispatcher drains every
+                // bound listener fd.
                 out[count] = .{
                     .kind = .accept,
                     .conn_id = 0,
@@ -855,8 +876,10 @@ fn translateIoUringEvents(events: []const io_uring_poll_backend.IoUringEvent, ou
             count += 1;
         }
 
-        // Handle write events (POLLOUT)
-        if ((ev.events & 0x004) != 0 and raw_id != 0) {
+        // Handle write events (POLLOUT). Listeners only arm POLLIN, but guard
+        // their tokens here too so a stray POLLOUT can't be misread as a
+        // connection write (raw_id - 1).
+        if ((ev.events & 0x004) != 0 and raw_id != 0 and !isListenerId(raw_id)) {
             if (count >= out.len) break;
             out[count] = .{
                 .kind = .write,

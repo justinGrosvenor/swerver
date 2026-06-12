@@ -612,6 +612,23 @@ pub fn getPeerAddress(fd: std.posix.fd_t) ?PeerAddress {
     return .{ .storage = .{ .ip6 = storage } };
 }
 
+/// Local port a socket is bound to (the port it was accept()ed on).
+/// Used to map an accepted connection to its listener's protocol config.
+/// Mirrors getPeerAddress but calls getsockname; uses the project's own
+/// SockAddrIn/SockAddrIn6 types so the BSD `len` field is handled correctly.
+pub fn getLocalPort(fd: std.posix.fd_t) ?u16 {
+    var storage: SockAddrIn6 = undefined;
+    var addr_len: std.posix.socklen_t = @sizeOf(SockAddrIn6);
+    const sockaddr_ptr: *std.posix.sockaddr = @ptrCast(&storage);
+    const rc = std.posix.system.getsockname(fd, sockaddr_ptr, &addr_len);
+    if (rc != 0) return null;
+    if (sockaddr_ptr.family == std.posix.AF.INET) {
+        const ip4_ptr: *SockAddrIn = @ptrCast(&storage);
+        return std.mem.bigToNative(u16, ip4_ptr.port);
+    }
+    return std.mem.bigToNative(u16, storage.port);
+}
+
 fn isSupportedPlatform() bool {
     return switch (builtin.os.tag) {
         .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly => true,
@@ -1040,6 +1057,40 @@ test "isPrivateAddress blocks expanded special ranges" {
     try std.testing.expect(!isPrivateAddress(mk.v4(8, 8, 8, 8)));
     try std.testing.expect(!isPrivateAddress(mk.v4(100, 63, 0, 1))); // just below CGNAT
     try std.testing.expect(!isPrivateAddress(mk.v4(1, 1, 1, 1)));
+}
+
+test "getLocalPort reports the bound listener port" {
+    if (!isSupportedPlatform()) return error.SkipZigTest;
+    // Bind an ephemeral port (port 0) — getLocalPort must read back the
+    // kernel-assigned port, proving it parses getsockname correctly.
+    const lfd = listen("127.0.0.1", 0, 16) catch return error.SkipZigTest;
+    defer clock.closeFd(lfd);
+    const bound = getLocalPort(lfd) orelse return error.SkipZigTest;
+    try std.testing.expect(bound != 0);
+
+    // Connect a client and verify the accepted fd reports the same local
+    // port — this is exactly the lookup setupAcceptedConnection performs.
+    const cfd = std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
+    if (cfd < 0) return error.SkipZigTest;
+    defer clock.closeFd(@intCast(cfd));
+    var caddr = buildSockaddr4(std.Io.net.Ip4Address.parse("127.0.0.1", bound) catch return error.SkipZigTest);
+    _ = std.posix.system.connect(@intCast(cfd), @ptrCast(&caddr), @sizeOf(SockAddrIn));
+
+    // The listener is non-blocking; spin briefly for the accept to land.
+    var accepted: std.posix.fd_t = -1;
+    var tries: usize = 0;
+    while (tries < 1000) : (tries += 1) {
+        var sa: SockAddrIn6 = undefined;
+        var slen: std.posix.socklen_t = @sizeOf(SockAddrIn6);
+        const rc = std.posix.system.accept(lfd, @ptrCast(&sa), &slen);
+        if (rc >= 0) {
+            accepted = @intCast(rc);
+            break;
+        }
+    }
+    if (accepted < 0) return error.SkipZigTest;
+    defer clock.closeFd(accepted);
+    try std.testing.expectEqual(bound, getLocalPort(accepted).?);
 }
 
 test "parseGroSegmentSize reads UDP_GRO cmsg" {

@@ -1,5 +1,17 @@
 const std = @import("std");
 
+/// One TCP listener with its own protocol config. A single process can bind
+/// many of these (multi-listener model): e.g. plaintext h1, h2c-only, TLS
+/// h1/h2, and QUIC/h3 on distinct ports, all served by the normal worker set.
+pub const ListenerConfig = struct {
+    address: []const u8 = "0.0.0.0",
+    port: u16,
+    use_tls: bool = false,
+    h2c_only: bool = false,
+    quic_enabled: bool = false,
+    quic_port: u16 = 0,
+};
+
 pub const ServerConfig = struct {
     address: []const u8,
     port: u16,
@@ -39,6 +51,26 @@ pub const ServerConfig = struct {
     /// per-request open/fstat/read syscalls. Per-worker, lazy-populated,
     /// bounded; Date stays fresh (re-encoded per response, never cached).
     cache_static_files: bool = false,
+    /// Explicit per-port listener configs. Empty means single-listener mode
+    /// (the legacy address/port/tls/quic fields are used via listenerForPort).
+    listeners: []const ListenerConfig = &.{},
+
+    /// Resolve the listener config for a given local port. Falls back to a
+    /// config synthesized from the legacy single-port fields when `listeners`
+    /// is empty or the port isn't found (keeps single-listener configs working).
+    pub fn listenerForPort(self: *const ServerConfig, port: u16) ListenerConfig {
+        for (self.listeners) |l| if (l.port == port) return l;
+        return .{
+            .address = self.address,
+            .port = self.port,
+            // Mirror the tcp_tls_provider build condition in server.zig:
+            // TLS is "on" for the legacy listener iff a cert path is set.
+            .use_tls = (self.tls.cert_path.len > 0),
+            .h2c_only = self.http2.h2c_only,
+            .quic_enabled = self.quic.enabled,
+            .quic_port = self.quic.port,
+        };
+    }
 
     pub fn default() ServerConfig {
         return .{
@@ -284,6 +316,44 @@ pub const OtelConfig = struct {
     /// `https://` collector_url so secrets aren't sent in the clear.
     headers: []const u8 = "",
 };
+
+test "listenerForPort returns matching explicit listener" {
+    const listeners = [_]ListenerConfig{
+        .{ .port = 18080, .h2c_only = false },
+        .{ .port = 18082, .h2c_only = true, .use_tls = false },
+    };
+    var cfg = ServerConfig.default();
+    cfg.listeners = &listeners;
+
+    const l0 = cfg.listenerForPort(18080);
+    try std.testing.expectEqual(@as(u16, 18080), l0.port);
+    try std.testing.expectEqual(false, l0.h2c_only);
+
+    const l1 = cfg.listenerForPort(18082);
+    try std.testing.expectEqual(@as(u16, 18082), l1.port);
+    try std.testing.expectEqual(true, l1.h2c_only);
+}
+
+test "listenerForPort falls back to legacy single-port fields" {
+    var cfg = ServerConfig.default();
+    cfg.address = "127.0.0.1";
+    cfg.port = 9000;
+    cfg.http2.h2c_only = true;
+    // No explicit listeners → synthesized fallback for any port lookup.
+    const l = cfg.listenerForPort(12345);
+    try std.testing.expectEqual(@as(u16, 9000), l.port);
+    try std.testing.expectEqualStrings("127.0.0.1", l.address);
+    try std.testing.expectEqual(true, l.h2c_only);
+    // No cert configured → fallback use_tls is false.
+    try std.testing.expectEqual(false, l.use_tls);
+}
+
+test "listenerForPort fallback reflects TLS cert presence" {
+    var cfg = ServerConfig.default();
+    cfg.tls.cert_path = "/tmp/cert.pem";
+    const l = cfg.listenerForPort(cfg.port);
+    try std.testing.expectEqual(true, l.use_tls);
+}
 
 pub const ConfigError = error{
     InvalidMaxConnections,
