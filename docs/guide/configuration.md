@@ -8,7 +8,7 @@ swerver is configured one of two ways, and they describe the same thing:
 The JSON parser fills in a `ServerConfig` (see `src/config.zig`) and then validates it, so both paths share the same field set, the same defaults, and the same validation rules. This page walks the main sections with a realistic file. For the complete field-by-field reference, see [Config schema](../reference/config-schema.md).
 
 !!! info "Schema version"
-    The config file schema is at `SCHEMA_VERSION = "1.0"`. The core sections — `server`, `timeouts`, `limits`, `buffer_pool`, `tls`, `http2`, `quic`, `upstreams`, `routes` — are stable across the `v0.1.0-alpha.N` series. Newer sub-schemas (`access_log`, `metrics`, `rate_limit`, `x402`) may move before 1.0; a config that sets only the core fields survives alpha version bumps. Unknown keys are ignored, so a config can carry settings a given build doesn't understand.
+    The config file schema is at `SCHEMA_VERSION = "1.0"`. The core sections (`server`, `timeouts`, `limits`, `buffer_pool`, `tls`, `http2`, `quic`, `upstreams`, `routes`) are stable across the `v0.1.0-alpha.N` series. Newer sub-schemas (`access_log`, `metrics`, `rate_limit`, `x402`) may move before 1.0; a config that sets only the core fields survives alpha version bumps. Unknown keys are ignored, so a config can carry settings a given build doesn't understand.
 
 ## A realistic config
 
@@ -77,7 +77,7 @@ The listener and the global resource budget.
 | `listeners` | `[]` | Explicit per-port listeners (multi-listener mode). When empty, the single `address`/`port` above is bound. See [TLS, HTTP/2 & HTTP/3](protocols.md). |
 
 !!! note "`workers` and CPU count"
-    `workers: 0` forks one worker per detected CPU, each with its own event loop and buffer pools, all sharing the listening socket via `SO_REUSEPORT`. This is the usual production setting. Use `1` for development or when you want a single process to attach a debugger to.
+    `workers: 0` forks one worker per detected CPU, each with its own event loop and buffer pools, all sharing the listening socket via `SO_REUSEPORT`. This is the usual production setting. Use `1` for development or to attach a debugger to a single process.
 
 ## `timeouts`
 
@@ -113,16 +113,16 @@ Fixed-size buffers are allocated once at startup; nothing is allocated per reque
 
 These sections enable and tune the protocol and database subsystems:
 
-- **`tls`** — certificate paths, SNI multi-cert, and mTLS. See [TLS, HTTP/2 & HTTP/3](protocols.md).
-- **`http2`** — stream limits, flow-control window, and the `h2c_only` cleartext switch. See [TLS, HTTP/2 & HTTP/3](protocols.md).
-- **`quic`** — HTTP/3 over QUIC: `enabled`, `port`, cert/key, idle timeout, stream limits. See [TLS, HTTP/2 & HTTP/3](protocols.md).
-- **`postgres`** — the native async PostgreSQL client (disabled by default; the password is read from `password_env`, never the file). See [PostgreSQL](postgres.md).
+- **`tls`**: certificate paths, SNI multi-cert, and mTLS. See [TLS, HTTP/2 & HTTP/3](protocols.md).
+- **`http2`**: stream limits, flow-control window, and the `h2c_only` cleartext switch. See [TLS, HTTP/2 & HTTP/3](protocols.md).
+- **`quic`**: HTTP/3 over QUIC: `enabled`, `port`, cert/key, idle timeout, stream limits. See [TLS, HTTP/2 & HTTP/3](protocols.md).
+- **`postgres`**: the native async PostgreSQL client (disabled by default; the password is read from `password_env`, never the file). See [PostgreSQL](postgres.md).
 
 Proxy `upstreams` and `routes` (load balancing, health checks, per-route auth / rate limiting / caching / body validation) are covered in [Reverse proxy & gateway](reverse-proxy.md).
 
 ## Embedded `ServerConfig`
 
-When embedding swerver, build a `ServerConfig` directly — every JSON section above maps to a struct field of the same name. Start from `ServerConfig.default()` or `ServerBuilder.configDefault()` and override what you need:
+When embedding swerver, build a `ServerConfig` directly: every JSON section above maps to a struct field of the same name. Start from `ServerConfig.default()` or `ServerBuilder.configDefault()` and override what you need:
 
 ```zig
 const cfg = swerver.ServerConfig{
@@ -162,7 +162,7 @@ kill -HUP "$(pgrep -o swerver)"
 
 | Change | Effect |
 | --- | --- |
-| **Value-type fields** — `timeouts`, `limits` | Reloaded in place; existing connections keep running. |
-| **Structural changes** — `routes`, `upstreams`, TLS certificates | Require a restart to take effect. |
+| **Value-type fields** (`timeouts`, `limits`) | Reloaded in place; existing connections keep running. |
+| **Structural changes** (`routes`, `upstreams`, TLS certificates) | Require a restart to take effect. |
 
 For runtime route/upstream changes without a restart, use the [Admin API](../operations/admin-api.md).

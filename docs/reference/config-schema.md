@@ -2,10 +2,10 @@
 
 swerver reads a single JSON config file (`--config config.json`). This page is the field-by-field reference, organized by top-level section. Every key here is parsed by `src/config_file.zig`; defaults come from the struct definitions in `src/config.zig`.
 
-The schema is at version **`1.0`** (`SCHEMA_VERSION` in `src/config_file.zig`). The core sections — `server`, `timeouts`, `limits`, `buffer_pool`, `tls`, `quic`, `upstreams`, `routes` — are stable across the `v0.1.0-alpha.N` series. Newer sub-schemas (`x402`, `rate_limit`, access-log/metrics) may still move before 1.0.
+The schema is at version **`1.0`** (`SCHEMA_VERSION` in `src/config_file.zig`). The core sections (`server`, `timeouts`, `limits`, `buffer_pool`, `tls`, `quic`, `upstreams`, `routes`) are stable across the `v0.1.0-alpha.N` series. Newer sub-schemas (`x402`, `rate_limit`, access-log/metrics) may still move before 1.0.
 
 !!! note "Everything is optional"
-    Unknown keys are ignored, and every section can be omitted — an empty `{}` config starts swerver on its defaults. Set only what you need to override.
+    Unknown keys are ignored, and every section can be omitted: an empty `{}` config starts swerver on its defaults. Set only what you need to override.
 
 A minimal config:
 
@@ -26,7 +26,7 @@ A minimal config:
 | `workers` | integer | `1` | Worker processes. `1` = single-process (no fork); `0` = auto-detect CPU count. Overridden by `--workers`. |
 | `max_connections` | integer | `2048` | Max concurrent connections. Capped at 1,000,000; must be ≤ `buffer_pool.buffer_count / 2`. |
 | `static_root` | string | `""` (off) | Directory for static file serving. Empty disables it. Overridden by `--static-root`. |
-| `disable_middleware` | bool | `false` | Disable security headers, metrics, and access logging — for pure-benchmark mode. |
+| `disable_middleware` | bool | `false` | Disable security headers, metrics, and access logging, for pure-benchmark mode. |
 | `cache_static_files` | bool | `false` | Cache static files (and precompressed siblings) in memory per worker on first serve. |
 | `preencoded` | bool | `true` | Pre-encoded response registry for benchmark fast-paths. Set `false` to route every path through the normal pipeline. |
 | `allowed_hosts` | string[] | `[]` (all) | If non-empty, requests whose `Host` isn't in the list are rejected with 400. |
@@ -155,7 +155,7 @@ OpenTelemetry trace export. Disabled by default.
 | `collector_url` | string | `"http://localhost:4318"` | OTLP/HTTP collector endpoint. |
 | `service_name` | string | `"swerver"` | `service.name` resource attribute. |
 | `flush_interval_s` | integer | `5` | Export flush interval (seconds). |
-| `sample_rate` | integer | `100` | Sample percentage (0–100). |
+| `sample_rate` | integer | `100` | Sample percentage (0-100). |
 | `max_batch_size` | integer | `256` | Max spans per export batch. |
 | `headers` | string | `""` | Extra OTLP headers, `key1=value1,key2=value2` (e.g. backend auth). |
 
@@ -176,13 +176,13 @@ x402 payment middleware. Disabled by default. (Schema may move before 1.0.)
 
 ## `postgres`
 
-Native async PostgreSQL client. Enabled implicitly when `url` is set. The password is **never** read from the config file — only from the environment variable named by `password_env`.
+Native async PostgreSQL client. Enabled implicitly when `url` is set. The password is **never** read from the config file, only from the environment variable named by `password_env`.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `url` | string | — | `postgres://user@host:port/db?sslmode=…`. Host, port, user, database, and sslmode are parsed from it. A password in the URL is ignored with a warning. |
+| `url` | string | (none) | `postgres://user@host:port/db?sslmode=…`. Host, port, user, database, and sslmode are parsed from it. A password in the URL is ignored with a warning. |
 | `password_env` | string | `""` | Name of the env var holding the password. |
-| `pool_size_per_worker` | integer | `2` | Connections per worker. Must be **1–4**. |
+| `pool_size_per_worker` | integer | `2` | Connections per worker. Must be **1-4**. |
 | `statement_timeout_ms` | integer | `5000` | Per-statement timeout. |
 | `allow_cleartext_password` | bool | `false` | Allow answering a cleartext-password request over a *plaintext* connection (cleartext over TLS is always allowed). |
 | `ssl_root_cert` | string | `""` | CA bundle (PEM) replacing the system trust store for `sslmode=verify-full`. |
@@ -201,10 +201,10 @@ Backend pools for the reverse proxy (requires an `-Denable-proxy=true` build). E
 | `name` | string | *required* | Upstream identifier referenced by routes. |
 | `servers` | object[] | *required* | Backend servers (see below). |
 | `load_balancer` | string | `"round_robin"` | One of `round_robin`, `least_conn`, `ip_hash`, `random`, `weighted_round_robin`. Unknown → `round_robin`. |
-| `health_check` | object | — | Active health checking (see below). |
-| `connection_pool` | object | — | Upstream connection-pool tuning (see below). |
-| `dns_discovery` | object | — | DNS-based server discovery. |
-| `consul_discovery` | object | — | Consul-based server discovery. |
+| `health_check` | object | (none) | Active health checking (see below). |
+| `connection_pool` | object | (none) | Upstream connection-pool tuning (see below). |
+| `dns_discovery` | object | (none) | DNS-based server discovery. |
+| `consul_discovery` | object | (none) | Consul-based server discovery. |
 | `allow_private` | bool | `true` | Allow private/loopback backend addresses. |
 
 ### `upstreams[].servers[]`
@@ -226,7 +226,7 @@ Backend pools for the reverse proxy (requires an `-Denable-proxy=true` build). E
 | `timeout_ms` | integer | `2000` | Probe timeout. |
 | `path` | string | `"/health"` | Probe request path. |
 | `expected_status` | integer | `200` | Healthy status code. |
-| `expected_body` | string | — | Optional body substring to require. |
+| `expected_body` | string | (none) | Optional body substring to require. |
 | `healthy_threshold` | integer | `2` | Consecutive successes to mark up. |
 | `unhealthy_threshold` | integer | `3` | Consecutive failures to mark down. |
 
@@ -266,9 +266,9 @@ Proxy routes, matched by path prefix (and optional host). Every route must refer
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `path_prefix` | string | *required* | Path prefix to match. |
-| `host` | string | — | Optional host match. |
+| `host` | string | (none) | Optional host match. |
 | `upstream` | string | *required* | Target upstream `name`. |
-| `rewrite_pattern` | string | — | Prefix to strip/replace in the upstream path. |
+| `rewrite_pattern` | string | (none) | Prefix to strip/replace in the upstream path. |
 | `rewrite_replacement` | string | `""` | Replacement for `rewrite_pattern`. |
 | `connect_timeout_ms` | integer | `5000` | Upstream connect timeout. |
 | `send_timeout_ms` | integer | `30000` | Upstream send timeout. |
@@ -276,14 +276,14 @@ Proxy routes, matched by path prefix (and optional host). Every route must refer
 | `total_timeout_ms` | integer | `120000` | Total request timeout. |
 | `max_response_bytes` | integer | `33554432` | Max upstream response size (32 MiB). |
 | `auth` | object | `none` | Per-route auth (see below). |
-| `rate_limit` | object | — | Per-route rate limit (see below). |
-| `cache` | object | — | Per-route response cache (see below). |
-| `traffic_split` | object[] | — | Weighted split across upstreams (canary/blue-green). |
-| `mirror` | string | — | Upstream to shadow-copy requests to. |
-| `body_schema` | object | — | JSON-Schema request-body validation. |
-| `upstream_headers` | object[] | — | `{ name, value }` headers added to the upstream request. |
-| `retry` | object | — | `{ max_retries }` (default `1`) on connection failure / retryable 5xx. |
-| `x402` | object | — | Per-route x402 pricing (see below). |
+| `rate_limit` | object | (none) | Per-route rate limit (see below). |
+| `cache` | object | (none) | Per-route response cache (see below). |
+| `traffic_split` | object[] | (none) | Weighted split across upstreams (canary/blue-green). |
+| `mirror` | string | (none) | Upstream to shadow-copy requests to. |
+| `body_schema` | object | (none) | JSON-Schema request-body validation. |
+| `upstream_headers` | object[] | (none) | `{ name, value }` headers added to the upstream request. |
+| `retry` | object | (none) | `{ max_retries }` (default `1`) on connection failure / retryable 5xx. |
+| `x402` | object | (none) | Per-route x402 pricing (see below). |
 
 ### `routes[].rate_limit`
 
@@ -311,7 +311,7 @@ Proxy routes, matched by path prefix (and optional host). Every route must refer
 | `jwt` | `secret` (required), `issuer`, `audience`, `claims_to_headers[]` (`{ claim, header }`) |
 | `forward_auth` | `url` (required), `headers_forward[]`, `headers_upstream[]`, `timeout_ms` (`5000`) |
 | `anonymous` | `subject` (`"anonymous"`) |
-| `chain` | `methods[]` — a list of nested auth methods (max depth 3) |
+| `chain` | `methods[]`, a list of nested auth methods (max depth 3) |
 
 ### `routes[].x402`
 
@@ -328,7 +328,7 @@ Proxy routes, matched by path prefix (and optional host). Every route must refer
 | `extra_name` | string | `""` | EIP-712 domain name. |
 | `extra_version` | string | `""` | EIP-712 domain version. |
 | `facilitator_url` | string | `""` | Per-route facilitator override. |
-| `extensions` | object | — | Free-form extension object, serialized into the payment payload. |
+| `extensions` | object | (none) | Free-form extension object, serialized into the payment payload. |
 | `resource_url` | string | `""` | Resource URL advertised in the 402. |
 | `inline_receipt` | bool | `false` | Inline the settlement receipt in the response. |
 
@@ -340,5 +340,5 @@ Config is hot-reloaded on `SIGHUP` (routes, upstreams, and value-typed settings 
 
 ## Related
 
-- [CLI flags](cli.md) — `--config`, plus the overrides that win over the file.
-- [Build options](build-options.md) — proxy, TLS, and HTTP/3 features must be compiled in.
+- [CLI flags](cli.md): `--config`, plus the overrides that win over the file.
+- [Build options](build-options.md): proxy, TLS, and HTTP/3 features must be compiled in.

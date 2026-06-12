@@ -1,16 +1,16 @@
 # Architecture
 
-swerver is a single-threaded event loop **per process**. There is no thread pool and no work-stealing — each worker process owns one event loop, one set of buffer pools, and the connections the kernel hands it. Concurrency comes from running N of these processes, not from threads sharing state. That's what lets the hot path stay allocation-free and lock-free: nothing on a request is contended.
+swerver is a single-threaded event loop **per process**. There is no thread pool and no work-stealing: each worker process owns one event loop, one set of buffer pools, and the connections the kernel hands it. Concurrency comes from running N of these processes, not from threads sharing state. That's what lets the hot path stay allocation-free and lock-free: nothing on a request is contended.
 
 ## Process and listener model
 
 A server runs as **N worker processes** under a fork manager (`master.zig`), one per CPU by default. Set `server.workers` (or `--workers`) to override; `workers: 1` runs single-process with no fork.
 
-Every worker binds the **same ports** with `SO_REUSEPORT`, so the kernel load-balances new connections across workers with no userspace coordination — no accept lock, no shared accept queue. On Linux, workers are CPU-pinned.
+Every worker binds the **same ports** with `SO_REUSEPORT`, so the kernel load-balances new connections across workers with no userspace coordination: no accept lock, no shared accept queue. On Linux, workers are CPU-pinned.
 
 A single worker can bind **multiple TCP ports at once** (the multi-listener model). Each listener carries its own protocol config: plaintext HTTP/1.1, h2c-only, TLS HTTP/1.1+HTTP/2 via ALPN, plus an optional QUIC/HTTP/3 endpoint over UDP. A plain `address`/`port` config is treated as a one-element listener set.
 
-**Protocol is resolved at accept.** When a connection arrives, the worker reads the local port (`getsockname`) and looks up the matching listener config. The I/O backends never need to know about per-port protocol differences — by the time bytes flow, the connection already knows whether it's plaintext h1, h2c, TLS+ALPN, or QUIC.
+**Protocol is resolved at accept.** When a connection arrives, the worker reads the local port (`getsockname`) and looks up the matching listener config. The I/O backends never need to know about per-port protocol differences: by the time bytes flow, the connection already knows whether it's plaintext h1, h2c, TLS+ALPN, or QUIC.
 
 ## I/O backends
 
@@ -21,7 +21,7 @@ Platform I/O is abstracted behind a single event-loop interface (`runtime/io.zig
 | `kqueue` | macOS / BSD | Readiness notification. |
 | `epoll` | Linux | Readiness notification. |
 | `io_uring_poll` | Linux (modern) | io_uring used as a poll/readiness layer. |
-| `io_uring_native` | Linux (modern) | io_uring completion model — inline accept, vectored writes, single-shot recv. |
+| `io_uring_native` | Linux (modern) | io_uring completion model: inline accept, vectored writes, single-shot recv. |
 
 The `io_uring` backends require `-Denable-io-uring=true` at build time. The event loop owns socket lifecycle and readiness; everything above it (TLS, protocol parsing, routing) is backend-agnostic.
 
@@ -36,11 +36,11 @@ const cfg = BufferPoolConfig{
 };
 ```
 
-A separate **body pool** (default 32 × 1 MB) isolates large uploads so a few big POSTs can't starve the hot-path pool. Pool sizes are config-tunable under `buffer_pool` — see the [config schema](../reference/config-schema.md#buffer_pool).
+A separate **body pool** (default 32 × 1 MB) isolates large uploads so a few big POSTs can't starve the hot-path pool. Pool sizes are config-tunable under `buffer_pool`; see the [config schema](../reference/config-schema.md#buffer_pool).
 
 ## Zero-copy parsing
 
-Request parsing happens **directly on the receive buffer**. Header names and values are `[]const u8` slices into the bytes the kernel delivered — not copies:
+Request parsing happens **directly on the receive buffer**. Header names and values are `[]const u8` slices into the bytes the kernel delivered, not copies:
 
 ```zig
 pub const Header = struct {
@@ -120,6 +120,6 @@ The middleware chain returns a small `Decision` union (allow / skip / reject / m
 
 ## Related
 
-- [Build options](../reference/build-options.md) — selecting the io_uring backend and protocol features.
-- [Benchmarks](benchmarks.md) — how this design performs under saturation.
-- [Handlers & responses](../guide/handlers.md) — why handlers are synchronous and how buffer lifetimes work.
+- [Build options](../reference/build-options.md): selecting the io_uring backend and protocol features.
+- [Benchmarks](benchmarks.md): how this design performs under saturation.
+- [Handlers & responses](../guide/handlers.md): why handlers are synchronous and how buffer lifetimes work.

@@ -23,7 +23,7 @@ The protocol features are opt-in build flags so a minimal HTTP/1.1 build pulls i
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `-Doptimize=ReleaseFast` | — | Maximum performance. Use for any real deployment. |
+| `-Doptimize=ReleaseFast` | (none) | Maximum performance. Use for any real deployment. |
 | `-Denable-tls=true` | `false` | TLS 1.3 (requires OpenSSL). |
 | `-Denable-http2=true` | `false` | HTTP/2 with HPACK. |
 | `-Denable-http3=true` | `false` | HTTP/3 over QUIC. |
@@ -31,7 +31,7 @@ The protocol features are opt-in build flags so a minimal HTTP/1.1 build pulls i
 See [Build options](../reference/build-options.md) for the full flag list (proxy, compression, io_uring, x402).
 
 !!! tip "A bare HTTP/1.1 build"
-    `zig build -Doptimize=ReleaseFast` with no feature flags produces an HTTP/1.1-only binary with no OpenSSL dependency — handy for a quick start or a constrained container.
+    `zig build -Doptimize=ReleaseFast` with no feature flags produces an HTTP/1.1-only binary with no OpenSSL dependency, handy for a quick start or a constrained container.
 
 ## Pre-built release binaries
 
@@ -55,7 +55,7 @@ The [HttpArena submission](https://github.com/justinGrosvenor/HttpArena) include
 
 ## Depend on swerver as a Zig package
 
-swerver ships as a Zig package — depend on it from another Zig project and embed the server into your own binary.
+swerver ships as a Zig package: depend on it from another Zig project and embed the server into your own binary.
 
 In your downstream project's `build.zig.zon`:
 

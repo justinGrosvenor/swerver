@@ -1,6 +1,6 @@
 # Admin API
 
-The admin API is a runtime management interface for editing routes and upstreams **without restarting** the server. It listens on its own port, separate from the main traffic listener, and every request is authenticated with an API key.
+The admin API is a runtime management interface for editing routes and upstreams **without restarting** the server. It listens on its own port, separate from the main traffic listener, and authenticates every request with an API key.
 
 This is the path for changes the [SIGHUP reload](deployment.md#graceful-shutdown-config-reload) can't do live: hot reload updates value-type fields in place but treats route and upstream changes as structural. The admin API applies them at runtime.
 
@@ -22,9 +22,9 @@ Add an `admin` block to the config:
 | Field | Default | Description |
 | --- | --- | --- |
 | `enabled` | `false` | Start the admin listener |
-| `port` | — | Port for the admin listener (separate from traffic) |
-| `address` | — | Bind address — keep it on a private interface |
-| `api_key` | — | Required on every request |
+| `port` | `9180` | Port for the admin listener (separate from traffic) |
+| `address` | `127.0.0.1` | Bind address; keep it on a private interface |
+| `api_key` | (none) | Required on every request |
 
 !!! warning "Lock it down"
     The admin API can rewrite routing at runtime. Bind it to a private interface or loopback (`address`), never the public one, and treat `api_key` as a secret. The config file is served by this API, so it must not contain other secrets (PostgreSQL passwords go in `password_env`, not the file).
@@ -49,7 +49,7 @@ curl -H "X-API-Key: secret-admin-key" http://127.0.0.1:9090/routes
 | `PUT` | `/upstreams/{name}` | Update an upstream |
 | `DELETE` | `/upstreams/{name}` | Remove an upstream |
 
-The JSON bodies match the `routes[]` and `upstreams[]` shapes from the config file — see [Reverse proxy & gateway](../guide/reverse-proxy.md) for the field reference.
+The JSON bodies match the `routes[]` and `upstreams[]` shapes from the config file. See [Reverse proxy & gateway](../guide/reverse-proxy.md) for the field reference.
 
 ## Examples
 
@@ -95,5 +95,5 @@ curl -X DELETE http://127.0.0.1:9090/routes/%2Fcanary%2F \
 
 ## See also
 
-- [Reverse proxy & gateway](../guide/reverse-proxy.md) — route and upstream field reference.
-- [Deployment](deployment.md) — SIGHUP reload vs. runtime edits.
+- [Reverse proxy & gateway](../guide/reverse-proxy.md): route and upstream field reference.
+- [Deployment](deployment.md): SIGHUP reload vs. runtime edits.

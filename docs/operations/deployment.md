@@ -29,10 +29,10 @@ zig build -Doptimize=ReleaseFast \
 
 | Optimize mode | Use for |
 | --- | --- |
-| `ReleaseFast` | Production — maximum throughput |
+| `ReleaseFast` | Production, maximum throughput |
 | `ReleaseSafe` | Production with safety checks |
 | `ReleaseSmall` | Smallest binary |
-| (omitted) | `Debug` — development only |
+| (omitted) | `Debug`, development only |
 
 The result is a single static binary at `zig-out/bin/swerver`.
 
@@ -61,13 +61,13 @@ See [Running from a config file](../getting-started/config-file.md) for the full
 
 ## The multi-worker fork model
 
-swerver runs a single-threaded event loop per process and scales by forking worker processes. With `server.workers` (or `--workers`) set to **`0`**, it forks **one worker per CPU**. Each worker binds the same port with `SO_REUSEPORT`, so the kernel spreads incoming connections across cores — no shared accept lock, no cross-core contention. On Linux, workers are pinned to CPUs.
+swerver runs a single-threaded event loop per process and scales by forking worker processes. With `server.workers` (or `--workers`) set to **`0`**, it forks **one worker per CPU**. Each worker binds the same port with `SO_REUSEPORT`, so the kernel spreads incoming connections across cores: no shared accept lock, no cross-core contention. On Linux, workers are pinned to CPUs.
 
 ```json
 { "server": { "port": 8080, "workers": 0 } }
 ```
 
-The master process supervises the workers and restarts any that exit unexpectedly. Because each worker is a separate process, per-worker state — connection pools, the PostgreSQL pool, rate-limit buckets — is **not** shared across workers; size limits accordingly (e.g. an upstream `connection_pool.max_connections` of 64 across 8 workers is up to 512 connections to that backend).
+The master process supervises the workers and restarts any that exit unexpectedly. Because each worker is a separate process, per-worker state (connection pools, the PostgreSQL pool, rate-limit buckets) is **not** shared across workers; size limits accordingly (e.g. an upstream `connection_pool.max_connections` of 64 across 8 workers is up to 512 connections to that backend).
 
 ## Docker
 
@@ -87,7 +87,7 @@ The recommended production base image is **`debian:trixie`**, which provides Ope
 swerver can terminate TLS itself or sit behind an L4/L7 load balancer or another proxy:
 
 - **TLS at swerver:** set `tls.cert_path` / `tls.key_path` (and `tls.certificates` for SNI multi-cert, `tls.client_ca_path` + `tls.client_cert_required` for mTLS). The front load balancer passes TCP straight through.
-- **TLS at the load balancer:** terminate upstream and forward cleartext to swerver. Trust the `X-Forwarded-For` / `X-Forwarded-Proto` headers the LB sets.
+- **TLS at the load balancer:** terminate upstream and forward cleartext to swerver. Trust the `X-Forwarded-For` / `X-Forwarded-Proto` headers the load balancer sets.
 
 Either way, run multiple swerver instances behind the LB and let `SO_REUSEPORT` plus the worker count handle per-host concurrency.
 
@@ -100,7 +100,7 @@ Either way, run multiple swerver instances behind the LB and let `SO_REUSEPORT` 
     kill -HUP $(pidof swerver)
     ```
 
-    Value-type fields (timeouts, limits) update in place. **Structural changes** — routes, upstreams, TLS certificates — require a restart. For runtime route/upstream edits without any restart, use the [Admin API](admin-api.md).
+    Value-type fields (timeouts, limits) update in place. **Structural changes** (routes, upstreams, TLS certificates) require a restart. For runtime route/upstream edits without any restart, use the [Admin API](admin-api.md).
 
 ## Health probes for orchestrators
 
@@ -108,7 +108,7 @@ swerver exposes two probe endpoints over all three protocols, served ahead of th
 
 | Path | Probe | Behavior |
 | --- | --- | --- |
-| `/.healthz` | Liveness | Always `200 OK`, empty body — the process is up |
+| `/.healthz` | Liveness | Always `200 OK`, empty body: the process is up |
 | `/.ready` | Readiness | `200` once buffer pools, listeners, TLS, and QUIC are initialized; otherwise `503` |
 
 Wire them into your orchestrator. Kubernetes example:

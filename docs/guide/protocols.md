@@ -1,6 +1,6 @@
 # TLS, HTTP/2 & HTTP/3
 
-swerver speaks HTTP/1.1, HTTP/2, and HTTP/3 from one binary, and a single process can bind several ports — each with its own protocol — at once. Handlers don't care which protocol or which port a request arrived on; this page is about the transport configuration in front of them.
+swerver speaks HTTP/1.1, HTTP/2, and HTTP/3 from one binary, and a single process can bind several ports at once, each with its own protocol. Handlers don't care which protocol or which port a request arrived on; this page is about the transport configuration in front of them.
 
 !!! note "Build flags"
     TLS, HTTP/2, and HTTP/3 are compile-time features. Build with `-Denable-tls=true -Denable-http2=true -Denable-http3=true` (HTTP/3 requires TLS) and an OpenSSL 3.5+ toolchain. See [Build options](../reference/build-options.md). The prebuilt release binaries are HTTP/1.1-only.
@@ -60,7 +60,7 @@ Require and verify client certificates by pointing `tls.client_ca_path` at the C
 
 ## HTTP/2
 
-Over TLS, HTTP/2 is negotiated automatically via ALPN — no extra config. A TLS listener serves HTTP/2 to clients that ask for `h2` and HTTP/1.1 to everyone else. Tune the protocol under `http2`:
+Over TLS, HTTP/2 is negotiated automatically via ALPN, no extra config. A TLS listener serves HTTP/2 to clients that ask for `h2` and HTTP/1.1 to everyone else. Tune the protocol under `http2`:
 
 | Key | Default | Description |
 | --- | --- | --- |
@@ -72,7 +72,7 @@ Over TLS, HTTP/2 is negotiated automatically via ALPN — no extra config. A TLS
 
 ### Cleartext h2c
 
-For HTTP/2 without TLS (e.g. behind a TLS-terminating edge), set `h2c_only: true` on a listener. That port then requires the HTTP/2 connection preface — prior-knowledge h2c — and refuses connections that begin with anything else, rather than silently falling back to HTTP/1.1. This is most useful on a dedicated multi-listener port (below).
+For HTTP/2 without TLS (e.g. behind a TLS-terminating edge), set `h2c_only: true` on a listener. That port then requires the HTTP/2 connection preface (prior-knowledge h2c) and refuses connections that begin with anything else, rather than silently falling back to HTTP/1.1. This is most useful on a dedicated multi-listener port (below).
 
 ## HTTP/3 over QUIC
 
@@ -105,20 +105,20 @@ When QUIC is enabled, swerver advertises HTTP/3 to HTTP/1.1 and HTTP/2 clients v
 
 ## Multi-listener model
 
-A single process can bind **multiple ports, each with its own protocol**, via `server.listeners[]`. When `listeners` is empty (the default), the server binds the single `server.port` and infers its protocol from the `tls`/`http2`/`quic` sections. When `listeners` is present, those legacy fields are ignored for binding — each listed entry is bound on every worker via `SO_REUSEPORT`, and the per-connection protocol is resolved **at accept time from the local port**.
+A single process can bind **multiple ports, each with its own protocol**, via `server.listeners[]`. When `listeners` is empty (the default), the server binds the single `server.port` and infers its protocol from the `tls`/`http2`/`quic` sections. When `listeners` is present, those legacy fields are ignored for binding: each listed entry is bound on every worker via `SO_REUSEPORT`, and the per-connection protocol is resolved **at accept time from the local port**.
 
 Each entry is:
 
 | Field | Default | Description |
 | --- | --- | --- |
 | `address` | `"0.0.0.0"` | Bind address. |
-| `port` | — | Bind port (required). |
+| `port` | none | Bind port (required). |
 | `use_tls` | `false` | Terminate TLS on this port (HTTP/1.1 + HTTP/2 via ALPN). |
 | `h2c_only` | `false` | Require the h2c preface; refuse non-HTTP/2 connections. |
 | `quic_enabled` | `false` | Also serve HTTP/3 over QUIC for this listener. |
 | `quic_port` | `0` | UDP port for this listener's QUIC. |
 
-The TLS certificates and QUIC tuning still come from the top-level `tls` and `quic` sections — a listener entry decides *which protocols* a port speaks, not the cert material.
+The TLS certificates and QUIC tuning still come from the top-level `tls` and `quic` sections; a listener entry decides *which protocols* a port speaks, not the cert material.
 
 ```json
 {
@@ -144,9 +144,9 @@ The TLS certificates and QUIC tuning still come from the top-level `tls` and `qu
 
 This binds:
 
-- **8080** — plaintext HTTP/1.1.
-- **8082** — cleartext HTTP/2 only (prior-knowledge h2c).
-- **8443** — TLS HTTP/1.1 and HTTP/2 (chosen by ALPN), plus HTTP/3 over QUIC on UDP 8443.
+- **8080**: plaintext HTTP/1.1.
+- **8082**: cleartext HTTP/2 only (prior-knowledge h2c).
+- **8443**: TLS HTTP/1.1 and HTTP/2 (chosen by ALPN), plus HTTP/3 over QUIC on UDP 8443.
 
 !!! tip "Single-listener stays simple"
     Most deployments never set `listeners`. Leaving it empty keeps the classic single-port setup, where `server.port` plus the `tls`/`quic` sections fully describe the listener.

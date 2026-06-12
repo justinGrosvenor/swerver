@@ -13,7 +13,7 @@ fn hello(ctx: *swerver.router.HandlerContext) swerver.response.Response {
 }
 
 fn item(ctx: *swerver.router.HandlerContext) swerver.response.Response {
-    // Return any Zig value — swerver serializes it with std.json.
+    // Return any Zig value: swerver serializes it with std.json.
     return ctx.jsonValue(200, .{
         .id = ctx.getParam("id"),
         .active = true,
@@ -59,18 +59,18 @@ curl localhost:8080/items/42
 
 **`Router.init(.{})`** creates an empty router. The argument is the x402 payment policy; `.{}` uses the defaults (no payment required), so you can ignore it until you need paid routes.
 
-**`router.get(path, handler)`** registers a handler for `GET`. There's a method for each verb — `get`, `post`, `put`, `delete`, `patch` — plus path params like `:id`. See [Routing](../guide/routing.md) for groups, params, and 404/405 handling.
+**`router.get(path, handler)`** registers a handler for `GET`. There's a method for each verb (`get`, `post`, `put`, `delete`, `patch`) plus path params like `:id`. See [Routing](../guide/routing.md) for groups, params, and 404/405 handling.
 
-**A handler** is a plain function taking `*swerver.router.HandlerContext` and returning a `swerver.response.Response`. No allocator, no error union — build a response and return it. The two response helpers used above:
+**A handler** is a plain function taking `*swerver.router.HandlerContext` and returning a `swerver.response.Response`. No allocator, no error union: build a response and return it. The two response helpers used above:
 
 | Helper | Returns |
 | --- | --- |
 | `ctx.text(status, bytes)` | a `text/plain` body |
 | `ctx.jsonValue(status, value)` | any Zig value, serialized as JSON with `std.json` |
 
-`ctx.getParam("id")` reads the `:id` path parameter as `?[]const u8`. See [Handlers & responses](../guide/handlers.md) for the full context API — JSON, headers, request body, the request arena, and app state.
+`ctx.getParam("id")` reads the `:id` path parameter as `?[]const u8`. See [Handlers & responses](../guide/handlers.md) for the full context API: JSON, headers, request body, the request arena, and app state.
 
-**`ServerBuilder.configDefault()`** starts a builder with the default `ServerConfig` (address `0.0.0.0`, port `8080`). `.router(router)` installs your routes and `.build(alloc)` validates the config and returns a heap-allocated `*Server` — so remember `server.deinit()` and `alloc.destroy(server)`.
+**`ServerBuilder.configDefault()`** starts a builder with the default `ServerConfig` (address `0.0.0.0`, port `8080`). `.router(router)` installs your routes and `.build(alloc)` validates the config and returns a heap-allocated `*Server`, so remember `server.deinit()` and `alloc.destroy(server)`.
 
 **`server.run(null)`** enters the event loop. Pass a `u64` of milliseconds instead of `null` to run for a fixed duration and exit (useful in tests).
 
@@ -79,6 +79,6 @@ curl localhost:8080/items/42
 
 ## Where to go next
 
-- **More examples** — see `examples/embedded/` for a self-contained app and `examples/gateway/` for a full API-gateway setup (auth, rate limiting, proxy, config) in the repo.
-- **[Routing](../guide/routing.md)** — path params, route groups, custom 404/405, route-scoped middleware.
-- **[Handlers & responses](../guide/handlers.md)** — JSON, request bodies, the request arena, dependency injection.
+- **More examples**: see `examples/embedded/` for a self-contained app and `examples/gateway/` for a full API-gateway setup (auth, rate limiting, proxy, config) in the repo.
+- **[Routing](../guide/routing.md)**: path params, route groups, custom 404/405, route-scoped middleware.
+- **[Handlers & responses](../guide/handlers.md)**: JSON, request bodies, the request arena, dependency injection.

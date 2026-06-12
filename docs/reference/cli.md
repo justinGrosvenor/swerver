@@ -1,6 +1,6 @@
 # CLI flags
 
-The `swerver` binary takes a small set of flags. Everything else lives in the [config file](config-schema.md) — the CLI is for picking a config and overriding the handful of values you most often change per-deployment.
+The `swerver` binary takes a small set of flags. Everything else lives in the [config file](config-schema.md); the CLI is for picking a config and overriding the handful of values you most often change per-deployment.
 
 ```bash
 swerver --config config.json --workers 8
@@ -23,12 +23,12 @@ Each flag accepts both `--flag value` and `--flag=value` forms.
 | `--run-for-ms <ms>` | integer | Run for the given number of milliseconds, then exit. Intended for tests and benchmarks. |
 
 !!! note "CLI overrides win"
-    When a flag and the config file set the same value (`--workers`, `--static-root`, `--cert`, `--key`), the CLI value takes precedence. Run with no flags at all and swerver starts on `0.0.0.0:8080` with built-in defaults.
+    When a flag and the config file set the same value (`--workers`, `--static-root`, `--cert`, `--key`), the CLI value wins. Run with no flags at all and swerver starts on `0.0.0.0:8080` with built-in defaults.
 
 !!! tip "Config token"
-    For `--config-url`, set `SWERVER_CONFIG_TOKEN` in the environment to send a bearer token with the fetch — keep secrets out of the process arguments.
+    For `--config-url`, set `SWERVER_CONFIG_TOKEN` in the environment to send a bearer token with the fetch, keeping secrets out of the process arguments.
 
 ## Related
 
-- [Build options](build-options.md) — the `-D` flags that decide which protocols are compiled in.
-- [Config schema](config-schema.md) — the full JSON config reference.
+- [Build options](build-options.md): the `-D` flags that decide which protocols are compiled in.
+- [Config schema](config-schema.md): the full JSON config reference.

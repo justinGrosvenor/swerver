@@ -1,13 +1,13 @@
 # Limitations & roadmap
 
-Honest, forward-looking notes about what's in and out of scope for the current alpha. **These are not known bugs** — they're promises about the surface and where it's headed.
+Honest, forward-looking notes about what's in and out of scope for the current alpha. **These are not known bugs**: they're promises about the surface and where it's headed.
 
 ## Limitations
 
 !!! warning "The public API is not frozen"
     Public types in `src/lib.zig` may change between alpha versions while the library surface is iterated on. Breaking changes are announced in release notes. The API freezes at the **1.0** release.
 
-**HTTP/3 is a young stack.** The RFC 9000–9002 + 9114 implementation is complete and handles real workloads — GET and POST/PUT both work end to end — but it hasn't seen the hardening the HTTP/1.1 and HTTP/2 paths have. Treat it as production-capable but new.
+**HTTP/3 is a young stack.** The RFC 9000-9002 + 9114 implementation is complete and handles real workloads (GET and POST/PUT both work end to end), but it hasn't seen the hardening the HTTP/1.1 and HTTP/2 paths have. Treat it as production-capable but new.
 
 **Linux and macOS only.** Windows is cross-compile-only today: no IOCP backend, no `sendfile`. It's on the long-term roadmap but not part of the alpha.
 
@@ -23,5 +23,5 @@ Honest, forward-looking notes about what's in and out of scope for the current a
 
 ## Related
 
-- [Benchmarks](benchmarks.md) — where the implementation stands today.
-- [Architecture](architecture.md) — the design these milestones build on.
+- [Benchmarks](benchmarks.md): where the implementation stands today.
+- [Architecture](architecture.md): the design these milestones build on.

@@ -1,8 +1,8 @@
 # PostgreSQL
 
-swerver ships a **native, async PostgreSQL client** — wire protocol v3, SCRAM-SHA-256 auth, optional TLS — written in Zig with no libpq dependency. It lets a handler serve data straight from the database, turning the gateway into an app server with no sidecar process.
+swerver ships a **native, async PostgreSQL client** (wire protocol v3, SCRAM-SHA-256 auth, optional TLS) written in Zig with no libpq dependency. It lets a handler serve data straight from the database, turning the gateway into an app server with no sidecar process.
 
-The defining property is that **a query never blocks the reactor**. A handler issues a query and *parks*: the connection is suspended, the worker goes back to serving other requests, and a *continuation* runs when the rows arrive. A slow or unreachable database stalls only the requests waiting on it — never the rest of the worker.
+The defining property is that **a query never blocks the reactor**. A handler issues a query and *parks*: the connection is suspended, the worker goes back to serving other requests, and a *continuation* runs when the rows arrive. A slow or unreachable database stalls only the requests waiting on it, never the rest of the worker.
 
 !!! info "Reached only when configured"
     The client is wired up only when a `postgres` config block is present. Without it, `ctx.pg.query(...)` returns `error.NotConnected`.
@@ -25,18 +25,18 @@ The pool is configured under the top-level `postgres` key:
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `url` | — | Connection URL: `postgres://user@host:port/db?sslmode=...` |
-| `password_env` | — | Name of the **env var** holding the password (see below) |
-| `pool_size_per_worker` | `2` | Connections per worker, must be `1`–`4` |
+| `url` | none | Connection URL: `postgres://user@host:port/db?sslmode=...` |
+| `password_env` | none | Name of the **env var** holding the password (see below) |
+| `pool_size_per_worker` | `2` | Connections per worker, must be `1` to `4` |
 | `statement_timeout_ms` | `5000` | Per-op deadline; bounds how long a parked request waits |
 | `ssl_root_cert` | system trust | CA bundle (PEM) for `sslmode=verify-full` |
 
 !!! warning "The password never lives in the config file"
     swerver reads the password from the env var named by `password_env`, and **ignores any password embedded in the `url`** (it logs a warning if it finds one). The config file is served by the admin API, so secrets must stay out of it.
 
-`sslmode` is set in the URL query string: `disable`, `require`, or `verify-full` (the default when TLS is on, doing chain + hostname verification). `pool_size_per_worker` outside `1`–`4` is rejected at startup with `error.InvalidPostgresConfig`.
+`sslmode` is set in the URL query string: `disable`, `require`, or `verify-full` (the default when TLS is on, doing chain + hostname verification). `pool_size_per_worker` outside `1` to `4` is rejected at startup with `error.InvalidPostgresConfig`.
 
-Each worker is a separate process and keeps its own pool — there is no cross-worker sharing.
+Each worker is a separate process and keeps its own pool; there is no cross-worker sharing.
 
 ## The handler API
 
@@ -54,7 +54,7 @@ ctx.pg.query(sql, args, StashType, stash_init, continuationFn)
 | `stash_init` | `StashType` | Initial stash value (copied into park state) |
 | `continuationFn` | `*const fn (*ResumeContext) Response` | Runs when rows arrive |
 
-`query()` returns the parked `Response` itself — a sentinel the router intercepts. You cannot "forget to park": the only value that parks the connection *is* the return value. Synchronous failures (pool down, op queue full) surface as ordinary errors you map to a 503 while you still hold the request:
+`query()` returns the parked `Response` itself, a sentinel the router intercepts. You cannot "forget to park": the only value that parks the connection *is* the return value. Synchronous failures (pool down, op queue full) surface as ordinary errors you map to a 503 while you still hold the request:
 
 ```zig
 return ctx.pg.query(sql, &.{org}, Stash, .{ .org_id = 7 }, onRows)
@@ -65,12 +65,12 @@ The `QueryError` set: `NotConnected`, `QueueFull`, `AlreadyParked`, `ParkTableFu
 
 ### The stash
 
-Anything the continuation needs from phase 1 must be copied into the **stash** — the read buffer (and so `ctx.request`) is recycled while parked. The stash is comptime-checked to be plain data: a pointer or slice field is a compile error. Copy bytes into fixed arrays.
+Anything the continuation needs from phase 1 must be copied into the **stash**, because the read buffer (and so `ctx.request`) is recycled while parked. The stash is comptime-checked to be plain data: a pointer or slice field is a compile error. Copy bytes into fixed arrays.
 
 ```zig
 const Stash = struct {
     org_id: u64,
-    name_buf: [64]u8 = undefined, // copied bytes — a slice would not compile
+    name_buf: [64]u8 = undefined, // copied bytes: a slice would not compile
     name_len: u8 = 0,
     step: u8 = 0,
 };
@@ -80,9 +80,9 @@ The stash is capped at 256 bytes.
 
 ### The continuation
 
-The continuation receives a `*ResumeContext` — deliberately **not** a `HandlerContext`. It has fresh `response_buf`, response headers, and an arena, but **no `request` field**: reading the recycled request is made unrepresentable rather than merely discouraged.
+The continuation receives a `*ResumeContext`, deliberately **not** a `HandlerContext`. It has fresh `response_buf`, response headers, and an arena, but **no `request` field**: reading the recycled request is made unrepresentable rather than merely discouraged.
 
-It runs **exactly once**, delivering either rows or an error through `rctx.result` (`PgError`: `Timeout`, `ConnectionLost`, `PipelineAborted`, `ServerError`, `ResultTooLarge`). Iterate rows with `res.rows()`; read columns by index; serialize into the response before returning, because the row data borrows the connection's recv buffer and is valid only for the duration of the call.
+It runs **exactly once**, delivering either rows or an error through `rctx.result` (`PgError`: `Timeout`, `ConnectionLost`, `PipelineAborted`, `ServerError`, `ResultTooLarge`). Iterate rows with `res.rows()`, read columns by index, and serialize into the response before returning, because the row data borrows the connection's recv buffer and is valid only for the duration of the call.
 
 | Column accessor | Returns |
 | --- | --- |
@@ -132,7 +132,7 @@ fn onUsers(rctx: *pg.ResumeContext) swerver.response.Response {
         users.append(rctx.allocator(), .{ .id = id, .name = name }) catch break;
     }
 
-    // Serialize into the resume buffer before returning — rows borrow the
+    // Serialize into the resume buffer before returning: rows borrow the
     // recv buffer and die when this continuation returns.
     const body = std.json.Stringify.valueAlloc(rctx.allocator(), users.items, .{}) catch
         return rctx_text(rctx, 500, "encode error");
@@ -146,7 +146,7 @@ fn rctx_text(rctx: *pg.ResumeContext, status: u16, msg: []const u8) swerver.resp
 ```
 
 !!! tip "Chaining queries"
-    A continuation can itself issue the next query with `rctx.query(...)` (or `rctx.queryBatch(...)`) and re-park through the same machinery. The blessed pattern for a multi-step flow is a single continuation function that switches on a `step` field in the stash — it reads like a state machine because it is one.
+    A continuation can itself issue the next query with `rctx.query(...)` (or `rctx.queryBatch(...)`) and re-park through the same machinery. The blessed pattern for a multi-step flow is a single continuation function that switches on a `step` field in the stash. It reads like a state machine because it is one.
 
 ## Going deeper
 

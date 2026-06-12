@@ -2,6 +2,7 @@
 
 Point `server.static_root` at a directory and swerver serves files from it for any request path **not matched by a registered route or a proxy rule**. Routes and the reverse proxy take precedence; static serving is the fallback.
 
+
 ```json
 {
   "server": {
@@ -18,13 +19,13 @@ File responses go out through `sendfile(2)`, so file bytes move from the page ca
 
 ## Precompressed siblings
 
-If a precompressed sibling of the requested file exists next to it and the client's `Accept-Encoding` permits that encoding, swerver serves the compressed file directly. This is **always on** — there's no flag — and it falls back to the identity file when no acceptable sibling exists.
+If a precompressed sibling of the requested file exists next to it and the client's `Accept-Encoding` permits that encoding, swerver serves the compressed file directly. This is **always on** (there's no flag) and it falls back to the identity file when no acceptable sibling exists.
 
 Given a request for `app.js`, swerver looks for, in order:
 
-1. `app.js.br` — served with `Content-Encoding: br` when `br` is acceptable.
-2. `app.js.gz` — served with `Content-Encoding: gzip` when `gzip` is acceptable.
-3. `app.js` — the identity file.
+1. `app.js.br`: served with `Content-Encoding: br` when `br` is acceptable.
+2. `app.js.gz`: served with `Content-Encoding: gzip` when `gzip` is acceptable.
+3. `app.js`: the identity file.
 
 An encoding is "acceptable" when its token is present in `Accept-Encoding` and not disabled with `q=0`. When a compressed sibling is served:
 
@@ -46,11 +47,11 @@ For hot static assets, set `cache_static_files: true`:
 }
 ```
 
-On first serve, swerver caches the file body in memory — **keyed by path and negotiated encoding** (identity / br / gzip) — so subsequent hits skip the `open` / `fstat` / `sendfile` syscalls and serve straight from memory. The cache is:
+On first serve, swerver caches the file body in memory, **keyed by path and negotiated encoding** (identity / br / gzip), so subsequent hits skip the `open` / `fstat` / `sendfile` syscalls and serve straight from memory. The cache is:
 
 - **Per worker**, lazily populated on first access, and bounded.
-- **Encoding-aware** — the identity, `.br`, and `.gz` variants of a path are cached as separate entries.
-- **Fresh on `Date`** — the `Date` header (and `Content-Length`, and HEAD handling) come from the normal response path at send time, never baked into the cached bytes.
+- **Encoding-aware**: the identity, `.br`, and `.gz` variants of a path are cached as separate entries.
+- **Fresh on `Date`**: the `Date` header (and `Content-Length`, and HEAD handling) come from the normal response path at send time, never baked into the cached bytes.
 
 Caching trades memory for fewer syscalls; leave it off when `static_root` holds many large or rarely-requested files.
 

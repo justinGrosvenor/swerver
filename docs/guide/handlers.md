@@ -6,7 +6,7 @@ A handler is a plain function that takes a `*HandlerContext` and returns a `resp
 const HandlerFn = *const fn (ctx: *swerver.router.HandlerContext) swerver.response.Response;
 ```
 
-Handlers are **synchronous** — they run to completion between `recv()` calls on the connection. That's what lets `ctx.request.headers` and `ctx.request.body` be `[]const u8` slices straight into the receive buffer, with no copy. There is no allocator parameter and no error union: build a `Response` and return it.
+Handlers are **synchronous**: they run to completion between `recv()` calls on the connection. That's what lets `ctx.request.headers` and `ctx.request.body` be `[]const u8` slices straight into the receive buffer, with no copy. There is no allocator parameter and no error union: build a `Response` and return it.
 
 ## The request
 
@@ -41,7 +41,7 @@ fn show(ctx: *swerver.router.HandlerContext) swerver.response.Response {
 
 ### Returning JSON the idiomatic way
 
-`ctx.jsonValue` serializes any value — a struct, a slice, a map — with the standard library's JSON encoder. Define a type for your payload and return it; you never format JSON by hand:
+`ctx.jsonValue` serializes any value (a struct, a slice, a map) with the standard library's JSON encoder. Define a type for your payload and return it; you never format JSON by hand:
 
 ```zig
 const Item = struct {
@@ -84,15 +84,15 @@ fn ok(_: *swerver.router.HandlerContext) swerver.response.Response {
 }
 ```
 
-Return only ordinary headers — the HTTP/2 and HTTP/3 encoders add `:status` and `content-length` for you.
+Return only ordinary headers; the HTTP/2 and HTTP/3 encoders add `:status` and `content-length` for you.
 
 ## Response body lifetimes
 
 A response body is a `[]const u8` that **must outlive the handler return**. The body is copied into the connection's write queue synchronously, before the next request on that worker runs, so anything valid at return time is safe. Three sources are valid:
 
-1. **Static slices** — string literals and `const` data.
-2. **The managed pool buffer** — `ctx.respond()` (below) or `ctx.jsonValue`, which the framework releases for you after the response is serialized.
-3. **The request arena** — `ctx.arenaAllocator()`, valid for the life of the handler.
+1. **Static slices**: string literals and `const` data.
+2. **The managed pool buffer**: `ctx.respond()` (below) or `ctx.jsonValue`, which the framework releases for you after the response is serialized.
+3. **The request arena**: `ctx.arenaAllocator()`, valid for the life of the handler.
 
 Don't return a slice into a stack buffer that goes out of scope, and don't stash request slices in module-level state across requests.
 
@@ -132,7 +132,7 @@ fn echo(ctx: *swerver.router.HandlerContext) swerver.response.Response {
     if (ctx.request.body.sliceOrNull()) |bytes| {
         return ctx.json(200, bytes);
     }
-    // Fragmented — copy into the scratch buffer.
+    // Fragmented: copy into the scratch buffer.
     const copied = ctx.request.body.copyTo(ctx.response_buf) orelse
         return ctx.text(413, "body too large");
     return ctx.json(200, copied);
@@ -141,7 +141,7 @@ fn echo(ctx: *swerver.router.HandlerContext) swerver.response.Response {
 
 ## App state & dependencies
 
-Handlers reach shared, app-wide state through the context — no globals:
+Handlers reach shared, app-wide state through the context, no globals:
 
 ```zig
 const Services = struct { db: *Database, cache: *Cache };
@@ -153,4 +153,4 @@ fn list(ctx: *swerver.router.HandlerContext) swerver.response.Response {
 }
 ```
 
-Install state once on the `Router` / `ServerBuilder` before the event loop starts. See [Dependency injection](#) — `ctx.state(T)` for a single app-state value, `ctx.services(T)` for a struct of typed dependencies, and `ctx.get(T)` for a typed lookup. For database access specifically, see [PostgreSQL](postgres.md).
+Install state once on the `Router` / `ServerBuilder` before the event loop starts: `ctx.state(T)` for a single app-state value, `ctx.services(T)` for a struct of typed dependencies, and `ctx.get(T)` for a typed lookup. For database access specifically, see [PostgreSQL](postgres.md).

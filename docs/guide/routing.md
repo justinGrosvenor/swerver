@@ -1,6 +1,6 @@
 # Routing
 
-The router maps an incoming method + path to one handler. It's a fixed-size trie-style table compiled once at startup: registration parses each pattern, and the hot path just walks segments — no allocation, no regex. A 64-bit bloom filter over first path segments fast-rejects most 404s before the route loop even runs.
+The router maps an incoming method + path to one handler. It's a fixed-size trie-style table compiled once at startup: registration parses each pattern, and the hot path just walks segments, with no allocation and no regex. A 64-bit bloom filter over first path segments fast-rejects most 404s before the route loop even runs.
 
 Build the router at startup, register every route, then hand it to the [`ServerBuilder`](../getting-started/first-server.md). Routes can't be added after `server.run()` starts.
 
@@ -35,7 +35,7 @@ try router.delete("/users/:id", deleteUser);
 | `router.route(method, path, handler)` | any `request.Method` |
 
 !!! note "HEAD is automatic"
-    A `GET` route also answers `HEAD` for the same path (RFC 9110 §9.3.2) — you don't register it separately.
+    A `GET` route also answers `HEAD` for the same path (RFC 9110 §9.3.2); you don't register it separately.
 
 ## Path parameters
 
@@ -51,7 +51,7 @@ try router.get("/users/:id", showUser);
 try router.get("/users/:id/posts/:post_id", showPost);
 ```
 
-`/users/42` matches the first route with `id = "42"`. `/users/42/posts/7` matches the second with `id = "42"` and `post_id = "7"`. The returned slice is a zero-copy view into the request path — valid for the duration of the handler call.
+`/users/42` matches the first route with `id = "42"`. `/users/42/posts/7` matches the second with `id = "42"` and `post_id = "7"`. The returned slice is a zero-copy view into the request path, valid for the duration of the handler call.
 
 A trailing `*` wildcard segment matches the rest of the path.
 
@@ -73,8 +73,8 @@ try api.get("/users/:id", showUser);        // → /api/v1/users/:id
 By default the router returns a plain `404 Not Found`, or `405 Method Not Allowed` (with an `Allow` header) when the path matches but the method doesn't. Override either with your own handler:
 
 ```zig
-router.fallback(notFound);          // 404 — no route matched the path
-router.methodNotAllowed(notAllowed); // 405 — path matched, method didn't
+router.fallback(notFound);          // 404: no route matched the path
+router.methodNotAllowed(notAllowed); // 405: path matched, method didn't
 ```
 
 ```zig
@@ -87,7 +87,7 @@ Both take an ordinary `HandlerFn`. The router always produces a valid `Response`
 
 ## Route-scoped middleware
 
-Most apps set one middleware chain on the router (`Router.setMiddleware`) and let every route share it. When a single route needs a different chain — stricter auth on an admin endpoint, or skipping rate limiting on a health check — use the fluent route builder:
+Most apps set one middleware chain on the router (`Router.setMiddleware`) and let every route share it. When a single route needs a different chain (stricter auth on an admin endpoint, or skipping rate limiting on a health check) use the fluent route builder:
 
 ```zig
 var admin_chain = buildAdminChain();
@@ -102,7 +102,7 @@ try router
 
 ## Registration errors
 
-Registration is fail-fast: the route table is fixed-size, so exceeding a limit returns an error rather than silently dropping the route. Treat these as **startup configuration errors** — the `try` in your setup code will surface them before the event loop starts.
+Registration is fail-fast: the route table is fixed-size, so exceeding a limit returns an error rather than silently dropping the route. Treat these as **startup configuration errors**: the `try` in your setup code will surface them before the event loop starts.
 
 | Error | Cause |
 | --- | --- |
@@ -115,5 +115,5 @@ If you legitimately need more, raise the ceilings with `Router.initWithLimits(po
 
 ## Next
 
-- **[Handlers & responses](handlers.md)** — the `HandlerContext` API, JSON, request bodies, app state.
-- **[Middleware](middleware.md)** — auth, rate limiting, caching, and the chain model.
+- **[Handlers & responses](handlers.md)**: the `HandlerContext` API, JSON, request bodies, app state.
+- **[Middleware](middleware.md)**: auth, rate limiting, caching, and the chain model.

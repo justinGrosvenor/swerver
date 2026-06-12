@@ -1,6 +1,6 @@
 # Reverse proxy & gateway
 
-swerver is also a reverse proxy and API gateway. The same router that dispatches your in-process [handlers](handlers.md) can instead forward a request to a pool of upstream servers — with load balancing, active health checks, response caching, traffic splitting, retries, and the full middleware chain (auth, rate limiting, compression) in front.
+swerver is also a reverse proxy and API gateway. The same router that dispatches your in-process [handlers](handlers.md) can instead forward a request to a pool of upstream servers, with load balancing, active health checks, response caching, traffic splitting, retries, and the full middleware chain (auth, rate limiting, compression) in front.
 
 The proxy is configured entirely in JSON, under two top-level keys: `upstreams` (named pools of backend servers) and `routes` (path prefixes that map to an upstream, plus per-route policy). No code required.
 
@@ -53,8 +53,8 @@ Each entry in `servers` is an object, not a bare `host:port` string:
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `address` | string | — | Backend host or IP (required) |
-| `port` | number | — | Backend port (required) |
+| `address` | string | none | Backend host or IP (required) |
+| `port` | number | none | Backend port (required) |
 | `weight` | number | `1` | Relative share for weighted balancing |
 | `max_fails` | number | `3` | Consecutive failures before the server is taken out of rotation |
 | `fail_timeout_ms` | number | `30000` | How long a failed server stays out before re-trying |
@@ -68,7 +68,7 @@ Set `load_balancer` on the upstream:
 | --- | --- |
 | `round_robin` | Rotate through servers sequentially (default) |
 | `least_conn` | Pick the server with the fewest active connections |
-| `ip_hash` | Consistent hashing on the client IP — sticky per client |
+| `ip_hash` | Consistent hashing on the client IP (sticky per client) |
 | `random` | Random selection |
 | `weighted_round_robin` | Round-robin honoring per-server `weight` |
 
@@ -85,7 +85,7 @@ When `health_check` is present, swerver probes each server on the configured `pa
 | `interval_ms` | `5000` | Time between probes |
 | `timeout_ms` | `2000` | Probe timeout |
 | `expected_status` | `200` | Status that counts as healthy |
-| `expected_body` | — | Optional substring the body must contain |
+| `expected_body` | none | Optional substring the body must contain |
 | `healthy_threshold` | `2` | Successes to mark healthy |
 | `unhealthy_threshold` | `3` | Failures to mark unhealthy |
 
@@ -124,11 +124,11 @@ A route binds a path prefix to an upstream and layers on per-route policy. The l
 | `upstream` | Name of the target upstream (required) |
 | `host` | Optional Host header match |
 | `rewrite_pattern` / `rewrite_replacement` | Rewrite the matched prefix before forwarding |
-| `retry` | Retry policy — see [Retries](#retries) |
-| `auth` | Per-route authentication — see [Authentication](#authentication) |
+| `retry` | Retry policy; see [Retries](#retries) |
+| `auth` | Per-route authentication; see [Authentication](#authentication) |
 | `rate_limit` | Token-bucket limiting (`requests_per_second`, `burst_size`, `key`) |
-| `cache` | Per-route response cache — see [Response caching](#response-caching) |
-| `traffic_split` | Weighted split across upstreams — see [Traffic splitting](#traffic-splitting) |
+| `cache` | Per-route response cache; see [Response caching](#response-caching) |
+| `traffic_split` | Weighted split across upstreams; see [Traffic splitting](#traffic-splitting) |
 | `mirror` | Name of an upstream to shadow traffic to |
 | `upstream_headers` | Extra `{name, value}` headers added to the forwarded request |
 | `connect_timeout_ms` / `send_timeout_ms` / `read_timeout_ms` / `total_timeout_ms` | Per-route proxy timeouts |
@@ -160,10 +160,10 @@ Retries are configured per route via `retry.max_retries` (default `1`):
 The retry policy is deliberately narrow and safe:
 
 - **Retryable statuses:** `502`, `503`, `504`.
-- **Retryable methods:** `GET`, `HEAD`, `OPTIONS` (idempotent only — a non-idempotent `POST` is never retried).
+- **Retryable methods:** `GET`, `HEAD`, `OPTIONS` (idempotent only; a non-idempotent `POST` is never retried).
 
 !!! tip "Why a retry can succeed"
-    On a retryable 5xx, the upstream connection is released **closed** rather than returned to the pool, so the retry opens a **fresh** connection. Under a SO_REUSEPORT upstream, that fresh connection can land on a different upstream worker than the one that just returned the transient 5xx — which is the whole point of retrying. On a connection failure (reset / read error), the connection is marked failed and evicted before the next attempt.
+    On a retryable 5xx, the upstream connection is released **closed** rather than returned to the pool, so the retry opens a **fresh** connection. Under a SO_REUSEPORT upstream, that fresh connection can land on a different upstream worker than the one that just returned the transient 5xx, which is the whole point of retrying. On a connection failure (reset / read error), the connection is marked failed and evicted before the next attempt.
 
 When all attempts are exhausted, the client still gets a response: `502` if no upstream was reachable, `504` on timeout.
 
@@ -187,7 +187,7 @@ Add a `cache` block to a route for a per-route LRU response cache:
 
 ## Traffic splitting
 
-`traffic_split` distributes requests across upstreams by weight — the mechanism for canary and blue-green rollouts. Weights are relative; below sends 10% to the canary:
+`traffic_split` distributes requests across upstreams by weight, the mechanism for canary and blue-green rollouts. Weights are relative; below sends 10% to the canary:
 
 ```json
 {
@@ -204,7 +204,7 @@ Add a `cache` block to a route for a per-route LRU response cache:
 
 ### Mirroring
 
-`mirror` shadows live traffic to a second upstream without affecting the client response — useful for load-testing a new version against production traffic. The mirrored response is discarded.
+`mirror` shadows live traffic to a second upstream without affecting the client response, useful for load-testing a new version against production traffic. The mirrored response is discarded.
 
 ```json
 { "path_prefix": "/api/", "upstream": "api", "mirror": "api_shadow" }
@@ -333,10 +333,10 @@ A realistic gateway: two upstreams, an API-key tier, a JWT tier with caching and
 }
 ```
 
-All fields are optional with sensible defaults — see `src/config_file.zig` for the authoritative schema, and `docs/design/5.0-reverse-proxy.md` in the repo for the full architecture.
+All fields are optional with sensible defaults. See `src/config_file.zig` for the authoritative schema, and `docs/design/5.0-reverse-proxy.md` in the repo for the full architecture.
 
 ## Where to next
 
-- [Deployment](../operations/deployment.md) — building with the proxy flag, the fork model, running behind a load balancer.
-- [Observability](../operations/observability.md) — proxy metrics, health, access logs.
-- [Admin API](../operations/admin-api.md) — add/remove routes and upstreams at runtime, no restart.
+- [Deployment](../operations/deployment.md): building with the proxy flag, the fork model, running behind a load balancer.
+- [Observability](../operations/observability.md): proxy metrics, health, access logs.
+- [Admin API](../operations/admin-api.md): add/remove routes and upstreams at runtime, no restart.
