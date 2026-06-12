@@ -12,13 +12,6 @@ HTTP/3   ──┘      │
 !!! warning "Alpha"
     The public API in `src/lib.zig` may change between alpha versions while it's iterated on; breaking changes are noted in release notes. See [Limitations & roadmap](about/limitations.md) for what's in and out of scope today.
 
-## Why swerver
-
-- **Three protocols, one binary.** HTTP/1.1, HTTP/2 (HPACK), and HTTP/3 over QUIC are served by a unified router; handlers don't care which protocol a request arrived on.
-- **A real framework, not just an engine.** Trie router, a zero-allocation middleware chain (auth, rate limiting, caching, compression, OpenTelemetry, body validation), a reverse proxy / API gateway, a native async PostgreSQL client, TLS termination, static file serving, and JSON config with hot reload.
-- **Top-tier performance.** Holds **#1 on JSON-over-TLS** on the [HttpArena](https://www.http-arena.com/) 64-core benchmark (1.95M req/s) and runs at the front across baseline, pipelined, HTTP/2, and HTTP/3, while carrying the full middleware chain. See [Benchmarks](about/benchmarks.md).
-- **Embed it or run it.** Use the prebuilt server with a JSON config, or depend on swerver as a Zig package and wire your own routes and handlers into the binary.
-
 ## A minimal server
 
 ```zig
