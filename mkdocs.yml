@@ -10,21 +10,25 @@ theme:
   name: material
   logo: assets/logo.png
   favicon: assets/logo.png
+  font:
+    text: Inter
+    code: JetBrains Mono
   palette:
-    - media: "(prefers-color-scheme: light)"
-      scheme: default
-      primary: indigo
-      accent: indigo
-      toggle:
-        icon: material/weather-night
-        name: Switch to dark mode
+    # Dark first, to match swerver.net.
     - media: "(prefers-color-scheme: dark)"
       scheme: slate
-      primary: indigo
-      accent: indigo
+      primary: black
+      accent: yellow
       toggle:
         icon: material/weather-sunny
         name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: black
+      accent: yellow
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
   features:
     - navigation.sections
     - navigation.top
@@ -59,6 +63,9 @@ markdown_extensions:
 
 plugins:
   - search
+
+extra_css:
+  - stylesheets/swerver.css
 
 # Internal design notes + harness fixtures aren't part of the public site.
 exclude_docs: |

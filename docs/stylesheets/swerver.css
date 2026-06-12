@@ -1,0 +1,93 @@
+/* swerver docs theme: matches swerver.net (dark, gold accent, Inter/JetBrains Mono). */
+
+:root {
+  --sw-gold: #FFD60A;
+  --sw-gold-muted: rgba(255, 214, 10, 0.12);
+}
+
+/* ── Dark scheme (default), mirroring swerver.net's tokens ── */
+[data-md-color-scheme="slate"] {
+  --md-default-bg-color:           #09090B;
+  --md-default-bg-color--light:    #141417;
+  --md-default-bg-color--lighter:  #18181B;
+  --md-default-bg-color--lightest: #27272A;
+
+  --md-primary-fg-color:           #09090B; /* header blends into the page */
+  --md-primary-fg-color--light:    #141417;
+  --md-primary-fg-color--dark:     #09090B;
+  --md-primary-bg-color:           #FAFAFA;
+  --md-primary-bg-color--light:    #A1A1AA;
+
+  --md-accent-fg-color:            var(--sw-gold);
+  --md-accent-fg-color--transparent: var(--sw-gold-muted);
+  --md-accent-bg-color:            #09090B;
+
+  --md-typeset-a-color:            var(--sw-gold);
+
+  --md-code-bg-color:              #141417;
+  --md-code-fg-color:              #FAFAFA;
+
+  --md-footer-bg-color:            #09090B;
+  --md-footer-bg-color--dark:      #0C0C0E;
+}
+
+/* ── Light scheme: keep the gold accent, darker for contrast ── */
+[data-md-color-scheme="default"] {
+  --md-primary-fg-color: #18181B;
+  --md-primary-bg-color: #FAFAFA;
+  --md-accent-fg-color:  #9A7D00;
+  --md-typeset-a-color:  #9A7D00;
+}
+
+/* Header: flat, with a hairline border like the swerver.net nav. */
+.md-header {
+  box-shadow: none;
+  border-bottom: 1px solid var(--md-default-bg-color--lightest);
+}
+
+/* Brand title + section labels in the mono face, like swerver.net's nav. */
+.md-header__title,
+.md-nav__title {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  letter-spacing: -0.01em;
+}
+
+/* Code blocks: raised panel, subtle border, rounded. */
+[data-md-color-scheme="slate"] .md-typeset pre {
+  border: 1px solid #1F1F23;
+  border-radius: 8px;
+}
+[data-md-color-scheme="slate"] .md-typeset pre > code {
+  background-color: #18181B;
+}
+[data-md-color-scheme="slate"] .md-typeset :not(pre) > code {
+  background-color: #18181B;
+  color: #FAFAFA;
+}
+
+/* Borders to match swerver.net (#27272A). */
+[data-md-color-scheme="slate"] .md-typeset table th,
+[data-md-color-scheme="slate"] .md-typeset table td,
+[data-md-color-scheme="slate"] .md-typeset hr {
+  border-color: #27272A;
+}
+
+/* Active nav item + selection in brand gold. */
+[data-md-color-scheme="slate"] .md-nav__link--active,
+[data-md-color-scheme="slate"] .md-nav__item--active > .md-nav__link {
+  color: var(--sw-gold);
+}
+::selection {
+  background: var(--sw-gold-muted);
+  color: var(--sw-gold);
+}
+
+/* Home-page "grid cards" feel a touch more like the swerver.net panels. */
+[data-md-color-scheme="slate"] .md-typeset .grid.cards > ul > li {
+  border: 1px solid #1F1F23;
+  background: #141417;
+  border-radius: 10px;
+}
+[data-md-color-scheme="slate"] .md-typeset .grid.cards > ul > li:hover {
+  border-color: var(--sw-gold);
+}
