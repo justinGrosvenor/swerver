@@ -2205,3 +2205,329 @@ fn writeSetting(payload: []u8, pos: *usize, id: u16, value: u32) void {
     payload[pos.* + 5] = @intCast(value & 0xff);
     pos.* += 6;
 }
+
+// ============================================================
+// Tests
+// ============================================================
+
+const testing = std.testing;
+
+test "writeFrameHeader round-trips length/type/flags/stream_id through Parser" {
+    // Serialize a HEADERS frame header (with a 4-byte dummy payload) and a full
+    // preface, then parse it back and assert every field matches.
+    var buf: [Preface.len + 9 + 4]u8 = undefined;
+    @memcpy(buf[0..Preface.len], Preface);
+    var off: usize = Preface.len;
+    const payload = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
+    try writeFrameHeader(buf[off .. off + 9], .headers, 0x4, 0x0001_0203, payload.len);
+    @memcpy(buf[off + 9 .. off + 9 + payload.len], &payload);
+    off += 9 + payload.len;
+
+    var parser = Parser.init();
+    var frames: [4]Frame = undefined;
+    const r = parser.parse(buf[0..off], &frames, .{ .max_frame_size = DefaultMaxFrameSize });
+    try testing.expectEqual(ParseState.complete, r.state);
+    try testing.expectEqual(@as(usize, 1), r.frame_count);
+    try testing.expectEqual(FrameType.headers, frames[0].header.typ);
+    try testing.expectEqual(@as(u8, 0x4), frames[0].header.flags);
+    try testing.expectEqual(@as(u32, 0x0001_0203), frames[0].header.stream_id);
+    try testing.expectEqual(@as(u32, 4), frames[0].header.length);
+    try testing.expectEqualSlices(u8, &payload, frames[0].payload);
+}
+
+test "writeFrame serializes the 24-bit big-endian length correctly" {
+    // A payload of 0x0102 (258) bytes must encode as length bytes 00 01 02.
+    var buf: [9 + 258]u8 = undefined;
+    var payload: [258]u8 = undefined;
+    @memset(&payload, 0);
+    const n = try writeFrame(&buf, .data, 0, 1, &payload);
+    try testing.expectEqual(@as(usize, 9 + 258), n);
+    try testing.expectEqual(@as(u8, 0x00), buf[0]);
+    try testing.expectEqual(@as(u8, 0x01), buf[1]);
+    try testing.expectEqual(@as(u8, 0x02), buf[2]);
+    try testing.expectEqual(@as(u8, @intFromEnum(FrameType.data)), buf[3]);
+}
+
+test "Parser rejects a frame whose length exceeds max_frame_size" {
+    // Build a frame header claiming a 100-byte payload but cap max_frame_size at 50.
+    var buf: [Preface.len + 9]u8 = undefined;
+    @memcpy(buf[0..Preface.len], Preface);
+    try writeFrameHeader(buf[Preface.len..], .data, 0, 1, 100);
+    var parser = Parser.init();
+    var frames: [4]Frame = undefined;
+    const r = parser.parse(&buf, &frames, .{ .max_frame_size = 50 });
+    try testing.expectEqual(ParseState.err, r.state);
+    try testing.expectEqual(ErrorCode.frame_size_error, r.error_code);
+}
+
+test "Parser recognizes the real HTTP/2 preface and reports complete" {
+    var parser = Parser.init();
+    var frames: [1]Frame = undefined;
+    const r = parser.parse(Preface, &frames, .{ .max_frame_size = DefaultMaxFrameSize });
+    try testing.expectEqual(ParseState.complete, r.state);
+    try testing.expectEqual(@as(usize, Preface.len), r.consumed_bytes);
+    try testing.expectEqual(@as(usize, 0), r.frame_count);
+}
+
+test "Parser accepts a partial preface prefix and resumes" {
+    // Feed the preface in two chunks; the first must be accepted as partial.
+    var parser = Parser.init();
+    var frames: [1]Frame = undefined;
+    const split = 5;
+    const r1 = parser.parse(Preface[0..split], &frames, .{ .max_frame_size = DefaultMaxFrameSize });
+    try testing.expectEqual(ParseState.partial, r1.state);
+    try testing.expectEqual(@as(usize, split), r1.consumed_bytes);
+    const r2 = parser.parse(Preface[split..], &frames, .{ .max_frame_size = DefaultMaxFrameSize });
+    try testing.expectEqual(ParseState.complete, r2.state);
+}
+
+test "Parser rejects an HTTP/1 request line as an invalid preface" {
+    var parser = Parser.init();
+    var frames: [1]Frame = undefined;
+    const r = parser.parse("GET / HTTP/1.1\r\n\r\n", &frames, .{ .max_frame_size = DefaultMaxFrameSize });
+    try testing.expectEqual(ParseState.err, r.state);
+    try testing.expectEqual(ErrorCode.invalid_preface, r.error_code);
+}
+
+test "HPACK encodeInt/decodeInt round-trip across the prefix boundary" {
+    // Values below the prefix max fit in one byte; values at/above need the
+    // multi-byte continuation form. Round-trip both through encode and decode.
+    const cases = [_]usize{ 0, 1, 10, 30, 31, 32, 127, 128, 1337, 16384, 0xFFFFF };
+    for (cases) |v| {
+        var buf: [8]u8 = undefined;
+        // 5-bit prefix (as used by HPACK dynamic table size updates), no flag bits.
+        const n = try encodeInt(&buf, 5, v, 0x00);
+        var idx: usize = 0;
+        const decoded = try decodeInt(buf[0..n], &idx, 5);
+        try testing.expectEqual(v, decoded);
+        try testing.expectEqual(n, idx);
+    }
+}
+
+test "HPACK encodeInt uses multi-byte form at the 5-bit boundary" {
+    // 31 is the max representable in a 5-bit prefix, so encoding 31 must spill
+    // into a continuation byte (prefix all-ones, then 0).
+    var buf: [4]u8 = undefined;
+    const n = try encodeInt(&buf, 5, 31, 0x00);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqual(@as(u8, 0x1f), buf[0]); // 0b11111
+    try testing.expectEqual(@as(u8, 0x00), buf[1]); // remainder 0
+    // 30 still fits in the prefix → single byte.
+    const n2 = try encodeInt(&buf, 5, 30, 0x00);
+    try testing.expectEqual(@as(usize, 1), n2);
+    try testing.expectEqual(@as(u8, 30), buf[0]);
+}
+
+test "HPACK static-table indexing decodes :method GET and :path /" {
+    // A request header block referencing only static-table entries:
+    //   index 2 -> :method GET, index 4 -> :path /, index 6 -> :scheme http,
+    //   index 1 -> :authority (we instead supply a literal authority).
+    // Indexed header field = 0x80 | index.
+    var dec = HpackDecoder.init();
+    var out: [16]request.Header = undefined;
+    const block = [_]u8{
+        0x82, // :method: GET
+        0x84, // :path: /
+        0x86, // :scheme: http
+    };
+    const result = try dec.decodeRequestBlock(&block, &out, DefaultMaxHeaderListSize);
+    try testing.expectEqual(request.Method.GET, result.method);
+    try testing.expectEqualStrings("/", result.path);
+    // Pseudo-headers are consumed, so no regular headers remain.
+    try testing.expectEqual(@as(usize, 0), result.headers.len);
+}
+
+test "HPACK literal-with-incremental-indexing round-trips a custom header" {
+    // Encode :method/:path/:scheme via static indices, then a literal header
+    // ("x-test: hello") with incremental indexing (0x40, name as literal).
+    var dec = HpackDecoder.init();
+    var out: [16]request.Header = undefined;
+    var block: [128]u8 = undefined;
+    var i: usize = 0;
+    block[i] = 0x82;
+    i += 1; // :method GET
+    block[i] = 0x84;
+    i += 1; // :path /
+    block[i] = 0x86;
+    i += 1; // :scheme http
+    // literal header with incremental indexing, new name
+    block[i] = 0x40;
+    i += 1;
+    i += try encodeString(block[i..], "x-test");
+    i += try encodeString(block[i..], "hello");
+
+    const result = try dec.decodeRequestBlock(block[0..i], &out, DefaultMaxHeaderListSize);
+    try testing.expectEqual(request.Method.GET, result.method);
+    try testing.expectEqual(@as(usize, 1), result.headers.len);
+    try testing.expectEqualStrings("x-test", result.headers[0].name);
+    try testing.expectEqualStrings("hello", result.headers[0].value);
+}
+
+test "HPACK dynamic table: second reference resolves via indexed field" {
+    // First block adds "x-custom: v1" to the dynamic table via incremental
+    // indexing. Static table has 61 entries, so the newest dynamic entry is
+    // index 62, encoded as an indexed header field (0x80 | 62 = 0xBE).
+    var dec = HpackDecoder.init();
+    var out: [16]request.Header = undefined;
+    var block1: [128]u8 = undefined;
+    var i: usize = 0;
+    block1[i] = 0x82;
+    i += 1;
+    block1[i] = 0x84;
+    i += 1;
+    block1[i] = 0x86;
+    i += 1;
+    block1[i] = 0x40;
+    i += 1;
+    i += try encodeString(block1[i..], "x-custom");
+    i += try encodeString(block1[i..], "v1");
+    _ = try dec.decodeRequestBlock(block1[0..i], &out, DefaultMaxHeaderListSize);
+
+    // Second block: pseudo-headers + indexed reference to the dynamic entry.
+    const block2 = [_]u8{ 0x82, 0x84, 0x86, 0x80 | 62 };
+    const r2 = try dec.decodeRequestBlock(&block2, &out, DefaultMaxHeaderListSize);
+    try testing.expectEqual(@as(usize, 1), r2.headers.len);
+    try testing.expectEqualStrings("x-custom", r2.headers[0].name);
+    try testing.expectEqualStrings("v1", r2.headers[0].value);
+}
+
+test "HPACK response encode -> decode round-trips status and headers" {
+    // encodeResponseHeaders is the real outbound encoder; decode it back with
+    // decodeResponseBlock and verify the round-trip.
+    var enc_buf: [512]u8 = undefined;
+    const hdrs = [_]response.Header{
+        .{ .name = "content-type", .value = "text/plain" },
+        .{ .name = "x-custom", .value = "abc" },
+    };
+    const n = try encodeResponseHeaders(&enc_buf, 200, &hdrs, 11, "Mon, 01 Jan 2024 00:00:00 GMT");
+
+    var dec = HpackDecoder.init();
+    var out: [16]request.Header = undefined;
+    const result = try dec.decodeResponseBlock(enc_buf[0..n], &out, DefaultMaxHeaderListSize);
+    try testing.expectEqualStrings("200", result.status);
+
+    var saw_ct = false;
+    var saw_custom = false;
+    var saw_cl = false;
+    for (result.headers) |h| {
+        if (std.mem.eql(u8, h.name, "content-type")) {
+            try testing.expectEqualStrings("text/plain", h.value);
+            saw_ct = true;
+        } else if (std.mem.eql(u8, h.name, "x-custom")) {
+            try testing.expectEqualStrings("abc", h.value);
+            saw_custom = true;
+        } else if (std.mem.eql(u8, h.name, "content-length")) {
+            try testing.expectEqualStrings("11", h.value);
+            saw_cl = true;
+        }
+    }
+    try testing.expect(saw_ct);
+    try testing.expect(saw_custom);
+    try testing.expect(saw_cl);
+}
+
+test "encodeResponseHeaders uses static index 0x88 for status 200" {
+    // Status 200 maps to static table index 8 -> indexed field 0x80|8 = 0x88.
+    var buf: [64]u8 = undefined;
+    const n = try encodeResponseHeaders(&buf, 200, &.{}, 0, "Mon, 01 Jan 2024 00:00:00 GMT");
+    try testing.expect(n > 0);
+    try testing.expectEqual(@as(u8, 0x88), buf[0]);
+}
+
+test "SETTINGS frame updates peer max frame size and initial window" {
+    // Drive a SETTINGS frame through the full Stack.ingest path (after preface)
+    // and assert the connection settings are applied.
+    var stack = Stack.init();
+    var input: [Preface.len + 9 + 12]u8 = undefined;
+    @memcpy(input[0..Preface.len], Preface);
+    // Two settings: MAX_FRAME_SIZE(0x5)=32768, INITIAL_WINDOW_SIZE(0x4)=131072.
+    var payload: [12]u8 = undefined;
+    var plen: usize = 0;
+    writeSetting(&payload, &plen, 0x5, 32768);
+    writeSetting(&payload, &plen, 0x4, 131072);
+    const fn_len = try writeFrame(input[Preface.len..], .settings, 0, 0, &payload);
+
+    var frames: [8]Frame = undefined;
+    var events: [8]Event = undefined;
+    const r = stack.ingest(input[0 .. Preface.len + fn_len], &frames, &events);
+    try testing.expectEqual(ParseState.complete, r.state);
+    try testing.expectEqual(@as(u32, 32768), stack.peer_max_frame_size);
+    try testing.expectEqual(@as(i32, 131072), stack.initial_peer_window);
+    // A non-ACK SETTINGS frame produces a settings event so the caller can ACK.
+    var saw_settings = false;
+    for (events[0..r.event_count]) |ev| {
+        if (ev == .settings) {
+            try testing.expectEqual(false, ev.settings.ack);
+            saw_settings = true;
+        }
+    }
+    try testing.expect(saw_settings);
+}
+
+test "SETTINGS_INITIAL_WINDOW_SIZE rejects a value above 2^31-1" {
+    var stack = Stack.init();
+    var input: [Preface.len + 9 + 6]u8 = undefined;
+    @memcpy(input[0..Preface.len], Preface);
+    var payload: [6]u8 = undefined;
+    var plen: usize = 0;
+    writeSetting(&payload, &plen, 0x4, 0x8000_0000); // 2^31, illegal
+    const fn_len = try writeFrame(input[Preface.len..], .settings, 0, 0, &payload);
+    var frames: [4]Frame = undefined;
+    var events: [4]Event = undefined;
+    const r = stack.ingest(input[0 .. Preface.len + fn_len], &frames, &events);
+    try testing.expectEqual(ParseState.err, r.state);
+    try testing.expectEqual(ErrorCode.protocol_error, r.error_code);
+}
+
+test "WINDOW_UPDATE grows the connection send window and unblocks it" {
+    var stack = Stack.init();
+    // Force the connection send window negative to simulate a blocked sender.
+    stack.conn_send_window = 0;
+    var input: [Preface.len + 9 + 4]u8 = undefined;
+    @memcpy(input[0..Preface.len], Preface);
+    const fn_len = try writeWindowUpdate(input[Preface.len..], 0, 5000);
+    var frames: [4]Frame = undefined;
+    var events: [4]Event = undefined;
+    const r = stack.ingest(input[0 .. Preface.len + fn_len], &frames, &events);
+    try testing.expectEqual(ParseState.complete, r.state);
+    try testing.expectEqual(@as(i32, 5000), stack.conn_send_window);
+    // Was blocked (<=0) and is now positive -> a window_opened event fires.
+    var saw_opened = false;
+    for (events[0..r.event_count]) |ev| {
+        if (ev == .window_opened) {
+            try testing.expectEqual(@as(u32, 0), ev.window_opened.stream_id);
+            try testing.expectEqual(@as(u32, 5000), ev.window_opened.increment);
+            saw_opened = true;
+        }
+    }
+    try testing.expect(saw_opened);
+}
+
+test "WINDOW_UPDATE overflowing the connection window is a flow-control error" {
+    var stack = Stack.init();
+    stack.conn_send_window = 0x7FFF_FFFF; // already at the max
+    var input: [Preface.len + 9 + 4]u8 = undefined;
+    @memcpy(input[0..Preface.len], Preface);
+    const fn_len = try writeWindowUpdate(input[Preface.len..], 0, 1);
+    var frames: [4]Frame = undefined;
+    var events: [4]Event = undefined;
+    const r = stack.ingest(input[0 .. Preface.len + fn_len], &frames, &events);
+    try testing.expectEqual(ParseState.err, r.state);
+    try testing.expectEqual(ErrorCode.flow_control_error, r.error_code);
+}
+
+test "canSend/consumeSendWindow respect connection and stream windows" {
+    var stack = Stack.init();
+    const stream = stack.openTestStream(1);
+    stream.send_window = 100;
+    stack.conn_send_window = 40;
+    // Limited by the connection window (40), capped at want (1000).
+    try testing.expectEqual(@as(usize, 40), stack.canSend(1, 1000));
+    stack.consumeSendWindow(1, 30);
+    try testing.expectEqual(@as(i32, 10), stack.conn_send_window);
+    try testing.expectEqual(@as(i32, 70), stream.send_window);
+    // Now connection-limited to 10.
+    try testing.expectEqual(@as(usize, 10), stack.canSend(1, 1000));
+    // Unknown stream -> 0.
+    try testing.expectEqual(@as(usize, 0), stack.canSend(3, 100));
+}

@@ -188,3 +188,86 @@ fn makeServiceGetter(comptime Services: type) router_mod.ServiceGetter {
         }
     }.get;
 }
+
+test "configDefault carries ServerConfig defaults into the builder" {
+    const b = ServerBuilder.configDefault();
+    // configDefault() must mirror ServerConfig.default().
+    try std.testing.expectEqual(@as(u16, 8080), b.cfg.port);
+    try std.testing.expectEqualStrings("0.0.0.0", b.cfg.address);
+    try std.testing.expectEqual(@as(usize, 2048), b.cfg.max_connections);
+    // No optional wiring has been applied yet.
+    try std.testing.expect(b.router_opt == null);
+    try std.testing.expect(b.middleware_chain == null);
+    try std.testing.expect(b.app_state == null);
+    try std.testing.expect(b.app_services == null);
+    try std.testing.expect(b.app_services_get == null);
+    try std.testing.expect(b.proxy_instance == null);
+}
+
+test "config(custom) carries custom values through the builder" {
+    var cfg = config_mod.ServerConfig.default();
+    cfg.port = 9090;
+    cfg.address = "127.0.0.1";
+    cfg.max_connections = 64;
+    const b = ServerBuilder.config(cfg);
+    try std.testing.expectEqual(@as(u16, 9090), b.cfg.port);
+    try std.testing.expectEqualStrings("127.0.0.1", b.cfg.address);
+    try std.testing.expectEqual(@as(usize, 64), b.cfg.max_connections);
+}
+
+test "chaining setters wire fields and return a new builder by value" {
+    var app_state: u32 = 7;
+    const app_router = router_mod.Router.init(.{});
+    const base = ServerBuilder.configDefault();
+
+    const chained = base
+        .router(app_router)
+        .withState(&app_state);
+
+    // The chained builder has the wiring applied...
+    try std.testing.expect(chained.router_opt != null);
+    try std.testing.expect(chained.app_state != null);
+    try std.testing.expectEqual(@as(*anyopaque, @ptrCast(&app_state)), chained.app_state.?);
+    // ...while the original is untouched (methods take/return by value).
+    try std.testing.expect(base.router_opt == null);
+    try std.testing.expect(base.app_state == null);
+}
+
+test "preencoded/cacheStaticFiles toggles flip the right config flags" {
+    const b = ServerBuilder.configDefault();
+    // Defaults are off.
+    try std.testing.expect(!b.cfg.disable_preencoded);
+    try std.testing.expect(!b.cfg.cache_static_files);
+
+    const toggled = b.disablePreencoded().cacheStaticFiles();
+    try std.testing.expect(toggled.cfg.disable_preencoded);
+    try std.testing.expect(toggled.cfg.cache_static_files);
+}
+
+test "build allocates a Server then deinit releases it with no leak" {
+    // build() does not bind a socket — listener_fd stays null until run() —
+    // so we can build + deinit safely under the testing allocator and assert
+    // no leaks. disablePreencoded keeps init lean.
+    const builder = ServerBuilder.configDefault().disablePreencoded();
+    const srv = try builder.build(std.testing.allocator);
+    defer std.testing.allocator.destroy(srv);
+    defer srv.deinit();
+
+    // The built server reflects the config and has not acquired a listener.
+    try std.testing.expectEqual(@as(u16, 8080), srv.cfg.port);
+    try std.testing.expect(srv.listener_fd == null);
+    try std.testing.expect(srv.proxy == null);
+}
+
+test "build installs the provided router instead of a fresh one" {
+    const app_router = router_mod.Router.init(.{});
+    const builder = ServerBuilder.configDefault()
+        .disablePreencoded()
+        .router(app_router);
+    const srv = try builder.build(std.testing.allocator);
+    defer std.testing.allocator.destroy(srv);
+    defer srv.deinit();
+
+    // The router we handed in (no payment policy) should be the one installed.
+    try std.testing.expect(!srv.app_router.x402_policy.require_payment);
+}

@@ -74,3 +74,100 @@ pub const BufferPool = struct {
         return self.storage[start .. start + self.buffer_size];
     }
 };
+
+test "BufferPool.init allocates N buffers of the configured size" {
+    const cfg = config.BufferPoolConfig{ .buffer_size = 256, .buffer_count = 8 };
+    var pool = try BufferPool.init(std.testing.allocator, cfg);
+    defer pool.deinit();
+
+    try std.testing.expectEqual(@as(usize, 256), pool.buffer_size);
+    try std.testing.expectEqual(@as(usize, 8), pool.buffer_count);
+    try std.testing.expectEqual(@as(usize, 8), pool.free_len);
+
+    const h = pool.acquire().?;
+    try std.testing.expectEqual(@as(usize, 256), h.bytes.len);
+    // Buffer is writable across its whole length.
+    @memset(h.bytes, 0xAB);
+    try std.testing.expectEqual(@as(u8, 0xAB), h.bytes[h.bytes.len - 1]);
+    pool.release(h);
+}
+
+test "BufferPool.acquire exhausts after buffer_count handles then returns null" {
+    const cfg = config.BufferPoolConfig{ .buffer_size = 64, .buffer_count = 3 };
+    var pool = try BufferPool.init(std.testing.allocator, cfg);
+    defer pool.deinit();
+
+    var handles: [3]BufferHandle = undefined;
+    for (0..3) |i| {
+        handles[i] = pool.acquire().?;
+    }
+    // Pool is now empty.
+    try std.testing.expectEqual(@as(usize, 0), pool.free_len);
+    try std.testing.expect(pool.acquire() == null);
+
+    // Clean up so deinit does not leak.
+    for (handles) |h| pool.release(h);
+}
+
+test "BufferPool.release makes a buffer available for a subsequent acquire" {
+    const cfg = config.BufferPoolConfig{ .buffer_size = 64, .buffer_count = 1 };
+    var pool = try BufferPool.init(std.testing.allocator, cfg);
+    defer pool.deinit();
+
+    const first = pool.acquire().?;
+    try std.testing.expect(pool.acquire() == null); // exhausted
+
+    pool.release(first);
+    const second = pool.acquire().?; // now succeeds again
+    try std.testing.expectEqual(@as(u32, 0), second.index);
+    pool.release(second);
+}
+
+test "BufferPool.acquire hands out distinct, non-aliasing buffers" {
+    const cfg = config.BufferPoolConfig{ .buffer_size = 32, .buffer_count = 4 };
+    var pool = try BufferPool.init(std.testing.allocator, cfg);
+    defer pool.deinit();
+
+    var handles: [4]BufferHandle = undefined;
+    for (0..4) |i| handles[i] = pool.acquire().?;
+
+    // Distinct indices.
+    for (0..4) |i| {
+        for (i + 1..4) |j| {
+            try std.testing.expect(handles[i].index != handles[j].index);
+        }
+    }
+
+    // Distinct, non-overlapping memory: stamp each buffer with its own byte
+    // and confirm no write bled into another buffer.
+    for (handles, 0..) |h, i| @memset(h.bytes, @intCast(i + 1));
+    for (handles, 0..) |h, i| {
+        try std.testing.expectEqual(@as(u8, @intCast(i + 1)), h.bytes[0]);
+        try std.testing.expectEqual(@as(u8, @intCast(i + 1)), h.bytes[h.bytes.len - 1]);
+    }
+
+    for (handles) |h| pool.release(h);
+}
+
+test "BufferPool reuses released buffers in LIFO order" {
+    const cfg = config.BufferPoolConfig{ .buffer_size = 16, .buffer_count = 3 };
+    var pool = try BufferPool.init(std.testing.allocator, cfg);
+    defer pool.deinit();
+
+    const a = pool.acquire().?;
+    const b = pool.acquire().?;
+    const c = pool.acquire().?;
+    try std.testing.expectEqual(@as(usize, 0), pool.free_len);
+
+    // Release in a known order, then re-acquire: the free stack is LIFO,
+    // so the most recently released handle is handed back first.
+    pool.release(b);
+    pool.release(a);
+    const next = pool.acquire().?;
+    try std.testing.expectEqual(a.index, next.index);
+
+    pool.release(c);
+    pool.release(next);
+    // After returning everything the pool is full again.
+    try std.testing.expectEqual(@as(usize, 3), pool.free_len);
+}
