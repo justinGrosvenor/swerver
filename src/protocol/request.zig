@@ -160,3 +160,103 @@ pub const RequestView = struct {
         return self.getHeader(name) != null;
     }
 };
+
+test "getHeader is case-insensitive and returns null for missing headers" {
+    const headers = [_]Header{
+        .{ .name = "Content-Type", .value = "application/json" },
+        .{ .name = "X-Custom", .value = "v1" },
+    };
+    const view = RequestView{
+        .method = .GET,
+        .path = "/",
+        .headers = &headers,
+    };
+
+    // Exact case match.
+    try std.testing.expectEqualStrings("application/json", view.getHeader("Content-Type").?);
+    // Differing case still matches (RFC 9110 §5.1).
+    try std.testing.expectEqualStrings("application/json", view.getHeader("content-type").?);
+    try std.testing.expectEqualStrings("application/json", view.getHeader("CONTENT-TYPE").?);
+    try std.testing.expectEqualStrings("v1", view.getHeader("x-custom").?);
+
+    // Missing header returns null.
+    try std.testing.expect(view.getHeader("Authorization") == null);
+    try std.testing.expect(!view.hasHeader("Authorization"));
+    try std.testing.expect(view.hasHeader("content-type"));
+}
+
+test "Method.fromString parses standard methods and rejects unknown" {
+    try std.testing.expectEqual(Method.GET, Method.fromString("GET").?);
+    try std.testing.expectEqual(Method.POST, Method.fromString("POST").?);
+    try std.testing.expectEqual(Method.PUT, Method.fromString("PUT").?);
+    try std.testing.expectEqual(Method.DELETE, Method.fromString("DELETE").?);
+
+    // fromString only knows the registered set; case matters and extensions are unknown.
+    try std.testing.expect(Method.fromString("PROPFIND") == null);
+    try std.testing.expect(Method.fromString("get") == null);
+    try std.testing.expect(Method.fromString("") == null);
+}
+
+test "Method.fromStringExtended maps extension tokens to OTHER and rejects invalid tokens" {
+    // Known methods still resolve to their concrete tag.
+    try std.testing.expectEqual(Method.GET, Method.fromStringExtended("GET").?);
+    try std.testing.expectEqual(Method.PATCH, Method.fromStringExtended("PATCH").?);
+
+    // Valid extension tokens become OTHER.
+    try std.testing.expectEqual(Method.OTHER, Method.fromStringExtended("PROPFIND").?);
+    try std.testing.expectEqual(Method.OTHER, Method.fromStringExtended("MKCOL").?);
+
+    // Non-token characters (space, control) are rejected outright.
+    try std.testing.expect(Method.fromStringExtended("BAD METHOD") == null);
+    try std.testing.expect(Method.fromStringExtended("") == null);
+    try std.testing.expect(Method.fromStringExtended("GET\r") == null);
+}
+
+test "getMethodName returns tag name for known methods and raw bytes for OTHER" {
+    const known = RequestView{ .method = .DELETE, .path = "/", .headers = &.{} };
+    try std.testing.expectEqualStrings("DELETE", known.getMethodName());
+
+    const ext = RequestView{
+        .method = .OTHER,
+        .method_raw = "PROPFIND",
+        .path = "/",
+        .headers = &.{},
+    };
+    try std.testing.expectEqualStrings("PROPFIND", ext.getMethodName());
+}
+
+test "RequestBody slice exposes bytes via sliceOrNull, len and copyTo" {
+    const body = RequestBody{ .slice = "hello body" };
+
+    try std.testing.expectEqual(@as(usize, 10), body.len());
+    try std.testing.expectEqualStrings("hello body", body.sliceOrNull().?);
+
+    var dst: [16]u8 = undefined;
+    const copied = body.copyTo(&dst).?;
+    try std.testing.expectEqualStrings("hello body", copied);
+    // Returned slice is trimmed to the body length, not the buffer length.
+    try std.testing.expectEqual(@as(usize, 10), copied.len);
+}
+
+test "RequestBody.copyTo returns null when destination is too small" {
+    const body = RequestBody{ .slice = "0123456789" };
+    var too_small: [4]u8 = undefined;
+    try std.testing.expect(body.copyTo(&too_small) == null);
+
+    // Exact-fit destination succeeds.
+    var exact: [10]u8 = undefined;
+    try std.testing.expectEqualStrings("0123456789", body.copyTo(&exact).?);
+}
+
+test "RequestBody length_only and scattered have no contiguous slice" {
+    const lo = RequestBody{ .length_only = 1234 };
+    try std.testing.expectEqual(@as(usize, 1234), lo.len());
+    try std.testing.expect(lo.sliceOrNull() == null);
+    var dst: [2048]u8 = undefined;
+    // length_only carries no bytes, so copyTo cannot materialize them.
+    try std.testing.expect(lo.copyTo(&dst) == null);
+
+    // empty helper is a zero-length contiguous slice.
+    try std.testing.expectEqual(@as(usize, 0), RequestBody.empty.len());
+    try std.testing.expectEqualStrings("", RequestBody.empty.sliceOrNull().?);
+}

@@ -1443,3 +1443,241 @@ test "jsonValue serializes a struct with std.json" {
         resp.body.bytes,
     );
 }
+
+// --- Test helpers for the handler/response API ---------------------------
+//
+// These mirror the construction idiom used by the tests above: build a
+// `Router`, a stack-allocated `HandlerScratch`, a `middleware.Context`, and
+// a `RequestView`, then drive a request through `router.handle`. Two small
+// helpers keep the assertions readable.
+
+const TestRig = struct {
+    response_buf: [RESPONSE_BUF_SIZE]u8 = undefined,
+    response_headers: [MAX_RESPONSE_HEADERS]response.Header = undefined,
+    arena_buf: [ARENA_BUF_SIZE]u8 = undefined,
+    mw_ctx: middleware.Context = .{},
+
+    fn scratch(self: *TestRig) HandlerScratch {
+        return .{
+            .response_buf = self.response_buf[0..],
+            .response_headers = self.response_headers[0..],
+            .arena_buf = self.arena_buf[0..],
+        };
+    }
+
+    fn run(self: *TestRig, router: *Router, method: request.Method, path: []const u8) RouteResult {
+        var sc = self.scratch();
+        const req = request.RequestView{
+            .method = method,
+            .path = path,
+            .headers = &.{},
+            .body = .{ .slice = "" },
+        };
+        return router.handle(req, &self.mw_ctx, &sc);
+    }
+};
+
+fn bodyBytes(resp: response.Response) []const u8 {
+    return switch (resp.body) {
+        .bytes => |b| b,
+        else => "",
+    };
+}
+
+fn headerValue(resp: response.Response, name: []const u8) ?[]const u8 {
+    for (resp.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
+    }
+    return null;
+}
+
+test "getParam returns matched path parameter value" {
+    var router = Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+
+    const handler = struct {
+        fn h(ctx: *HandlerContext) response.Response {
+            const id = ctx.getParam("id") orelse "MISSING";
+            return ctx.text(200, id);
+        }
+    }.h;
+    try router.get("/users/:id", handler);
+
+    var rig = TestRig{};
+    const result = rig.run(&router, .GET, "/users/42");
+    try std.testing.expectEqual(@as(u16, 200), result.resp.status);
+    try std.testing.expectEqualStrings("42", bodyBytes(result.resp));
+    // A param that was not declared yields null.
+    try std.testing.expect(headerValue(result.resp, "Content-Type") != null);
+}
+
+test "multi-segment params extract both values in order" {
+    var router = Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+
+    const handler = struct {
+        fn h(ctx: *HandlerContext) response.Response {
+            const x = ctx.getParam("x") orelse "?";
+            const y = ctx.getParam("y") orelse "?";
+            // Pack both into the request-scoped response buffer.
+            const out = std.fmt.bufPrint(ctx.response_buf, "{s}|{s}", .{ x, y }) catch "ERR";
+            return ctx.text(200, out);
+        }
+    }.h;
+    try router.get("/a/:x/b/:y", handler);
+
+    var rig = TestRig{};
+    const result = rig.run(&router, .GET, "/a/foo/b/bar");
+    try std.testing.expectEqual(@as(u16, 200), result.resp.status);
+    try std.testing.expectEqualStrings("foo|bar", bodyBytes(result.resp));
+}
+
+test "ctx.text sets text/plain Content-Type, status and body" {
+    var router = Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+
+    const handler = struct {
+        fn h(ctx: *HandlerContext) response.Response {
+            return ctx.text(201, "created");
+        }
+    }.h;
+    try router.get("/t", handler);
+
+    var rig = TestRig{};
+    const result = rig.run(&router, .GET, "/t");
+    try std.testing.expectEqual(@as(u16, 201), result.resp.status);
+    try std.testing.expectEqualStrings("created", bodyBytes(result.resp));
+    try std.testing.expectEqualStrings("text/plain", headerValue(result.resp, "Content-Type").?);
+}
+
+test "ctx.html sets text/html Content-Type, status and body" {
+    var router = Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+
+    const handler = struct {
+        fn h(ctx: *HandlerContext) response.Response {
+            return ctx.html(200, "<h1>hi</h1>");
+        }
+    }.h;
+    try router.get("/page", handler);
+
+    var rig = TestRig{};
+    const result = rig.run(&router, .GET, "/page");
+    try std.testing.expectEqual(@as(u16, 200), result.resp.status);
+    try std.testing.expectEqualStrings("<h1>hi</h1>", bodyBytes(result.resp));
+    try std.testing.expectEqualStrings("text/html; charset=utf-8", headerValue(result.resp, "Content-Type").?);
+}
+
+test "ctx.json sets application/json Content-Type and body" {
+    var router = Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+
+    const handler = struct {
+        fn h(ctx: *HandlerContext) response.Response {
+            return ctx.json(200, "{\"ok\":true}");
+        }
+    }.h;
+    try router.get("/j", handler);
+
+    var rig = TestRig{};
+    const result = rig.run(&router, .GET, "/j");
+    try std.testing.expectEqual(@as(u16, 200), result.resp.status);
+    try std.testing.expectEqualStrings("{\"ok\":true}", bodyBytes(result.resp));
+    try std.testing.expectEqualStrings("application/json", headerValue(result.resp, "Content-Type").?);
+}
+
+test "route group prepends prefix and routes with params" {
+    var router = Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+
+    const handler = struct {
+        fn h(ctx: *HandlerContext) response.Response {
+            const id = ctx.getParam("id") orelse "MISSING";
+            return ctx.text(200, id);
+        }
+    }.h;
+
+    var api = router.group("/api/v1");
+    try api.get("/users/:id", handler);
+
+    var rig = TestRig{};
+    // Full prefixed path matches.
+    const ok = rig.run(&router, .GET, "/api/v1/users/7");
+    try std.testing.expectEqual(@as(u16, 200), ok.resp.status);
+    try std.testing.expectEqualStrings("7", bodyBytes(ok.resp));
+
+    // The un-prefixed path must NOT match (404).
+    var rig2 = TestRig{};
+    const miss = rig2.run(&router, .GET, "/users/7");
+    try std.testing.expectEqual(@as(u16, 404), miss.resp.status);
+}
+
+test "404 fallback fires for unregistered path with default body" {
+    var router = Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+
+    const handler = struct {
+        fn h(ctx: *HandlerContext) response.Response {
+            return ctx.text(200, "ok");
+        }
+    }.h;
+    try router.get("/known", handler);
+
+    var rig = TestRig{};
+    const result = rig.run(&router, .GET, "/unknown");
+    try std.testing.expectEqual(@as(u16, 404), result.resp.status);
+    try std.testing.expectEqualStrings("Not Found", bodyBytes(result.resp));
+}
+
+test "405 method-not-allowed when path matches but method does not" {
+    var router = Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+
+    const handler = struct {
+        fn h(ctx: *HandlerContext) response.Response {
+            return ctx.text(200, "ok");
+        }
+    }.h;
+    try router.get("/widgets/:id", handler);
+
+    var rig = TestRig{};
+    const result = rig.run(&router, .DELETE, "/widgets/9");
+    try std.testing.expectEqual(@as(u16, 405), result.resp.status);
+    // The default 405 advertises the allowed methods in an Allow header.
+    const allow = headerValue(result.resp, "Allow");
+    try std.testing.expect(allow != null);
+    try std.testing.expect(std.mem.indexOf(u8, allow.?, "GET") != null);
+}
+
+test "custom 404 fallback handler is invoked" {
+    var router = Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+
+    const handler = struct {
+        fn known(ctx: *HandlerContext) response.Response {
+            return ctx.text(200, "ok");
+        }
+        fn nf(ctx: *HandlerContext) response.Response {
+            return ctx.json(404, "{\"error\":\"nope\"}");
+        }
+    };
+    try router.get("/known", handler.known);
+    router.fallback(handler.nf);
+
+    var rig = TestRig{};
+    // Use a path whose first segment ("known") is in the bloom filter so the
+    // bloom fast-reject doesn't short-circuit to the default notFound() — this
+    // forces the route loop to run and fall through to the custom fallback.
+    const result = rig.run(&router, .GET, "/known/extra");
+    try std.testing.expectEqual(@as(u16, 404), result.resp.status);
+    try std.testing.expectEqualStrings("{\"error\":\"nope\"}", bodyBytes(result.resp));
+    try std.testing.expectEqualStrings("application/json", headerValue(result.resp, "Content-Type").?);
+}
+
+test "jsonValue serializes a slice payload" {
+    var router = Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+
+    const handler = struct {
+        fn h(ctx: *HandlerContext) response.Response {
+            return ctx.json(200, std.fmt.bufPrint(ctx.response_buf, "[{d},{d},{d}]", .{ 1, 2, 3 }) catch "[]");
+        }
+    }.h;
+    try router.get("/nums", handler);
+
+    var rig = TestRig{};
+    const result = rig.run(&router, .GET, "/nums");
+    try std.testing.expectEqual(@as(u16, 200), result.resp.status);
+    try std.testing.expectEqualStrings("[1,2,3]", bodyBytes(result.resp));
+    try std.testing.expectEqualStrings("application/json", headerValue(result.resp, "Content-Type").?);
+}

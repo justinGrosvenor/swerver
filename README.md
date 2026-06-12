@@ -15,6 +15,8 @@ HTTP/3   ──┘      │
 
 > **Alpha release.** The public library API in `src/lib.zig` will change between alpha versions as it's iterated on. Breaking changes are announced in release notes. See [Known limitations](#known-limitations) for what's in and out of scope for the current release.
 
+📖 **Documentation: [justingrosvenor.github.io/swerver](https://justingrosvenor.github.io/swerver/)**: getting started, routing, handlers, middleware, configuration, the reverse proxy, and the PostgreSQL client.
+
 ## What
 
 Swerver is a bare-metal HTTP/1.1 + HTTP/2 + HTTP/3 server. It holds **#1 on JSON-over-TLS** on HttpArena's 64-core benchmark (1.95M req/s) and runs top-tier across baseline, pipelined, HTTP/2, and HTTP/3, carrying a full middleware chain, TLS termination, and routing.
@@ -66,9 +68,9 @@ zig build -Doptimize=ReleaseFast -Denable-tls=true -Denable-http2=true -Denable-
 Tagged alpha releases publish cross-compiled binaries for linux-{x86_64, aarch64} and macos-{x86_64, aarch64} on the [Releases page](https://github.com/justinGrosvenor/swerver/releases). Download, extract, and run:
 
 ```bash
-curl -LO https://github.com/justinGrosvenor/swerver/releases/download/v0.1.0-alpha.12/swerver-v0.1.0-alpha.12-linux-x86_64.tar.gz
-tar -xzf swerver-v0.1.0-alpha.12-linux-x86_64.tar.gz
-./swerver-v0.1.0-alpha.12-linux-x86_64 --config config.json
+curl -LO https://github.com/justinGrosvenor/swerver/releases/download/v0.1.0-alpha.23/swerver-v0.1.0-alpha.23-linux-x86_64.tar.gz
+tar -xzf swerver-v0.1.0-alpha.23-linux-x86_64.tar.gz
+./swerver-v0.1.0-alpha.23-linux-x86_64 --config config.json
 ```
 
 > **Release binaries are built without TLS, HTTP/2, or HTTP/3.** OpenSSL linking requires the host toolchain, so the cross-compiled binaries ship as HTTP/1.1-only. Build from source or use the Docker image for full protocol support.
@@ -79,7 +81,7 @@ The HttpArena submission includes a Dockerfile that builds a full-featured (TLS 
 
 ## Use as a library
 
-Swerver ships as a Zig package — you can depend on it from another Zig project and embed the server into your own binary.
+Swerver ships as a Zig package: depend on it from another Zig project and embed the server into your own binary.
 
 In your downstream project's `build.zig.zon`:
 
@@ -89,7 +91,7 @@ In your downstream project's `build.zig.zon`:
     .version = "0.1.0",
     .dependencies = .{
         .swerver = .{
-            .url = "https://github.com/justinGrosvenor/swerver/archive/refs/tags/v0.1.0-alpha.12.tar.gz",
+            .url = "https://github.com/justinGrosvenor/swerver/archive/refs/tags/v0.1.0-alpha.23.tar.gz",
             // .hash will be filled in by `zig fetch --save`
         },
     },
@@ -233,7 +235,7 @@ const cfg = BufferPoolConfig{
 
 ### JSON config file
 
-The config file schema is at version `1.0` (see `SCHEMA_VERSION` in `src/config_file.zig`). Core fields — `server`, `timeouts`, `limits`, `buffer_pool`, `tls`, `quic`, `upstreams`, `routes` — are stable for the `v0.1.0-alpha.N` series. Newer sub-schemas (`access_log`, `metrics`, `rate_limit`, `x402`) may move before 1.0; config files that set only the core fields will survive alpha version bumps.
+The config file schema is at version `1.0` (see `SCHEMA_VERSION` in `src/config_file.zig`). Core fields (`server`, `timeouts`, `limits`, `buffer_pool`, `tls`, `quic`, `upstreams`, `routes`) are stable for the `v0.1.0-alpha.N` series. Newer sub-schemas (`access_log`, `metrics`, `rate_limit`, `x402`) may move before 1.0; config files that set only the core fields will survive alpha version bumps.
 
 ```bash
 zig build run -- --config config.json
@@ -315,7 +317,7 @@ Full RFC 9000-9002 implementation:
 Middleware runs in a chain with zero allocations:
 
 ```zig
-// Middleware returns a decision (simplified — actual type has 5 variants)
+// Middleware returns a decision (simplified; actual type has 5 variants)
 pub const Decision = union(enum) {
     allow,                           // Continue to next middleware
     skip,                            // Skip remaining middleware
@@ -346,7 +348,7 @@ pub const Decision = union(enum) {
 | `-Denable-http3` | false | HTTP/3 over QUIC |
 | `-Denable-proxy` | false | Reverse proxy |
 | `-Denable-io-uring` | false | io_uring backend (Linux) |
-| `-Denable-compression` | false | Response compression (requires zlib) |
+| `-Denable-compression` | true (native) | Response compression (requires zlib); off when cross-compiling |
 | `-Denable-x402-crypto` | false | x402 local signature verification (secp256k1) |
 | `-Doptimize=ReleaseFast` | | Maximum performance |
 
@@ -417,11 +419,11 @@ Zero errors at 64-core saturation. ~222us average latency on limited-conn.
 
 ## Known limitations
 
-Forward-looking notes about API stability and feature scope. **These are not known bugs** — they're promises about what is and isn't in the current release.
+Forward-looking notes about API stability and feature scope. **These are not known bugs**: they're promises about what is and isn't in the current release.
 
 - **API surface is not frozen.** Public types in `src/lib.zig` may change between alpha versions while the library surface is iterated on. Breaking changes are announced in release notes. The API will be frozen at the 1.0 release.
 - **HTTP/3 is a young stack.** The RFC 9000-9002 + 9114 implementation is complete and handles real workloads (GET and POST/PUT both work end-to-end), but it hasn't seen the hardening that the HTTP/1.1 and HTTP/2 paths have. Treat it as production-capable but new.
-- **Platform support is Linux and macOS only.** Windows is cross-compile-only — no IOCP backend, no sendfile. On the long-term roadmap but not part of the alpha.
+- **Platform support is Linux and macOS only.** Windows is cross-compile-only: no IOCP backend, no sendfile. On the long-term roadmap but not part of the alpha.
 - **Full QUIC 0-RTT / early data is not implemented.** The handshake works and post-handshake throughput is competitive; 0-RTT adds replay protection and per-session token storage that are deferred to a later release.
 
 ## Roadmap

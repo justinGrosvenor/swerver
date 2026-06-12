@@ -739,3 +739,268 @@ const WriteEntry = struct {
 fn nextIndex(index: u16) u16 {
     return (index + 1) % write_queue_capacity;
 }
+
+// Tests --------------------------------------------------------------------
+
+test "valid state transitions succeed" {
+    var conn = Connection.init(0);
+    // A fresh reset puts the connection in `.accept`.
+    conn.reset(1, 100);
+    try std.testing.expectEqual(State.accept, conn.state);
+
+    // accept -> handshake -> active -> draining -> closed -> accept
+    try conn.transition(.handshake, 110);
+    try std.testing.expectEqual(State.handshake, conn.state);
+    try std.testing.expectEqual(@as(u64, 110), conn.state_enter_ms);
+
+    try conn.transition(.active, 120);
+    try std.testing.expectEqual(State.active, conn.state);
+
+    try conn.transition(.draining, 130);
+    try std.testing.expectEqual(State.draining, conn.state);
+
+    try conn.transition(.closed, 140);
+    try std.testing.expectEqual(State.closed, conn.state);
+
+    try conn.transition(.accept, 150);
+    try std.testing.expectEqual(State.accept, conn.state);
+}
+
+test "accept may go directly to active (plaintext, no handshake)" {
+    var conn = Connection.init(0);
+    conn.reset(1, 0);
+    try conn.transition(.active, 10);
+    try std.testing.expectEqual(State.active, conn.state);
+}
+
+test "any non-closed state may transition to err" {
+    var conn = Connection.init(0);
+    conn.reset(1, 0);
+    // accept -> err
+    try conn.transition(.err, 5);
+    try std.testing.expectEqual(State.err, conn.state);
+    // err -> closed is the only legal exit from err
+    try conn.transition(.closed, 6);
+    try std.testing.expectEqual(State.closed, conn.state);
+}
+
+test "invalid state transitions are rejected" {
+    var conn = Connection.init(0);
+    conn.reset(1, 0);
+
+    // accept -> draining is illegal (must pass through active).
+    try std.testing.expectError(error.InvalidTransition, conn.transition(.draining, 10));
+    // The failed transition must not mutate state.
+    try std.testing.expectEqual(State.accept, conn.state);
+
+    // closed only goes back to accept; closed -> active is illegal.
+    conn.state = .closed;
+    try std.testing.expectError(error.InvalidTransition, conn.transition(.active, 10));
+    try std.testing.expectEqual(State.closed, conn.state);
+
+    // err only goes to closed; err -> active is illegal.
+    conn.state = .err;
+    try std.testing.expectError(error.InvalidTransition, conn.transition(.active, 10));
+
+    // draining cannot reopen to active.
+    conn.state = .draining;
+    try std.testing.expectError(error.InvalidTransition, conn.transition(.active, 10));
+}
+
+test "isValidTransition matrix matches the state machine rules" {
+    // Spot-check the full matrix of the private predicate.
+    try std.testing.expect(isValidTransition(.accept, .handshake));
+    try std.testing.expect(isValidTransition(.accept, .active));
+    try std.testing.expect(isValidTransition(.handshake, .active));
+    try std.testing.expect(isValidTransition(.active, .draining));
+    try std.testing.expect(isValidTransition(.draining, .closed));
+    try std.testing.expect(isValidTransition(.err, .closed));
+    try std.testing.expect(isValidTransition(.closed, .accept));
+
+    try std.testing.expect(!isValidTransition(.accept, .draining));
+    try std.testing.expect(!isValidTransition(.handshake, .draining));
+    try std.testing.expect(!isValidTransition(.active, .handshake));
+    try std.testing.expect(!isValidTransition(.draining, .active));
+    try std.testing.expect(!isValidTransition(.closed, .active));
+    try std.testing.expect(!isValidTransition(.closed, .closed));
+    try std.testing.expect(!isValidTransition(.err, .active));
+}
+
+test "read backpressure crosses high and low water thresholds" {
+    var conn = Connection.init(0);
+    conn.reset(1, 0);
+    const bp = config.Backpressure{
+        .read_high_water = 1000,
+        .read_low_water = 400,
+        .write_high_water = 1000,
+        .write_low_water = 400,
+    };
+
+    // Below the high-water mark: reads stay enabled.
+    conn.onReadBuffered(500, bp);
+    try std.testing.expect(!conn.read_paused);
+    try std.testing.expect(conn.canRead(bp, 0));
+
+    // Crossing the high-water mark pauses reads.
+    conn.onReadBuffered(600, bp); // total 1100 >= 1000
+    try std.testing.expect(conn.read_paused);
+    try std.testing.expect(!conn.canRead(bp, 0));
+
+    // Draining to just above the low-water mark keeps reads paused (hysteresis).
+    conn.onReadConsumed(600, bp); // total 500 > 400 low-water
+    try std.testing.expect(conn.read_paused);
+
+    // Draining at/below the low-water mark resumes reads.
+    conn.onReadConsumed(200, bp); // total 300 <= 400 low-water
+    try std.testing.expect(!conn.read_paused);
+    try std.testing.expect(conn.canRead(bp, 0));
+}
+
+test "write backpressure crosses high and low water thresholds" {
+    var conn = Connection.init(0);
+    conn.reset(1, 0);
+    const bp = config.Backpressure{
+        .read_high_water = 1000,
+        .read_low_water = 400,
+        .write_high_water = 1000,
+        .write_low_water = 400,
+    };
+
+    conn.onWriteBuffered(800, bp);
+    try std.testing.expect(!conn.write_paused);
+    try std.testing.expect(conn.canWrite(bp));
+
+    conn.onWriteBuffered(300, bp); // total 1100 >= 1000
+    try std.testing.expect(conn.write_paused);
+    try std.testing.expect(!conn.canWrite(bp));
+
+    conn.onWriteCompleted(500, bp); // total 600 > 400 low-water, still paused
+    try std.testing.expect(conn.write_paused);
+
+    conn.onWriteCompleted(300, bp); // total 300 <= 400 low-water, resumes
+    try std.testing.expect(!conn.write_paused);
+    try std.testing.expect(conn.canWrite(bp));
+}
+
+test "rate-limit pause holds reads until the resume deadline" {
+    var conn = Connection.init(0);
+    conn.reset(1, 0);
+    // Keep read_buffered_bytes above the high-water mark so the backpressure
+    // logic agrees the connection should stay paused — this isolates the
+    // rate-limit deadline as the only thing that can lift the pause.
+    const bp = config.Backpressure{
+        .read_high_water = 1000,
+        .read_low_water = 400,
+        .write_high_water = 1000,
+        .write_low_water = 400,
+    };
+    conn.read_buffered_bytes = 2000; // above high-water
+
+    conn.setRateLimitPause(1000, 500); // resume at t=1500
+    try std.testing.expect(conn.read_paused);
+    try std.testing.expectEqual(@as(u64, 1500), conn.resume_read_at_ms);
+
+    // Before the deadline reads stay paused.
+    try std.testing.expect(!conn.canRead(bp, 1400));
+    try std.testing.expect(conn.read_paused);
+    try std.testing.expect(conn.resume_read_at_ms != 0);
+
+    // At/after the deadline the rate-limit gate clears its timestamp. Reads are
+    // still gated by backpressure (buffer is full), but the rate-limit deadline
+    // itself has been consumed.
+    _ = conn.canRead(bp, 1500);
+    try std.testing.expectEqual(@as(u64, 0), conn.resume_read_at_ms);
+}
+
+test "reset returns the connection to a clean baseline" {
+    var conn = Connection.init(0);
+    conn.reset(1, 100);
+
+    // Dirty the connection up.
+    conn.state = .active;
+    conn.read_buffered_bytes = 999;
+    conn.write_buffered_bytes = 888;
+    conn.read_paused = true;
+    conn.write_paused = true;
+    conn.resume_read_at_ms = 5000;
+    conn.close_after_write = true;
+    conn.protocol = .http2;
+    conn.timeout_phase = .body;
+    conn.is_tls = true;
+    conn.is_head_request = true;
+    conn.x402 = .pending;
+    _ = conn.enqueueWrite(undefined, 10);
+    try std.testing.expect(conn.write_count > 0);
+
+    // Reset with a new generation id.
+    conn.reset(2, 200);
+
+    try std.testing.expectEqual(@as(u64, 2), conn.id);
+    try std.testing.expectEqual(State.accept, conn.state);
+    try std.testing.expectEqual(@as(usize, 0), conn.read_buffered_bytes);
+    try std.testing.expectEqual(@as(usize, 0), conn.write_buffered_bytes);
+    try std.testing.expect(!conn.read_paused);
+    try std.testing.expect(!conn.write_paused);
+    try std.testing.expectEqual(@as(u64, 0), conn.resume_read_at_ms);
+    try std.testing.expect(!conn.close_after_write);
+    try std.testing.expectEqual(Protocol.http1, conn.protocol);
+    try std.testing.expectEqual(TimeoutPhase.idle, conn.timeout_phase);
+    try std.testing.expect(!conn.is_tls);
+    try std.testing.expect(!conn.is_head_request);
+    try std.testing.expectEqual(Connection.X402State.none, conn.x402);
+    try std.testing.expectEqual(@as(u16, 0), conn.write_count);
+    try std.testing.expectEqual(@as(u64, 200), conn.state_enter_ms);
+}
+
+test "write queue enqueue, peek, pop and capacity" {
+    var conn = Connection.init(0);
+    conn.reset(1, 0);
+
+    try std.testing.expect(conn.peekWrite() == null);
+    try std.testing.expectEqual(write_queue_capacity, conn.writeQueueAvailable());
+
+    try std.testing.expect(conn.enqueueWrite(undefined, 100));
+    try std.testing.expect(conn.enqueueWrite(undefined, 200));
+    try std.testing.expectEqual(@as(u16, 2), conn.write_count);
+
+    const head = conn.peekWrite().?;
+    try std.testing.expectEqual(@as(usize, 100), head.len);
+    const last = conn.peekLastWrite().?;
+    try std.testing.expectEqual(@as(usize, 200), last.len);
+
+    conn.popWrite();
+    try std.testing.expectEqual(@as(usize, 200), conn.peekWrite().?.len);
+    conn.popWrite();
+    try std.testing.expect(conn.peekWrite() == null);
+
+    // Fill to capacity, then the next enqueue must fail.
+    var i: u16 = 0;
+    while (i < write_queue_capacity) : (i += 1) {
+        try std.testing.expect(conn.enqueueWrite(undefined, i));
+    }
+    try std.testing.expect(!conn.canEnqueueWrite());
+    try std.testing.expect(!conn.enqueueWrite(undefined, 999));
+}
+
+test "ConnectionPool acquire/release tracks active set and recycles slots" {
+    var pool = try ConnectionPool.init(std.testing.allocator, 4);
+    defer pool.deinit();
+
+    const a = pool.acquire(0).?;
+    const b = pool.acquire(0).?;
+    const a_id = a.id;
+    try std.testing.expectEqual(@as(usize, 2), pool.activeConnections().len);
+    try std.testing.expectEqual(State.accept, a.state);
+    // Generation ids are monotonic and distinct.
+    try std.testing.expect(a.id != b.id);
+
+    pool.release(a);
+    try std.testing.expectEqual(@as(usize, 1), pool.activeConnections().len);
+    try std.testing.expectEqual(State.closed, a.state);
+
+    // The freed slot is handed back out on the next acquire (LIFO free stack),
+    // so `c` may alias `a`'s storage — but it carries a fresh generation id.
+    const c = pool.acquire(0).?;
+    try std.testing.expectEqual(@as(usize, 2), pool.activeConnections().len);
+    try std.testing.expect(c.id != a_id); // fresh generation
+}

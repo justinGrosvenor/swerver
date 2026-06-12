@@ -1,0 +1,95 @@
+site_name: swerver
+site_description: A bare-metal HTTP/1.1 + HTTP/2 + HTTP/3 server and framework written in pure Zig.
+site_url: https://justingrosvenor.github.io/swerver/
+repo_url: https://github.com/justinGrosvenor/swerver
+repo_name: justinGrosvenor/swerver
+edit_uri: edit/main/docs/
+copyright: Built with Zig. MIT licensed.
+
+theme:
+  name: material
+  logo: assets/logo.png
+  favicon: assets/logo.png
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.tracking
+    - navigation.instant
+    - navigation.indexes
+    - content.code.copy
+    - content.code.annotate
+    - content.action.edit
+    - search.suggest
+    - search.highlight
+    - toc.follow
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+plugins:
+  - search
+
+# Internal design notes + harness fixtures aren't part of the public site.
+exclude_docs: |
+  design/
+  testing/
+  personas.md
+
+nav:
+  - Home: index.md
+  - Getting started:
+      - Installation: getting-started/installation.md
+      - Your first server: getting-started/first-server.md
+      - Running from a config file: getting-started/config-file.md
+  - Guide:
+      - Routing: guide/routing.md
+      - Handlers & responses: guide/handlers.md
+      - Middleware: guide/middleware.md
+      - Configuration: guide/configuration.md
+      - TLS, HTTP/2 & HTTP/3: guide/protocols.md
+      - Static files: guide/static-files.md
+      - Reverse proxy & gateway: guide/reverse-proxy.md
+      - PostgreSQL: guide/postgres.md
+  - Operations:
+      - Deployment: operations/deployment.md
+      - Observability: operations/observability.md
+      - Admin API: operations/admin-api.md
+  - Reference:
+      - CLI flags: reference/cli.md
+      - Build options: reference/build-options.md
+      - Config schema: reference/config-schema.md
+  - About:
+      - Architecture: about/architecture.md
+      - Benchmarks: about/benchmarks.md
+      - Limitations & roadmap: about/limitations.md
