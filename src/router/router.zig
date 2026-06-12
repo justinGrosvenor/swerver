@@ -254,7 +254,7 @@ pub const HandlerContext = struct {
         return null;
     }
 
-    /// Build a JSON response
+    /// Build a JSON response from an already-encoded body.
     pub fn json(_: *HandlerContext, status: u16, body: []const u8) response.Response {
         return .{
             .status = status,
@@ -263,6 +263,28 @@ pub const HandlerContext = struct {
             },
             .body = .{ .bytes = body },
         };
+    }
+
+    /// Build a JSON response by serializing any value with the standard
+    /// library's JSON encoder. This is the idiomatic way to return JSON from a
+    /// handler: define a struct (or slice/map) for the payload and hand it to
+    /// `jsonValue` instead of formatting the body by hand. The encoded bytes
+    /// are written into the request arena and stay valid until the response has
+    /// been queued. Returns 500 if serialization fails (e.g. the value is
+    /// larger than the request arena).
+    pub fn jsonValue(self: *HandlerContext, status: u16, value: anytype) response.Response {
+        var list = std.ArrayList(u8).empty;
+        var w = std.Io.Writer.Allocating.fromArrayList(self.arenaAllocator(), &list);
+        std.json.Stringify.value(value, .{}, &w.writer) catch {
+            return .{
+                .status = 500,
+                .headers = &[_]response.Header{
+                    .{ .name = "Content-Type", .value = "application/json" },
+                },
+                .body = .{ .bytes = "{\"error\":\"json serialization failed\"}" },
+            };
+        };
+        return self.json(status, w.toArrayList().items);
     }
 
     /// Build a text response
@@ -1367,4 +1389,32 @@ test "method mismatch" {
 
     const result = router.handle(req, &mw_ctx, &scratch);
     try std.testing.expectEqual(@as(u16, 405), result.resp.status);
+}
+
+test "jsonValue serializes a struct with std.json" {
+    var arena_buf: [4096]u8 = undefined;
+    var response_buf: [RESPONSE_BUF_SIZE]u8 = undefined;
+    var response_headers: [MAX_RESPONSE_HEADERS]response.Header = undefined;
+    var mw_ctx = middleware.Context{};
+    var ctx = HandlerContext{
+        .request = .{ .method = .GET, .path = "/", .headers = &.{}, .body = .{ .slice = "" } },
+        .middleware_ctx = &mw_ctx,
+        .params = undefined,
+        .response_buf = response_buf[0..],
+        .response_headers = response_headers[0..],
+        .arena = std.heap.FixedBufferAllocator.init(&arena_buf),
+    };
+
+    const Item = struct { id: i64, name: []const u8, active: bool, tags: []const []const u8 };
+    const resp = ctx.jsonValue(200, .{
+        .count = 1,
+        .items = &[_]Item{.{ .id = 7, .name = "Gear", .active = true, .tags = &[_][]const u8{ "a", "b" } }},
+    });
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("application/json", resp.headers[0].value);
+    try std.testing.expectEqualStrings(
+        "{\"count\":1,\"items\":[{\"id\":7,\"name\":\"Gear\",\"active\":true,\"tags\":[\"a\",\"b\"]}]}",
+        resp.body.bytes,
+    );
 }
