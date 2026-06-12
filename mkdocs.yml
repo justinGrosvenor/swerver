@@ -9,7 +9,7 @@ copyright: Built with Zig. MIT licensed.
 theme:
   name: material
   logo: assets/logo.png
-  favicon: assets/logo.png
+  favicon: assets/favicon.svg
   font:
     text: Inter
     code: JetBrains Mono
