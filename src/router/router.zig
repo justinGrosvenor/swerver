@@ -268,23 +268,48 @@ pub const HandlerContext = struct {
     /// Build a JSON response by serializing any value with the standard
     /// library's JSON encoder. This is the idiomatic way to return JSON from a
     /// handler: define a struct (or slice/map) for the payload and hand it to
-    /// `jsonValue` instead of formatting the body by hand. The encoded bytes
-    /// are written into the request arena and stay valid until the response has
-    /// been queued. Returns 500 if serialization fails (e.g. the value is
-    /// larger than the request arena).
+    /// `jsonValue` instead of formatting the body by hand.
+    ///
+    /// The payload is encoded into the request arena when one is available, and
+    /// otherwise into a managed pool buffer (acquired via `respond`) so it
+    /// works on every protocol path — including HTTP/2 GETs, where the arena is
+    /// skipped. Returns 500 if no buffer is available or the value is too large
+    /// to encode.
     pub fn jsonValue(self: *HandlerContext, status: u16, value: anytype) response.Response {
-        var list = std.ArrayList(u8).empty;
-        var w = std.Io.Writer.Allocating.fromArrayList(self.arenaAllocator(), &list);
-        std.json.Stringify.value(value, .{}, &w.writer) catch {
-            return .{
-                .status = 500,
-                .headers = &[_]response.Header{
-                    .{ .name = "Content-Type", .value = "application/json" },
-                },
-                .body = .{ .bytes = "{\"error\":\"json serialization failed\"}" },
-            };
+        const json_err = response.Response{
+            .status = 500,
+            .headers = &[_]response.Header{
+                .{ .name = "Content-Type", .value = "application/json" },
+            },
+            .body = .{ .bytes = "{\"error\":\"json serialization failed\"}" },
         };
-        return self.json(status, w.toArrayList().items);
+
+        // Fast path: encode into the request arena when it has backing storage.
+        if (self.arena.buffer.len > 0) {
+            var list = std.ArrayList(u8).empty;
+            var w = std.Io.Writer.Allocating.fromArrayList(self.arenaAllocator(), &list);
+            if (std.json.Stringify.value(value, .{}, &w.writer)) {
+                return self.json(status, w.toArrayList().items);
+            } else |_| {}
+            // Arena overflowed — fall through to a larger managed buffer.
+        }
+
+        // Fallback: a managed pool buffer (HTTP/2 GET has a 0-byte arena).
+        var rb = self.respond() catch return json_err;
+        var w = std.Io.Writer.fixed(rb.handle.bytes);
+        std.json.Stringify.value(value, .{}, &w) catch {
+            if (self.buffer_ops) |ops| ops.release(ops.ctx, rb.handle);
+            return json_err;
+        };
+        rb.used = true;
+        rb.len = w.buffered().len;
+        return .{
+            .status = status,
+            .headers = &[_]response.Header{
+                .{ .name = "Content-Type", .value = "application/json" },
+            },
+            .body = .{ .managed = .{ .handle = rb.handle, .len = rb.len } },
+        };
     }
 
     /// Build a text response
