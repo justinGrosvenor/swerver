@@ -6,6 +6,12 @@
 
 <p align="center">A bare metal HTTP server written in pure Zig.</p>
 
+<p align="center">
+  <a href="https://swerver.net">swerver.net</a> ·
+  <a href="https://docs.swerver.net">docs</a> ·
+  <a href="https://x402.swerver.net">x402</a>
+</p>
+
 ```
 HTTP/1.1 ──┐
 HTTP/2   ──┼──► swerver ──► kqueue/epoll/io_uring ──► your code
