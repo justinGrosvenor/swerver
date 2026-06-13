@@ -15,7 +15,7 @@ HTTP/3   ──┘      │
 
 > **Alpha release.** The public library API in `src/lib.zig` will change between alpha versions as it's iterated on. Breaking changes are announced in release notes. See [Known limitations](#known-limitations) for what's in and out of scope for the current release.
 
-📖 **Documentation: [justingrosvenor.github.io/swerver](https://justingrosvenor.github.io/swerver/)**: getting started, routing, handlers, middleware, configuration, the reverse proxy, and the PostgreSQL client.
+📖 **Documentation: [docs.swerver.com](https://docs.swerver.com)**: getting started, routing, handlers, middleware, configuration, the reverse proxy, and the PostgreSQL client.
 
 ## What
 
