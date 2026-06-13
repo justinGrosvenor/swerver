@@ -43,7 +43,7 @@ Several built-ins are also driven by configuration rather than wired in code: wh
 | **OpenTelemetry** | Exports traces to an OTLP collector with configurable service name, sample rate, flush interval, and batch size. |
 | **Prometheus metrics** | Serves `/metrics` as Prometheus text (request/response counters, latency histograms, and QUIC stats, labeled per protocol) generated with zero heap allocations. |
 | **Health probes** | Intercepts `GET /.healthz` (liveness, always `200`) and `GET /.ready` (readiness, `200` when pools/listeners/TLS/QUIC are up, else `503`) before the router sees them. Bodies are empty. |
-| **x402 payments** | On a route tagged with x402 config, returns `402 Payment Required` with the payment challenge until a valid payment is presented. |
+| **x402 payments** | On a route tagged with x402 config, returns `402 Payment Required` with the payment challenge until a valid payment is presented. See the [x402 protocol docs](https://x402.swerver.net/docs). |
 
 ## Order and short-circuiting
 

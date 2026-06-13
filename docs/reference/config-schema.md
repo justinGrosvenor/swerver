@@ -163,7 +163,7 @@ OpenTelemetry trace export. Disabled by default.
 
 ## `x402`
 
-x402 payment middleware. Disabled by default. (Schema may move before 1.0.)
+x402 payment middleware. Disabled by default. (Schema may move before 1.0.) For the payment flow, facilitator protocol, and scheme details, see the [x402 documentation](https://x402.swerver.net/docs).
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
