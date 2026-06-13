@@ -61,3 +61,6 @@ FEATURE_REQUEST_settlement_reporting.md
 
 # MkDocs build output
 /site/
+
+# Local ad-hoc test script
+examples/gateway/test-x402.sh
