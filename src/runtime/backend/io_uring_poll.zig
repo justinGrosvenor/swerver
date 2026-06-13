@@ -4,15 +4,16 @@ const builtin = @import("builtin");
 const is_linux = builtin.os.tag == .linux;
 const linux = if (is_linux) std.os.linux else undefined;
 
-/// Phase 3a: Readiness-emulation io_uring backend.
+/// Readiness-emulation io_uring backend.
 ///
 /// Uses IORING_OP_POLL_ADD to emulate epoll-style readiness notifications.
 /// This is a drop-in replacement for the epoll backend — same event model,
 /// same dispatch in server.zig. The advantage is reduced syscall overhead:
 /// io_uring batches SQE submissions and CQE reaping in single syscalls.
 ///
-/// Phase 3b (future): Replace POLL_ADD with native IORING_OP_ACCEPT,
-/// IORING_OP_READ_FIXED, IORING_OP_WRITE_FIXED for true async I/O.
+/// A possible future step is to replace POLL_ADD with native
+/// IORING_OP_ACCEPT, IORING_OP_READ_FIXED, IORING_OP_WRITE_FIXED for
+/// true async I/O.
 
 // io_uring constants (from linux/io_uring.h)
 const IORING_SETUP_SQPOLL = 1 << 1;
@@ -35,7 +36,7 @@ pub const IoUringEvent = extern struct {
 };
 
 /// Bit 62 tags user_data values that belong to external
-/// (non-Connection-pool) fds — PostgreSQL client sockets (design 9.0).
+/// (non-Connection-pool) fds — PostgreSQL client sockets.
 /// MUST stay equal to io.zig's EXTERNAL_ID_BIT (io.zig pins the
 /// equality in a test; this module can't import io.zig without a cycle).
 pub const EXTERNAL_ID_BIT: u64 = 1 << 62;

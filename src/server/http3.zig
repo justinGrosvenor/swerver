@@ -19,10 +19,6 @@
 //! single buffer and uses `UDP_SEGMENT` (GSO) to hand them to the
 //! kernel in one sendmsg on Linux, falling back to per-packet
 //! `sendto` on macOS or when GSO fails.
-//!
-//! Pre-encoded cache hits bypass `encodeHttp3Response` entirely and
-//! feed the cached bytes directly into `sendHttp3ResponseBytes` —
-//! see `server/preencoded.zig`.
 
 const std = @import("std");
 
@@ -39,7 +35,6 @@ const middleware = @import("../middleware/middleware.zig");
 const quic_handler = @import("../quic/handler.zig");
 const quic_connection = @import("../quic/connection.zig");
 const clock = @import("../runtime/clock.zig");
-const preencoded = @import("preencoded.zig");
 const write_queue = @import("write_queue.zig");
 
 /// Maximum datagrams to drain per handleDatagram call before
@@ -67,7 +62,7 @@ pub fn handleDatagram(server: *Server) !void {
     // (edge-triggered drain). Each recvfrom returns one datagram;
     // we loop until WouldBlock or the drain cap. This saves re-
     // entering the event loop per datagram and is the first step
-    // toward recvmmsg batching (PR PERF-2 follow-up).
+    // toward recvmmsg batching.
     var drained: usize = 0;
     while (drained < MAX_DATAGRAMS_PER_DRAIN) : (drained += 1) {
         // recvmsg variant reads the UDP_GRO cmsg so the kernel can
@@ -228,13 +223,6 @@ fn processOneDatagram(
 /// storage and stay valid until the next `ingest` call; `req.body`
 /// is a slice into the decrypted STREAM frame payload and stays
 /// valid for the duration of this synchronous call.
-///
-/// Fast path (PR PERF-3): before running the router, check the
-/// pre-encoded h3 response cache for hot static endpoints
-/// (/plaintext, /json, /health, ...). On a cache hit, skip the
-/// router + middleware + encodeHttp3Response entirely and feed
-/// the cached bytes straight to the QUIC send loop. Saves
-/// 600-1500 cycles per request on the hottest paths.
 fn handleHttp3Request(
     server: *Server,
     udp_fd: std.posix.fd_t,
@@ -250,16 +238,6 @@ fn handleHttp3Request(
         // through the normal encode path since it's not cached.
         sendHttp3ResponseFromResponse(server, udp_fd, conn, req.stream_id, peer_addr, Server.badRequestResponse());
         return;
-    }
-
-    // --- Fast path: pre-encoded response cache ---
-    // x402 gate: skip cache when payment required (must run x402.evaluate first)
-    const method_str = req_view.getMethodName();
-    if (!server.app_router.has_any_paid_routes) {
-        if (preencoded.findAndRefreshPreencodedH3(server, method_str, req_view.path)) |entry| {
-            sendHttp3ResponseBytes(server, udp_fd, conn, req.stream_id, peer_addr, entry.bytes[0..entry.len]);
-            return;
-        }
     }
 
     // --- Static file serving ---
@@ -452,7 +430,7 @@ fn sendHttp3ResponseFromResponse(
 /// Send already-encoded h3 response bytes over the wire for a
 /// given QUIC stream. Splits into MTU-sized chunks and feeds each
 /// chunk through the unified `quic.handler::buildShortPacket`
-/// builder (PR PERF-0). Shared hot-path / cold-path helper.
+/// builder. Shared hot-path / cold-path helper.
 ///
 /// On Linux with GSO support, all packets are built contiguously
 /// into a batch buffer and sent in a single `sendmsg()` syscall

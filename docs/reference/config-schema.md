@@ -28,7 +28,7 @@ A minimal config:
 | `static_root` | string | `""` (off) | Directory for static file serving. Empty disables it. Overridden by `--static-root`. |
 | `disable_middleware` | bool | `false` | Disable security headers, metrics, and access logging, for pure-benchmark mode. |
 | `cache_static_files` | bool | `false` | Cache static files (and precompressed siblings) in memory per worker on first serve. |
-| `preencoded` | bool | `true` | Pre-encoded response registry for benchmark fast-paths. Set `false` to route every path through the normal pipeline. |
+| `preencoded` | bool | `false` | Opt-in pre-encoded fast path for canned error responses (and any registered hot endpoints). Off by default; set `true` to enable. |
 | `allowed_hosts` | string[] | `[]` (all) | If non-empty, requests whose `Host` isn't in the list are rejected with 400. |
 | `listeners` | object[] | `[]` | Explicit per-port listeners (see below). Absent → single-listener mode using `address`/`port`. |
 

@@ -806,10 +806,9 @@ pub const Connection = struct {
     /// Process stream data through the HTTP/3 stack.
     ///
     /// Returns the full `IngestResult` so callers can observe
-    /// `consumed` and `need_more`. Before PR A the caller only needed
-    /// `events` and the other fields were silently dropped — one of
-    /// the root causes of the h3 request-stream buffering bugs tracked
-    /// in `docs/design/8.0-h3-performance-plan.md`.
+    /// `consumed` and `need_more`. An earlier version had the caller
+    /// only use `events` and silently drop the other fields — one of
+    /// the root causes of the h3 request-stream buffering bugs.
     pub fn processHttp3Stream(self: *Connection, stream_id: u64, data: []const u8, end_stream: bool) Error!http3.IngestResult {
         if (self.http3_stack) |*stack| {
             return stack.ingest(stream_id, data, end_stream) catch return Error.ProtocolViolation;

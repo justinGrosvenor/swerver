@@ -90,7 +90,7 @@ pub const Response = struct {
     body: Body = .none,
     body_type: BodyType = .fixed,
 
-    /// Reserved park sentinel (design 9.0 Handler API). Status 0 is not
+    /// Reserved park sentinel (Handler API). Status 0 is not
     /// a real HTTP status; the dispatch layer intercepts it and parks
     /// the connection instead of serializing. Handlers obtain it ONLY
     /// as the return value of `ctx.pg.query(...)` — constructing it by

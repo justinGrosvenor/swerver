@@ -1,14 +1,14 @@
 //! Native PostgreSQL client — per-worker connection driver and query
-//! park machinery (design 9.0, phases 2.1–2.2b).
+//! park machinery.
 //!
-//! Connection bring-up: non-blocking connect, the phase-1
+//! Connection bring-up: non-blocking connect, the
 //! `pg.Handshake` driven by reactor readiness events, reconnect with
 //! exponential backoff. Query side: `query()` issues one
 //! extended-protocol op per ready slot, parks the HTTP request in the
 //! bounded park table, and the installed resume hook runs the
 //! continuation when ReadyForQuery (or timeout / connection loss)
 //! delivers the outcome. NO pipelining yet — one op in flight per slot;
-//! the FIFO is a later phase-2 step.
+//! the FIFO is a later step.
 //!
 //! Reactor contract:
 //!   - PG sockets register via `IoRuntime.registerExternalFd(slot, fd)`;
@@ -24,7 +24,7 @@
 //!   - DNS resolves once in `init()` (server startup) — never on the
 //!     reactor. Picking up a new address requires a restart; config
 //!     hot-reload of the postgres block is out of scope for this step.
-//!   - All four backends host external fds as of phase 2.2a (kqueue,
+//!   - All four backends host external fds (kqueue,
 //!     epoll, io_uring_poll, io_uring_native). The `disabled` latch
 //!     remains as a guard for any future backend that can't.
 
@@ -44,7 +44,7 @@ const handler_api = @import("handler_api.zig");
 /// TLS policy — defined next to the rest of the config surface.
 pub const SslMode = config_mod.PgSslMode;
 
-/// Hard cap on per-worker connections (design 9.0: pool of 2–4).
+/// Hard cap on per-worker connections (pool of 2–4).
 pub const MAX_SLOTS = 4;
 pub const DEFAULT_POOL_SIZE = 2;
 
@@ -55,7 +55,7 @@ pub const MAX_PARKED = 64;
 /// Sentinel for "no park" in op rings and the per-conn token array.
 const NO_PARK: u16 = std.math.maxInt(u16);
 
-/// Pipelining depth: ops in flight per connection (design 9.0 phase 4).
+/// Pipelining depth: ops in flight per connection.
 /// Each op carries its own Sync, so ops are protocol-independent — an
 /// ErrorResponse consumes only its own op's frames through its own
 /// ReadyForQuery and the next op proceeds normally.
@@ -174,7 +174,7 @@ const stmt_names: [STMT_CACHE_SIZE][3]u8 = blk: {
     break :blk names;
 };
 
-/// One parked HTTP request awaiting a PG op (design 9.0 Handler API).
+/// One parked HTTP request awaiting a PG op (Handler API).
 /// The continuation, stash, and generation check live here — the
 /// Connection carries only the `.db_parked` state byte.
 const ParkedRequest = struct {
@@ -230,7 +230,7 @@ pub const Options = struct {
     /// established TLS channel the request is always answered — the
     /// channel is encrypted. SCRAM is unaffected either way.
     allow_cleartext_password: bool = false,
-    /// TLS policy (design 9.0 phase 3). verify_full — chain + hostname —
+    /// TLS policy. verify_full — chain + hostname —
     /// is the fail-safe default; `require` encrypts without verifying
     /// (discouraged); `disable` never sends the SSLRequest. Anything
     /// other than disable needs a client TLS provider via installTls.
@@ -753,7 +753,7 @@ pub const PgClient = struct {
         return true;
     }
 
-    /// Cleartext-password policy (design 9.0): always acceptable over an
+    /// Cleartext-password policy: always acceptable over an
     /// established TLS channel (encrypted; server-authenticated under
     /// verify-full). Over plaintext only with the explicit operator
     /// opt-in. SCRAM never consults this — it never reveals the password.
@@ -904,7 +904,7 @@ pub const PgClient = struct {
         }
     }
 
-    // ── query / park (design 9.0 Handler API, phase 2.2b) ──────────
+    // ── query / park (Handler API) ──────────
 
     /// Issue one extended-protocol query (Parse/Bind/Describe/Execute/
     /// Sync, unnamed statement, text params in, binary results out) on a
@@ -930,7 +930,7 @@ pub const PgClient = struct {
         return self.queryBatch(io_rt, conn_index, conn_id, sql, &batch, stash_bytes, continuation);
     }
 
-    /// Batch variant (design 9.0 phase 4): ONE op containing one Parse,
+    /// Batch variant: ONE op containing one Parse,
     /// `args_batch.len` Bind/Execute pairs, and one Sync. All result
     /// rows land in a single frames region, so the continuation's
     /// `Result.rows()` iterates every execution's DataRows in order —
@@ -1700,8 +1700,8 @@ test "integration: reactor-driven connection bring-up (PG_TEST_DSN)" {
     }
 
     // ── Live query through the park machinery ──────────────────────
-    // The Hook mirrors what the http1 resume layer (phase 2.2b piece 2)
-    // does: build a ResumeContext from the Outcome, run the
+    // The Hook mirrors what the http1 resume layer does: build a
+    // ResumeContext from the Outcome, run the
     // continuation, observe its Response.
     const Stash = struct { magic: u64 = 0 };
     const Hook = struct {

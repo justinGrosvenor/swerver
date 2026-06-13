@@ -27,6 +27,10 @@ fn metrics(_: *router.HandlerContext) response.Response {
     return response.Response{ .status = 500, .headers = &.{}, .body = .{ .bytes = "metrics middleware not loaded" } };
 }
 
+fn health(_: *router.HandlerContext) response.Response {
+    return response.Response{ .status = 200, .headers = &.{}, .body = .none };
+}
+
 fn version(ctx: *router.HandlerContext) response.Response {
     var builder = ctx.respond() catch return response.Response{
         .status = 503,
@@ -71,8 +75,7 @@ pub fn main() !void {
     // metrics_mw.evaluate pre-hook intercepts before this handler runs.
     try app_router.get("/metrics", metrics);
 
-    // Register built-in /health endpoint.
-    try swerver.benchmark.registerRoutes(&app_router);
+    try app_router.get("/health", health);
 
     // Middleware: metrics endpoint (/metrics), security headers, access logging.
     middleware.security.buildCache();

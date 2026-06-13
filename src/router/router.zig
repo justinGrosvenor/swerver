@@ -115,7 +115,7 @@ pub const HandlerContext = struct {
     arena: std.heap.FixedBufferAllocator,
     /// Actual charge amount for x402 `upto` scheme (set by handler)
     charge_amount: []const u8 = "",
-    /// PostgreSQL query surface (design 9.0): `ctx.pg.query(...)`.
+    /// PostgreSQL query surface: `ctx.pg.query(...)`.
     pg: PgHandle = .{},
 
     pub const Param = struct {
@@ -346,7 +346,7 @@ pub const HandlerContext = struct {
 // integers, bools, strings, slices, optionals) it resolves field names,
 // separators, and type dispatch at compile time, emitting one `writeAll` of a
 // concatenated literal per field with run-based string escaping. On typical
-// payloads that is ~1.6x faster than `std.json.Stringify` (see `_bench/`).
+// payloads that is ~1.6x faster than `std.json.Stringify`.
 // Anything it does not specialize (floats, enums, unions, tuples, arrays,
 // maps, `std.json.Value`, structs with non-identifier field names) is deferred
 // to `std.json.Stringify.value`, so the output is byte-identical to the
@@ -534,7 +534,7 @@ pub const HandlerScratch = struct {
     arena_buf: []u8,
     arena_handle: ?buffer_pool.BufferHandle = null,
     buffer_ops: ?middleware.BufferOps = null,
-    /// PostgreSQL park-and-resume binding (design 9.0). Set by the H1
+    /// PostgreSQL park-and-resume binding. Set by the H1
     /// dispatch layer when a PG client is configured; the zero value
     /// makes `ctx.pg.query()` fail with error.NotConnected.
     pg: PgBinding = .{},
@@ -550,10 +550,9 @@ pub const PgBinding = struct {
     conn_id: u64 = 0,
 };
 
-/// `ctx.pg` — the handler-facing query surface (design 9.0 Handler
-/// API). `query()` issues one parameterized statement, parks the
-/// request, and returns the park sentinel Response, which the handler
-/// must return. See docs/design/9.0-postgres-client.md.
+/// `ctx.pg` — the handler-facing query surface. `query()` issues
+/// one parameterized statement, parks the request, and returns the
+/// park sentinel Response, which the handler must return.
 pub const PgHandle = struct {
     binding: PgBinding = .{},
 
@@ -580,7 +579,7 @@ pub const PgHandle = struct {
     }
 
     /// Batch variant: one op, N Bind/Execute pairs of the same SQL, all
-    /// result rows in one continuation Result (design 9.0 phase 4).
+    /// result rows in one continuation Result.
     pub fn queryBatch(
         self: PgHandle,
         sql: []const u8,
@@ -1038,7 +1037,7 @@ pub const Router = struct {
 
         // Only capture request start time if post-response hooks exist
         // (access logging, metrics). Skip both clock_gettime calls when
-        // middleware is disabled — saves ~40-100ns per request.
+        // middleware is disabled.
         if (self.middleware_chain.post.len > 0) {
             mw_ctx.request_start = clock.Instant.now();
         }
@@ -1172,7 +1171,7 @@ pub const Router = struct {
         }
 
         // Post-response hooks: access logging, metrics, etc.
-        // Skip entirely when no hooks are registered (benchmark mode).
+        // Skip entirely when no post-response hooks are configured.
         if (self.middleware_chain.post.len > 0) {
             const elapsed_ns: u64 = if (mw_ctx.request_start) |start|
                 if (clock.Instant.now()) |now_inst| now_inst.since(start) else 0
@@ -1407,7 +1406,6 @@ fn notFound() response.Response {
     };
 }
 
-/// Default 405 response
 /// Default 500 response
 pub fn internalError() response.Response {
     return .{

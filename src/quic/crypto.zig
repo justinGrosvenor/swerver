@@ -462,10 +462,9 @@ pub fn unprotectPayload(
 /// The caller's buffer must therefore have at least
 /// `packet_len + AEAD_TAG_LEN` bytes of capacity.
 ///
-/// This avoids the pre-PR-PERF-4 pattern of allocating a 64 KiB
-/// stack scratch and copying the ciphertext back — one memcpy and
-/// ~64 KiB of L1-cache thrash eliminated per encrypt. See
-/// `docs/design/8.0-h3-performance-plan.md` PR PERF-4.
+/// This avoids the older pattern of allocating a 64 KiB stack
+/// scratch and copying the ciphertext back — one memcpy and ~64 KiB
+/// of L1-cache thrash eliminated per encrypt.
 pub fn protectPacket(
     keys: *const Keys,
     packet_number: u64,
@@ -519,10 +518,9 @@ pub fn protectPacket(
 /// captured into a local before decrypt runs (unprotectPayload does
 /// this), so there's no read-after-write hazard.
 ///
-/// Pre-PR-PERF-4 this function allocated a 64 KiB stack scratch,
-/// decrypted into it, then memcpy'd back. That's eliminated now —
-/// one memcpy and ~64 KiB of L1-cache thrash gone per decrypt. See
-/// `docs/design/8.0-h3-performance-plan.md` PR PERF-4.
+/// An earlier version of this function allocated a 64 KiB stack
+/// scratch, decrypted into it, then memcpy'd back. That's eliminated
+/// now — one memcpy and ~64 KiB of L1-cache thrash gone per decrypt.
 pub fn unprotectPacket(
     keys: *const Keys,
     largest_pn: u64,
@@ -946,8 +944,8 @@ test "AEAD authentication failure" {
 }
 
 test "AEAD in-place encrypt/decrypt — dst.ptr == src.ptr is safe" {
-    // PR PERF-4 premise check: the refactored protectPacket /
-    // unprotectPacket pass `out = packet_bytes[header_len..]` directly
+    // Premise check: protectPacket / unprotectPacket pass
+    // `out = packet_bytes[header_len..]` directly
     // to the inner AEAD primitives, overlapping with the source
     // slice. This test locks in that std.crypto.aead.aes_gcm.Aes128Gcm
     // supports that overlap end-to-end. If this test ever starts

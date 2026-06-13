@@ -1,5 +1,5 @@
-//! Binary-format decoders for the common PostgreSQL type OIDs
-//! (design 9.0 phase 1), plus text-format parse helpers for fallback.
+//! Binary-format decoders for the common PostgreSQL type OIDs,
+//! plus text-format parse helpers for fallback.
 //!
 //! All decoders are pure functions over the raw column bytes of a
 //! DataRow value (binary result format, network byte order). `numeric`

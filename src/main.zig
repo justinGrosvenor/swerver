@@ -108,11 +108,8 @@ pub fn main(init: std.process.Init) !void {
             app_router.facilitator = fac_config;
         }
     }
-    try swerver.benchmark.registerRoutes(&app_router);
-    swerver.benchmark.loadDataset();
     if (!cfg.disable_middleware) {
         swerver.middleware.security.buildCache();
-        swerver.benchmark.registerPostHooks(&app_router);
     }
 
     // Build proxy from config file if upstreams/routes defined.

@@ -24,9 +24,7 @@
 //!
 //! The h1 *read* path still lives in `server.zig` (inside
 //! `handleRead`) because it interleaves with h2 preface sniffing
-//! and TLS routing. After Extract 7 the read side moves to
-//! `server/dispatch.zig` and this module becomes the complete h1
-//! surface.
+//! and TLS routing.
 
 const std = @import("std");
 
@@ -1311,7 +1309,7 @@ pub fn dispatchToRouter(server: *Server, conn: *connection.Connection, req_view:
     }
 }
 
-/// Post-handler park handling (design 9.0 Handler API). Returns true
+/// Post-handler park handling (Handler API). Returns true
 /// when the caller must NOT queue the handler's response: either the
 /// request parked for a PG op (conn enters .db_parked; the resume path
 /// in dispatch.zig answers later), or the sentinel was returned without
