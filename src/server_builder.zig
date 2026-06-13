@@ -235,8 +235,8 @@ test "chaining setters wire fields and return a new builder by value" {
 
 test "preencoded/cacheStaticFiles toggles flip the right config flags" {
     const b = ServerBuilder.configDefault();
-    // Defaults are off.
-    try std.testing.expect(!b.cfg.disable_preencoded);
+    // Default: preencoded off (disable flag set), static cache off.
+    try std.testing.expect(b.cfg.disable_preencoded);
     try std.testing.expect(!b.cfg.cache_static_files);
 
     const toggled = b.disablePreencoded().cacheStaticFiles();

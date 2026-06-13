@@ -33,49 +33,6 @@ const dispatch = @import("server/dispatch.zig");
 const write_queue = @import("server/write_queue.zig");
 const pg_client_mod = @import("db/pg/client.zig");
 
-// ============================================================
-// Pre-encoded response cache (PR PERF-3)
-//
-// CACHE BYPASS SEMANTICS: the pre-encoded fast path intentionally
-// skips the router, the middleware chain, and the response encoder.
-// This is by design — it's the core of the performance win (no
-// per-request middleware overhead on benchmark hot endpoints). The
-// semantic contract:
-//
-//   What IS included in cached responses:
-//     - Status code + body (obviously)
-//     - Content-Type header (endpoint-specific, baked at register)
-//     - Date header (refreshed lazily once per epoch second)
-//     - Alt-Svc header (baked at register if QUIC is enabled)
-//     - Security headers (CSP, X-Content-Type-Options, X-Frame-
-//       Options, Referrer-Policy — merged from security.zig's
-//       getStaticSecurityHeaders() at register/rebuild time)
-//
-//   What is NOT included / NOT run:
-//     - Pre-request middleware chain (health probe rejection,
-//       rate limiting, observability request-ID injection)
-//     - Post-response middleware chain (access logging, metrics
-//       recording, structured logging)
-//     - x402 payment check — CORRECTLY handled: the check runs
-//       BEFORE the cache lookup in handleHttp3Request / the h1
-//       dispatchToRouter path, so paid endpoints can't bypass
-//     - CORS origin/credentials headers (request-dependent)
-//     - HSTS (only on TLS; the caller knows but the cache
-//       doesn't distinguish — follow-up if needed)
-//
-//   Production implications:
-//     - Cached responses don't appear in access logs or metrics.
-//       For benchmark workloads this is fine (nobody reads the
-//       logs). For production, disable the cache or wire a
-//       lightweight post-cache logging hook.
-//     - Cached responses are not rate-limited per-IP. Health
-//       probes are intentionally exempt; hot benchmark endpoints
-//       assume unlimited throughput.
-//     - Cached responses include security headers as of the
-//       MW-2 fix, so HSTS / CSP / X-Frame-Options are present
-//       even on the fast path.
-// ============================================================
-
 // TLS_PLAINTEXT_WRITE_CAP and TLS_CIPHER_SCRATCH_SIZE live in
 // `server/tls.zig` alongside the handshake + ciphertext pump helpers.
 
