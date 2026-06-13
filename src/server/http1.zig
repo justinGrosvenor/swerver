@@ -1259,7 +1259,9 @@ pub fn dispatchToRouter(server: *Server, conn: *connection.Connection, req_view:
         return;
     }
 
-    // Fast path: pre-encoded h1 response cache.
+    // Opt-in benchmark fast path (off by default): serves precomputed bytes
+    // for a few hot endpoints, bypassing the router, middleware, and encoder.
+    // Empty unless preencoded is enabled, so this is a no-op for normal servers.
     if (preencoded.tryDispatchPreencodedH1(server, conn, req_view) == .dispatched) return;
 
     var mw_ctx = middleware.Context{

@@ -42,10 +42,12 @@ pub const ServerConfig = struct {
     /// Disable security headers, metrics, and access logging middleware.
     /// Use for pure benchmark mode where middleware overhead matters.
     disable_middleware: bool = false,
-    /// Disable preencoded response cache (benchmark fast-paths for /echo,
-    /// /health, /plaintext, /pipeline). Set true when user routes need
-    /// those paths.
-    disable_preencoded: bool = false,
+    /// Disable the preencoded response cache, a benchmark fast path that
+    /// serves /echo, /health, /plaintext, /pipeline (and error pages) as
+    /// precomputed bytes, bypassing the router, middleware, and encoder.
+    /// Off by default so a default server takes the normal pipeline; set
+    /// `preencoded: true` in the config to opt in.
+    disable_preencoded: bool = true,
     /// Cache static files (and their precompressed siblings) in memory on
     /// first serve, keyed by path + negotiated encoding. Removes the
     /// per-request open/fstat/read syscalls. Per-worker, lazy-populated,

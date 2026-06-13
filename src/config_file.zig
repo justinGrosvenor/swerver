@@ -879,13 +879,13 @@ test "parse minimal config" {
 }
 
 test "preencoded + cache_static_files map to server config" {
-    // Defaults: preencoded on (disable_preencoded false), cache off.
+    // Defaults: preencoded off (disable_preencoded true), cache off.
     {
         var loaded = try parseJsonFromBytes(std.testing.allocator,
             \\{ "server": { "port": 9090 } }
         );
         defer loaded.deinit();
-        try std.testing.expectEqual(false, loaded.server_config.disable_preencoded);
+        try std.testing.expectEqual(true, loaded.server_config.disable_preencoded);
         try std.testing.expectEqual(false, loaded.server_config.cache_static_files);
     }
     // Tuned entry: positive preencoded:false disables the registry; cache on.
