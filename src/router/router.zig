@@ -265,10 +265,12 @@ pub const HandlerContext = struct {
         };
     }
 
-    /// Build a JSON response by serializing any value with the standard
-    /// library's JSON encoder. This is the idiomatic way to return JSON from a
-    /// handler: define a struct (or slice/map) for the payload and hand it to
-    /// `jsonValue` instead of formatting the body by hand.
+    /// Build a JSON response by serializing any value. This is the idiomatic
+    /// way to return JSON from a handler: define a struct (or slice/map) for
+    /// the payload and hand it to `jsonValue` instead of formatting the body
+    /// by hand. Encoding uses `stringifyJson` (a comptime-specialized encoder
+    /// for the common shapes, deferring to `std.json` for the rest), so the
+    /// output is identical to the standard encoder.
     ///
     /// The payload is encoded into the request arena when one is available, and
     /// otherwise into a managed pool buffer (acquired via `respond`) so it
@@ -288,7 +290,7 @@ pub const HandlerContext = struct {
         if (self.arena.buffer.len > 0) {
             var list = std.ArrayList(u8).empty;
             var w = std.Io.Writer.Allocating.fromArrayList(self.arenaAllocator(), &list);
-            if (std.json.Stringify.value(value, .{}, &w.writer)) {
+            if (stringifyJson(value, &w.writer)) {
                 return self.json(status, w.toArrayList().items);
             } else |_| {}
             // Arena overflowed — fall through to a larger managed buffer.
@@ -297,7 +299,7 @@ pub const HandlerContext = struct {
         // Fallback: a managed pool buffer (HTTP/2 GET has a 0-byte arena).
         var rb = self.respond() catch return json_err;
         var w = std.Io.Writer.fixed(rb.handle.bytes);
-        std.json.Stringify.value(value, .{}, &w) catch {
+        stringifyJson(value, &w) catch {
             if (self.buffer_ops) |ops| ops.release(ops.ctx, rb.handle);
             return json_err;
         };
@@ -336,6 +338,111 @@ pub const HandlerContext = struct {
         };
     }
 };
+
+// ── JSON serialization ───────────────────────────────────────────
+//
+// `stringifyJson` is a comptime-specialized JSON encoder used by
+// `HandlerContext.jsonValue`. For the common shapes (non-tuple structs,
+// integers, bools, strings, slices, optionals) it resolves field names,
+// separators, and type dispatch at compile time, emitting one `writeAll` of a
+// concatenated literal per field with run-based string escaping. On typical
+// payloads that is ~1.6x faster than `std.json.Stringify` (see `_bench/`).
+// Anything it does not specialize (floats, enums, unions, tuples, arrays,
+// maps, `std.json.Value`, structs with non-identifier field names) is deferred
+// to `std.json.Stringify.value`, so the output is byte-identical to the
+// standard encoder for every supported value.
+
+/// Write `s` as a JSON string (surrounding quotes + escaping), bulk-copying
+/// spans that need no escaping. Matches std.json's default escape set: `"`,
+/// `\`, the named control escapes, and `\u00XX` for other control bytes;
+/// UTF-8 and `/` pass through unescaped.
+fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
+    try w.writeAll("\"");
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        const esc: ?[]const u8 = switch (c) {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            0x08 => "\\b",
+            0x0c => "\\f",
+            else => null,
+        };
+        if (esc) |e| {
+            if (i > start) try w.writeAll(s[start..i]);
+            try w.writeAll(e);
+            start = i + 1;
+        } else if (c < 0x20) {
+            if (i > start) try w.writeAll(s[start..i]);
+            const hex = "0123456789abcdef";
+            const u = [_]u8{ '\\', 'u', '0', '0', hex[(c >> 4) & 0xf], hex[c & 0xf] };
+            try w.writeAll(&u);
+            start = i + 1;
+        }
+    }
+    if (s.len > start) try w.writeAll(s[start..]);
+    try w.writeAll("\"");
+}
+
+/// Encode `value` as JSON into `w`. Comptime-specialized for the common
+/// shapes; delegates anything else to `std.json.Stringify.value` (see the
+/// module note above), so output always matches the standard encoder.
+fn stringifyJson(value: anytype, w: *std.Io.Writer) !void {
+    const T = @TypeOf(value);
+    switch (@typeInfo(T)) {
+        .bool => try w.writeAll(if (value) "true" else "false"),
+        .int, .comptime_int => try w.print("{d}", .{value}),
+        .optional => if (value) |v| try stringifyJson(v, w) else try w.writeAll("null"),
+        .@"struct" => |info| {
+            // Fast path only for non-tuple structs whose field names need no
+            // JSON escaping (valid Zig identifiers always qualify). Otherwise
+            // defer so tuples render as arrays and odd names stay escaped.
+            const fast = comptime blk: {
+                if (info.is_tuple) break :blk false;
+                for (info.fields) |f| {
+                    for (f.name) |c| switch (c) {
+                        'A'...'Z', 'a'...'z', '0'...'9', '_', '-' => {},
+                        else => break :blk false,
+                    };
+                }
+                break :blk true;
+            };
+            if (fast) {
+                try w.writeAll("{");
+                inline for (info.fields, 0..) |field, idx| {
+                    try w.writeAll(comptime (if (idx == 0) "\"" else ",\"") ++ field.name ++ "\":");
+                    try stringifyJson(@field(value, field.name), w);
+                }
+                try w.writeAll("}");
+            } else {
+                try std.json.Stringify.value(value, .{}, w);
+            }
+        },
+        .pointer => |p| {
+            if (p.size == .slice) {
+                if (p.child == u8) {
+                    try writeJsonString(w, value);
+                } else {
+                    try w.writeAll("[");
+                    for (value, 0..) |elem, idx| {
+                        if (idx > 0) try w.writeAll(",");
+                        try stringifyJson(elem, w);
+                    }
+                    try w.writeAll("]");
+                }
+            } else {
+                try std.json.Stringify.value(value, .{}, w);
+            }
+        },
+        // Floats (exact shortest-repr formatting), enums, unions, arrays,
+        // maps, std.json.Value, etc. — defer to the standard encoder.
+        else => try std.json.Stringify.value(value, .{}, w),
+    }
+}
 
 /// Fluent builder for registering a single route with a per-route
 /// middleware chain. Constructed via `Router.routeBuilder(method,
@@ -1680,4 +1787,79 @@ test "jsonValue serializes a slice payload" {
     try std.testing.expectEqual(@as(u16, 200), result.resp.status);
     try std.testing.expectEqualStrings("[1,2,3]", bodyBytes(result.resp));
     try std.testing.expectEqualStrings("application/json", headerValue(result.resp, "Content-Type").?);
+}
+
+// Encode `value` with both stringifyJson and std.json, assert byte-identical.
+fn expectJsonMatchesStd(value: anytype) !void {
+    var mine_buf: [8192]u8 = undefined;
+    var std_buf: [8192]u8 = undefined;
+    var mw = std.Io.Writer.fixed(mine_buf[0..]);
+    try stringifyJson(value, &mw);
+    var sw = std.Io.Writer.fixed(std_buf[0..]);
+    try std.json.Stringify.value(value, .{}, &sw);
+    try std.testing.expectEqualStrings(sw.buffered(), mw.buffered());
+}
+
+test "stringifyJson output is byte-identical to std.json across shapes" {
+    const Rating = struct { score: i64, count: i64 };
+    const Item = struct { id: i64, name: []const u8, active: bool, tags: []const []const u8, rating: Rating };
+    const Maybe = struct { a: ?i64, b: ?[]const u8 };
+
+    // Nested structs, slices, bools, signed ints, empty slice.
+    try expectJsonMatchesStd(.{
+        .count = 2,
+        .items = &[_]Item{
+            .{ .id = 7, .name = "Gear", .active = true, .tags = &[_][]const u8{ "a", "b" }, .rating = .{ .score = 4, .count = 9 } },
+            .{ .id = -3, .name = "x", .active = false, .tags = &[_][]const u8{}, .rating = .{ .score = 0, .count = 0 } },
+        },
+    });
+    // Optionals: null and present, both field positions.
+    try expectJsonMatchesStd(Maybe{ .a = null, .b = "x" });
+    try expectJsonMatchesStd(Maybe{ .a = 5, .b = null });
+    // Top-level string.
+    try expectJsonMatchesStd(@as([]const u8, "plain"));
+}
+
+test "stringifyJson escapes strings identically to std.json" {
+    // Quotes, backslash, the named control escapes, a bare control byte, and
+    // UTF-8 (which must pass through unescaped).
+    try expectJsonMatchesStd(@as([]const u8, "a\"b\\c\nd\te\rf\x08g\x0ch\x01i\u{00e9}j"));
+    try expectJsonMatchesStd(.{ .msg = @as([]const u8, "line1\nline2\ttab \"q\"") });
+}
+
+test "stringifyJson defers non-specialized types to std.json" {
+    const Color = enum { red, green, blue };
+    // Enum, float (exact shortest-repr), fixed array, and tuple (renders as a
+    // JSON array) all route through the std.json fallback.
+    try expectJsonMatchesStd(Color.green);
+    try expectJsonMatchesStd(@as(f64, 3.5));
+    try expectJsonMatchesStd([_]u32{ 1, 2, 3 });
+    try expectJsonMatchesStd(.{ @as(i64, 1), @as(i64, 2), @as(i64, 3) });
+    // A struct that mixes a fast field (int) with a deferred field (float).
+    try expectJsonMatchesStd(.{ .id = @as(i64, 1), .ratio = @as(f64, 0.25), .ok = true });
+}
+
+test "jsonValue end-to-end produces escaped, std-identical body" {
+    var arena_buf: [4096]u8 = undefined;
+    var response_buf: [RESPONSE_BUF_SIZE]u8 = undefined;
+    var response_headers: [MAX_RESPONSE_HEADERS]response.Header = undefined;
+    var mw_ctx = middleware.Context{};
+    var ctx = HandlerContext{
+        .request = .{ .method = .GET, .path = "/", .headers = &.{}, .body = .{ .slice = "" } },
+        .middleware_ctx = &mw_ctx,
+        .params = undefined,
+        .response_buf = response_buf[0..],
+        .response_headers = response_headers[0..],
+        .arena = std.heap.FixedBufferAllocator.init(&arena_buf),
+    };
+
+    const payload = .{ .name = @as([]const u8, "a\"b\nc"), .n = @as(i64, -5), .ok = false };
+    const resp = ctx.jsonValue(200, payload);
+
+    var std_buf: [4096]u8 = undefined;
+    var sw = std.Io.Writer.fixed(std_buf[0..]);
+    try std.json.Stringify.value(payload, .{}, &sw);
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings(sw.buffered(), resp.body.bytes);
 }
