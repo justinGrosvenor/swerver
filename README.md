@@ -25,7 +25,7 @@ HTTP/3   ──┘      │
 
 ## What
 
-Swerver is a bare-metal HTTP/1.1 + HTTP/2 + HTTP/3 server. It holds **#1 on JSON-over-TLS** on HttpArena's 64-core benchmark (1.95M req/s) and runs top-tier across baseline, pipelined, HTTP/2, and HTTP/3, carrying a full middleware chain, TLS termination, and routing.
+Swerver is a bare-metal HTTP/1.1 + HTTP/2 + HTTP/3 server. It runs among the fastest entries on HttpArena's 64-core benchmark, including the json-tls workload (TLS termination plus JSON serialization) at 1.95M req/s, and ranks high across baseline, pipelined, HTTP/2, and HTTP/3, while carrying a full middleware chain, TLS termination, and routing.
 
 Fixed-size buffer pools. Stack-allocated parsing. No garbage collection. No hidden allocations. No surprises.
 
@@ -366,11 +366,11 @@ pub const Decision = union(enum) {
 
 ## Benchmarks
 
-[HttpArena](https://www.http-arena.com/) leaderboard (64-core dedicated hardware, same Docker-compose environment for every framework):
+[HttpArena](https://www.http-arena.com/) leaderboard numbers from swerver's most recent submission (64-core dedicated hardware, same Docker-compose environment for every framework). Live rankings move as other entries land:
 
 | Test | Conns | Requests/sec | |
 |---|---:|---:|---|
-| **json-tls** (TLS + JSON serialize) | 4096 | **1,950,310** | **#1** |
+| **json-tls** (TLS + JSON serialize) | 4096 | **1,950,310** | |
 | baseline (HTTP/1.1 plaintext) | 4096 | 3,664,110 | |
 | pipelined (HTTP/1.1) | 4096 | 24,907,762 | |
 | limited-conn (connection churn) | 4096 | 2,556,130 | |
@@ -381,7 +381,7 @@ pub const Decision = union(enum) {
 
 Zero errors at 64-core saturation. ~222us average latency on limited-conn.
 
-**A note on "fastest":** on raw HTTP/1.1 microbenchmarks (plaintext baseline, pipelined, limited-conn), feature-stripped reference servers edge swerver by 1-2%. Neither implements TLS, HTTP/2, or HTTP/3, so neither appears on json-tls, baseline-h2, or baseline-h3. Swerver is the fastest server that does the full job: three protocols, TLS termination, routing, and a complete middleware chain.
+**A note on "fastest":** on raw HTTP/1.1 microbenchmarks (plaintext baseline, pipelined, limited-conn), feature-stripped reference servers edge swerver by 1-2%. Neither implements TLS, HTTP/2, or HTTP/3, so neither appears on json-tls, baseline-h2, or baseline-h3. Swerver is among the fastest servers that do the full job: three protocols, TLS termination, routing, and a complete middleware chain.
 
 ## Features
 
