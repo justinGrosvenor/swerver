@@ -19,7 +19,6 @@ const quic_connection = @import("quic/connection.zig");
 const middleware = @import("middleware/middleware.zig");
 const request = @import("protocol/request.zig");
 const metrics_mw = @import("middleware/metrics_mw.zig");
-const benchmark_routes = @import("benchmark_routes.zig");
 const proxy_mod = @import("proxy/proxy.zig");
 const forward_mod = @import("proxy/forward.zig");
 const preencoded = @import("server/preencoded.zig");
@@ -235,21 +234,16 @@ pub const Server = struct {
     /// per-connection `tls_cipher_carry_handle`.
     tls_cipher_scratch: [server_tls.TLS_CIPHER_SCRATCH_SIZE]u8 = undefined,
 
-    /// Quick-start constructor for the benchmark-style server: pre-
-    /// registers the HttpArena / TechEmpower routes and the default
-    /// middleware chain, then hands back a ready-to-`run()` Server.
-    /// Use `initWithRouter` / `initInPlace` directly if you want to
-    /// build your own router without the benchmark handlers.
+    /// Quick-start constructor: builds a Server with an empty default router
+    /// and the standard middleware security cache. Supply your own routes via
+    /// `initWithRouter` or `ServerBuilder`.
     pub fn init(allocator: std.mem.Allocator, cfg: config.ServerConfig) !Server {
-        var app_router = router.Router.init(.{
+        const app_router = router.Router.init(.{
             .require_payment = cfg.x402.enabled,
             .payment_required_b64 = cfg.x402.payment_required_b64,
             .payment_required_json = cfg.x402.payment_required_json,
         });
-        try benchmark_routes.registerRoutes(&app_router);
         middleware.security.buildCache();
-        benchmark_routes.registerPostHooks(&app_router);
-        benchmark_routes.loadDataset();
         return initWithRouter(allocator, cfg, app_router);
     }
 
@@ -1821,10 +1815,7 @@ test "buildHttp3RequestView validates pseudo-headers and field names" {
     }
 }
 
-// Benchmark / TechEmpower handlers, `/json` dataset loader, and the
-// `registerDefaultRoutes` / `registerDefaultPostHooks` wiring moved to
-// `src/benchmark_routes.zig`. Downstream consumers reach them through
-// `swerver.benchmark.registerRoutes(&app_router)`,
-// `swerver.benchmark.registerPostHooks(&app_router)`, and
-// `swerver.benchmark.loadDataset()`. See `examples/httparena/main.zig`
-// for a reference consumer.
+// Benchmark / TechEmpower handlers and the `/json` dataset loader live in
+// `src/benchmark_routes.zig`. They are not part of the library API or this
+// constructor; the bundled `swerver` CLI (`src/main.zig`) imports that file
+// directly and registers them explicitly.

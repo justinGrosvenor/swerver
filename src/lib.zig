@@ -76,12 +76,6 @@
 //! - `config_file.loadConfigFile` — JSON file parser that returns a
 //!   `LoadedConfig` with arena-owned strings.
 //!
-//! ### Benchmark helpers (opt-in)
-//! - `benchmark.registerRoutes` / `benchmark.registerPostHooks` /
-//!   `benchmark.loadDataset` — register the HttpArena / TechEmpower
-//!   benchmark route set on an existing router. Not part of the core
-//!   surface; see `examples/httparena/main.zig` for how to use it.
-//!
 //! ## Stability
 //!
 //! This is an alpha release. The public API may change between alpha
@@ -149,13 +143,8 @@ pub const db = struct {
     pub const pg = @import("db/pg/pg.zig");
 };
 
-/// Benchmark route handlers (HttpArena / TechEmpower). **Not part of
-/// the stable API** — this namespace exists so benchmark-oriented
-/// consumers (the bundled `src/main.zig` binary, `examples/httparena/`,
-/// and any downstream project that wants the same endpoints) can
-/// register the canonical benchmark route set without copy-pasting
-/// handler definitions. The handler shapes, the `/json` dataset
-/// format, and the helper signatures here may be moved or removed
-/// before 1.0 without a major bump. Fine for benchmarks; don't build
-/// production apps against it.
+/// Benchmark route handlers (HttpArena / TechEmpower). Opt-in: NOT registered
+/// by `Server.init`. Consumers call `registerRoutes` / `loadDataset` /
+/// `registerPostHooks` explicitly (the bundled `swerver` CLI does). Not part
+/// of the stable API and may change before 1.0.
 pub const benchmark = @import("benchmark_routes.zig");
