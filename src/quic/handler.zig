@@ -691,8 +691,7 @@ pub const Handler = struct {
 
         // Pull the in-order contiguous bytes from the Stream and hand
         // them to the HTTP/3 stack. Feeding reassembled in-order bytes
-        // (instead of raw `stream_frame.data`) fixes findings #2 and
-        // #3 in `docs/design/8.0-h3-performance-plan.md`: h3 frames
+        // (instead of raw `stream_frame.data`) ensures h3 frames
         // that span multiple QUIC STREAM frames are now correctly
         // reassembled, and out-of-order STREAM frames never feed the
         // h3 parser out of order.
@@ -1005,7 +1004,7 @@ fn buildHandshakePacket(out: []u8, opts: BuildPacketOptions) Error!BuildPacketRe
             largest,
             ranges.first_range,
             additional,
-            0, // TODO: compute real ack_delay from packet receive timestamps
+            0, // ack_delay is reported as 0, which is acceptable here
         ) catch return Error.HandshakeFailed;
         off += acked;
     }
@@ -1065,9 +1064,8 @@ fn buildHandshakePacket(out: []u8, opts: BuildPacketOptions) Error!BuildPacketRe
 /// Options for building a short-header (1-RTT) packet.
 ///
 /// Exposed so the Server's response path can call `buildShortPacket`
-/// directly instead of maintaining its own parallel 1-RTT builder
-/// (`server.zig::buildStreamPacket` pre-PR-PERF-0). Unifying on a
-/// single builder is the prerequisite for GSO batching in PR PERF-1:
+/// directly instead of maintaining its own parallel 1-RTT builder.
+/// Unifying on a single builder is the prerequisite for GSO batching:
 /// every 1-RTT packet needs the same layout so a run of them can be
 /// handed to `UDP_SEGMENT` in one sendmsg.
 pub const BuildShortPacketOptions = struct {
@@ -1172,7 +1170,7 @@ pub fn buildShortPacket(out: []u8, opts: BuildShortPacketOptions) Error!BuildPac
             largest,
             ranges.first_range,
             additional,
-            0, // TODO: compute real ack_delay from packet receive timestamps
+            0, // ack_delay is reported as 0, which is acceptable here
         ) catch return Error.HandshakeFailed;
         off += acked;
     }

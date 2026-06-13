@@ -205,7 +205,7 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
         if (o.headers) |v| cfg.otel.headers = v;
     }
 
-    // PostgreSQL client (design 9.0; TLS client mode since phase 3)
+    // PostgreSQL client (supports TLS client mode)
     if (file_cfg.postgres) |p| {
         if (p.url) |url| {
             const parsed = pg_client_mod.parseUrl(url) catch return error.ConfigParseError;

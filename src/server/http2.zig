@@ -38,7 +38,6 @@ const middleware = @import("../middleware/middleware.zig");
 const router = @import("../router/router.zig");
 const clock = @import("../runtime/clock.zig");
 const buffer_pool = @import("../runtime/buffer_pool.zig");
-const preencoded = @import("preencoded.zig");
 const write_queue = @import("write_queue.zig");
 
 pub fn matchesHttp2Preface(candidate: []const u8) bool {
@@ -162,18 +161,8 @@ pub fn handleHttp2Read(server: *Server, conn: *connection.Connection) !void {
                     if (!server.isAllowedHost(hdr.request)) {
                         try queueHttp2Response(server, conn, hdr.stream_id, Server.badRequestResponse(), hdr.request.method == .HEAD);
                     } else if (hdr.end_stream) {
-                        // GET/HEAD/DELETE or any no-body request —
-                        // hot endpoints skip the router via the
-                        // pre-encoded cache; otherwise dispatch
-                        // normally.
-                        const method_str = hdr.request.getMethodName();
-                        const h2_cached = if (!server.app_router.has_any_paid_routes)
-                            preencoded.findAndRefreshPreencodedH2(server, method_str, hdr.request.path)
-                        else
-                            null;
-                        if (h2_cached) |entry| {
-                            preencoded.sendH2PreencodedBytes(server, conn, hdr.stream_id, entry);
-                        } else if (server.cfg.static_root.len > 0 and std.mem.startsWith(u8, hdr.request.path, "/static/")) {
+                        // GET/HEAD/DELETE or any no-body request.
+                        if (server.cfg.static_root.len > 0 and std.mem.startsWith(u8, hdr.request.path, "/static/")) {
                             // Static file serving over h2 — same
                             // open+read path as h1 but the response
                             // goes through queueHttp2Response.

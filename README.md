@@ -341,7 +341,7 @@ pub const Decision = union(enum) {
 | Flag | Description |
 |------|-------------|
 | `--config <path>` | Load JSON configuration file |
-| `--workers <n>` | Number of worker processes (default: CPU count) |
+| `--workers <n>` | Number of worker processes (default: 1; 0 = auto-detect CPU count) |
 | `--static-root <path>` | Serve static files from directory |
 | `--run-for-ms <ms>` | Run for specified duration then exit (testing) |
 

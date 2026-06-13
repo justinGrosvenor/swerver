@@ -20,8 +20,7 @@ The JSON parser fills in a `ServerConfig` (see `src/config.zig`) and then valida
     "workers": 0,
     "max_connections": 4096,
     "static_root": "./public",
-    "cache_static_files": true,
-    "preencoded": true
+    "cache_static_files": true
   },
   "timeouts": {
     "idle_ms": 60000,
@@ -72,7 +71,7 @@ The listener and the global resource budget.
 | `max_connections` | `2048` | Hard cap on concurrent connections. Capped at 1,000,000. |
 | `static_root` | `""` | Directory served for paths not matched by a route or proxy rule. Empty disables static serving. See [Static files](static-files.md). |
 | `cache_static_files` | `false` | Cache static bodies (and precompressed siblings) in memory per worker, skipping per-request file syscalls. |
-| `preencoded` | `true` | Keep the pre-encoded response cache (canned error responses, benchmark fast-paths). Set `false` to route every path through the normal pipeline. |
+| `preencoded` | `false` | Opt-in pre-encoded fast path for canned error responses (and any registered hot endpoints). Off by default; set `true` to enable. |
 | `allowed_hosts` | `[]` | Accepted `Host` values. Empty accepts all; otherwise a non-matching `Host` is rejected with `400`. |
 | `listeners` | `[]` | Explicit per-port listeners (multi-listener mode). When empty, the single `address`/`port` above is bound. See [TLS, HTTP/2 & HTTP/3](protocols.md). |
 

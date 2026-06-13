@@ -1,9 +1,9 @@
-//! PostgreSQL wire protocol v3 message codec (design 9.0, phase 1).
+//! PostgreSQL wire protocol v3 message codec.
 //!
 //! Pure functions over byte slices: frontend message writers serialize
 //! into caller-provided buffers, backend message parsers return slices
 //! borrowing from the input buffer. No allocation, no I/O — the reactor
-//! integration (phase 2) owns sockets and buffers.
+//! integration owns sockets and buffers.
 //!
 //! Protocol reference: https://www.postgresql.org/docs/current/protocol-message-formats.html
 

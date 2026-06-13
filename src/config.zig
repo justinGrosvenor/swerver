@@ -26,7 +26,7 @@ pub const ServerConfig = struct {
     quic: QuicConfig,
     admin: AdminConfig,
     otel: OtelConfig,
-    /// Native PostgreSQL client (design 9.0). Disabled by default.
+    /// Native PostgreSQL client. Disabled by default.
     postgres: PostgresConfig = .{},
     /// Root directory for static file serving. Empty means disabled.
     static_root: []const u8,
@@ -42,8 +42,8 @@ pub const ServerConfig = struct {
     /// Disable security headers, metrics, and access logging middleware.
     /// Use for pure benchmark mode where middleware overhead matters.
     disable_middleware: bool = false,
-    /// Disable the preencoded response cache, a benchmark fast path that
-    /// serves /echo, /health, /plaintext, /pipeline (and error pages) as
+    /// Disable the preencoded HTTP/1.1 response cache. When enabled it
+    /// serves common error responses (and any opt-in hot endpoints) as
     /// precomputed bytes, bypassing the router, middleware, and encoder.
     /// Off by default so a default server takes the normal pipeline; set
     /// `preencoded: true` in the config to opt in.
@@ -252,7 +252,7 @@ pub const QuicConfig = struct {
     }
 };
 
-/// PostgreSQL client TLS policy (design 9.0 phase 3). The subset of
+/// PostgreSQL client TLS policy. The subset of
 /// libpq's sslmode values that have honest semantics: `prefer`/`allow`
 /// (opportunistic) and `verify-ca` (chain without hostname) are
 /// deliberately not offered.
@@ -268,7 +268,7 @@ pub const PgSslMode = enum {
     verify_full,
 };
 
-/// Native PostgreSQL client (design 9.0). Populated from the config
+/// Native PostgreSQL client. Populated from the config
 /// file's "postgres" block; host/port/user/database/sslmode come from
 /// parsing the `url` field. The password is read from the environment
 /// variable named by `password_env` at server init — never from the
@@ -283,7 +283,7 @@ pub const PostgresConfig = struct {
     password_env: []const u8 = "",
     /// Connections per worker process (1..4).
     pool_size_per_worker: u8 = 2,
-    /// Parsed and stored now; enforced by the query API (next step).
+    /// Enforced by the query API as a per-query deadline.
     statement_timeout_ms: u32 = 5_000,
     /// Explicit opt-in for answering a cleartext-password request over a
     /// PLAINTEXT connection. Cleartext over an established TLS channel

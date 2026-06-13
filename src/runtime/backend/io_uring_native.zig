@@ -372,7 +372,7 @@ pub const Op = enum(u4) {
     /// handleWrite and retries the writev.
     poll_writable = 5,
     /// POLL_ADD readiness wake on an external (non-Connection-pool)
-    /// fd — PostgreSQL client sockets (design 9.0). The conn_id field
+    /// fd — PostgreSQL client sockets. The conn_id field
     /// carries the external SLOT number, a separate id space from pool
     /// conn ids, and the gen field indexes `external_gens` (NOT
     /// `generations`). External fds are poll-driven readiness only —
@@ -551,7 +551,7 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
     /// multishot is still producing CQEs.
     recv_armed: []bool,
     /// External (non-Connection-pool) fds — PostgreSQL client sockets
-    /// (design 9.0) — keyed by external slot. Poll-driven readiness
+    /// — keyed by external slot. Poll-driven readiness
     /// ONLY: external fds never touch the recv/send/buffer-group
     /// machinery above.
     external_fds: [MAX_EXTERNAL_FDS]ExternalFd = [_]ExternalFd{.{}} ** MAX_EXTERNAL_FDS,

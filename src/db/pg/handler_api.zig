@@ -1,5 +1,5 @@
 //! Handler-facing park-and-resume types for the PostgreSQL client
-//! (design 9.0 "Handler API", decided 2026-06-10).
+//! ("Handler API").
 //!
 //! The contract, briefly:
 //!   - `ctx.pg.query(...)` returns the park sentinel `Response` itself —
@@ -231,7 +231,7 @@ pub const ResumeContext = struct {
     repark_fn: ReparkFn,
     repark_batch_fn: ReparkBatchFn,
 
-    /// Typed view of the stash written by `query()` in phase 1. Same
+    /// Typed view of the stash written by `query()`. Same
     /// comptime plain-data enforcement as the write side.
     pub fn stash(self: *ResumeContext, comptime T: type) *T {
         comptime assertPlainData(T);
@@ -246,7 +246,7 @@ pub const ResumeContext = struct {
 
     /// Issue the next query in a chain and re-park. Returns the park
     /// sentinel `Response` to return from the continuation — identical
-    /// contract to `ctx.pg.query` in phase 1 (text-format params).
+    /// contract to `ctx.pg.query` (text-format params).
     pub fn query(
         self: *ResumeContext,
         sql: []const u8,

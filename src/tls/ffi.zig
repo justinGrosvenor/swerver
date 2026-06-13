@@ -145,7 +145,7 @@ pub fn setSniHostname(ssl: *SSL, hostname: [:0]const u8) bool {
     return SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, @ptrCast(@constCast(hostname.ptr))) != 0;
 }
 
-// Client-side certificate verification (PG client, design 9.0 phase 3).
+// Client-side certificate verification (PG client).
 // X509_VERIFY_PARAM_set1_ip_asc is needed because SSL_set1_host matches
 // dNSName SANs (and the CN fallback) only — an IP-literal peer must be
 // checked against iPAddress SANs instead, same split libpq makes.

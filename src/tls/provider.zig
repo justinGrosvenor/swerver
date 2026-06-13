@@ -204,7 +204,7 @@ pub const Provider = struct {
     }
 
     /// Initialize a client-mode TLS provider for outbound TCP connections
-    /// (PostgreSQL client, design 9.0 phase 3).
+    /// (used by the PostgreSQL client).
     ///
     /// `verify` selects verify-full semantics: chain verification against
     /// the trust store plus per-session hostname/IP verification (set up

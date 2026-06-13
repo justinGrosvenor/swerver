@@ -7,7 +7,6 @@ const config_file = @import("config_file.zig");
 const server = @import("server.zig");
 const server_builder = @import("server_builder.zig");
 const master = @import("master.zig");
-const benchmark_routes = @import("benchmark_routes.zig");
 
 // Runtime
 const buffer_pool = @import("runtime/buffer_pool.zig");
@@ -116,7 +115,6 @@ comptime {
     _ = server;
     _ = server_builder;
     _ = master;
-    _ = benchmark_routes;
     _ = @import("server/preencoded.zig");
     _ = @import("server/tls.zig");
     _ = @import("server/accept.zig");

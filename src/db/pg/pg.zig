@@ -1,8 +1,8 @@
-//! Native PostgreSQL client — module root (design 9.0, phase 1).
+//! Native PostgreSQL client — module root.
 //!
-//! Phase 1 ships the pure-protocol layer only: wire codec, SCRAM-SHA-256,
+//! This module is the pure-protocol layer: wire codec, SCRAM-SHA-256,
 //! binary type decoders, and a socket-free `Handshake` state machine.
-//! Phase 2 (reactor integration) drives `Handshake` from the event loop:
+//! The reactor integration drives `Handshake` from the event loop:
 //! call `takeSend` whenever the socket is writable and a message is
 //! pending, `feed` with whatever bytes arrived, repeat until `isReady`.
 
@@ -35,7 +35,7 @@ pub const HandshakeError = error{
 /// no allocation: outbound messages serialize into caller buffers and
 /// inbound parsing borrows from the caller's receive buffer.
 ///
-/// Driving contract (phase 2):
+/// Driving contract:
 ///   1. `takeSend(buf)` — returns the next message to transmit, or null.
 ///   2. `feed(bytes)` — consume backend bytes; returns how many were
 ///      used. The unconsumed tail holds a partial frame and must be
@@ -172,7 +172,7 @@ pub const Handshake = struct {
             .authentication => try self.handleAuth(frame.payload),
             .parameter_status => {
                 // Server runtime parameters (server_version, TimeZone, ...)
-                // are not needed by phase 1; phase 2 may record them.
+                // are parsed but not currently recorded.
                 _ = try protocol.parseParameterStatus(frame.payload);
             },
             .backend_key_data => {
@@ -446,7 +446,7 @@ test "handshake: query-phase message mid-auth is unexpected" {
 // ---------------------------------------------------------------------------
 // Optional integration test against a live server. Set PG_TEST_DSN to a
 // URL of the form postgres://user:password@host:port/database to enable.
-// Test-only blocking I/O — shipped code never opens sockets in phase 1.
+// Test-only blocking I/O — the codec module itself never opens sockets.
 // ---------------------------------------------------------------------------
 
 const TestDsn = struct {

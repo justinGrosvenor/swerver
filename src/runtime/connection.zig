@@ -265,7 +265,7 @@ pub const Connection = struct {
     is_tunnel: bool = false,
     /// Async park state (H1 only — H2/H3 needs per-stream state).
     /// Historically x402-specific; `.db_parked` reuses the same byte for
-    /// PostgreSQL park-and-resume (design 9.0) because every dispatch
+    /// PostgreSQL park-and-resume because every dispatch
     /// gate that must pause on an x402 park (pipeline loop, recv re-arm)
     /// must pause identically on a DB park. Same type and offset — the
     /// Connection auto-layout is load-bearing (see the struct-level
@@ -284,7 +284,7 @@ pub const Connection = struct {
         resolved_allow,
         resolved_reject,
         settle_pending,
-        /// Request parked awaiting a PostgreSQL op (design 9.0). The
+        /// Request parked awaiting a PostgreSQL op. The
         /// park entry (continuation, stash, deadline, generation) lives
         /// in the per-worker PgClient, not on the Connection.
         db_parked,

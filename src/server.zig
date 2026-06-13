@@ -101,7 +101,7 @@ pub const Server = struct {
     /// Reverse proxy handler (null if proxy not configured)
     proxy: ?*proxy_mod.Proxy = null,
     /// Native PostgreSQL client (null unless the "postgres" config block
-    /// is present). Phase 2.1: connection bring-up only — no query API.
+    /// is present).
     pg_client: ?*pg_client_mod.PgClient = null,
     /// Client-mode TLS provider for the PG client (null when sslmode is
     /// disable or TLS is compiled out). Owned here — mirrors
@@ -152,23 +152,15 @@ pub const Server = struct {
     /// Cached Date header value (updated once per second)
     cached_date: [29]u8 = undefined,
     cached_date_epoch: u64 = 0,
-    /// Pre-encoded HTTP/3 response cache for hot static endpoints
-    /// (PR PERF-3). Fully-encoded h3 response bytes (HEADERS frame +
-    /// DATA frame) are held here; on a cache hit the router, router
-    /// middleware, and encodeHttp3Response are all skipped. Refreshed
-    /// lazily once per second to pick up Date header changes.
-    h3_preencoded: [preencoded.MAX_H3_PREENCODED]preencoded.PreencodedH3Response = undefined,
-    h3_preencoded_count: usize = 0,
     /// In-memory static file cache (cfg.cache_static_files). Per-worker,
     /// lazy-populated on first serve, keyed by "<path>\x00<accept-class>".
     /// null when the flag is off. Bodies are owned; freed in deinit.
     static_cache: ?std.StringHashMap(StaticCacheEntry) = null,
     /// Total bytes of cached static bodies, bounded by STATIC_CACHE_MAX_BYTES.
     static_cache_bytes: usize = 0,
-    /// Pre-encoded HTTP/1.1 response cache for the same hot static
-    /// endpoints. Same shape as `h3_preencoded` but the bytes are
-    /// raw HTTP/1.1 (status line + headers + body). Refresh is
-    /// lazy / per-second just like h3.
+    /// Pre-encoded HTTP/1.1 response cache for opt-in hot static
+    /// endpoints. The bytes are raw HTTP/1.1 (status line + headers +
+    /// body). Refresh is lazy / per-second to track the Date header.
     h1_preencoded: [preencoded.MAX_H1_PREENCODED]preencoded.PreencodedH1Response = undefined,
     h1_preencoded_count: usize = 0,
     /// Pre-encoded error responses (404, 400, 405, 501). Keyed by
@@ -177,12 +169,6 @@ pub const Server = struct {
     /// the endpoint cache.
     h1_error_cache: [4]preencoded.PreencodedH1Response = undefined,
     h1_error_cache_count: usize = 0,
-    /// Pre-encoded HTTP/2 response cache. Holds a stream-id-agnostic
-    /// template — HEADERS frame header + HPACK block + optional DATA
-    /// frame header + body. Send-time patches stream_id bytes in
-    /// place and enqueues the write.
-    h2_preencoded: [preencoded.MAX_H2_PREENCODED]preencoded.PreencodedH2Response = undefined,
-    h2_preencoded_count: usize = 0,
     /// Shared ciphertext drain scratch for TLS memory-BIO writes. Sized to
     /// hold one full TLS record's ciphertext (max_plaintext 16384 + 256 bytes
     /// of AEAD/framing overhead). Per-SSL_write we cap plaintext at 16 KiB so
@@ -328,12 +314,6 @@ pub const Server = struct {
 
         if (!self.cfg.disable_preencoded) {
             preencoded.initPreencodedH1(self);
-            if (build_options.enable_http2) preencoded.initPreencodedH2(self);
-            // Pre-encode the h3 response bytes for hot static endpoints
-            // (PR PERF-3). Requires http3_stack to be initialized.
-            if (build_options.enable_http3 and self.http3_stack != null) {
-                preencoded.initPreencodedH3(self);
-            }
         }
 
         if (cfg.otel.enabled) {
@@ -342,9 +322,9 @@ pub const Server = struct {
             self.otel = otel_ptr;
         }
 
-        // PostgreSQL client (design 9.0, phase 2.1: connection bring-up
-        // only). DNS resolves once here at startup — never on the
-        // reactor — so an unreachable resolver can't stall the loop.
+        // PostgreSQL client connection bring-up. DNS resolves once
+        // here at startup — never on the reactor — so an unreachable
+        // resolver can't stall the loop.
         // The actual non-blocking connects start from the housekeeping
         // tick once the event loop runs.
         if (cfg.postgres.enabled) pg_blk: {
@@ -358,8 +338,8 @@ pub const Server = struct {
                 const v = std.c.getenv(name_z_ptr) orelse break :pwd "";
                 break :pwd std.mem.sliceTo(v, 0);
             };
-            // Client-mode TLS (design 9.0 phase 3): build the provider up
-            // front so a bad CA path or a TLS-less build fails the whole
+            // Client-mode TLS: build the provider up front so a bad CA
+            // path or a TLS-less build fails the whole
             // postgres block instead of every connect attempt.
             if (cfg.postgres.sslmode != .disable) {
                 const ca: ?[:0]const u8 = if (cfg.postgres.ssl_root_cert.len > 0)
@@ -626,7 +606,7 @@ pub const Server = struct {
     }
 
     /// Thin wrappers around `server/dispatch.zig`. The dispatch
-    /// body moved out in Extract 7; these methods remain on
+    /// body lives in that module; these methods remain on
     /// `Server` so `server/tls.zig` can schedule a read/write pass
     /// after a handshake completes without importing
     /// `server/dispatch.zig` directly (which would form a cycle:
@@ -740,12 +720,6 @@ pub const Server = struct {
         };
     }
 
-    /// Dispatch an HTTP/2 request to the router and queue its response.
-    /// Shared helper for the HEADERS-only and HEADERS+DATA dispatch
-    /// paths in handleHttp2Read. `body` is an empty slice for GET/HEAD
-    /// requests or a slice into the connection's read buffer for
-    /// POST/PUT requests (valid for the duration of this synchronous
-    /// call).
     /// Guess Content-Type from file extension
     pub fn guessContentType(path: []const u8) []const u8 {
         if (std.mem.endsWith(u8, path, ".html") or std.mem.endsWith(u8, path, ".htm")) {
@@ -1033,8 +1007,9 @@ pub const Server = struct {
         encoding: StaticEncoding,
     };
 
-    /// Total cached static body bytes never exceed this (per worker). The
-    /// benchmark/static set is tiny; we never evict, just stop caching.
+    /// Total cached static body bytes never exceed this (per worker).
+    /// Once the cap is hit, further files are served uncached rather
+    /// than evicting existing entries.
     const STATIC_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
     /// The Accept-Encoding facts that change which file gets served. Cached

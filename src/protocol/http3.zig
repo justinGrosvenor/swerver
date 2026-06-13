@@ -231,9 +231,7 @@ pub const Stack = struct {
     /// Cached IMF-fixdate string for the Date response header,
     /// refreshed once per Unix epoch second. Mirrors h1's
     /// Server.getCachedDate pattern. Saves ~100 cycles per response
-    /// on the cold h3 path. The hot path (PR PERF-3 pre-encoded
-    /// cache) bakes the Date into its cached bytes and refreshes
-    /// those independently.
+    /// on the h3 response path.
     cached_date: [29]u8 = undefined,
     cached_date_epoch: u64 = 0,
 
@@ -278,8 +276,7 @@ pub const Stack = struct {
     /// lets multiple concurrent request streams in a single QUIC packet
     /// each hold stable slices at the same time. The counter is reset
     /// to 0 once per packet by the handler via `clearEvents`, after the
-    /// previous packet's events have been fully dispatched. Finding #7
-    /// in `docs/design/8.0-h3-performance-plan.md`.
+    /// previous packet's events have been fully dispatched.
     fn copyHeaders(self: *Stack, headers: []const Header) Error![]const Header {
         const start = self.header_count;
         for (headers) |hdr| {
@@ -717,9 +714,9 @@ pub const Stack = struct {
         }
         // RFC 9110 §6.6.1: Origin servers MUST send Date header (except 1xx).
         // Served from the per-Stack cache; refreshed once per Unix
-        // epoch second. Pre-PR PERF-3-followup this called
-        // formatImfDateHttp3 on every response, costing ~100 cycles
-        // per request for modular arithmetic over the Unix timestamp.
+        // epoch second. An earlier version called formatImfDateHttp3
+        // on every response, costing ~100 cycles per request for
+        // modular arithmetic over the Unix timestamp.
         if (status >= 200) {
             const date_str = self.getCachedDate();
             all_headers[header_count] = .{ .name = "date", .value = date_str };
