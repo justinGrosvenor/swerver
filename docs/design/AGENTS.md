@@ -25,6 +25,8 @@
 - [6.0-middleware.md](6.0-middleware.md) - Middleware chain, context propagation, and built-in middleware behavior.
 - [7.0-rfc-compliance-index.md](7.0-rfc-compliance-index.md) - RFC compliance tracking index for HTTP, proxy, and transport behavior.
 - [8.0-h3-performance-plan.md](8.0-h3-performance-plan.md) - h3 fast-path engineering plan targeting HttpArena submission.
+- [9.0-postgres-client.md](9.0-postgres-client.md) - Native async PostgreSQL client: per-worker pool, SCRAM, TLS, pipelining, and the park-and-resume handler API.
+- [10.0-edge-functions.md](10.0-edge-functions.md) - WASM edge functions: Tier-1 cheap hot-path filters, the two-tier compute model with Nether, custom ABI, and park-and-resume host calls.
 
 ## Subdirectories
 
