@@ -120,7 +120,8 @@ pub const IoUringPollBackend = struct {
     /// Track registered FDs for re-arming (POLL_ADD is one-shot)
     /// Layout: [0..MAX_LISTENERS)=listeners, [MAX_LISTENERS]=UDP,
     /// [MAX_LISTENERS+1..]=connections (indexed by conn_id + MAX_LISTENERS + 1).
-    /// All listener slots carry conn_id=0 so their CQEs translate to .accept.
+    /// Slot 0 uses conn_id=0; additional slots use LISTENER_ID_BASE+slot as
+    /// their token. Both ranges translate to .accept in io.zig.
     registered_fds: []RegisteredFd,
     /// Number of listener slots in use ([0..listener_count) of registered_fds).
     /// Re-arming a listener CQE (conn_id=0) re-arms every active listener slot

@@ -64,3 +64,6 @@ FEATURE_REQUEST_settlement_reporting.md
 
 # Local ad-hoc test script
 examples/gateway/test-x402.sh
+
+# Settlement failure logs
+settle-failures.jsonl

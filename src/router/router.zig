@@ -1107,7 +1107,7 @@ pub const Router = struct {
                             }
                             if (effective_policy.settlement_url.len > 0) {
                                 const amount = if (ctx.charge_amount.len > 0) ctx.charge_amount else effective_policy.price;
-                                settlement.enqueue(effective_policy.gateway_id, settle.transaction, effective_policy.network, effective_policy.asset, amount);
+                                settlement.enqueue(effective_policy.gateway_id, settle.transaction, effective_policy.network, effective_policy.asset, amount, path_only);
                             }
                         } else {
                             std.log.warn("x402 settlement failed: {s}", .{settle.error_reason});

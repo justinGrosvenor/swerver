@@ -18,6 +18,8 @@ pub const Record = struct {
     asset_len: u8 = 0,
     amount: [32]u8 = undefined,
     amount_len: u8 = 0,
+    request_path: [256]u8 = undefined,
+    request_path_len: u8 = 0,
 };
 
 pub const SettlementConfig = struct {
@@ -105,6 +107,7 @@ pub fn enqueue(
     network_str: []const u8,
     asset: []const u8,
     amount: []const u8,
+    request_path: []const u8,
 ) void {
     const wp = write_pos.load(.acquire);
     const rp = read_pos.load(.acquire);
@@ -124,6 +127,8 @@ pub fn enqueue(
     @memcpy(rec.asset[0..rec.asset_len], asset[0..rec.asset_len]);
     rec.amount_len = @intCast(@min(amount.len, 32));
     @memcpy(rec.amount[0..rec.amount_len], amount[0..rec.amount_len]);
+    rec.request_path_len = @intCast(@min(request_path.len, 255));
+    @memcpy(rec.request_path[0..rec.request_path_len], request_path[0..rec.request_path_len]);
     ring[wp % QUEUE_SIZE] = rec;
     write_pos.store(wp +% 1, .release);
 }
@@ -260,6 +265,8 @@ fn buildJson(buf: []u8, rec: *const Record) !usize {
     off += jsonEscape(buf[off..], rec.asset[0..rec.asset_len]);
     off += copyInto(buf[off..], "\",\"amount\":\"");
     off += jsonEscape(buf[off..], rec.amount[0..rec.amount_len]);
+    off += copyInto(buf[off..], "\",\"path\":\"");
+    off += jsonEscape(buf[off..], rec.request_path[0..rec.request_path_len]);
     off += copyInto(buf[off..], "\"}");
     if (off >= buf.len) return error.BufferTooSmall;
     return off;
@@ -324,6 +331,9 @@ test "buildJson: produces valid settlement JSON" {
     const amt = "1000000";
     rec.amount_len = @intCast(amt.len);
     @memcpy(rec.amount[0..amt.len], amt);
+    const rp = "/search";
+    rec.request_path_len = @intCast(rp.len);
+    @memcpy(rec.request_path[0..rp.len], rp);
 
     var buf: [1024]u8 = undefined;
     const len = try buildJson(&buf, &rec);
@@ -333,14 +343,15 @@ test "buildJson: produces valid settlement JSON" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"txHash\":\"0xabc123\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"network\":\"eip155:84532\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"amount\":\"1000000\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"path\":\"/search\"") != null);
 }
 
 test "enqueue and count" {
     write_pos = std.atomic.Value(u32).init(0);
     read_pos = std.atomic.Value(u32).init(0);
-    enqueue("gw1", "tx1", "eip155:1", "0xasset", "100");
+    enqueue("gw1", "tx1", "eip155:1", "0xasset", "100", "/path");
     try std.testing.expectEqual(@as(u32, 1), write_pos.load(.acquire));
-    enqueue("gw2", "tx2", "eip155:1", "0xasset", "200");
+    enqueue("gw2", "tx2", "eip155:1", "0xasset", "200", "/path");
     try std.testing.expectEqual(@as(u32, 2), write_pos.load(.acquire));
     write_pos = std.atomic.Value(u32).init(0);
     read_pos = std.atomic.Value(u32).init(0);
@@ -359,6 +370,8 @@ test "buildPost: includes auth header when token present" {
     @memcpy(rec.asset[0..5], "asset");
     rec.amount_len = 3;
     @memcpy(rec.amount[0..3], "100");
+    rec.request_path_len = 4;
+    @memcpy(rec.request_path[0..4], "/api");
 
     var json_buf: [1024]u8 = undefined;
     const json_len = try buildJson(&json_buf, &rec);

@@ -408,7 +408,7 @@ pub const Proxy = struct {
         // Buffer is full. The response may be exactly complete (parse
         // succeeded above and returned), complete-but-close-delimited, or
         // (the common case for large bodies) incomplete: grow to the heap.
-        var capacity: usize = @min(@max(fixed.len * 4, fixed.len), cap);
+        var capacity: usize = @min(fixed.len * 4, cap);
         if (capacity <= fixed.len) return error.TooLarge;
         var owned = self.allocator.alloc(u8, capacity) catch return error.ReadFailed;
         @memcpy(owned[0..total], fixed[0..total]);
@@ -494,7 +494,7 @@ pub const Proxy = struct {
         // Retry loop
         const retry_config = route.retry;
         var attempts: u8 = 0;
-        const max_attempts = retry_config.max_retries + 1;
+        const max_attempts = @as(u16, retry_config.max_retries) + 1;
         const start_instant = clock.Instant.now();
         const total_limit_ns: u64 = @as(u64, route.timeouts.total_ms) * 1_000_000;
 
@@ -752,7 +752,7 @@ pub const Proxy = struct {
 
         const retry_config = route.retry;
         var attempts: u8 = 0;
-        const max_attempts = retry_config.max_retries + 1;
+        const max_attempts = @as(u16, retry_config.max_retries) + 1;
         const body_len = body_view.totalLen();
         const start_instant = clock.Instant.now();
         const total_limit_ns: u64 = @as(u64, route.timeouts.total_ms) * 1_000_000;
