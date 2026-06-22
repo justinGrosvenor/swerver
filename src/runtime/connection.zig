@@ -288,6 +288,11 @@ pub const Connection = struct {
         /// park entry (continuation, stash, deadline, generation) lives
         /// in the per-worker PgClient, not on the Connection.
         db_parked,
+        /// Request parked awaiting a Nether sandbox exec (design 11.0).
+        /// Park entry lives in the per-worker NetherClient. Same dispatch
+        /// gates as db_parked: every place that pauses on a DB park
+        /// pauses identically on a sandbox park.
+        sandbox_parked,
     };
 
     pub fn init(index: u32) Connection {

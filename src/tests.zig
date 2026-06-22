@@ -85,6 +85,10 @@ const pg_types = @import("db/pg/types.zig");
 const pg_client = @import("db/pg/client.zig");
 const pg_handler_api = @import("db/pg/handler_api.zig");
 
+// Sandbox runtime (Nether integration, design 11.0)
+const sandbox_nether = @import("sandbox/nether.zig");
+const sandbox_handler_api = @import("sandbox/handler_api.zig");
+
 // Proxy
 const proxy_upstream = @import("proxy/upstream.zig");
 const proxy_pool = @import("proxy/pool.zig");
@@ -195,6 +199,8 @@ comptime {
     _ = pg_types;
     _ = pg_client;
     _ = pg_handler_api;
+    _ = sandbox_nether;
+    _ = sandbox_handler_api;
 
     // Proxy
     _ = proxy_cache;
