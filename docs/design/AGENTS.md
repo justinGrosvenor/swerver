@@ -27,6 +27,7 @@
 - [8.0-h3-performance-plan.md](8.0-h3-performance-plan.md) - h3 fast-path engineering plan targeting HttpArena submission.
 - [9.0-postgres-client.md](9.0-postgres-client.md) - Native async PostgreSQL client: per-worker pool, SCRAM, TLS, pipelining, and the park-and-resume handler API.
 - [10.0-edge-functions.md](10.0-edge-functions.md) - WASM edge functions: Tier-1 cheap hot-path filters, the two-tier compute model with Nether, custom ABI, and park-and-resume host calls.
+- [11.0-sandbox-runtime.md](11.0-sandbox-runtime.md) - Nether integration: drive Tier-2 microVM sandboxes from a swerver handler over Nether's control socket, reusing park-and-resume and external-FD dispatch.
 
 ## Subdirectories
 
