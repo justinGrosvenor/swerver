@@ -536,6 +536,7 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
                             result.settle_network[0..result.settle_network_len],
                             result.settle_asset[0..result.settle_asset_len],
                             result.settle_amount[0..result.settle_amount_len],
+                            result.request_path[0..result.request_path_len],
                         );
                     } else if (!result.success) {
                         std.log.warn("x402 async settlement failed: {s}", .{result.error_reason[0..result.error_reason_len]});
@@ -1446,7 +1447,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
                         if (std.ascii.eqlIgnoreCase(hdr.name, "x-charge-amount")) break hdr.value;
                     } else "";
                     var settle_entry = x402_client.RequestEntry{ .kind = .settle, .conn_index = conn.index, .conn_id = conn.id };
-                    fillSettleEntry(&settle_entry, fac, x402_result.allow.payment_header, &x402_policy, charge);
+                    fillSettleEntry(&settle_entry, fac, x402_result.allow.payment_header, &x402_policy, charge, parse.view.path);
                     if (settle_entry.http_len == 0) break :settle_blk;
 
                     // Settle-park: hold response until settlement completes, then inject receipt header.
@@ -2295,6 +2296,7 @@ fn fillSettleEntry(
     payment_header: []const u8,
     policy: *const x402_mod.RoutePaymentConfig,
     charge: []const u8,
+    request_path: []const u8,
 ) void {
     const shl: u8 = @intCast(@min(fac.host.len, entry.host.len));
     @memcpy(entry.host[0..shl], fac.host[0..shl]);
@@ -2319,6 +2321,9 @@ fn fillSettleEntry(
     const amt_len: u8 = @intCast(@min(amt.len, entry.settle_amount.len));
     @memcpy(entry.settle_amount[0..amt_len], amt[0..amt_len]);
     entry.settle_amount_len = amt_len;
+    const rp_len: u8 = @intCast(@min(request_path.len, entry.request_path.len));
+    @memcpy(entry.request_path[0..rp_len], request_path[0..rp_len]);
+    entry.request_path_len = rp_len;
 }
 
 /// Pack upstream response (status + headers + body) into a pool buffer

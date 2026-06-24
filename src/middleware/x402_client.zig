@@ -25,6 +25,8 @@ pub const RequestEntry = struct {
     settle_asset_len: u8 = 0,
     settle_amount: [32]u8 = undefined,
     settle_amount_len: u8 = 0,
+    request_path: [256]u8 = undefined,
+    request_path_len: u8 = 0,
     has_settlement_url: bool = false,
 };
 
@@ -46,6 +48,8 @@ pub const ResultEntry = struct {
     settle_asset_len: u8 = 0,
     settle_amount: [32]u8 = undefined,
     settle_amount_len: u8 = 0,
+    request_path: [256]u8 = undefined,
+    request_path_len: u8 = 0,
     has_settlement_url: bool = false,
     receipt_b64: [512]u8 = undefined,
     receipt_b64_len: u16 = 0,
@@ -231,6 +235,8 @@ fn workerLoop() void {
                     result.settle_asset_len = req.settle_asset_len;
                     result.settle_amount = req.settle_amount;
                     result.settle_amount_len = req.settle_amount_len;
+                    result.request_path = req.request_path;
+                    result.request_path_len = req.request_path_len;
                     result.has_settlement_url = req.has_settlement_url;
                     if (!result.success) {
                         spillSettle(
