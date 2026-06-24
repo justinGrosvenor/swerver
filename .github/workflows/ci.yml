@@ -28,6 +28,8 @@ jobs:
         uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
+      - name: Check (compile exe + examples + all test variants, no run)
+        run: zig build check --summary all
       - name: Build (Debug)
         run: zig build --summary all
       - name: Build (ReleaseFast)
@@ -46,6 +48,8 @@ jobs:
         uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
+      - name: Check (compile exe + examples + all test variants, no run)
+        run: zig build check --summary all
       - name: Build (Debug)
         run: zig build --summary all
       - name: Build (ReleaseFast)

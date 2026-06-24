@@ -202,6 +202,27 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| gateway_run.addArgs(args);
     const gateway_step = b.step("gateway", "Run gateway example");
     gateway_step.dependOn(&gateway_run.step);
+
+    // --- check: compile everything without running ---
+    // `zig build test` only compiles the unit-test binary, not the server
+    // exe or the example exes. A changed public signature can therefore pass
+    // `zig build test` yet break `zig build` (Zig analyzes lazily, so an
+    // unreferenced call site is never checked by the tests). `check` compiles
+    // the server exe, both examples, the bench exe, and the matrix-safe test
+    // variants without running them, so signature drift is caught before push.
+    // Fast: compile-only, no test execution. The H3 / all-features variants
+    // are omitted for the same reason test-matrix omits them: they need
+    // OpenSSL 3.5+ (QUIC TLS symbols) to link, which CI's OpenSSL 3.0 lacks.
+    const check_step = b.step("check", "Compile all artifacts without running (signature-drift guard)");
+    check_step.dependOn(&exe.step);
+    check_step.dependOn(&example_exe.step);
+    check_step.dependOn(&gateway_exe.step);
+    check_step.dependOn(&bench_exe.step);
+    check_step.dependOn(&tests.step);
+    check_step.dependOn(&test_tls.step);
+    check_step.dependOn(&test_http2.step);
+    check_step.dependOn(&test_proxy.step);
+    check_step.dependOn(&test_io_uring.step);
 }
 
 const FeatureFlags = struct {
