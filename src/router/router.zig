@@ -562,6 +562,13 @@ pub const WasmBinding = struct {
     conn_id: u64 = 0,
     deadline_ms: u64 = 0,
     resume_decision: ?middleware.Decision = null,
+    /// Transport start hook: invoked when a filter parks, with the park token and
+    /// the guest-encoded outbound request (the staged host_call bytes). The
+    /// transport (mock or vsock) performs the call and later delivers the result
+    /// via dispatch.wasmComplete(token, ...). Null when no transport is wired
+    /// (the park then only completes via the deadline tick).
+    start_fn: ?*const fn (ctx: *anyopaque, token: u32, request: []const u8) void = null,
+    start_ctx: ?*anyopaque = null,
 };
 
 /// Connection identity + per-worker PG client, threaded from the
@@ -1187,13 +1194,17 @@ pub const Router = struct {
                                     .pause_reads_ms = if (bp.pause_reads) bp.resume_after_ms else null,
                                 },
                             },
-                            .parked => {
+                            .parked => |call_request| {
                                 // Pin the instance in the park table (keyed to this
-                                // connection) and return the park sentinel; the
+                                // connection), kick the transport with the staged
+                                // request, and return the park sentinel; the
                                 // dispatch layer's handleParkSentinel sets
-                                // .wasm_parked and the transport (C1) drives the
-                                // host call to completion -> wasmResume.
-                                if (table.park(inst, req, scratch.wasm.conn_index, scratch.wasm.conn_id, scratch.wasm.deadline_ms, r.wasm_fuel)) |_| {
+                                // .wasm_parked and the transport drives the host
+                                // call to completion -> wasmResume.
+                                if (table.park(inst, req, scratch.wasm.conn_index, scratch.wasm.conn_id, scratch.wasm.deadline_ms, r.wasm_fuel)) |token| {
+                                    if (scratch.wasm.start_fn) |start| {
+                                        start(scratch.wasm.start_ctx.?, token, call_request);
+                                    }
                                     return .{ .resp = response.Response.parked };
                                 }
                                 // Park table full: unpin and fail closed.
@@ -2092,5 +2103,66 @@ test "wasm: re-dispatch injects resume decision (skip filter, run handler)" {
             .wasm = .{ .resume_decision = .{ .reject = .{ .status = 418, .headers = &.{}, .body = .{ .bytes = "teapot" } } } },
         };
         try std.testing.expectEqual(@as(u16, 418), router.handle(req, &mw_ctx, &scratch2).resp.status);
+    } else return error.SkipZigTest;
+}
+
+test "wasm: filter park registers in table and fires the transport start hook" {
+    if (build_options.enable_wasm) {
+        const FILTER = @embedFile("../wasm/testdata/filter_probe.wasm");
+        var pool = try wasm_filter.Pool.init(std.testing.allocator, FILTER, .{ .instances = 1 });
+        defer pool.deinit();
+        var table = wasm_host_call.Table{};
+
+        var router = Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+        const handler = struct {
+            fn h(_: *HandlerContext) response.Response {
+                return response.Response.ok();
+            }
+        }.h;
+        try router.get("/enrich", handler);
+        _ = router.attachWasmFilter("/enrich", &pool, wasm_filter.DEFAULT_FUEL);
+
+        const Cap = struct {
+            var called: bool = false;
+            var tok: u32 = 12345;
+            var req_len: usize = 0;
+            fn start(ctx: *anyopaque, token: u32, req_bytes: []const u8) void {
+                _ = ctx;
+                called = true;
+                tok = token;
+                req_len = req_bytes.len;
+            }
+        };
+
+        var response_buf: [RESPONSE_BUF_SIZE]u8 = undefined;
+        var response_headers: [MAX_RESPONSE_HEADERS]response.Header = undefined;
+        var arena_buf: [ARENA_BUF_SIZE]u8 = undefined;
+        var mw_ctx = middleware.Context{};
+        var scratch = HandlerScratch{
+            .response_buf = response_buf[0..],
+            .response_headers = response_headers[0..],
+            .arena_buf = arena_buf[0..],
+            .wasm = .{
+                .table = @ptrCast(&table),
+                .conn_index = 1,
+                .conn_id = 1,
+                .deadline_ms = 9_999_999,
+                .start_fn = Cap.start,
+                .start_ctx = @ptrCast(&table),
+            },
+        };
+        // /enrich stages a host_call and parks: handle returns the sentinel, the
+        // park is registered, and the transport start hook fires with the token
+        // and the staged request bytes.
+        const req = request.RequestView{ .method = .GET, .path = "/enrich", .headers = &.{} };
+        const result = router.handle(req, &mw_ctx, &scratch);
+        try std.testing.expect(result.resp.isParked());
+        try std.testing.expect(Cap.called);
+        try std.testing.expect(Cap.req_len > 0);
+        try std.testing.expect(table.hasParkFor(1, 1));
+
+        // Completing the host call resumes the filter to a decision.
+        const c = table.complete(Cap.tok, "ok") orelse return error.NoCompletion;
+        try std.testing.expect(c.decision == .allow);
     } else return error.SkipZigTest;
 }

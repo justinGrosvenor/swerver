@@ -838,15 +838,31 @@ fn wasmResume(server: *Server, completion: wasm_host_call_mod.Completion) void {
 /// is disabled or nothing is parked.
 fn wasmTick(server: *Server, now_ms: u64) void {
     if (build_options.enable_wasm) {
+        // Mock transport (e2e mock lane): complete parks queued since the last
+        // tick with the canned reply. Drained here, off any handler stack frame.
+        if (server.wasm_mock_enabled and server.wasm_mock_count > 0) {
+            const reply = server.wasm_mock_reply;
+            const n = server.wasm_mock_count;
+            server.wasm_mock_count = 0;
+            for (server.wasm_mock_pending[0..n]) |token| wasmComplete(server, token, reply);
+        }
+        // Wall-clock deadlines.
         var completions: [16]wasm_host_call_mod.Completion = undefined;
         const n = server.wasm_host_calls.tick(now_ms, &completions);
         for (completions[0..n]) |c| wasmResume(server, c);
     }
 }
 
-/// Deliver a completed host call (success path). The transport (C1) calls this
-/// when the guest reply is in; it resumes the filter and re-dispatches. `token`
-/// is a wasm.host_call.Token (u32).
+/// Transport start hook (router.WasmBinding.start_fn). Routes a freshly parked
+/// filter's host call to the Server's transport (mock or vsock).
+fn wasmStartThunk(ctx: *anyopaque, token: u32, request: []const u8) void {
+    const server: *Server = @ptrCast(@alignCast(ctx));
+    server.wasmStartHostCall(token, request);
+}
+
+/// Deliver a completed host call (success path). The transport calls this when
+/// the guest reply is in; it resumes the filter and re-dispatches. `token` is a
+/// wasm.host_call.Token (u32).
 pub fn wasmComplete(server: *Server, token: u32, result: []const u8) void {
     if (build_options.enable_wasm) {
         if (server.wasm_host_calls.complete(token, result)) |c| wasmResume(server, c);
@@ -1679,6 +1695,8 @@ pub fn handleRead(server: *Server, index: u32) !void {
                 .conn_index = conn.index,
                 .conn_id = conn.id,
                 .deadline_ms = server.now_ms + WASM_HOST_CALL_TIMEOUT_MS,
+                .start_fn = if (build_options.enable_wasm) wasmStartThunk else null,
+                .start_ctx = if (build_options.enable_wasm) @ptrCast(server) else null,
             },
         };
         const otel_start = if (server.otel != null) clock.realtimeNanos() orelse 0 else 0;

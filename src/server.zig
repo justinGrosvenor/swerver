@@ -115,6 +115,15 @@ pub const Server = struct {
     /// worker; void when wasm is compiled out.
     wasm_host_calls: if (build_options.enable_wasm) wasm_host_call_mod.Table else void =
         if (build_options.enable_wasm) .{} else {},
+    /// Mock host-call transport (e2e mock lane / C2 validation). When enabled, a
+    /// parked filter is completed on the next housekeeping tick with
+    /// `wasm_mock_reply` instead of a real vsock call. Off in production; the real
+    /// vsock transport (C3) replaces this. The pending ring holds park tokens
+    /// awaiting mock completion.
+    wasm_mock_enabled: bool = false,
+    wasm_mock_reply: []const u8 = "ok",
+    wasm_mock_pending: [64]u32 = undefined,
+    wasm_mock_count: usize = 0,
     /// Native PostgreSQL client (null unless the "postgres" config block
     /// is present).
     pg_client: ?*pg_client_mod.PgClient = null,
@@ -594,6 +603,20 @@ pub const Server = struct {
     pub fn wasmCancelForConn(self: *Server, conn_index: u32, conn_id: u64) void {
         if (build_options.enable_wasm) {
             _ = self.wasm_host_calls.cancelForConn(conn_index, conn_id);
+        }
+    }
+
+    /// Transport start hook (set as WasmBinding.start_fn). Initiates the host
+    /// call for a freshly parked filter. The mock transport just queues the token
+    /// for completion on the next tick; the real vsock transport (C3) issues the
+    /// guest call here. `request` is the staged outbound bytes (mock ignores them).
+    pub fn wasmStartHostCall(self: *Server, token: u32, req_bytes: []const u8) void {
+        if (build_options.enable_wasm) {
+            _ = req_bytes;
+            if (self.wasm_mock_enabled and self.wasm_mock_count < self.wasm_mock_pending.len) {
+                self.wasm_mock_pending[self.wasm_mock_count] = token;
+                self.wasm_mock_count += 1;
+            }
         }
     }
 
