@@ -516,11 +516,21 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
     const wasm_defs = file_cfg.wasm_filters orelse &[_]WasmFilterJson{};
     const wasm_out = try alloc.alloc(WasmFilterConfig, wasm_defs.len);
     for (wasm_defs, 0..) |w, wi| {
+        var instances = w.instances orelse 1;
+        if (instances == 0) {
+            std.log.warn("wasm_filters['{s}']: instances=0 is invalid (would 503 every request); using 1", .{w.match});
+            instances = 1;
+        }
+        var fuel = w.fuel orelse 5_000_000;
+        if (fuel <= 0) {
+            std.log.warn("wasm_filters['{s}']: fuel<=0 would fail-close every looping filter; using default", .{w.match});
+            fuel = 5_000_000;
+        }
         wasm_out[wi] = .{
             .match = w.match,
             .module_path = w.module,
-            .instances = w.instances orelse 1,
-            .fuel = w.fuel orelse 5_000_000,
+            .instances = instances,
+            .fuel = fuel,
         };
     }
 

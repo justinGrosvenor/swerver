@@ -7,8 +7,8 @@
 //!
 //! ABI (custom, minimal, v1). Host imports the guest may call:
 //!   get_method() -> i32                                  method enum (see Method)
-//!   get_path(out_ptr, out_cap) -> len                    request path
-//!   get_header(name_ptr,name_len,out_ptr,out_cap) -> len header value (0=absent)
+//!   get_path(out_ptr, out_cap) -> len                    request path (len=true size, copied=min)
+//!   get_header(name_ptr,name_len,out_ptr,out_cap) -> len header value (0=absent; len=true size)
 //!   header_count() -> i32                                number of request headers
 //!   body_len() -> i32                                    request body length (true total)
 //!   read_body(src_off, out_ptr, out_cap) -> len          copy a body window in
@@ -308,7 +308,9 @@ fn hostGetPath(rt: c.IM3Runtime, ctx: c.IM3ImportContext, sp: [*c]u64, mem: ?*an
     const path = inst.req.path;
     const n = @min(path.len, dst.len);
     @memcpy(dst[0..n], path[0..n]);
-    ret.* = @intCast(n);
+    // Return the TRUE length (copied = min(len, cap)) so a guest with an
+    // undersized buffer can detect truncation and grow/retry.
+    ret.* = @intCast(path.len);
     return null;
 }
 
@@ -323,12 +325,13 @@ fn hostGetHeader(rt: c.IM3Runtime, ctx: c.IM3ImportContext, sp: [*c]u64, mem: ?*
     const name = guestView(rt, mem, name_ptr, name_len) orelse return trap(TRAP_OOB);
     const dst = guestView(rt, mem, out_ptr, out_cap) orelse return trap(TRAP_OOB);
     const val = inst.req.getHeader(name) orelse {
-        ret.* = 0;
+        ret.* = 0; // 0 = header absent (an empty present value also returns 0)
         return null;
     };
     const n = @min(val.len, dst.len);
     @memcpy(dst[0..n], val[0..n]);
-    ret.* = @intCast(n);
+    // True length (copied = min(len, cap)); lets the guest detect truncation.
+    ret.* = @intCast(val.len);
     return null;
 }
 
@@ -558,11 +561,14 @@ pub const Pool = struct {
     wasm_bytes: []u8,
 
     pub fn init(alloc: std.mem.Allocator, wasm_bytes: []const u8, config: Config) Error!Pool {
-        std.debug.assert(config.instances > 0);
+        // Clamp to at least one instance. A zero count is a config error (it
+        // would make acquire() always fail and 503 every request); the assert
+        // that used to guard this is compiled out in release, so clamp instead.
+        const count = @max(config.instances, 1);
         const owned = try alloc.dupe(u8, wasm_bytes);
         errdefer alloc.free(owned);
 
-        const instances = try alloc.alloc(Instance, config.instances);
+        const instances = try alloc.alloc(Instance, count);
         errdefer alloc.free(instances);
 
         var built: usize = 0;
@@ -785,6 +791,25 @@ test "park/resume: terminal invoke() fails closed on a parking filter" {
     try testing.expect(pool.acquire() != null); // not stuck pinned
     // release the one we just acquired
     for (pool.instances) |*i| i.state = .idle;
+}
+
+test "abi: get_path returns the true length so truncation is detectable" {
+    var pool = try Pool.init(testing.allocator, FILTER_WASM, .{ .instances = 1 });
+    defer pool.deinit();
+    const inst = pool.acquire() orelse return error.AcquireFailed;
+    const p = "/a/fairly/long/path";
+    const r = mkReq(.GET, p, &.{});
+    inst.req = &r;
+    active = inst;
+    defer {
+        active = null;
+        inst.state = .idle;
+    }
+    runtime.fuel.unlimited();
+    const f = inst.module.findOptional("get_path_ret") orelse return error.FunctionNotFound;
+    // Tiny 4-byte cap: the host copies 4 bytes but reports the true length.
+    const ret = try runtime.callI32_2(f, 0, 4);
+    try testing.expectEqual(@as(i32, @intCast(p.len)), ret);
 }
 
 test "security: pool caps each instance's max linear memory" {

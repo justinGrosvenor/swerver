@@ -35,6 +35,34 @@ fn bodyViewToRequestBody(bv: forward.BodyView) request.RequestBody {
     };
 }
 
+var proxy_modify_warned = false;
+
+/// Run a route's WASM edge filter (if any) against `req_view`. Returns a
+/// short-circuit Response when the filter rejects (or fails closed); null to
+/// proceed with forwarding. `.modify` (response-header injection) is not yet
+/// supported on the proxy path -- honoring it needs the staged headers captured
+/// past the instance release and merged into the upstream response (Phase 2b for
+/// the proxy). Rather than silently drop it (as before) we log once and forward;
+/// `.modify` is honored on the embedded Router today. See design 10.0.
+fn runWasmFilter(route: *const upstream.ProxyRoute, req_view: *const request.RequestView) ?response.Response {
+    if (build_options.enable_wasm) {
+        if (route.wasm_pool) |pool_ptr| {
+            const fpool: *wasm_filter.Pool = @ptrCast(@alignCast(pool_ptr));
+            switch (fpool.run(req_view, route.wasm_fuel)) {
+                .reject => |resp| return resp,
+                .modify => {
+                    if (!proxy_modify_warned) {
+                        proxy_modify_warned = true;
+                        std.log.warn("wasm filter returned modify on a proxy route; response-header injection is not supported on proxy routes yet, forwarding without the staged headers (embedded Router honors modify)", .{});
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+    return null;
+}
+
 /// Reverse Proxy Handler
 ///
 /// Main entry point for proxying requests to upstream servers.
@@ -481,19 +509,9 @@ pub const Proxy = struct {
         };
 
         // Per-route WASM edge filter (design 10.0): authenticate/policy-gate
-        // before forwarding. allow proceeds; reject short-circuits with the
-        // staged response; a trap/exhaustion fails closed inside the pool. This
-        // entry handles bodyless / small-body requests, so req.body already
-        // carries any body for body_len/read_body.
-        if (build_options.enable_wasm) {
-            if (route.wasm_pool) |pool_ptr| {
-                const fpool: *wasm_filter.Pool = @ptrCast(@alignCast(pool_ptr));
-                switch (fpool.run(&req, route.wasm_fuel)) {
-                    .reject => |resp| return .{ .resp = resp, .proxy = self },
-                    else => {},
-                }
-            }
-        }
+        // before forwarding. This entry handles bodyless / small-body requests,
+        // so req.body already carries any body for body_len/read_body.
+        if (runWasmFilter(route, &req)) |resp| return .{ .resp = resp, .proxy = self };
 
         const effective_upstream = route.selectUpstream();
 
@@ -760,16 +778,10 @@ pub const Proxy = struct {
         // The accumulated body lives in body_view, not req.body, so expose it to
         // the filter (body_len/read_body) on a request copy. The mapping is
         // zero-copy: BodyView and RequestBody share the scattered-buffer shape.
-        if (build_options.enable_wasm) {
-            if (route.wasm_pool) |pool_ptr| {
-                const fpool: *wasm_filter.Pool = @ptrCast(@alignCast(pool_ptr));
-                var filter_req = req;
-                filter_req.body = bodyViewToRequestBody(body_view);
-                switch (fpool.run(&filter_req, route.wasm_fuel)) {
-                    .reject => |resp| return .{ .resp = resp, .proxy = self },
-                    else => {},
-                }
-            }
+        {
+            var filter_req = req;
+            filter_req.body = bodyViewToRequestBody(body_view);
+            if (runWasmFilter(route, &filter_req)) |resp| return .{ .resp = resp, .proxy = self };
         }
 
         const effective_upstream_b = route.selectUpstream();

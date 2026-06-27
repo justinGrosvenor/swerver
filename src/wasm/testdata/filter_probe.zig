@@ -25,7 +25,8 @@ var body_buf: [4096]u8 = undefined;
 var result_buf: [256]u8 = undefined;
 
 export fn on_request() i32 {
-    const plen = get_path(&path_buf, path_buf.len);
+    // get_path returns the TRUE length; clamp to our buffer when slicing.
+    const plen = @min(get_path(&path_buf, path_buf.len), path_buf.len);
     const path = path_buf[0..plen];
 
     // Phase 3: stage an outbound host call and park. on_resume (below) decides
@@ -106,6 +107,12 @@ export fn on_resume() i32 {
     const msg = "enrichment denied";
     respond(403, msg.ptr, msg.len);
     return 1; // reject
+}
+
+/// Returns get_path's raw return value (true path length) for a given output
+/// buffer, so a test can verify truncation is detectable with an undersized cap.
+export fn get_path_ret(out_ptr: [*]u8, out_cap: u32) i32 {
+    return @intCast(get_path(out_ptr, out_cap));
 }
 
 export var spin_counter: u64 = 0;
