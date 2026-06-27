@@ -15,10 +15,25 @@ const consul_mod = @import("consul.zig");
 const compress_mod = @import("../middleware/compress.zig");
 const net = @import("../runtime/net.zig");
 const clock = @import("../runtime/clock.zig");
+const buffer_pool = @import("../runtime/buffer_pool.zig");
 const build_options = @import("build_options");
 // WASM edge filters (design 10.0). Gated; ProxyRoute stores the pool as an
 // opaque pointer so this module compiles without the vendored wasm3 dependency.
 const wasm_filter = if (build_options.enable_wasm) @import("../wasm/filter.zig") else struct {};
+
+/// Map a proxy BodyView onto a RequestView body so a WASM filter can read it via
+/// body_len/read_body. Zero-copy: the two share the scattered-buffer layout.
+fn bodyViewToRequestBody(bv: forward.BodyView) request.RequestBody {
+    return switch (bv) {
+        .slice => |s| .{ .slice = s },
+        .buffers => |b| .{ .scattered = .{
+            .handles = b.handles,
+            .last_buf_len = b.last_buf_len,
+            .total_len = b.total_len,
+            .buffer_size = b.buffer_size,
+        } },
+    };
+}
 
 /// Reverse Proxy Handler
 ///
@@ -467,12 +482,9 @@ pub const Proxy = struct {
 
         // Per-route WASM edge filter (design 10.0): authenticate/policy-gate
         // before forwarding. allow proceeds; reject short-circuits with the
-        // staged response; a trap/exhaustion fails closed inside the pool.
-        // NOTE: request-body filtering (body_len/read_body) is NOT available on
-        // the proxy path: the proxy carries the body in a separate BodyView, not
-        // req.body, so a body-reading filter here sees length 0. Body filtering
-        // is supported on the embedded Router only (Phase 2a); wiring BodyView
-        // into the proxy filter invocation is a follow-up.
+        // staged response; a trap/exhaustion fails closed inside the pool. This
+        // entry handles bodyless / small-body requests, so req.body already
+        // carries any body for body_len/read_body.
         if (build_options.enable_wasm) {
             if (route.wasm_pool) |pool_ptr| {
                 const fpool: *wasm_filter.Pool = @ptrCast(@alignCast(pool_ptr));
@@ -745,10 +757,15 @@ pub const Proxy = struct {
         };
 
         // Per-route WASM edge filter (design 10.0); see handle() for rationale.
+        // The accumulated body lives in body_view, not req.body, so expose it to
+        // the filter (body_len/read_body) on a request copy. The mapping is
+        // zero-copy: BodyView and RequestBody share the scattered-buffer shape.
         if (build_options.enable_wasm) {
             if (route.wasm_pool) |pool_ptr| {
                 const fpool: *wasm_filter.Pool = @ptrCast(@alignCast(pool_ptr));
-                switch (fpool.run(&req, route.wasm_fuel)) {
+                var filter_req = req;
+                filter_req.body = bodyViewToRequestBody(body_view);
+                switch (fpool.run(&filter_req, route.wasm_fuel)) {
                     .reject => |resp| return .{ .resp = resp, .proxy = self },
                     else => {},
                 }
@@ -1314,4 +1331,58 @@ test "percentDecodePath" {
 
     // Invalid hex digits rejected
     try std.testing.expect(Proxy.percentDecodePath("/bad%GG") == null);
+}
+
+test "wasm: proxy BodyView (scattered) is filter-readable via body ABI" {
+    if (build_options.enable_wasm) {
+        const FILTER = @embedFile("../wasm/testdata/filter_probe.wasm");
+        var pool = try wasm_filter.Pool.init(std.testing.allocator, FILTER, .{ .instances = 1 });
+        defer pool.deinit();
+
+        // A scattered body "deny me now" split across two pool buffers. Maps to
+        // RequestBody.scattered, which the filter materializes and inspects.
+        var b0 = "deny ".*; // non-last chunk: buffer_size bytes
+        var b1 = "me now".*; // last chunk: last_buf_len bytes
+        var handles = [_]buffer_pool.BufferHandle{
+            .{ .index = 0, .bytes = b0[0..] },
+            .{ .index = 1, .bytes = b1[0..] },
+        };
+        const bv = forward.BodyView{ .buffers = .{
+            .handles = handles[0..],
+            .last_buf_len = b1.len,
+            .total_len = b0.len + b1.len,
+            .buffer_size = b0.len,
+        } };
+
+        var r = request.RequestView{
+            .method = .POST,
+            .path = "/submit",
+            .headers = &.{},
+            .body = bodyViewToRequestBody(bv),
+        };
+        const d = pool.run(&r, wasm_filter.DEFAULT_FUEL);
+        try std.testing.expect(d == .reject);
+        try std.testing.expectEqual(@as(u16, 403), d.reject.status);
+
+        // A clean scattered body is allowed.
+        var c0 = "hello ".*;
+        var c1 = "world".*;
+        var handles2 = [_]buffer_pool.BufferHandle{
+            .{ .index = 0, .bytes = c0[0..] },
+            .{ .index = 1, .bytes = c1[0..] },
+        };
+        const bv2 = forward.BodyView{ .buffers = .{
+            .handles = handles2[0..],
+            .last_buf_len = c1.len,
+            .total_len = c0.len + c1.len,
+            .buffer_size = c0.len,
+        } };
+        var r2 = request.RequestView{
+            .method = .POST,
+            .path = "/submit",
+            .headers = &.{},
+            .body = bodyViewToRequestBody(bv2),
+        };
+        try std.testing.expect(pool.run(&r2, wasm_filter.DEFAULT_FUEL) == .allow);
+    } else return error.SkipZigTest;
 }
