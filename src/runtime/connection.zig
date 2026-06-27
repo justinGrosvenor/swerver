@@ -288,6 +288,11 @@ pub const Connection = struct {
         /// park entry (continuation, stash, deadline, generation) lives
         /// in the per-worker PgClient, not on the Connection.
         db_parked,
+        /// Request parked awaiting a WASM edge-filter host call (design 10.0).
+        /// The park entry (pinned instance, request, deadline, generation) lives
+        /// in the per-worker wasm host_call.Table, not on the Connection. Like
+        /// db_parked, this pauses every gate that checks `x402 != .none`.
+        wasm_parked,
     };
 
     pub fn init(index: u32) Connection {

@@ -29,6 +29,7 @@ const config_file_mod = @import("config_file.zig");
 // WASM edge filters (design 10.0). Gated; the Server stores the manager as an
 // opaque pointer so this file compiles without the vendored wasm3 dependency.
 const wasm_manager_mod = if (build_options.enable_wasm) @import("wasm/manager.zig") else struct {};
+const wasm_host_call_mod = if (build_options.enable_wasm) @import("wasm/host_call.zig") else struct {};
 const accept_mod = @import("server/accept.zig");
 const http3_mod = @import("server/http3.zig");
 const http2_mod = @import("server/http2.zig");
@@ -110,6 +111,10 @@ pub const Server = struct {
     /// Per-worker WASM filter manager owning the filter pools. Opaque so this
     /// struct needs no build-flag gating; a *wasm.manager.Manager when enabled.
     wasm_manager: ?*anyopaque = null,
+    /// Per-worker WASM host-call park table (design 10.0). Inline, lives for the
+    /// worker; void when wasm is compiled out.
+    wasm_host_calls: if (build_options.enable_wasm) wasm_host_call_mod.Table else void =
+        if (build_options.enable_wasm) .{} else {},
     /// Native PostgreSQL client (null unless the "postgres" config block
     /// is present).
     pg_client: ?*pg_client_mod.PgClient = null,
@@ -572,6 +577,23 @@ pub const Server = struct {
             const mgr: *wasm_manager_mod.Manager = @ptrCast(@alignCast(p));
             mgr.deinit();
             self.allocator.destroy(mgr);
+        }
+    }
+
+    /// Is a WASM filter parked on this connection (generation-checked)? Used by
+    /// handleParkSentinel to set `.wasm_parked`.
+    pub fn wasmHasParkFor(self: *Server, conn_index: u32, conn_id: u64) bool {
+        if (build_options.enable_wasm) {
+            return self.wasm_host_calls.hasParkFor(conn_index, conn_id);
+        }
+        return false;
+    }
+
+    /// Release any WASM park bound to this connection (client disconnect). The
+    /// pinned instance is returned to its pool; no response is served.
+    pub fn wasmCancelForConn(self: *Server, conn_index: u32, conn_id: u64) void {
+        if (build_options.enable_wasm) {
+            _ = self.wasm_host_calls.cancelForConn(conn_index, conn_id);
         }
     }
 
@@ -1200,6 +1222,9 @@ pub const Server = struct {
         // (generation-checked), so the continuation can never write
         // into this slot's next occupant. O(1) when not parked.
         if (self.pg_client) |pgc| pgc.cancelForConn(conn.index, conn.id);
+        // Same for a parked WASM filter: release the pinned instance so it does
+        // not leak when the client disconnects mid-park. O(1) when not parked.
+        self.wasmCancelForConn(conn.index, conn.id);
         if (conn.is_tunnel) {
             if (conn.tunnel_peer_index) |pi| {
                 conn.tunnel_peer_index = null;

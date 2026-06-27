@@ -1325,7 +1325,13 @@ pub fn handleParkSentinel(server: *Server, conn: *connection.Connection, resp: r
                 return true;
             }
         }
-        std.log.err("pg: handler returned the park sentinel without a live parked query; responding 500", .{});
+        // WASM edge-filter park (design 10.0). The filter hook registered the
+        // park in the per-worker host_call table before returning the sentinel.
+        if (server.wasmHasParkFor(conn.index, conn.id)) {
+            conn.x402 = .wasm_parked;
+            return true;
+        }
+        std.log.err("park sentinel without a live parked op; responding 500", .{});
         queueResponse(server, conn, .{
             .status = 500,
             .headers = &.{},
@@ -1341,6 +1347,8 @@ pub fn handleParkSentinel(server: *Server, conn: *connection.Connection, resp: r
             pgc.cancelForConn(conn.index, conn.id);
         }
     }
+    // Cancel an orphaned wasm park (sentinel discarded) to avoid a pinned-instance leak.
+    server.wasmCancelForConn(conn.index, conn.id);
     return false;
 }
 

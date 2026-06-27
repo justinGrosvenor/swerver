@@ -14,6 +14,7 @@ const build_options = @import("build_options");
 // vendored wasm3 dependency; the Route stores the pool as an opaque pointer so
 // the struct itself needs no gating.
 const wasm_filter = if (build_options.enable_wasm) @import("../wasm/filter.zig") else struct {};
+const wasm_host_call = if (build_options.enable_wasm) @import("../wasm/host_call.zig") else struct {};
 
 /// Per-thread scratch for merging handler-returned headers with
 /// middleware-accumulated headers (security, CORS, etc.) before the
@@ -543,6 +544,24 @@ pub const HandlerScratch = struct {
     /// dispatch layer when a PG client is configured; the zero value
     /// makes `ctx.pg.query()` fail with error.NotConnected.
     pg: PgBinding = .{},
+    /// WASM edge-filter park-and-resume binding (design 10.0). Set by the H1
+    /// dispatch layer when wasm is enabled. The zero value (table == null) makes
+    /// a parking filter fail closed (no park path), preserving direct
+    /// Router.handle callers and the proxy path.
+    wasm: WasmBinding = .{},
+};
+
+/// WASM park binding, threaded from the H1 dispatch layer into the filter hook.
+/// `table` is a `*wasm.host_call.Table` (opaque so this struct needs no
+/// build-flag gating). On a re-dispatch after a completed host call,
+/// `resume_decision` carries the resumed filter decision so the hook skips
+/// re-invoking the filter and applies it (the handler then runs for allow).
+pub const WasmBinding = struct {
+    table: ?*anyopaque = null,
+    conn_index: u32 = 0,
+    conn_id: u64 = 0,
+    deadline_ms: u64 = 0,
+    resume_decision: ?middleware.Decision = null,
 };
 
 /// Connection identity + per-worker PG client, threaded from the
@@ -1125,25 +1144,79 @@ pub const Router = struct {
                 }
             }
             // Per-route WASM edge filter (design 10.0). Runs after native
-            // middleware, before the handler: it can allow, reject, or stage
-            // response headers (modify). A trap/exhaustion fails closed inside
-            // the pool. Only compiled when built with -Denable-wasm.
+            // middleware, before the handler. Terminal decisions: allow, reject,
+            // modify (stage response headers). Phase 3: a filter may PARK on a
+            // host_call; if the dispatch layer wired a park binding, the request
+            // parks (returns the sentinel) and resumes later via wasmResume.
+            // Only compiled when built with -Denable-wasm.
             if (build_options.enable_wasm) {
                 if (r.wasm_pool) |pool_ptr| {
                     const pool: *wasm_filter.Pool = @ptrCast(@alignCast(pool_ptr));
-                    switch (pool.run(&req, r.wasm_fuel)) {
-                        .allow, .skip => {},
-                        .reject => |resp| {
-                            result_resp = resp;
+                    if (scratch.wasm.resume_decision) |rd| {
+                        // Re-dispatch: a completed host call injected its decision;
+                        // skip the filter and apply it (handler runs for allow).
+                        switch (rd) {
+                            .allow, .skip => {},
+                            .reject => |resp| {
+                                result_resp = resp;
+                                return .{ .resp = result_resp };
+                            },
+                            .modify => |mod| wasm_modify_headers = mod.response_headers,
+                            .rate_limit_backpressure => |bp| return .{
+                                .resp = bp.resp,
+                                .pause_reads_ms = if (bp.pause_reads) bp.resume_after_ms else null,
+                            },
+                        }
+                    } else if (scratch.wasm.table) |tbl_ptr| {
+                        // Park-capable path (H1 dispatch wired the binding).
+                        const table: *wasm_host_call.Table = @ptrCast(@alignCast(tbl_ptr));
+                        const inst = pool.acquire() orelse {
+                            result_resp = .{ .status = 503, .headers = &.{}, .body = .{ .bytes = "edge function pool exhausted" } };
                             return .{ .resp = result_resp };
-                        },
-                        .modify => |mod| {
-                            wasm_modify_headers = mod.response_headers;
-                        },
-                        .rate_limit_backpressure => |bp| return .{
-                            .resp = bp.resp,
-                            .pause_reads_ms = if (bp.pause_reads) bp.resume_after_ms else null,
-                        },
+                        };
+                        switch (wasm_filter.invokeOutcome(inst, &req, r.wasm_fuel)) {
+                            .decision => |d| switch (d) {
+                                .allow, .skip => {},
+                                .reject => |resp| {
+                                    result_resp = resp;
+                                    return .{ .resp = result_resp };
+                                },
+                                .modify => |mod| wasm_modify_headers = mod.response_headers,
+                                .rate_limit_backpressure => |bp| return .{
+                                    .resp = bp.resp,
+                                    .pause_reads_ms = if (bp.pause_reads) bp.resume_after_ms else null,
+                                },
+                            },
+                            .parked => {
+                                // Pin the instance in the park table (keyed to this
+                                // connection) and return the park sentinel; the
+                                // dispatch layer's handleParkSentinel sets
+                                // .wasm_parked and the transport (C1) drives the
+                                // host call to completion -> wasmResume.
+                                if (table.park(inst, req, scratch.wasm.conn_index, scratch.wasm.conn_id, scratch.wasm.deadline_ms, r.wasm_fuel)) |_| {
+                                    return .{ .resp = response.Response.parked };
+                                }
+                                // Park table full: unpin and fail closed.
+                                _ = wasm_filter.cancelPark(inst);
+                                result_resp = .{ .status = 503, .headers = &.{}, .body = .{ .bytes = "edge function park table full" } };
+                                return .{ .resp = result_resp };
+                            },
+                        }
+                    } else {
+                        // No park binding (direct Router.handle caller / proxy):
+                        // terminal run, fails closed on a park.
+                        switch (pool.run(&req, r.wasm_fuel)) {
+                            .allow, .skip => {},
+                            .reject => |resp| {
+                                result_resp = resp;
+                                return .{ .resp = result_resp };
+                            },
+                            .modify => |mod| wasm_modify_headers = mod.response_headers,
+                            .rate_limit_backpressure => |bp| return .{
+                                .resp = bp.resp,
+                                .pause_reads_ms = if (bp.pause_reads) bp.resume_after_ms else null,
+                            },
+                        }
                     }
                 }
             }
@@ -1978,5 +2051,46 @@ test "wasm: per-route filter allow / reject / modify via handle" {
             }
             try std.testing.expect(found);
         }
+    } else return error.SkipZigTest;
+}
+
+test "wasm: re-dispatch injects resume decision (skip filter, run handler)" {
+    if (build_options.enable_wasm) {
+        const FILTER = @embedFile("../wasm/testdata/filter_probe.wasm");
+        var pool = try wasm_filter.Pool.init(std.testing.allocator, FILTER, .{ .instances = 1 });
+        defer pool.deinit();
+
+        var router = Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+        const handler = struct {
+            fn h(_: *HandlerContext) response.Response {
+                return response.Response.ok();
+            }
+        }.h;
+        try router.get("/api/orders", handler);
+        _ = router.attachWasmFilter("/api/orders", &pool, wasm_filter.DEFAULT_FUEL);
+
+        var response_buf: [RESPONSE_BUF_SIZE]u8 = undefined;
+        var response_headers: [MAX_RESPONSE_HEADERS]response.Header = undefined;
+        var arena_buf: [ARENA_BUF_SIZE]u8 = undefined;
+        var mw_ctx = middleware.Context{};
+        // /api/orders with no key: the filter WOULD reject 401. With an injected
+        // resume decision of allow, the filter is skipped and the handler runs.
+        var scratch = HandlerScratch{
+            .response_buf = response_buf[0..],
+            .response_headers = response_headers[0..],
+            .arena_buf = arena_buf[0..],
+            .wasm = .{ .resume_decision = .allow },
+        };
+        const req = request.RequestView{ .method = .GET, .path = "/api/orders", .headers = &.{} };
+        try std.testing.expectEqual(@as(u16, 200), router.handle(req, &mw_ctx, &scratch).resp.status);
+
+        // An injected reject is served without running the handler.
+        var scratch2 = HandlerScratch{
+            .response_buf = response_buf[0..],
+            .response_headers = response_headers[0..],
+            .arena_buf = arena_buf[0..],
+            .wasm = .{ .resume_decision = .{ .reject = .{ .status = 418, .headers = &.{}, .body = .{ .bytes = "teapot" } } } },
+        };
+        try std.testing.expectEqual(@as(u16, 418), router.handle(req, &mw_ctx, &scratch2).resp.status);
     } else return error.SkipZigTest;
 }

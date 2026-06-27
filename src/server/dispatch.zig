@@ -46,6 +46,11 @@ const accept_mod = @import("accept.zig");
 const http1_mod = @import("http1.zig");
 const pg_client_mod = @import("../db/pg/client.zig");
 const pg_handler_api = @import("../db/pg/handler_api.zig");
+const wasm_host_call_mod = if (build_options.enable_wasm) @import("../wasm/host_call.zig") else struct {};
+/// Wall-clock deadline for an in-flight WASM filter host call (design 10.0). The
+/// reactor tick fails closed past this; fuel bounds compute, this backstops a
+/// stalled host call (a slow/dead guest).
+const WASM_HOST_CALL_TIMEOUT_MS: u64 = 30_000;
 const http2_mod = @import("http2.zig");
 const http3_mod = @import("http3.zig");
 const preencoded = @import("preencoded.zig");
@@ -482,6 +487,7 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
             if (server.pg_client) |pgc| {
                 pgc.tick(&server.io, now_ms);
             }
+            wasmTick(server, now_ms);
             if (server.otel) |otel_exp| {
                 otel_exp.tick(now_ms);
             }
@@ -741,6 +747,109 @@ fn pgResume(ctx: *anyopaque, outcome: *const pg_client_mod.Outcome) void {
     if (rconn.id != outcome.conn_id or rconn.state == .closed) return;
     if (!rconn.close_after_write and rconn.x402 == .none) {
         if (rconn.fd) |pfd| server.io.rearmRecv(outcome.conn_index, pfd);
+    }
+}
+
+/// Drive a completed WASM host call: deliver the resumed filter Decision to the
+/// parked HTTP connection and restart its I/O. Mirrors pgResume, but a wasm
+/// FILTER parked before the handler, so allow/modify RE-DISPATCH the request
+/// (re-enter router.handle with the filter skipped so the handler runs); reject
+/// and backpressure are served directly. The transport (C1) and the deadline
+/// tick call this. H1 only. Compiled only when wasm is enabled.
+fn wasmResume(server: *Server, completion: wasm_host_call_mod.Completion) void {
+    const conn = server.io.getConnection(completion.conn_index) orelse return;
+    if (conn.id != completion.conn_id) return; // slot recycled while parked
+    if (conn.x402 != .wasm_parked) return;
+    conn.x402 = .none;
+
+    switch (completion.decision) {
+        .reject => |resp| {
+            http1_mod.queueResponse(server, conn, resp) catch {
+                conn.close_after_write = true;
+            };
+        },
+        .rate_limit_backpressure => |bp| {
+            http1_mod.queueResponse(server, conn, bp.resp) catch {
+                conn.close_after_write = true;
+            };
+            if (bp.pause_reads) conn.setRateLimitPause(server.now_ms, bp.resume_after_ms);
+        },
+        .allow, .skip, .modify => {
+            // Re-run the pipeline with the resumed decision injected so the
+            // filter is skipped and the handler runs. The request view still
+            // points into the pinned read buffer.
+            var response_buf: [PG_RESUME_BUF_SIZE]u8 = undefined;
+            var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
+            const arena_handle = server.io.acquireBuffer();
+            defer if (arena_handle) |h| server.io.releaseBuffer(h);
+            var empty_arena: [0]u8 = undefined;
+            const arena_buf = if (arena_handle) |h| h.bytes else empty_arena[0..];
+            var mw_ctx = middleware.Context{
+                .client_ip = conn.cached_peer_ip,
+                .protocol = .http1,
+            };
+            var scratch = router.HandlerScratch{
+                .response_buf = response_buf[0..],
+                .response_headers = response_headers[0..],
+                .arena_buf = arena_buf,
+                .pg = .{
+                    .client = server.pg_client,
+                    .io_rt = &server.io,
+                    .conn_index = completion.conn_index,
+                    .conn_id = completion.conn_id,
+                },
+                .wasm = .{
+                    .table = if (build_options.enable_wasm) @ptrCast(&server.wasm_host_calls) else null,
+                    .conn_index = completion.conn_index,
+                    .conn_id = completion.conn_id,
+                    .deadline_ms = server.now_ms + WASM_HOST_CALL_TIMEOUT_MS,
+                    .resume_decision = completion.decision,
+                },
+            };
+            const result = server.app_router.handle(completion.req, &mw_ctx, &scratch);
+            // The handler may itself park (PG); handleParkSentinel catches that.
+            if (http1_mod.handleParkSentinel(server, conn, result.resp)) {
+                if (conn.x402 != .none) return; // re-parked; resume again later
+            } else {
+                http1_mod.queueResponse(server, conn, result.resp) catch {
+                    conn.close_after_write = true;
+                };
+            }
+        },
+    }
+
+    // Restart connection I/O (same tail as pgResume): flush, drain pipelined
+    // requests buffered behind the park, re-arm recv.
+    if (conn.write_count > 0) handleWrite(server, completion.conn_index) catch {};
+    const postconn = server.io.getConnection(completion.conn_index) orelse return;
+    if (postconn.id != completion.conn_id or postconn.state == .closed) return;
+    if (postconn.x402 == .none and postconn.read_buffered_bytes > 0) {
+        handleRead(server, completion.conn_index) catch {};
+    }
+    const rconn = server.io.getConnection(completion.conn_index) orelse return;
+    if (rconn.id != completion.conn_id or rconn.state == .closed) return;
+    if (!rconn.close_after_write and rconn.x402 == .none) {
+        if (rconn.fd) |pfd| server.io.rearmRecv(completion.conn_index, pfd);
+    }
+}
+
+/// Fire WASM host-call wall-clock deadlines from the housekeeping tick: each
+/// timed-out park is failed closed and delivered via wasmResume. No-op when wasm
+/// is disabled or nothing is parked.
+fn wasmTick(server: *Server, now_ms: u64) void {
+    if (build_options.enable_wasm) {
+        var completions: [16]wasm_host_call_mod.Completion = undefined;
+        const n = server.wasm_host_calls.tick(now_ms, &completions);
+        for (completions[0..n]) |c| wasmResume(server, c);
+    }
+}
+
+/// Deliver a completed host call (success path). The transport (C1) calls this
+/// when the guest reply is in; it resumes the filter and re-dispatches. `token`
+/// is a wasm.host_call.Token (u32).
+pub fn wasmComplete(server: *Server, token: u32, result: []const u8) void {
+    if (build_options.enable_wasm) {
+        if (server.wasm_host_calls.complete(token, result)) |c| wasmResume(server, c);
     }
 }
 
@@ -1562,6 +1671,14 @@ pub fn handleRead(server: *Server, index: u32) !void {
                 .io_rt = &server.io,
                 .conn_index = conn.index,
                 .conn_id = conn.id,
+            },
+            .wasm = .{
+                // *wasm.host_call.Table (opaque); null when wasm is compiled out,
+                // which makes a parking filter fail closed.
+                .table = if (build_options.enable_wasm) @ptrCast(&server.wasm_host_calls) else null,
+                .conn_index = conn.index,
+                .conn_id = conn.id,
+                .deadline_ms = server.now_ms + WASM_HOST_CALL_TIMEOUT_MS,
             },
         };
         const otel_start = if (server.otel != null) clock.realtimeNanos() orelse 0 else 0;

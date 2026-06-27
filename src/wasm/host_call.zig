@@ -19,6 +19,7 @@
 const std = @import("std");
 const filter = @import("filter.zig");
 const middleware = @import("../middleware/middleware.zig");
+const request = @import("../protocol/request.zig");
 
 pub const Token = u32;
 pub const INVALID_TOKEN: Token = std.math.maxInt(u32);
@@ -30,6 +31,10 @@ pub const Completion = struct {
     conn_index: u32,
     conn_id: u64,
     decision: middleware.Decision,
+    /// The parked request, for re-dispatch on resume-to-allow/modify. Its slices
+    /// point into the connection's pinned read buffer (valid while parked).
+    /// Unused for a reject decision (served directly without re-running the handler).
+    req: request.RequestView,
 };
 
 /// Why a park ended without a host-call result (all fail closed).
@@ -47,6 +52,7 @@ pub const Table = struct {
         conn_id: u64 = 0,
         deadline_ms: u64 = 0,
         resume_fuel: i64 = filter.DEFAULT_FUEL,
+        req: request.RequestView = undefined,
     };
 
     slots: [CAP]Slot = [1]Slot{.{}} ** CAP,
@@ -57,6 +63,7 @@ pub const Table = struct {
     pub fn park(
         self: *Table,
         instance: *filter.Instance,
+        req: request.RequestView,
         conn_index: u32,
         conn_id: u64,
         deadline_ms: u64,
@@ -72,11 +79,21 @@ pub const Table = struct {
                     .conn_id = conn_id,
                     .deadline_ms = deadline_ms,
                     .resume_fuel = resume_fuel,
+                    .req = req,
                 };
                 return @intCast(i);
             }
         }
         return null;
+    }
+
+    /// Is there a live park for this connection (generation-checked)? Mirrors
+    /// PgClient.hasParkFor; used by handleParkSentinel to set `.wasm_parked`.
+    pub fn hasParkFor(self: *Table, conn_index: u32, conn_id: u64) bool {
+        for (&self.slots) |*s| {
+            if (s.active and s.conn_index == conn_index and s.conn_id == conn_id) return true;
+        }
+        return false;
     }
 
     /// The host call for `token` completed: resume the filter with `result` and
@@ -85,7 +102,7 @@ pub const Table = struct {
     pub fn complete(self: *Table, token: Token, result: []const u8) ?Completion {
         const s = self.live(token) orelse return null;
         const decision = filter.resumeCall(s.instance, result, s.resume_fuel);
-        const out = Completion{ .conn_index = s.conn_index, .conn_id = s.conn_id, .decision = decision };
+        const out = Completion{ .conn_index = s.conn_index, .conn_id = s.conn_id, .decision = decision, .req = s.req };
         s.active = false;
         return out;
     }
@@ -97,7 +114,7 @@ pub const Table = struct {
         _ = reason;
         const s = self.live(token) orelse return null;
         const decision = filter.cancelPark(s.instance);
-        const out = Completion{ .conn_index = s.conn_index, .conn_id = s.conn_id, .decision = decision };
+        const out = Completion{ .conn_index = s.conn_index, .conn_id = s.conn_id, .decision = decision, .req = s.req };
         s.active = false;
         return out;
     }
@@ -126,7 +143,7 @@ pub const Table = struct {
             if (n >= out.len) break;
             if (s.active and now_ms >= s.deadline_ms) {
                 const decision = filter.cancelPark(s.instance);
-                out[n] = .{ .conn_index = s.conn_index, .conn_id = s.conn_id, .decision = decision };
+                out[n] = .{ .conn_index = s.conn_index, .conn_id = s.conn_id, .decision = decision, .req = s.req };
                 n += 1;
                 s.active = false;
             }
@@ -155,7 +172,6 @@ pub const Table = struct {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
-const request = @import("../protocol/request.zig");
 const FILTER_WASM = @embedFile("testdata/filter_probe.wasm");
 
 // Park a real filter instance (the /enrich fixture path stages a host_call and
@@ -167,7 +183,7 @@ fn parkOne(pool: *filter.Pool, table: *Table, conn_index: u32, conn_id: u64, dea
         .parked => {},
         .decision => return error.DidNotPark,
     }
-    return table.park(inst, conn_index, conn_id, deadline_ms, filter.DEFAULT_FUEL) orelse error.TableFull;
+    return table.park(inst, r, conn_index, conn_id, deadline_ms, filter.DEFAULT_FUEL) orelse error.TableFull;
 }
 
 test "host_call table: complete resumes the filter to a decision" {
@@ -254,6 +270,6 @@ test "host_call table: full table returns null token" {
     const inst = pool.acquire() orelse return error.AcquireFailed;
     const r = request.RequestView{ .method = .GET, .path = "/enrich", .headers = &.{} };
     try testing.expect(filter.invokeOutcome(inst, &r, filter.DEFAULT_FUEL) == .parked);
-    try testing.expect(table.park(inst, 999, 999, 5000, filter.DEFAULT_FUEL) == null);
+    try testing.expect(table.park(inst, r, 999, 999, 5000, filter.DEFAULT_FUEL) == null);
     _ = filter.cancelPark(inst);
 }
