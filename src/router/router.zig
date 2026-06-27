@@ -9,6 +9,11 @@ const clock = @import("../runtime/clock.zig");
 const io_runtime = @import("../runtime/io.zig");
 const pg_client_mod = @import("../db/pg/client.zig");
 const pg_handler_api = @import("../db/pg/handler_api.zig");
+const build_options = @import("build_options");
+// WASM edge filters (design 10.0). Gated so router.zig compiles without the
+// vendored wasm3 dependency; the Route stores the pool as an opaque pointer so
+// the struct itself needs no gating.
+const wasm_filter = if (build_options.enable_wasm) @import("../wasm/filter.zig") else struct {};
 
 /// Per-thread scratch for merging handler-returned headers with
 /// middleware-accumulated headers (security, CORS, etc.) before the
@@ -619,6 +624,11 @@ pub const Route = struct {
     middleware_chain: ?*middleware.Chain = null,
     x402_policy: x402.RoutePaymentConfig = .{},
     body_policy: BodyPolicy = .accumulate,
+    /// Optional per-route WASM edge filter pool (design 10.0). Opaque to avoid
+    /// gating this struct on build_options.enable_wasm; cast to *wasm_filter.Pool
+    /// in handle() inside a comptime-gated block. Set via attachWasmFilter.
+    wasm_pool: ?*anyopaque = null,
+    wasm_fuel: i64 = 0,
     pattern_buf: [MAX_PATTERN_LEN]u8 = undefined,
     pattern_len: usize = 0,
     param_count: u8 = 0,
@@ -783,6 +793,22 @@ pub const Router = struct {
     /// Set middleware chain
     pub fn setMiddleware(self: *Router, chain: middleware.Chain) void {
         self.middleware_chain = chain;
+    }
+
+    /// Attach a WASM edge-filter pool to every route whose pattern equals
+    /// `pattern`. `pool` is a `*wasm.filter.Pool` (opaque here so router.zig
+    /// needs no build-flag gating); `fuel` is the per-invocation budget. The
+    /// pool must outlive the router. Returns the number of routes matched.
+    pub fn attachWasmFilter(self: *Router, pattern: []const u8, pool: *anyopaque, fuel: i64) usize {
+        var matched: usize = 0;
+        for (self.routes[0..self.route_count]) |*r| {
+            if (std.mem.eql(u8, r.pattern, pattern)) {
+                r.wasm_pool = pool;
+                r.wasm_fuel = fuel;
+                matched += 1;
+            }
+        }
+        return matched;
     }
 
     /// Set app state pointer (for HandlerContext.state).
@@ -1045,6 +1071,11 @@ pub const Router = struct {
         var result_resp: response.Response = undefined;
         const result_pause: ?u64 = null;
         var ran_handler = false;
+        // Response headers staged by a WASM filter's modify decision; merged
+        // below alongside middleware headers. Borrows the filter instance
+        // scratch, valid until the response is serialized (single-threaded,
+        // non-reentrant per worker).
+        var wasm_modify_headers: []const response.Header = &.{};
 
         var path_matched = false;
         for (self.routes[0..self.route_count]) |r| {
@@ -1093,6 +1124,30 @@ pub const Router = struct {
                     },
                 }
             }
+            // Per-route WASM edge filter (design 10.0). Runs after native
+            // middleware, before the handler: it can allow, reject, or stage
+            // response headers (modify). A trap/exhaustion fails closed inside
+            // the pool. Only compiled when built with -Denable-wasm.
+            if (build_options.enable_wasm) {
+                if (r.wasm_pool) |pool_ptr| {
+                    const pool: *wasm_filter.Pool = @ptrCast(@alignCast(pool_ptr));
+                    switch (pool.run(&req, r.wasm_fuel)) {
+                        .allow, .skip => {},
+                        .reject => |resp| {
+                            result_resp = resp;
+                            return .{ .resp = result_resp };
+                        },
+                        .modify => |mod| {
+                            wasm_modify_headers = mod.response_headers;
+                        },
+                        .rate_limit_backpressure => |bp| return .{
+                            .resp = bp.resp,
+                            .pause_reads_ms = if (bp.pause_reads) bp.resume_after_ms else null,
+                        },
+                    }
+                }
+            }
+
             result_resp = r.handler(&ctx);
             ran_handler = true;
             if (result_resp.status >= 200 and result_resp.status < 300) {
@@ -1143,7 +1198,7 @@ pub const Router = struct {
         // per thread and the protocol layer serializes the response bytes
         // before the next request on the same thread.
         const mw_headers = self.middleware_chain.getResponseHeaders();
-        if (mw_headers.len > 0 or x402_has_receipt) {
+        if (mw_headers.len > 0 or x402_has_receipt or wasm_modify_headers.len > 0) {
             const handler_headers = result_resp.headers;
             const merge_cap = merged_headers_tls.len;
             var i: usize = 0;
@@ -1153,6 +1208,11 @@ pub const Router = struct {
                 i += 1;
             }
             for (mw_headers) |h| {
+                if (i >= merge_cap) break;
+                merged_headers_tls[i] = h;
+                i += 1;
+            }
+            for (wasm_modify_headers) |h| {
                 if (i >= merge_cap) break;
                 merged_headers_tls[i] = h;
                 i += 1;
@@ -1860,4 +1920,63 @@ test "jsonValue end-to-end produces escaped, std-identical body" {
 
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqualStrings(sw.buffered(), resp.body.bytes);
+}
+
+test "wasm: per-route filter allow / reject / modify via handle" {
+    if (build_options.enable_wasm) {
+        const FILTER = @embedFile("../wasm/testdata/filter_probe.wasm");
+
+        var pool = try wasm_filter.Pool.init(std.testing.allocator, FILTER, .{ .instances = 2 });
+        defer pool.deinit();
+
+        var router = Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+        const handler = struct {
+            fn h(_: *HandlerContext) response.Response {
+                return response.Response.ok();
+            }
+        }.h;
+        try router.get("/api/orders", handler);
+        try router.get("/modify/thing", handler);
+
+        try std.testing.expectEqual(@as(usize, 1), router.attachWasmFilter("/api/orders", &pool, wasm_filter.DEFAULT_FUEL));
+        try std.testing.expectEqual(@as(usize, 1), router.attachWasmFilter("/modify/thing", &pool, wasm_filter.DEFAULT_FUEL));
+
+        var response_buf: [RESPONSE_BUF_SIZE]u8 = undefined;
+        var response_headers: [MAX_RESPONSE_HEADERS]response.Header = undefined;
+        var arena_buf: [ARENA_BUF_SIZE]u8 = undefined;
+
+        // 1. /api/orders without key -> filter rejects 401 (handler never runs).
+        {
+            var mw_ctx = middleware.Context{};
+            var scratch = HandlerScratch{ .response_buf = response_buf[0..], .response_headers = response_headers[0..], .arena_buf = arena_buf[0..] };
+            const req = request.RequestView{ .method = .GET, .path = "/api/orders", .headers = &.{} };
+            const result = router.handle(req, &mw_ctx, &scratch);
+            try std.testing.expectEqual(@as(u16, 401), result.resp.status);
+            try std.testing.expectEqualStrings("missing api key", result.resp.bodyBytes());
+        }
+
+        // 2. /api/orders with key -> filter allows -> handler 200.
+        {
+            var mw_ctx = middleware.Context{};
+            var scratch = HandlerScratch{ .response_buf = response_buf[0..], .response_headers = response_headers[0..], .arena_buf = arena_buf[0..] };
+            const hdrs = [_]response.Header{.{ .name = "x-api-key", .value = "sk_live_1" }};
+            const req = request.RequestView{ .method = .GET, .path = "/api/orders", .headers = &hdrs };
+            const result = router.handle(req, &mw_ctx, &scratch);
+            try std.testing.expectEqual(@as(u16, 200), result.resp.status);
+        }
+
+        // 3. /modify/thing -> filter modify stages x-checked -> handler 200 + header merged.
+        {
+            var mw_ctx = middleware.Context{};
+            var scratch = HandlerScratch{ .response_buf = response_buf[0..], .response_headers = response_headers[0..], .arena_buf = arena_buf[0..] };
+            const req = request.RequestView{ .method = .GET, .path = "/modify/thing", .headers = &.{} };
+            const result = router.handle(req, &mw_ctx, &scratch);
+            try std.testing.expectEqual(@as(u16, 200), result.resp.status);
+            var found = false;
+            for (result.resp.headers) |h| {
+                if (std.mem.eql(u8, h.name, "x-checked")) found = true;
+            }
+            try std.testing.expect(found);
+        }
+    } else return error.SkipZigTest;
 }

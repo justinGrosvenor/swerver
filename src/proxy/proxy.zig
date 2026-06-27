@@ -15,6 +15,10 @@ const consul_mod = @import("consul.zig");
 const compress_mod = @import("../middleware/compress.zig");
 const net = @import("../runtime/net.zig");
 const clock = @import("../runtime/clock.zig");
+const build_options = @import("build_options");
+// WASM edge filters (design 10.0). Gated; ProxyRoute stores the pool as an
+// opaque pointer so this module compiles without the vendored wasm3 dependency.
+const wasm_filter = if (build_options.enable_wasm) @import("../wasm/filter.zig") else struct {};
 
 /// Reverse Proxy Handler
 ///
@@ -461,6 +465,20 @@ pub const Proxy = struct {
             return .{ .resp = forward.createErrorResponse(502), .proxy = self };
         };
 
+        // Per-route WASM edge filter (design 10.0): authenticate/policy-gate
+        // before forwarding. allow proceeds; reject short-circuits with the
+        // staged response; a trap/exhaustion fails closed inside the pool.
+        // (Request/response body+header rewrite to the upstream is Phase 2.)
+        if (build_options.enable_wasm) {
+            if (route.wasm_pool) |pool_ptr| {
+                const fpool: *wasm_filter.Pool = @ptrCast(@alignCast(pool_ptr));
+                switch (fpool.run(&req, route.wasm_fuel)) {
+                    .reject => |resp| return .{ .resp = resp, .proxy = self },
+                    else => {},
+                }
+            }
+        }
+
         const effective_upstream = route.selectUpstream();
 
         // Get upstream configuration
@@ -721,6 +739,17 @@ pub const Proxy = struct {
         const route = self.matchRoute(&req) orelse {
             return .{ .resp = forward.createErrorResponse(502), .proxy = self };
         };
+
+        // Per-route WASM edge filter (design 10.0); see handle() for rationale.
+        if (build_options.enable_wasm) {
+            if (route.wasm_pool) |pool_ptr| {
+                const fpool: *wasm_filter.Pool = @ptrCast(@alignCast(pool_ptr));
+                switch (fpool.run(&req, route.wasm_fuel)) {
+                    .reject => |resp| return .{ .resp = resp, .proxy = self },
+                    else => {},
+                }
+            }
+        }
 
         const effective_upstream_b = route.selectUpstream();
 

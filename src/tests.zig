@@ -221,6 +221,14 @@ comptime {
     if (builtin.os.tag.isDarwin()) {
         _ = @import("runtime/backend/kqueue.zig");
     }
+
+    // WASM edge functions (design 10.0): only when built with -Denable-wasm,
+    // so the @cImport of vendored wasm3 never runs in a build without it.
+    if (@import("build_options").enable_wasm) {
+        _ = @import("wasm/runtime.zig");
+        _ = @import("wasm/filter.zig");
+        _ = @import("wasm/manager.zig");
+    }
 }
 
 const Parsed = struct {

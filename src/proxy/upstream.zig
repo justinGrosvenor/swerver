@@ -136,6 +136,11 @@ pub const ProxyRoute = struct {
     /// Traffic mirroring: name of upstream to shadow-send requests to.
     /// Fire-and-forget — mirror response is discarded.
     mirror: ?[]const u8 = null,
+    /// Per-route WASM edge filter (design 10.0). Opaque `*wasm.filter.Pool`,
+    /// invoked before forwarding: it can allow or reject (auth/policy gate).
+    /// Set by the filter manager at startup; null means no filter. See proxy.zig.
+    wasm_pool: ?*anyopaque = null,
+    wasm_fuel: i64 = 0,
 
     /// Resolve the upstream name, applying traffic split if configured.
     pub fn selectUpstream(self: *const ProxyRoute) []const u8 {

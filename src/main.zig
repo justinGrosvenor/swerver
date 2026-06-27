@@ -133,10 +133,16 @@ pub fn main(init: std.process.Init) !void {
     else
         null;
 
+    // WASM edge-filter specs (design 10.0), if any. Built into per-worker pools
+    // at server run() start. Empty slice when none configured or wasm is off.
+    const wasm_specs: []const swerver.config_file.WasmFilterConfig =
+        if (loaded_config) |lc| lc.wasm_filters else &.{};
+
     if (cfg.workers != 1) {
         // Multi-process mode
         var master = try swerver.Master.init(allocator, cfg, app_router, proxy_ptr);
         master.config_source = config_source;
+        master.wasm_filter_specs = wasm_specs;
         defer master.deinit();
         try master.run(args.run_for_ms);
     } else {
@@ -153,6 +159,7 @@ pub fn main(init: std.process.Init) !void {
             allocator.destroy(srv);
         }
         srv.config_source = config_source;
+        srv.wasm_filter_specs = wasm_specs;
         try srv.run(args.run_for_ms);
     }
 }

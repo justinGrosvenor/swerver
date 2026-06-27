@@ -34,10 +34,25 @@ pub const SCHEMA_VERSION = "1.0";
 
 /// Loaded configuration from a JSON file.
 /// Owns all parsed string data via an arena allocator.
+/// Declarative WASM edge-filter binding (design 10.0). Plain struct (not gated
+/// on enable_wasm) so config parsing is build-flag-independent; the server
+/// converts these to wasm.manager.Spec and builds pools only when wasm is on.
+pub const WasmFilterConfig = struct {
+    /// Route pattern (embedded Router) or proxy path prefix to bind to.
+    match: []const u8,
+    /// Path to the .wasm module on disk.
+    module_path: []const u8,
+    /// Pre-instantiated instances per worker.
+    instances: usize = 4,
+    /// Per-invocation fuel budget (loop back-edges).
+    fuel: i64 = 5_000_000,
+};
+
 pub const LoadedConfig = struct {
     server_config: config_mod.ServerConfig,
     upstreams: []const upstream_mod.Upstream,
     routes: []const upstream_mod.ProxyRoute,
+    wasm_filters: []const WasmFilterConfig,
     arena: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *LoadedConfig) void {
@@ -491,10 +506,24 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
         }
     }
 
+    // WASM edge filters (design 10.0). Parsed unconditionally; the server only
+    // builds pools from these when compiled with -Denable-wasm.
+    const wasm_defs = file_cfg.wasm_filters orelse &[_]WasmFilterJson{};
+    const wasm_out = try alloc.alloc(WasmFilterConfig, wasm_defs.len);
+    for (wasm_defs, 0..) |w, wi| {
+        wasm_out[wi] = .{
+            .match = w.match,
+            .module_path = w.module,
+            .instances = w.instances orelse 4,
+            .fuel = w.fuel orelse 5_000_000,
+        };
+    }
+
     return .{
         .server_config = cfg,
         .upstreams = upstreams_out,
         .routes = routes_out,
+        .wasm_filters = wasm_out,
         .arena = arena,
     };
 }
@@ -593,6 +622,14 @@ const FileConfig = struct {
     postgres: ?PostgresJson = null,
     upstreams: ?[]const UpstreamJson = null,
     routes: ?[]const RouteJson = null,
+    wasm_filters: ?[]const WasmFilterJson = null,
+};
+
+const WasmFilterJson = struct {
+    match: []const u8,
+    module: []const u8,
+    instances: ?usize = null,
+    fuel: ?i64 = null,
 };
 
 const ServerJson = struct {
@@ -876,6 +913,29 @@ test "parse minimal config" {
     try std.testing.expectEqualStrings("0.0.0.0", loaded.server_config.address);
     try std.testing.expectEqual(@as(usize, 0), loaded.upstreams.len);
     try std.testing.expectEqual(@as(usize, 0), loaded.routes.len);
+}
+
+test "parse wasm_filters block (design 10.0)" {
+    const json =
+        \\{
+        \\  "server": { "port": 8080 },
+        \\  "wasm_filters": [
+        \\    { "match": "/api/", "module": "./auth.wasm", "instances": 8, "fuel": 2000000 },
+        \\    { "match": "/admin/", "module": "./admin.wasm" }
+        \\  ]
+        \\}
+    ;
+    var loaded = try parseJsonFromBytes(std.testing.allocator, json);
+    defer loaded.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), loaded.wasm_filters.len);
+    try std.testing.expectEqualStrings("/api/", loaded.wasm_filters[0].match);
+    try std.testing.expectEqualStrings("./auth.wasm", loaded.wasm_filters[0].module_path);
+    try std.testing.expectEqual(@as(usize, 8), loaded.wasm_filters[0].instances);
+    try std.testing.expectEqual(@as(i64, 2000000), loaded.wasm_filters[0].fuel);
+    // Defaults applied when omitted.
+    try std.testing.expectEqual(@as(usize, 4), loaded.wasm_filters[1].instances);
+    try std.testing.expectEqual(@as(i64, 5000000), loaded.wasm_filters[1].fuel);
 }
 
 test "preencoded + cache_static_files map to server config" {

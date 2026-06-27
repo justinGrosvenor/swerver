@@ -20,11 +20,15 @@ const middleware = @import("middleware/middleware.zig");
 const request = @import("protocol/request.zig");
 const metrics_mw = @import("middleware/metrics_mw.zig");
 const proxy_mod = @import("proxy/proxy.zig");
+const upstream_mod = @import("proxy/upstream.zig");
 const forward_mod = @import("proxy/forward.zig");
 const preencoded = @import("server/preencoded.zig");
 const server_tls = @import("server/tls.zig");
 const otel_mod = @import("middleware/otel.zig");
 const config_file_mod = @import("config_file.zig");
+// WASM edge filters (design 10.0). Gated; the Server stores the manager as an
+// opaque pointer so this file compiles without the vendored wasm3 dependency.
+const wasm_manager_mod = if (build_options.enable_wasm) @import("wasm/manager.zig") else struct {};
 const accept_mod = @import("server/accept.zig");
 const http3_mod = @import("server/http3.zig");
 const http2_mod = @import("server/http2.zig");
@@ -100,6 +104,12 @@ pub const Server = struct {
     quic: ?quic_handler.Handler,
     /// Reverse proxy handler (null if proxy not configured)
     proxy: ?*proxy_mod.Proxy = null,
+    /// Declarative WASM edge-filter specs (from config). Set before run();
+    /// pools are built per-worker at run() start and rebuilt on config reload.
+    wasm_filter_specs: []const config_file_mod.WasmFilterConfig = &.{},
+    /// Per-worker WASM filter manager owning the filter pools. Opaque so this
+    /// struct needs no build-flag gating; a *wasm.manager.Manager when enabled.
+    wasm_manager: ?*anyopaque = null,
     /// Native PostgreSQL client (null unless the "postgres" config block
     /// is present).
     pg_client: ?*pg_client_mod.PgClient = null,
@@ -397,6 +407,9 @@ pub const Server = struct {
             p.deinit();
             self.allocator.destroy(p);
         }
+        // Free WASM filter pools after the proxy that referenced them.
+        self.freeWasmManager(self.wasm_manager);
+        self.wasm_manager = null;
         if (self.spare_fd) |fd| clock.closeFd(fd);
         // Close every bound listener. listener_fd aliases listeners_buf[0].fd
         // (multi-listener model), so we drive closing off the array only and do
@@ -524,6 +537,57 @@ pub const Server = struct {
         }
     }
 
+    /// Build a per-worker WASM filter manager from `specs`, attaching its pools
+    /// to `routes` (the proxy route table, mutated in place). Returns the opaque
+    /// manager pointer, or null if wasm is disabled / no specs. A spec that
+    /// fails to load is logged and skipped (its route then runs unfiltered).
+    fn buildWasmManager(
+        self: *Server,
+        specs: []const config_file_mod.WasmFilterConfig,
+        routes: []upstream_mod.ProxyRoute,
+    ) ?*anyopaque {
+        if (!build_options.enable_wasm) return null;
+        if (specs.len == 0) return null;
+        const mgr = self.allocator.create(wasm_manager_mod.Manager) catch return null;
+        mgr.* = wasm_manager_mod.Manager.init(self.allocator);
+        for (specs) |w| {
+            var one = [_]wasm_manager_mod.Spec{.{
+                .match = w.match,
+                .module_path = w.module_path,
+                .instances = w.instances,
+                .fuel = w.fuel,
+            }};
+            const n = mgr.loadAndAttachProxy(routes, &one) catch {
+                std.log.err("wasm filter '{s}': failed to load module '{s}'", .{ w.match, w.module_path });
+                continue;
+            };
+            std.log.info("wasm filter '{s}' -> {s} ({d} route(s), {d} instances)", .{ w.match, w.module_path, n, w.instances });
+        }
+        return @ptrCast(mgr);
+    }
+
+    fn freeWasmManager(self: *Server, ptr: ?*anyopaque) void {
+        if (!build_options.enable_wasm) return;
+        if (ptr) |p| {
+            const mgr: *wasm_manager_mod.Manager = @ptrCast(@alignCast(p));
+            mgr.deinit();
+            self.allocator.destroy(mgr);
+        }
+    }
+
+    /// Build the WASM filter pools for this worker and attach them to the live
+    /// proxy. Called once at run() start (per worker, after fork). Idempotent:
+    /// tears down any existing manager first.
+    pub fn setupWasmFilters(self: *Server) void {
+        if (!build_options.enable_wasm) return;
+        const proxy = self.proxy orelse return;
+        self.freeWasmManager(self.wasm_manager);
+        self.wasm_manager = self.buildWasmManager(
+            self.wasm_filter_specs,
+            @constCast(proxy.config.routes),
+        );
+    }
+
     /// Apply a pending reload result produced by the background thread.
     /// Called from the event loop; only does the fast pointer swap.
     pub fn applyPendingReload(self: *Server) void {
@@ -556,14 +620,22 @@ pub const Server = struct {
 
             const old_proxy = self.proxy;
             const old_arena = self.reload_arena;
+            const old_wasm = self.wasm_manager;
             self.proxy = proxy_ptr;
             self.reload_arena = loaded.arena;
+
+            // Rebuild the WASM filter pools for the new route table, then free
+            // the old manager AFTER the old proxy is gone (its routes referenced
+            // the old pools). Safe: applyPendingReload runs in the event loop,
+            // never mid-request, so no in-flight filter holds an old instance.
+            self.wasm_manager = self.buildWasmManager(loaded.wasm_filters, @constCast(loaded.routes));
 
             if (old_proxy) |old| {
                 old.deinit();
                 self.allocator.destroy(old);
             }
             if (old_arena) |*oa| oa.deinit();
+            self.freeWasmManager(old_wasm);
             self.needs_peer_ip = true;
 
             const source = self.config_source.?;
@@ -581,6 +653,9 @@ pub const Server = struct {
                     self.allocator.destroy(old);
                     self.proxy = null;
                 }
+                // Proxy removed: tear down its filter pools too.
+                self.freeWasmManager(self.wasm_manager);
+                self.wasm_manager = null;
                 if (self.reload_arena) |*old_arena| old_arena.deinit();
                 self.reload_arena = loaded.arena;
                 self.needs_peer_ip = self.app_router.middleware_chain.post.len > 0;
@@ -598,6 +673,9 @@ pub const Server = struct {
     }
 
     pub fn run(self: *Server, run_for_ms: ?u64) !void {
+        // Build this worker's WASM filter pools and attach them to the proxy
+        // before entering the event loop (per-worker, after fork).
+        self.setupWasmFilters();
         return dispatch.runLoop(self, run_for_ms);
     }
 

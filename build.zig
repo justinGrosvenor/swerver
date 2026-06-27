@@ -11,6 +11,9 @@ pub fn build(b: *std.Build) void {
     const enable_proxy = b.option(bool, "enable-proxy", "Enable reverse proxy support") orelse false;
     const enable_io_uring = b.option(bool, "enable-io-uring", "Enable io_uring backend (Linux only)") orelse false;
     const enable_x402_crypto = b.option(bool, "enable-x402-crypto", "Enable x402 local signature verification (secp256k1)") orelse false;
+    // WASM edge functions (design 10.0). Off by default: demand-gated, and the
+    // only feature that vendors C source (wasm3). Cross-compiles to static musl.
+    const enable_wasm = b.option(bool, "enable-wasm", "Enable WASM edge functions (vendored wasm3)") orelse false;
 
     const is_native = target.result.os.tag == builtin.os.tag and target.result.cpu.arch == builtin.cpu.arch;
     const effective_enable_tls = enable_tls and is_native;
@@ -26,6 +29,7 @@ pub fn build(b: *std.Build) void {
     options.addOption(bool, "enable_io_uring", enable_io_uring);
     options.addOption(bool, "enable_x402_crypto", effective_enable_x402_crypto);
     options.addOption(bool, "enable_compression", enable_compression);
+    options.addOption(bool, "enable_wasm", enable_wasm);
 
     const swerver_module = b.addModule("swerver", .{
         .root_source_file = b.path("src/lib.zig"),
@@ -36,6 +40,9 @@ pub fn build(b: *std.Build) void {
     swerver_module.addOptions("build_options", options);
     if (enable_compression) {
         swerver_module.linkSystemLibrary("z", .{});
+    }
+    if (enable_wasm) {
+        addWasm3(b, swerver_module);
     }
     // Only link OpenSSL when TLS/HTTP3 is enabled and the target matches the host.
     const need_tls = effective_enable_tls or effective_enable_http3;
@@ -63,13 +70,13 @@ pub fn build(b: *std.Build) void {
     // --- Test targets ---
     // Each test variant needs its own module because build_options differ.
 
-    const tests = addTestVariant(b, target, optimize, swerver_module, options);
+    const tests = addTestVariant(b, target, optimize, swerver_module, options, enable_wasm);
     const test_run = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&test_run.step);
 
     const options_tls = makeOptions(b, .{ .enable_tls = true });
-    const test_tls = addTestVariant(b, target, optimize, swerver_module, options_tls);
+    const test_tls = addTestVariant(b, target, optimize, swerver_module, options_tls, false);
     if (is_native) {
         test_tls.root_module.linkSystemLibrary("ssl", .{});
         test_tls.root_module.linkSystemLibrary("crypto", .{});
@@ -77,11 +84,11 @@ pub fn build(b: *std.Build) void {
     const test_tls_run = b.addRunArtifact(test_tls);
 
     const options_http2 = makeOptions(b, .{ .enable_http2 = true });
-    const test_http2 = addTestVariant(b, target, optimize, swerver_module, options_http2);
+    const test_http2 = addTestVariant(b, target, optimize, swerver_module, options_http2, false);
     const test_http2_run = b.addRunArtifact(test_http2);
 
     const options_http3 = makeOptions(b, .{ .enable_tls = true, .enable_http3 = true });
-    const test_http3 = addTestVariant(b, target, optimize, swerver_module, options_http3);
+    const test_http3 = addTestVariant(b, target, optimize, swerver_module, options_http3, false);
     if (is_native) {
         test_http3.root_module.linkSystemLibrary("ssl", .{});
         test_http3.root_module.linkSystemLibrary("crypto", .{});
@@ -89,20 +96,20 @@ pub fn build(b: *std.Build) void {
     const test_http3_run = b.addRunArtifact(test_http3);
 
     const options_proxy = makeOptions(b, .{ .enable_proxy = true });
-    const test_proxy = addTestVariant(b, target, optimize, swerver_module, options_proxy);
+    const test_proxy = addTestVariant(b, target, optimize, swerver_module, options_proxy, false);
     const test_proxy_run = b.addRunArtifact(test_proxy);
 
     const options_io_uring = makeOptions(b, .{ .enable_io_uring = true });
-    const test_io_uring = addTestVariant(b, target, optimize, swerver_module, options_io_uring);
+    const test_io_uring = addTestVariant(b, target, optimize, swerver_module, options_io_uring, false);
     const test_io_uring_run = b.addRunArtifact(test_io_uring);
 
     const options_x402_crypto = makeOptions(b, .{ .enable_x402_crypto = true });
-    const test_x402_crypto = addTestVariant(b, target, optimize, swerver_module, options_x402_crypto);
+    const test_x402_crypto = addTestVariant(b, target, optimize, swerver_module, options_x402_crypto, false);
     test_x402_crypto.root_module.linkSystemLibrary("crypto", .{});
     const test_x402_crypto_run = b.addRunArtifact(test_x402_crypto);
 
     const options_all = makeOptions(b, .{ .enable_tls = true, .enable_http2 = true, .enable_http3 = true, .enable_proxy = true, .enable_io_uring = true, .enable_x402_crypto = true });
-    const test_all = addTestVariant(b, target, optimize, swerver_module, options_all);
+    const test_all = addTestVariant(b, target, optimize, swerver_module, options_all, false);
     if (is_native) {
         test_all.root_module.linkSystemLibrary("ssl", .{});
         test_all.root_module.linkSystemLibrary("crypto", .{});
@@ -233,7 +240,46 @@ const FeatureFlags = struct {
     enable_io_uring: bool = false,
     enable_x402_crypto: bool = false,
     enable_compression: bool = false,
+    enable_wasm: bool = false,
 };
+
+// Core wasm3 translation units. Excludes the WASI/tracer/meta API bindings
+// (a sandboxed filter has no ambient syscall surface) and m3_api_uvwasi.c
+// (external dep, not vendored). See vendor/wasm3/PATCHES.md.
+const WASM3_FILES = [_][]const u8{
+    "m3_core.c",   "m3_env.c",      "m3_module.c",   "m3_parse.c",
+    "m3_compile.c", "m3_emit.c",    "m3_optimize.c", "m3_exec.c",
+    "m3_function.c", "m3_bind.c",   "m3_code.c",     "m3_info.c",
+    "m3_api_libc.c",
+};
+
+const WASM3_CFLAGS = [_][]const u8{
+    "-std=gnu11",          "-Wall",                  "-Wextra",
+    "-Wno-unused-function", "-Wno-unused-parameter", "-Wno-unused-variable",
+    "-O3",                  "-fno-sanitize=undefined",
+};
+
+/// wasm3 include paths only — needed by any module whose source @cImports
+/// wasm3.h (so translate-c can find the headers). Does not compile the C.
+fn addWasm3Headers(b: *std.Build, module: *std.Build.Module) void {
+    module.addIncludePath(b.path("vendor/wasm3/source"));
+    // Shim provides a macOS <endian.h> so @cImport translate-c succeeds; see
+    // vendor/wasm3/PATCHES.md. Searched after source/, harmless to the .c.
+    module.addIncludePath(b.path("vendor/wasm3/shim"));
+}
+
+/// Add the vendored wasm3 interpreter (headers + C) to a module. Module must
+/// link libc. The C is compiled exactly once (into swerver_module); test
+/// modules that re-import wasm source get headers-only via addWasm3Headers to
+/// avoid duplicate symbols, since they link swerver_module's compiled objects.
+fn addWasm3(b: *std.Build, module: *std.Build.Module) void {
+    addWasm3Headers(b, module);
+    module.addCSourceFiles(.{
+        .root = b.path("vendor/wasm3/source"),
+        .files = &WASM3_FILES,
+        .flags = &WASM3_CFLAGS,
+    });
+}
 
 fn makeOptions(b: *std.Build, flags: FeatureFlags) *std.Build.Step.Options {
     const opts = b.addOptions();
@@ -244,6 +290,7 @@ fn makeOptions(b: *std.Build, flags: FeatureFlags) *std.Build.Step.Options {
     opts.addOption(bool, "enable_io_uring", flags.enable_io_uring);
     opts.addOption(bool, "enable_x402_crypto", flags.enable_x402_crypto);
     opts.addOption(bool, "enable_compression", flags.enable_compression);
+    opts.addOption(bool, "enable_wasm", flags.enable_wasm);
     return opts;
 }
 
@@ -253,6 +300,7 @@ fn addTestVariant(
     optimize: std.builtin.OptimizeMode,
     swerver_module: *std.Build.Module,
     opts: *std.Build.Step.Options,
+    with_wasm: bool,
 ) *std.Build.Step.Compile {
     const test_module = b.createModule(.{
         .root_source_file = b.path("src/tests.zig"),
@@ -262,5 +310,10 @@ fn addTestVariant(
     });
     test_module.addOptions("build_options", opts);
     test_module.addImport("swerver", swerver_module);
+    // tests.zig re-imports swerver source into the root test module, so when
+    // wasm is on, the root module needs wasm3 headers for runtime.zig's
+    // @cImport. The C objects come from swerver_module (linked), so headers
+    // only — never compile the C twice (duplicate symbols).
+    if (with_wasm) addWasm3Headers(b, test_module);
     return b.addTest(.{ .root_module = test_module });
 }

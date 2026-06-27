@@ -1,6 +1,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const config_fetch = @import("config_fetch.zig");
+const config_file_mod = @import("config_file.zig");
 const ServerBuilder = @import("server_builder.zig").ServerBuilder;
 const router = @import("router/router.zig");
 const clock = @import("runtime/clock.zig");
@@ -67,6 +68,9 @@ pub const Master = struct {
     crash_count: []u8,
     /// Config source for worker hot reload (propagated to each worker)
     config_source: ?config_fetch.ConfigSource = null,
+    /// WASM edge-filter specs (design 10.0), propagated to each worker, which
+    /// builds its own per-worker filter pools at run() start.
+    wasm_filter_specs: []const config_file_mod.WasmFilterConfig = &.{},
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -171,6 +175,7 @@ pub const Master = struct {
                 std.process.exit(1);
             };
             srv.config_source = self.config_source;
+            srv.wasm_filter_specs = self.wasm_filter_specs;
 
             srv.run(null) catch |err| {
                 std.log.err("[w{d}] server error: {}", .{ worker_id, err });
