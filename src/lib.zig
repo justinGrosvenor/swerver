@@ -151,6 +151,7 @@ pub const wasm = if (build_options.enable_wasm)
         pub const runtime = @import("wasm/runtime.zig");
         pub const filter = @import("wasm/filter.zig");
         pub const manager = @import("wasm/manager.zig");
+        pub const host_call = @import("wasm/host_call.zig");
     }
 else
     struct {};

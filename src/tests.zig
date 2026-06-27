@@ -228,6 +228,7 @@ comptime {
         _ = @import("wasm/runtime.zig");
         _ = @import("wasm/filter.zig");
         _ = @import("wasm/manager.zig");
+        _ = @import("wasm/host_call.zig");
     }
 }
 
