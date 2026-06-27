@@ -15,8 +15,11 @@
 //!   set_response_header(name_ptr,name_len,val_ptr,val_len)  stage a response header
 //!   respond(status, body_ptr, body_len)                  stage a reject response
 //!   log(ptr, len)                                        diagnostic log line
-//! Guest export:
-//!   on_request() -> i32   0=allow 1=reject 2=modify (3=parked reserved, Phase 3)
+//!   host_call(ptr, len) -> i32                           stage an outbound call, park (Phase 3)
+//!   read_call_result(out_ptr, out_cap) -> len            read the call result in on_resume
+//! Guest exports:
+//!   on_request() -> i32   0=allow 1=reject 2=modify 3=parked (staged a host_call)
+//!   on_resume() -> i32    re-entered after a host call completes; 0/1/2 (Phase 3)
 //!
 //! Single-threaded worker: the active instance is a process-global, set around
 //! each invocation so the C host callbacks can reach the staging scratch and the
@@ -57,6 +60,11 @@ const GUEST_STACK_BYTES = 64 * 1024;
 /// capped. A filter validating the body must reject when body_len() exceeds this
 /// (otherwise an oversized body could hide content past the view). 64 KiB.
 const MAX_BODY_VIEW = 64 * 1024;
+/// Phase 3 host-call buffers: the outbound request the filter stages, and the
+/// result delivered back on resume. Both live in the pinned instance across the
+/// park, so they are bounded.
+const CALL_REQUEST_CAP = 4096;
+const CALL_RESULT_CAP = 16 * 1024;
 
 /// Default per-invocation fuel budget (loop back-edges). Tunable per-route in
 /// config; sized here to be generous for a metadata filter while still bounding
@@ -130,6 +138,9 @@ pub const Instance = struct {
 
     module: runtime.Module,
     on_request: c.IM3Function,
+    /// Phase 3 resume entry, re-entered after a host call completes. Optional:
+    /// a filter that never parks does not export it.
+    on_resume: ?c.IM3Function = null,
     state: State = .idle,
 
     // Per-invocation input (borrowed) and staged outputs (owned scratch).
@@ -150,6 +161,15 @@ pub const Instance = struct {
     body_full_len: usize = 0,
     body_buf: [MAX_BODY_VIEW]u8 = undefined,
 
+    // Phase 3 host call: the outbound request staged by host_call() during
+    // on_request, and the result staged by the host before on_resume(). Both
+    // persist in the pinned instance across the park.
+    has_pending_call: bool = false,
+    pending_call_len: usize = 0,
+    call_buf: [CALL_REQUEST_CAP]u8 = undefined,
+    call_result_len: usize = 0,
+    call_result_buf: [CALL_RESULT_CAP]u8 = undefined,
+
     fn resetStaging(self: *Instance) void {
         self.staged_status = 0;
         self.staged_body_len = 0;
@@ -158,6 +178,9 @@ pub const Instance = struct {
         self.body_materialized = false;
         self.body_view_len = 0;
         self.body_full_len = 0;
+        self.has_pending_call = false;
+        self.pending_call_len = 0;
+        self.call_result_len = 0;
     }
 
     /// Materialize the request body into the bounded view buffer on first access.
@@ -344,6 +367,42 @@ fn hostRespond(rt: c.IM3Runtime, ctx: c.IM3ImportContext, sp: [*c]u64, mem: ?*an
     return null;
 }
 
+// Phase 3: stage an outbound host call. The guest encodes its request (target +
+// payload, opaque to swerver here) into [ptr,len]; the host performs it while the
+// request is parked and delivers the result to on_resume. Returns 0 on success,
+// -1 if the request exceeds CALL_REQUEST_CAP (the guest can shrink and retry).
+fn hostHostCall(rt: c.IM3Runtime, ctx: c.IM3ImportContext, sp: [*c]u64, mem: ?*anyopaque) callconv(.c) ?*const anyopaque {
+    _ = ctx;
+    const inst = active orelse return trap(TRAP_NO_ACTIVE);
+    const ret: *i32 = @ptrCast(@alignCast(sp));
+    const ptr: u32 = @truncate(sp[1]);
+    const len: u32 = @truncate(sp[2]);
+    const src = guestView(rt, mem, ptr, len) orelse return trap(TRAP_OOB);
+    if (src.len > inst.call_buf.len) {
+        ret.* = -1;
+        return null;
+    }
+    @memcpy(inst.call_buf[0..src.len], src);
+    inst.pending_call_len = src.len;
+    inst.has_pending_call = true;
+    ret.* = 0;
+    return null;
+}
+
+// Phase 3: in on_resume, copy the host-call result into guest memory.
+fn hostReadCallResult(rt: c.IM3Runtime, ctx: c.IM3ImportContext, sp: [*c]u64, mem: ?*anyopaque) callconv(.c) ?*const anyopaque {
+    _ = ctx;
+    const inst = active orelse return trap(TRAP_NO_ACTIVE);
+    const ret: *i32 = @ptrCast(@alignCast(sp));
+    const out_ptr: u32 = @truncate(sp[1]);
+    const out_cap: u32 = @truncate(sp[2]);
+    const dst = guestView(rt, mem, out_ptr, out_cap) orelse return trap(TRAP_OOB);
+    const n = @min(inst.call_result_len, dst.len);
+    @memcpy(dst[0..n], inst.call_result_buf[0..n]);
+    ret.* = @intCast(n);
+    return null;
+}
+
 fn hostLog(rt: c.IM3Runtime, ctx: c.IM3ImportContext, sp: [*c]u64, mem: ?*anyopaque) callconv(.c) ?*const anyopaque {
     _ = ctx;
     const ptr: u32 = @truncate(sp[0]);
@@ -371,6 +430,8 @@ fn linkAbi(mod: *runtime.Module) Error!void {
     try mod.link("env", "set_response_header", "v(iiii)", hostSetResponseHeader);
     try mod.link("env", "respond", "v(iii)", hostRespond);
     try mod.link("env", "log", "v(ii)", hostLog);
+    try mod.link("env", "host_call", "i(ii)", hostHostCall);
+    try mod.link("env", "read_call_result", "i(ii)", hostReadCallResult);
 }
 
 // --- Decision mapping -------------------------------------------------------
@@ -396,29 +457,95 @@ fn buildDecision(inst: *Instance, code: Decision) middleware.Decision {
             .response_headers = inst.staged_headers[0..inst.staged_header_count],
             .continue_chain = true,
         } },
-        DECISION_PARKED => failClosed(), // Phase 3: not yet implemented
+        DECISION_PARKED => failClosed(), // handled by invokeOutcome, not here
         else => failClosed(),
     };
 }
 
-/// Run one filter invocation. Returns a Decision whose reject body / modify
-/// headers borrow `inst` scratch and stay valid until `inst` is reused.
-pub fn invoke(inst: *Instance, req: *const request.RequestView, fuel_budget: i64) middleware.Decision {
+/// Result of a park-aware invocation (Phase 3).
+pub const Outcome = union(enum) {
+    /// Terminal decision; the instance has been released back to the pool.
+    decision: middleware.Decision,
+    /// The filter staged a host call and parked. The instance is PINNED
+    /// (.parked, withheld from the pool) and must be resumed via resumeCall
+    /// once the host call completes, or cancelled via cancelPark. The slice is
+    /// the guest-encoded outbound request, borrowing the pinned instance's
+    /// buffer (valid until resume/cancel).
+    parked: []const u8,
+};
+
+/// Park-aware invocation (Phase 3). On a terminal decision the instance is
+/// released; on a park it is pinned for a later resumeCall.
+pub fn invokeOutcome(inst: *Instance, req: *const request.RequestView, fuel_budget: i64) Outcome {
     inst.resetStaging();
     inst.req = req;
     inst.state = .running;
+    active = inst;
+
+    runtime.fuel.set(fuel_budget);
+    const code = runtime.callI32(inst.on_request) catch {
+        active = null;
+        inst.state = .idle;
+        return .{ .decision = failClosed() };
+    };
+    active = null;
+
+    if (code == DECISION_PARKED) {
+        if (inst.has_pending_call) {
+            inst.state = .parked; // pinned; NOT returned to the pool
+            return .{ .parked = inst.call_buf[0..inst.pending_call_len] };
+        }
+        // parked code with no staged host call is a guest protocol error.
+        inst.state = .idle;
+        return .{ .decision = failClosed() };
+    }
+
+    inst.state = .idle;
+    return .{ .decision = buildDecision(inst, code) };
+}
+
+/// Deliver a completed host-call result to a parked instance and re-enter its
+/// on_resume export, producing the terminal Decision. Releases the instance.
+pub fn resumeCall(inst: *Instance, result_bytes: []const u8, fuel_budget: i64) middleware.Decision {
+    std.debug.assert(inst.state == .parked);
+    const n = @min(result_bytes.len, inst.call_result_buf.len);
+    @memcpy(inst.call_result_buf[0..n], result_bytes[0..n]);
+    inst.call_result_len = n;
+
+    const on_resume = inst.on_resume orelse {
+        inst.state = .idle;
+        return failClosed(); // parked but no resume export: protocol error
+    };
 
     active = inst;
     defer {
         active = null;
         inst.state = .idle;
     }
-
     runtime.fuel.set(fuel_budget);
-    const code = runtime.callI32(inst.on_request) catch {
-        return failClosed();
-    };
+    const code = runtime.callI32(on_resume) catch return failClosed();
     return buildDecision(inst, code);
+}
+
+/// Release a parked instance without resuming (host call failed, timed out, or
+/// the client disconnected). Returns the fail-closed Decision to serve if the
+/// request is still live.
+pub fn cancelPark(inst: *Instance) middleware.Decision {
+    inst.state = .idle;
+    return failClosed();
+}
+
+/// Terminal invocation for callers that cannot park (the synchronous router /
+/// proxy pre-hook today). A filter that parks here fails closed until the
+/// server-side resume path (Phase 3 reactor wiring) is in place.
+pub fn invoke(inst: *Instance, req: *const request.RequestView, fuel_budget: i64) middleware.Decision {
+    switch (invokeOutcome(inst, req, fuel_budget)) {
+        .decision => |d| return d,
+        .parked => {
+            inst.state = .idle; // unpin: this path cannot resume
+            return failClosed();
+        },
+    }
 }
 
 /// A per-worker pool of pre-instantiated instances for one filter module.
@@ -449,7 +576,11 @@ pub const Pool = struct {
             // closed (returns -1) instead of OOMing the worker.
             try mod.setMemoryCap(config.max_memory_pages);
             const on_request = try mod.find("on_request");
-            inst.* = .{ .module = mod, .on_request = on_request };
+            inst.* = .{
+                .module = mod,
+                .on_request = on_request,
+                .on_resume = mod.findOptional("on_resume"),
+            };
             built += 1;
         }
 
@@ -589,6 +720,71 @@ test "body: oversized body rejected; body_len reports true length" {
     const d = pool.run(&r, DEFAULT_FUEL);
     try testing.expect(d == .reject);
     try testing.expectEqual(@as(u16, 413), d.reject.status);
+}
+
+test "park/resume: filter parks, pins instance, resumes to allow" {
+    var pool = try Pool.init(testing.allocator, FILTER_WASM, .{ .instances = 1 });
+    defer pool.deinit();
+
+    const inst = pool.acquire() orelse return error.AcquireFailed;
+    const r = mkReq(.GET, "/enrich", &.{});
+    const out = invokeOutcome(inst, &r, DEFAULT_FUEL);
+
+    // Parked: the staged outbound request is visible and the instance is pinned.
+    try testing.expect(out == .parked);
+    try testing.expectEqualStrings("lookup:user", out.parked);
+    try testing.expectEqual(Instance.State.parked, inst.state);
+    // Pinned instance is withheld from the pool (1 instance -> exhausted).
+    try testing.expect(pool.acquire() == null);
+
+    // Host call returns "ok" -> on_resume allows; instance released.
+    const d = resumeCall(inst, "ok", DEFAULT_FUEL);
+    try testing.expect(d == .allow);
+    try testing.expectEqual(Instance.State.idle, inst.state);
+    try testing.expect(pool.acquire() != null);
+    inst.state = .idle;
+}
+
+test "park/resume: resume result drives reject" {
+    var pool = try Pool.init(testing.allocator, FILTER_WASM, .{ .instances = 1 });
+    defer pool.deinit();
+    const inst = pool.acquire() orelse return error.AcquireFailed;
+    const r = mkReq(.GET, "/enrich", &.{});
+    try testing.expect(invokeOutcome(inst, &r, DEFAULT_FUEL) == .parked);
+
+    const d = resumeCall(inst, "no-such-user", DEFAULT_FUEL);
+    try testing.expect(d == .reject);
+    try testing.expectEqual(@as(u16, 403), d.reject.status);
+    try testing.expectEqualStrings("enrichment denied", d.reject.bodyBytes());
+}
+
+test "park/resume: cancelPark releases a pinned instance, fail-closed" {
+    var pool = try Pool.init(testing.allocator, FILTER_WASM, .{ .instances = 1 });
+    defer pool.deinit();
+    const inst = pool.acquire() orelse return error.AcquireFailed;
+    const r = mkReq(.GET, "/enrich", &.{});
+    try testing.expect(invokeOutcome(inst, &r, DEFAULT_FUEL) == .parked);
+
+    const d = cancelPark(inst);
+    try testing.expect(d == .reject);
+    try testing.expectEqual(@as(u16, 500), d.reject.status);
+    try testing.expectEqual(Instance.State.idle, inst.state);
+    try testing.expect(pool.acquire() != null);
+    inst.state = .idle;
+}
+
+test "park/resume: terminal invoke() fails closed on a parking filter" {
+    var pool = try Pool.init(testing.allocator, FILTER_WASM, .{ .instances = 1 });
+    defer pool.deinit();
+    // The synchronous run() path cannot resume, so a parking filter fails closed
+    // (500) and the instance is released, not leaked as pinned.
+    const r = mkReq(.GET, "/enrich", &.{});
+    const d = pool.run(&r, DEFAULT_FUEL);
+    try testing.expect(d == .reject);
+    try testing.expectEqual(@as(u16, 500), d.reject.status);
+    try testing.expect(pool.acquire() != null); // not stuck pinned
+    // release the one we just acquired
+    for (pool.instances) |*i| i.state = .idle;
 }
 
 test "security: pool caps each instance's max linear memory" {

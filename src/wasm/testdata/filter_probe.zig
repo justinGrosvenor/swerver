@@ -13,6 +13,8 @@ extern "env" fn get_header(name_ptr: [*]const u8, name_len: u32, out_ptr: [*]u8,
 extern "env" fn header_count() i32;
 extern "env" fn body_len() i32;
 extern "env" fn read_body(src_off: u32, out_ptr: [*]u8, out_cap: u32) u32;
+extern "env" fn host_call(ptr: [*]const u8, len: u32) i32;
+extern "env" fn read_call_result(out_ptr: [*]u8, out_cap: u32) u32;
 extern "env" fn set_response_header(name_ptr: [*]const u8, name_len: u32, val_ptr: [*]const u8, val_len: u32) void;
 extern "env" fn respond(status: u32, body_ptr: [*]const u8, body_len: u32) void;
 extern "env" fn log(ptr: [*]const u8, len: u32) void;
@@ -20,10 +22,19 @@ extern "env" fn log(ptr: [*]const u8, len: u32) void;
 var path_buf: [1024]u8 = undefined;
 var key_buf: [256]u8 = undefined;
 var body_buf: [4096]u8 = undefined;
+var result_buf: [256]u8 = undefined;
 
 export fn on_request() i32 {
     const plen = get_path(&path_buf, path_buf.len);
     const path = path_buf[0..plen];
+
+    // Phase 3: stage an outbound host call and park. on_resume (below) decides
+    // based on the result the host delivers.
+    if (std.mem.startsWith(u8, path, "/enrich")) {
+        const q = "lookup:user";
+        _ = host_call(q.ptr, q.len);
+        return 3; // parked
+    }
 
     // Trap probes, reachable through the real on_request entry so invoke()'s
     // fail-closed path can be tested.
@@ -83,6 +94,18 @@ export fn on_request() i32 {
 export fn abi_probe(ptr: u32, len: u32) i32 {
     _ = get_path(@ptrFromInt(ptr), len);
     return 0;
+}
+
+// Phase 3 resume entry: read the host-call result and decide. "ok" -> allow,
+// anything else -> reject 403.
+export fn on_resume() i32 {
+    const n = read_call_result(&result_buf, result_buf.len);
+    if (std.mem.startsWith(u8, result_buf[0..n], "ok")) {
+        return 0; // allow
+    }
+    const msg = "enrichment denied";
+    respond(403, msg.ptr, msg.len);
+    return 1; // reject
 }
 
 export var spin_counter: u64 = 0;
