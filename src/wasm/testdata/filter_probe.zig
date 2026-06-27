@@ -11,12 +11,15 @@ extern "env" fn get_method() i32;
 extern "env" fn get_path(out_ptr: [*]u8, out_cap: u32) u32;
 extern "env" fn get_header(name_ptr: [*]const u8, name_len: u32, out_ptr: [*]u8, out_cap: u32) u32;
 extern "env" fn header_count() i32;
+extern "env" fn body_len() i32;
+extern "env" fn read_body(src_off: u32, out_ptr: [*]u8, out_cap: u32) u32;
 extern "env" fn set_response_header(name_ptr: [*]const u8, name_len: u32, val_ptr: [*]const u8, val_len: u32) void;
 extern "env" fn respond(status: u32, body_ptr: [*]const u8, body_len: u32) void;
 extern "env" fn log(ptr: [*]const u8, len: u32) void;
 
 var path_buf: [1024]u8 = undefined;
 var key_buf: [256]u8 = undefined;
+var body_buf: [4096]u8 = undefined;
 
 export fn on_request() i32 {
     const plen = get_path(&path_buf, path_buf.len);
@@ -33,6 +36,25 @@ export fn on_request() i32 {
         while (true) {
             spin_counter +%= 1;
         }
+    }
+
+    // Body inspection: reject any /submit request whose body starts with "deny".
+    // Demonstrates read_body + body_len; a too-large body is rejected rather
+    // than trusted past the filter's view.
+    if (std.mem.startsWith(u8, path, "/submit")) {
+        const total: usize = @intCast(body_len());
+        if (total > body_buf.len) {
+            const msg = "body too large";
+            respond(413, msg.ptr, msg.len);
+            return 1;
+        }
+        const n = read_body(0, &body_buf, body_buf.len);
+        if (std.mem.startsWith(u8, body_buf[0..n], "deny")) {
+            const msg = "body rejected";
+            respond(403, msg.ptr, msg.len);
+            return 1;
+        }
+        return 0;
     }
 
     if (std.mem.startsWith(u8, path, "/modify/")) {

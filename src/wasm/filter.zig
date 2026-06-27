@@ -10,6 +10,8 @@
 //!   get_path(out_ptr, out_cap) -> len                    request path
 //!   get_header(name_ptr,name_len,out_ptr,out_cap) -> len header value (0=absent)
 //!   header_count() -> i32                                number of request headers
+//!   body_len() -> i32                                    request body length (true total)
+//!   read_body(src_off, out_ptr, out_cap) -> len          copy a body window in
 //!   set_response_header(name_ptr,name_len,val_ptr,val_len)  stage a response header
 //!   respond(status, body_ptr, body_len)                  stage a reject response
 //!   log(ptr, len)                                        diagnostic log line
@@ -50,6 +52,11 @@ const MAX_RESPONSE_HEADERS = middleware.Chain.MAX_MIDDLEWARE_HEADERS; // 16
 const STAGED_BODY_CAP = 4096;
 const SCRATCH_CAP = 4096; // response-header name/value bytes
 const GUEST_STACK_BYTES = 64 * 1024;
+/// Largest request body a filter can read (the materialized view). The full body
+/// still flows untouched to the handler/upstream; only the FILTER's view is
+/// capped. A filter validating the body must reject when body_len() exceeds this
+/// (otherwise an oversized body could hide content past the view). 64 KiB.
+const MAX_BODY_VIEW = 64 * 1024;
 
 /// Default per-invocation fuel budget (loop back-edges). Tunable per-route in
 /// config; sized here to be generous for a metadata filter while still bounding
@@ -135,11 +142,31 @@ pub const Instance = struct {
     scratch: [SCRATCH_CAP]u8 = undefined,
     scratch_used: usize = 0,
 
+    // Request body, materialized lazily on first body access (scattered -> linear
+    // is the "zero-copy tax"). The view is bounded by MAX_BODY_VIEW; body_full_len
+    // reports the true length so a filter can detect a body larger than its view.
+    body_materialized: bool = false,
+    body_view_len: usize = 0,
+    body_full_len: usize = 0,
+    body_buf: [MAX_BODY_VIEW]u8 = undefined,
+
     fn resetStaging(self: *Instance) void {
         self.staged_status = 0;
         self.staged_body_len = 0;
         self.staged_header_count = 0;
         self.scratch_used = 0;
+        self.body_materialized = false;
+        self.body_view_len = 0;
+        self.body_full_len = 0;
+    }
+
+    /// Materialize the request body into the bounded view buffer on first access.
+    /// Cheap and idempotent thereafter (per invocation).
+    fn ensureBody(self: *Instance) void {
+        if (self.body_materialized) return;
+        self.body_materialized = true;
+        self.body_full_len = self.req.body.len();
+        self.body_view_len = materializeBody(self.req.body, &self.body_buf);
     }
 
     /// Copy bytes into the instance scratch; returns a stable slice or null if
@@ -158,6 +185,31 @@ pub const Instance = struct {
 var active: ?*Instance = null;
 
 // --- guest-memory bounds helpers -------------------------------------------
+
+/// Copy up to dst.len bytes of the request body into dst (scattered -> linear),
+/// returning the number copied. Reuses the chunk walk from RequestBody.copyTo
+/// but caps at dst.len instead of requiring the whole body to fit.
+fn materializeBody(body: request.RequestBody, dst: []u8) usize {
+    switch (body) {
+        .slice => |s| {
+            const n = @min(s.len, dst.len);
+            @memcpy(dst[0..n], s[0..n]);
+            return n;
+        },
+        .scattered => |b| {
+            var off: usize = 0;
+            for (b.handles, 0..) |handle, i| {
+                if (off >= dst.len) break;
+                const chunk_len = if (i == b.handles.len - 1) b.last_buf_len else b.buffer_size;
+                const take = @min(chunk_len, dst.len - off);
+                @memcpy(dst[off .. off + take], handle.bytes[0..take]);
+                off += take;
+            }
+            return off;
+        },
+        .length_only => return 0,
+    }
+}
 
 fn guestView(rt: c.IM3Runtime, mem: ?*anyopaque, ptr: u32, len: u32) ?[]u8 {
     const base_opt = mem orelse return null;
@@ -188,6 +240,38 @@ fn hostHeaderCount(rt: c.IM3Runtime, ctx: c.IM3ImportContext, sp: [*c]u64, mem: 
     const inst = active orelse return trap(TRAP_NO_ACTIVE);
     const ret: *i32 = @ptrCast(@alignCast(sp));
     ret.* = @intCast(inst.req.headers.len);
+    return null;
+}
+
+fn hostBodyLen(rt: c.IM3Runtime, ctx: c.IM3ImportContext, sp: [*c]u64, mem: ?*anyopaque) callconv(.c) ?*const anyopaque {
+    _ = rt;
+    _ = ctx;
+    _ = mem;
+    const inst = active orelse return trap(TRAP_NO_ACTIVE);
+    inst.ensureBody();
+    const ret: *i32 = @ptrCast(@alignCast(sp));
+    // True total length (may exceed the readable view; the filter can detect it).
+    ret.* = @intCast(@min(inst.body_full_len, @as(usize, std.math.maxInt(i32))));
+    return null;
+}
+
+fn hostReadBody(rt: c.IM3Runtime, ctx: c.IM3ImportContext, sp: [*c]u64, mem: ?*anyopaque) callconv(.c) ?*const anyopaque {
+    _ = ctx;
+    const inst = active orelse return trap(TRAP_NO_ACTIVE);
+    inst.ensureBody();
+    const ret: *i32 = @ptrCast(@alignCast(sp));
+    const src_off: u32 = @truncate(sp[1]);
+    const out_ptr: u32 = @truncate(sp[2]);
+    const out_cap: u32 = @truncate(sp[3]);
+    const dst = guestView(rt, mem, out_ptr, out_cap) orelse return trap(TRAP_OOB);
+    if (src_off >= inst.body_view_len) {
+        ret.* = 0;
+        return null;
+    }
+    const avail = inst.body_view_len - src_off;
+    const n = @min(avail, dst.len);
+    @memcpy(dst[0..n], inst.body_buf[src_off .. src_off + n]);
+    ret.* = @intCast(n);
     return null;
 }
 
@@ -282,6 +366,8 @@ fn linkAbi(mod: *runtime.Module) Error!void {
     try mod.link("env", "get_path", "i(ii)", hostGetPath);
     try mod.link("env", "get_header", "i(iiii)", hostGetHeader);
     try mod.link("env", "header_count", "i()", hostHeaderCount);
+    try mod.link("env", "body_len", "i()", hostBodyLen);
+    try mod.link("env", "read_body", "i(iii)", hostReadBody);
     try mod.link("env", "set_response_header", "v(iiii)", hostSetResponseHeader);
     try mod.link("env", "respond", "v(iii)", hostRespond);
     try mod.link("env", "log", "v(ii)", hostLog);
@@ -472,6 +558,37 @@ test "filter: runaway loop hits fuel -> fail closed (500)" {
     // The pool still works after a trapped invocation (instance reusable).
     const ok = mkReq(.GET, "/public", &.{});
     try testing.expect(pool.run(&ok, DEFAULT_FUEL) == .allow);
+}
+
+test "body: clean body allowed" {
+    var pool = try Pool.init(testing.allocator, FILTER_WASM, .{ .instances = 1 });
+    defer pool.deinit();
+    var r = mkReq(.POST, "/submit", &.{});
+    r.body = .{ .slice = "hello world" };
+    try testing.expect(pool.run(&r, DEFAULT_FUEL) == .allow);
+}
+
+test "body: denied body rejected via read_body" {
+    var pool = try Pool.init(testing.allocator, FILTER_WASM, .{ .instances = 1 });
+    defer pool.deinit();
+    var r = mkReq(.POST, "/submit", &.{});
+    r.body = .{ .slice = "deny this request" };
+    const d = pool.run(&r, DEFAULT_FUEL);
+    try testing.expect(d == .reject);
+    try testing.expectEqual(@as(u16, 403), d.reject.status);
+    try testing.expectEqualStrings("body rejected", d.reject.bodyBytes());
+}
+
+test "body: oversized body rejected; body_len reports true length" {
+    var pool = try Pool.init(testing.allocator, FILTER_WASM, .{ .instances = 1 });
+    defer pool.deinit();
+    // 5000 > the fixture's 4096-byte view, so body_len() lets it detect and 413.
+    var big: [5000]u8 = @splat('a');
+    var r = mkReq(.POST, "/submit", &.{});
+    r.body = .{ .slice = &big };
+    const d = pool.run(&r, DEFAULT_FUEL);
+    try testing.expect(d == .reject);
+    try testing.expectEqual(@as(u16, 413), d.reject.status);
 }
 
 test "security: pool caps each instance's max linear memory" {

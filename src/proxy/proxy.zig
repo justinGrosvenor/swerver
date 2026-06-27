@@ -468,7 +468,11 @@ pub const Proxy = struct {
         // Per-route WASM edge filter (design 10.0): authenticate/policy-gate
         // before forwarding. allow proceeds; reject short-circuits with the
         // staged response; a trap/exhaustion fails closed inside the pool.
-        // (Request/response body+header rewrite to the upstream is Phase 2.)
+        // NOTE: request-body filtering (body_len/read_body) is NOT available on
+        // the proxy path: the proxy carries the body in a separate BodyView, not
+        // req.body, so a body-reading filter here sees length 0. Body filtering
+        // is supported on the embedded Router only (Phase 2a); wiring BodyView
+        // into the proxy filter invocation is a follow-up.
         if (build_options.enable_wasm) {
             if (route.wasm_pool) |pool_ptr| {
                 const fpool: *wasm_filter.Pool = @ptrCast(@alignCast(pool_ptr));
