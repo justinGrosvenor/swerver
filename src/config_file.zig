@@ -38,12 +38,17 @@ pub const SCHEMA_VERSION = "1.0";
 /// on enable_wasm) so config parsing is build-flag-independent; the server
 /// converts these to wasm.manager.Spec and builds pools only when wasm is on.
 pub const WasmFilterConfig = struct {
-    /// Route pattern (embedded Router) or proxy path prefix to bind to.
+    /// Proxy route path prefix to bind to (matched against ProxyRoute.path_prefix).
+    /// Config-driven filters attach to PROXY routes only; embedded-Router app
+    /// routes are wired via the Zig API (router.attachWasmFilter /
+    /// wasm.manager.loadAndAttachRouter), since the embedded router is not built
+    /// from the config file. See server.setupWasmFilters.
     match: []const u8,
     /// Path to the .wasm module on disk.
     module_path: []const u8,
-    /// Pre-instantiated instances per worker.
-    instances: usize = 4,
+    /// Pre-instantiated instances per worker. 1 suffices under the synchronous
+    /// Phase-1 model; raise only once Phase 3 parking lands (see filter.Config).
+    instances: usize = 1,
     /// Per-invocation fuel budget (loop back-edges).
     fuel: i64 = 5_000_000,
 };
@@ -514,7 +519,7 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
         wasm_out[wi] = .{
             .match = w.match,
             .module_path = w.module,
-            .instances = w.instances orelse 4,
+            .instances = w.instances orelse 1,
             .fuel = w.fuel orelse 5_000_000,
         };
     }
@@ -934,7 +939,7 @@ test "parse wasm_filters block (design 10.0)" {
     try std.testing.expectEqual(@as(usize, 8), loaded.wasm_filters[0].instances);
     try std.testing.expectEqual(@as(i64, 2000000), loaded.wasm_filters[0].fuel);
     // Defaults applied when omitted.
-    try std.testing.expectEqual(@as(usize, 4), loaded.wasm_filters[1].instances);
+    try std.testing.expectEqual(@as(usize, 1), loaded.wasm_filters[1].instances);
     try std.testing.expectEqual(@as(i64, 5000000), loaded.wasm_filters[1].fuel);
 }
 

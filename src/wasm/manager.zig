@@ -24,7 +24,8 @@ pub const Error = filter.Error || error{ FileTooLarge, ModuleReadFailed };
 pub const Spec = struct {
     match: []const u8,
     module_path: []const u8,
-    instances: usize = 4,
+    /// See filter.Config.instances: 1 suffices for the sync Phase-1 model.
+    instances: usize = 1,
     fuel: i64 = filter.DEFAULT_FUEL,
 };
 
@@ -77,8 +78,10 @@ pub const Manager = struct {
         return self.addPool(spec.match, bytes, spec.instances, spec.fuel);
     }
 
-    /// Load every spec and attach to an embedded Router by route pattern.
-    /// Returns the number of (spec, route) attachments made.
+    /// Load every spec and attach to an embedded Router by route pattern. This
+    /// is the Zig-API path for embedded apps; the config-file `wasm_filters`
+    /// block uses loadAndAttachProxy instead (the embedded router is not built
+    /// from config). Returns the number of (spec, route) attachments made.
     pub fn loadAndAttachRouter(self: *Manager, router: *router_mod.Router, specs: []const Spec) Error!usize {
         var attached: usize = 0;
         for (specs) |spec| {
@@ -212,4 +215,37 @@ test "manager.load reads a module from disk and filters" {
     // A bad path surfaces ModuleReadFailed rather than crashing.
     const bad = [_]Spec{.{ .match = "/x", .module_path = "/nonexistent/nope.wasm" }};
     try testing.expectError(Error.ModuleReadFailed, mgr.loadAndAttachRouter(&router, &bad));
+}
+
+test "reload teardown ordering: old manager freed, new routes keep filtering" {
+    // Mirrors server.applyPendingReload's invariant: a new manager is attached
+    // to the new route table before the old manager is freed, so freeing the old
+    // pools never dangles a live route. Here routes_b are the "new" proxy's
+    // routes; routes_a belong to the torn-down old proxy.
+    const fixture = @embedFile("testdata/filter_probe.wasm");
+
+    var routes_a = [_]upstream.ProxyRoute{.{ .path_prefix = "/api/", .upstream = "backend" }};
+    var routes_b = [_]upstream.ProxyRoute{.{ .path_prefix = "/api/", .upstream = "backend" }};
+
+    var mgr1 = Manager.init(testing.allocator);
+    const p1 = try mgr1.addPool("/api/", fixture, 1, filter.DEFAULT_FUEL);
+    routes_a[0].wasm_pool = p1;
+    routes_a[0].wasm_fuel = filter.DEFAULT_FUEL;
+
+    var mgr2 = Manager.init(testing.allocator);
+    defer mgr2.deinit();
+    const p2 = try mgr2.addPool("/api/", fixture, 1, filter.DEFAULT_FUEL);
+    routes_b[0].wasm_pool = p2;
+    routes_b[0].wasm_fuel = filter.DEFAULT_FUEL;
+
+    // Reload: the old manager (and its pools) is freed. routes_a now dangles and
+    // is never touched again, exactly as the old proxy is gone after the swap.
+    mgr1.deinit();
+
+    // The new route table still filters correctly through its own live pool.
+    const fp: *filter.Pool = @ptrCast(@alignCast(routes_b[0].wasm_pool.?));
+    const req = request.RequestView{ .method = .GET, .path = "/api/orders", .headers = &.{} };
+    const d = fp.run(&req, routes_b[0].wasm_fuel);
+    try testing.expect(d == .reject);
+    try testing.expectEqual(@as(u16, 401), d.reject.status);
 }

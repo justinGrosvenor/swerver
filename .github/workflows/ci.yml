@@ -36,6 +36,16 @@ jobs:
         run: zig build -Doptimize=ReleaseFast --summary all
       - name: Test (all feature-flag variants)
         run: zig build test-matrix --summary all
+      # WASM edge functions are gated behind -Denable-wasm (off by default), so
+      # the steps above never compile src/wasm, vendor/wasm3, or the
+      # if (build_options.enable_wasm) integration blocks in
+      # router.zig/server.zig/proxy.zig. Compile them here (catches signature
+      # drift vs middleware.Decision / RequestView / ProxyRoute) and run the
+      # security suite (fuel trap, memory cap, ABI fuzz, fail-closed).
+      - name: WASM edge functions check + test (-Denable-wasm)
+        run: |
+          zig build check -Denable-wasm=true --summary all
+          zig build test -Denable-wasm=true --summary all
 
   test-macos:
     runs-on: macos-latest
@@ -56,6 +66,12 @@ jobs:
         run: zig build -Doptimize=ReleaseFast --summary all
       - name: Test (all feature-flag variants)
         run: zig build test-matrix --summary all
+      # Same wasm coverage as Linux; macOS additionally exercises the
+      # vendor/wasm3/shim/endian.h path that @cImport translate-c needs here.
+      - name: WASM edge functions check + test (-Denable-wasm)
+        run: |
+          zig build check -Denable-wasm=true --summary all
+          zig build test -Denable-wasm=true --summary all
 
   cross-compile-linux:
     runs-on: macos-latest
@@ -72,3 +88,7 @@ jobs:
         run: zig build -Dtarget=x86_64-linux-musl --summary all
       - name: Cross-compile for Linux (ReleaseFast)
         run: zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast --summary all
+      # Proves vendored wasm3 (C) cross-compiles into a single static binary,
+      # the load-bearing claim behind choosing wasm3 over a JIT.
+      - name: Cross-compile with WASM edge functions (static musl)
+        run: zig build -Dtarget=x86_64-linux-musl -Denable-wasm=true -Doptimize=ReleaseFast --summary all

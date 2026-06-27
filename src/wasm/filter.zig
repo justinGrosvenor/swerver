@@ -19,8 +19,22 @@
 //! Single-threaded worker: the active instance is a process-global, set around
 //! each invocation so the C host callbacks can reach the staging scratch and the
 //! live request without threading a pointer through the wasm3 ABI.
+//!
+//! STATELESSNESS CONTRACT (important). A pooled instance is REUSED across many
+//! requests, from different end-users. invoke() resets the host-side staging
+//! (status/body/headers/scratch) before each call, but it does NOT reset the
+//! guest's linear memory or wasm globals: wasm3 has no cheap re-instantiate, and
+//! zeroing megabytes of linear memory per request would defeat the microsecond
+//! budget. Therefore a filter MUST be stateless across invocations: anything it
+//! writes to a wasm global or to linear memory persists into the next request on
+//! that instance. This is not a sandbox escape (same module, same tenant code),
+//! but it is a real isolation property the filter author owns. Filters should
+//! treat each on_request() as reading inputs and producing a Decision, never as
+//! accumulating state. (Per-request scratch buffers reset by the guest at the
+//! top of on_request() are fine; module-level mutable state is not.)
 
 const std = @import("std");
+const builtin = @import("builtin");
 const runtime = @import("runtime.zig");
 const request = @import("../protocol/request.zig");
 const response = @import("../response/response.zig");
@@ -48,7 +62,7 @@ const GUEST_STACK_BYTES = 64 * 1024;
 /// filters, and it doubles as the time bound (fuel is charged per loop iteration
 /// ~ instructions ~ time). A separate wall-clock deadline only becomes
 /// meaningful in Phase 3, where a host call PARKS the request and control
-/// returns to the reactor — there the tick can time out a stalled park. Until
+/// returns to the reactor, and there the tick can time out a stalled park. Until
 /// then, fuel (compute) + the memory cap (below) are the enforced bounds.
 pub const DEFAULT_FUEL: i64 = 5_000_000;
 
@@ -60,7 +74,14 @@ pub const DEFAULT_MAX_MEMORY_PAGES: u32 = 64;
 /// Per-pool resource bounds. Fuel is per-invocation (passed to run); memory cap
 /// and instance count are fixed at pool construction.
 pub const Config = struct {
-    instances: usize = 4,
+    /// Pre-instantiated instances per worker. Under the Phase-1 synchronous
+    /// model the reactor is single-threaded and a filter never yields mid-call,
+    /// so acquire() always returns the same idle instance and 1 is sufficient;
+    /// each extra instance only reserves another `max_memory_pages` of linear
+    /// memory. Phase 3 (parked host calls) is what needs N > 1: a parked filter
+    /// pins its instance while the request is suspended, so the pool size caps
+    /// concurrent parked filters.
+    instances: usize = 1,
     max_memory_pages: u32 = DEFAULT_MAX_MEMORY_PAGES,
 };
 
@@ -243,8 +264,15 @@ fn hostLog(rt: c.IM3Runtime, ctx: c.IM3ImportContext, sp: [*c]u64, mem: ?*anyopa
     _ = ctx;
     const ptr: u32 = @truncate(sp[0]);
     const len: u32 = @truncate(sp[1]);
+    // Always bounds-check (an out-of-bounds log pointer must still trap), but
+    // only emit in Debug. The message is guest-controlled and a guest can call
+    // log() up to its fuel budget; a blocking, locked stderr write per call is a
+    // log-spam/noise vector, so release builds drop the output (still trapping
+    // on OOB). A future ABI revision can route this to a rate-limited sink.
     const msg = guestView(rt, mem, ptr, len) orelse return trap(TRAP_OOB);
-    std.debug.print("[wasm] {s}\n", .{msg});
+    if (builtin.mode == .Debug) {
+        std.debug.print("[wasm] {s}\n", .{msg});
+    }
     return null;
 }
 
@@ -454,7 +482,7 @@ test "security: pool caps each instance's max linear memory" {
     }
 }
 
-test "security: ABI fuzz — out-of-bounds (ptr,len) always traps, never escapes memory" {
+test "security: ABI fuzz: out-of-bounds (ptr,len) always traps, never escapes memory" {
     var pool = try Pool.init(testing.allocator, FILTER_WASM, .{ .instances = 1 });
     defer pool.deinit();
 
