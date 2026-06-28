@@ -226,7 +226,8 @@ pub const Table = struct {
         return false;
     }
 
-    /// Is there a live park for this specific stream (generation-checked)? The
+    /// Is there a live park for this specific stream (matched by conn id +
+    /// stream id, not the token generation)? The
     /// per-stream counterpart to hasParkFor, used by the H2/H3 dispatch (E2) to
     /// confirm a park-sentinel response really registered a park on the stream
     /// before suspending it.
