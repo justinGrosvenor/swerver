@@ -24,17 +24,102 @@ const request = @import("../protocol/request.zig");
 pub const Token = u32;
 pub const INVALID_TOKEN: Token = std.math.maxInt(u32);
 
-/// Terminal result of a parked filter, with the connection it belongs to. The
-/// server uses (conn_index, conn_id) to find the waiting connection (re-checking
-/// the generation) and acts on `decision`.
+/// Which HTTP protocol the parked stream belongs to. Reuses the canonical
+/// h1/h2/h3 enum so the resume path can route delivery (H1 queueResponse vs the
+/// H2/H3 stream-correct sends wired in E2). H1 is the only protocol that parks
+/// today; H2/H3 set the real value once E2 lands.
+pub const Protocol = middleware.Context.Protocol;
+
+/// Bounded backing storage for a park's OWNED request snapshot. Parks are rare,
+/// so a per-slot copy is cheap, and owning it frees the resume path from
+/// depending on the connection's read buffer (H1) or a reused frame buffer
+/// (H2/H3) staying pinned. A request whose method/path/headers/body do not fit
+/// these bounds fails the park (the caller fails closed), matching the
+/// table-full behavior. method_raw + path + header name/value bytes + a small
+/// body all share `buf`.
+const SNAP_BUF_CAP = 4096;
+const SNAP_MAX_HEADERS = 32;
+
+const ReqSnapshot = struct {
+    buf: [SNAP_BUF_CAP]u8 = undefined,
+    headers: [SNAP_MAX_HEADERS]request.Header = undefined,
+};
+
+/// Copy `src` into the slot-owned `snap` storage and return a RequestView whose
+/// slices point at that owned storage (stable while the slot is live). Returns
+/// null when the request does not fit the bounded snapshot; the caller then
+/// fails the park closed rather than borrowing the (soon-reused) source buffer.
+fn buildSnapshot(snap: *ReqSnapshot, src: request.RequestView) ?request.RequestView {
+    var off: usize = 0;
+
+    var method_raw: []const u8 = "";
+    if (src.method_raw.len > 0) {
+        if (off + src.method_raw.len > snap.buf.len) return null;
+        @memcpy(snap.buf[off..][0..src.method_raw.len], src.method_raw);
+        method_raw = snap.buf[off..][0..src.method_raw.len];
+        off += src.method_raw.len;
+    }
+
+    if (off + src.path.len > snap.buf.len) return null;
+    @memcpy(snap.buf[off..][0..src.path.len], src.path);
+    const path = snap.buf[off..][0..src.path.len];
+    off += src.path.len;
+
+    if (src.headers.len > snap.headers.len) return null;
+    for (src.headers, 0..) |h, i| {
+        if (off + h.name.len + h.value.len > snap.buf.len) return null;
+        @memcpy(snap.buf[off..][0..h.name.len], h.name);
+        const name = snap.buf[off..][0..h.name.len];
+        off += h.name.len;
+        @memcpy(snap.buf[off..][0..h.value.len], h.value);
+        const value = snap.buf[off..][0..h.value.len];
+        off += h.value.len;
+        snap.headers[i] = .{ .name = name, .value = value };
+    }
+    const headers = snap.headers[0..src.headers.len];
+
+    var body: request.RequestBody = .{ .slice = "" };
+    const body_len = src.body.len();
+    if (body_len > 0) {
+        if (off + body_len > snap.buf.len) return null;
+        // copyTo materializes slice/scattered bytes; length_only carries none
+        // (returns null) -> fail the park closed.
+        const copied = src.body.copyTo(snap.buf[off..][0..body_len]) orelse return null;
+        body = .{ .slice = copied };
+        off += copied.len;
+    }
+
+    return request.RequestView{
+        .method = src.method,
+        .method_raw = method_raw,
+        .path = path,
+        .headers = headers,
+        .body = body,
+    };
+}
+
+/// Terminal result of a parked filter, with the stream it belongs to. The server
+/// uses (conn_index, conn_id, stream_id, protocol) to find the waiting stream
+/// (re-checking the generation) and acts on `decision`.
 pub const Completion = struct {
     conn_index: u32,
     conn_id: u64,
+    /// Stream within the connection. H1 uses the sentinel 0 (one in-flight
+    /// request per connection); H2/H3 carry the real stream id (E2).
+    stream_id: u32,
+    /// Protocol of the parked stream; `wasmResume` routes delivery by it.
+    protocol: Protocol,
     decision: middleware.Decision,
-    /// The parked request, for re-dispatch on resume-to-allow/modify. Its slices
-    /// point into the connection's pinned read buffer (valid while parked).
-    /// Unused for a reject decision (served directly without re-running the handler).
+    /// The parked request, for re-dispatch on resume-to-allow/modify. It is an
+    /// OWNED snapshot in the park slot's storage (no longer a borrow of the
+    /// connection read buffer), valid through the synchronous resume that
+    /// consumes this Completion. Unused for a reject decision (served directly
+    /// without re-running the handler).
     req: request.RequestView,
+    /// Opaque resumed-path context carried from park time. E0 leaves it null;
+    /// E1 populates it with the proxy's cache/otel/x402-settlement context so the
+    /// resumed forward can run the post-`proxy.handle` processing.
+    resume_ctx: ?*anyopaque,
 };
 
 /// Why a park ended without a host-call result (all fail closed).
@@ -50,37 +135,55 @@ pub const Table = struct {
         instance: *filter.Instance = undefined,
         conn_index: u32 = 0,
         conn_id: u64 = 0,
+        stream_id: u32 = 0,
+        protocol: Protocol = .http1,
         deadline_ms: u64 = 0,
         resume_fuel: i64 = filter.DEFAULT_FUEL,
+        resume_ctx: ?*anyopaque = null,
+        /// Rebuilt view over `snap` (owned copy), not a borrow of the request's
+        /// source buffer. Valid while the slot is active.
         req: request.RequestView = undefined,
+        snap: ReqSnapshot = .{},
     };
 
     slots: [CAP]Slot = [1]Slot{.{}} ** CAP,
 
-    /// Register a parked filter. The instance must already be pinned (`.parked`)
-    /// by filter.invokeOutcome. Returns a token, or null if the table is full
-    /// (the caller should filter.cancelPark the instance and fail closed).
+    /// Register a parked filter, keyed by (conn_index, conn_id, stream_id,
+    /// protocol). The instance must already be pinned (`.parked`) by
+    /// filter.invokeOutcome. Snapshots the request into the slot's owned storage
+    /// so the resume path does not depend on the source buffer staying pinned.
+    /// Returns a token, or null if the table is full or the request does not fit
+    /// the bounded snapshot (the caller should filter.cancelPark the instance and
+    /// fail closed). `resume_ctx` is the opaque resumed-path context (E1; null in
+    /// E0).
     pub fn park(
         self: *Table,
         instance: *filter.Instance,
         req: request.RequestView,
         conn_index: u32,
         conn_id: u64,
+        stream_id: u32,
+        protocol: Protocol,
         deadline_ms: u64,
         resume_fuel: i64,
+        resume_ctx: ?*anyopaque,
     ) ?Token {
         std.debug.assert(instance.state == .parked);
         for (&self.slots, 0..) |*s, i| {
             if (!s.active) {
-                s.* = .{
-                    .active = true,
-                    .instance = instance,
-                    .conn_index = conn_index,
-                    .conn_id = conn_id,
-                    .deadline_ms = deadline_ms,
-                    .resume_fuel = resume_fuel,
-                    .req = req,
-                };
+                // Build the owned snapshot in-place first; bail (caller fails
+                // closed) before claiming the slot if it does not fit.
+                const owned = buildSnapshot(&s.snap, req) orelse return null;
+                s.active = true;
+                s.instance = instance;
+                s.conn_index = conn_index;
+                s.conn_id = conn_id;
+                s.stream_id = stream_id;
+                s.protocol = protocol;
+                s.deadline_ms = deadline_ms;
+                s.resume_fuel = resume_fuel;
+                s.resume_ctx = resume_ctx;
+                s.req = owned;
                 return @intCast(i);
             }
         }
@@ -102,7 +205,7 @@ pub const Table = struct {
     pub fn complete(self: *Table, token: Token, result: []const u8) ?Completion {
         const s = self.live(token) orelse return null;
         const decision = filter.resumeCall(s.instance, result, s.resume_fuel);
-        const out = Completion{ .conn_index = s.conn_index, .conn_id = s.conn_id, .decision = decision, .req = s.req };
+        const out = self.completionFor(s, decision);
         s.active = false;
         return out;
     }
@@ -114,7 +217,7 @@ pub const Table = struct {
         _ = reason;
         const s = self.live(token) orelse return null;
         const decision = filter.cancelPark(s.instance);
-        const out = Completion{ .conn_index = s.conn_index, .conn_id = s.conn_id, .decision = decision, .req = s.req };
+        const out = self.completionFor(s, decision);
         s.active = false;
         return out;
     }
@@ -123,8 +226,25 @@ pub const Table = struct {
     /// pinned instance, drop the entry, and DON'T produce a completion (there is
     /// nobody to serve). Generation-checked. Returns true if one was found.
     pub fn cancelForConn(self: *Table, conn_index: u32, conn_id: u64) bool {
+        var found = false;
         for (&self.slots) |*s| {
             if (s.active and s.conn_index == conn_index and s.conn_id == conn_id) {
+                _ = filter.cancelPark(s.instance);
+                s.active = false;
+                found = true;
+            }
+        }
+        return found;
+    }
+
+    /// A single multiplexed stream closed (RST_STREAM / QUIC stream reset) while
+    /// a filter was parked on it: release that one pinned instance and drop the
+    /// entry, leaving the connection's other parked streams intact. The per-stream
+    /// counterpart to cancelForConn, used by H2/H3 (E2). Generation-checked.
+    /// Returns true if a matching park was found.
+    pub fn cancelForStream(self: *Table, conn_index: u32, conn_id: u64, stream_id: u32) bool {
+        for (&self.slots) |*s| {
+            if (s.active and s.conn_index == conn_index and s.conn_id == conn_id and s.stream_id == stream_id) {
                 _ = filter.cancelPark(s.instance);
                 s.active = false;
                 return true;
@@ -143,7 +263,7 @@ pub const Table = struct {
             if (n >= out.len) break;
             if (s.active and now_ms >= s.deadline_ms) {
                 const decision = filter.cancelPark(s.instance);
-                out[n] = .{ .conn_index = s.conn_index, .conn_id = s.conn_id, .decision = decision, .req = s.req };
+                out[n] = self.completionFor(s, decision);
                 n += 1;
                 s.active = false;
             }
@@ -165,6 +285,24 @@ pub const Table = struct {
         const s = &self.slots[token];
         return if (s.active) s else null;
     }
+
+    /// Build a Completion from a (still-active) slot, carrying the stream key,
+    /// protocol, owned request snapshot, and resumed-path context. The returned
+    /// `req` slices point into the slot's snapshot storage, which stays valid
+    /// through the synchronous resume that consumes the Completion (the slot is
+    /// not reused until the next park, and the worker is single-threaded).
+    fn completionFor(self: *Table, s: *Slot, decision: middleware.Decision) Completion {
+        _ = self;
+        return .{
+            .conn_index = s.conn_index,
+            .conn_id = s.conn_id,
+            .stream_id = s.stream_id,
+            .protocol = s.protocol,
+            .decision = decision,
+            .req = s.req,
+            .resume_ctx = s.resume_ctx,
+        };
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -183,7 +321,8 @@ fn parkOne(pool: *filter.Pool, table: *Table, conn_index: u32, conn_id: u64, dea
         .parked => {},
         .decision => return error.DidNotPark,
     }
-    return table.park(inst, r, conn_index, conn_id, deadline_ms, filter.DEFAULT_FUEL) orelse error.TableFull;
+    // H1 sentinels: stream_id 0, protocol .http1, no resumed-path context.
+    return table.park(inst, r, conn_index, conn_id, 0, .http1, deadline_ms, filter.DEFAULT_FUEL, null) orelse error.TableFull;
 }
 
 test "host_call table: complete resumes the filter to a decision" {
@@ -270,6 +409,94 @@ test "host_call table: full table returns null token" {
     const inst = pool.acquire() orelse return error.AcquireFailed;
     const r = request.RequestView{ .method = .GET, .path = "/enrich", .headers = &.{} };
     try testing.expect(filter.invokeOutcome(inst, &r, filter.DEFAULT_FUEL) == .parked);
-    try testing.expect(table.park(inst, r, 999, 999, 5000, filter.DEFAULT_FUEL) == null);
+    try testing.expect(table.park(inst, r, 999, 999, 0, .http1, 5000, filter.DEFAULT_FUEL, null) == null);
+    _ = filter.cancelPark(inst);
+}
+
+test "host_call table: completion carries stream_id + protocol sentinels for H1" {
+    var pool = try filter.Pool.init(testing.allocator, FILTER_WASM, .{ .instances = 1 });
+    defer pool.deinit();
+    var table = Table{};
+    const token = try parkOne(&pool, &table, 3, 4, 5000);
+    const c = table.complete(token, "ok") orelse return error.NoCompletion;
+    try testing.expectEqual(@as(u32, 0), c.stream_id);
+    try testing.expect(c.protocol == .http1);
+    try testing.expect(c.resume_ctx == null);
+}
+
+test "host_call table: cancelForStream releases only the matching stream" {
+    var pool = try filter.Pool.init(testing.allocator, FILTER_WASM, .{ .instances = 2 });
+    defer pool.deinit();
+    var table = Table{};
+
+    // Two parks on the same conn but different stream ids (the H2/H3 shape).
+    const inst_a = pool.acquire() orelse return error.AcquireFailed;
+    const r1 = request.RequestView{ .method = .GET, .path = "/enrich", .headers = &.{} };
+    try testing.expect(filter.invokeOutcome(inst_a, &r1, filter.DEFAULT_FUEL) == .parked);
+    _ = table.park(inst_a, r1, 1, 1, 7, .http2, 5000, filter.DEFAULT_FUEL, null) orelse return error.TableFull;
+
+    const inst_b = pool.acquire() orelse return error.AcquireFailed;
+    const r2 = request.RequestView{ .method = .GET, .path = "/enrich", .headers = &.{} };
+    try testing.expect(filter.invokeOutcome(inst_b, &r2, filter.DEFAULT_FUEL) == .parked);
+    _ = table.park(inst_b, r2, 1, 1, 9, .http2, 5000, filter.DEFAULT_FUEL, null) orelse return error.TableFull;
+
+    try testing.expectEqual(@as(usize, 2), table.liveCount());
+    // Wrong stream: no-op.
+    try testing.expect(table.cancelForStream(1, 1, 99) == false);
+    try testing.expectEqual(@as(usize, 2), table.liveCount());
+    // Matching stream: only that one is released.
+    try testing.expect(table.cancelForStream(1, 1, 7) == true);
+    try testing.expectEqual(@as(usize, 1), table.liveCount());
+}
+
+test "host_call table: owned snapshot survives mutation of the source buffer" {
+    var pool = try filter.Pool.init(testing.allocator, FILTER_WASM, .{ .instances = 1 });
+    defer pool.deinit();
+    var table = Table{};
+
+    // Back the request with MUTABLE storage, then scribble over it after parking
+    // to simulate the read/frame buffer being reused while the stream is parked.
+    var path_buf = "/enrich".*;
+    var name_buf = "x-trace".*;
+    var value_buf = "original-value".*;
+    var headers = [_]request.Header{.{ .name = &name_buf, .value = &value_buf }};
+    const r = request.RequestView{ .method = .GET, .path = &path_buf, .headers = &headers };
+
+    const inst = pool.acquire() orelse return error.AcquireFailed;
+    try testing.expect(filter.invokeOutcome(inst, &r, filter.DEFAULT_FUEL) == .parked);
+    const token = table.park(inst, r, 2, 2, 0, .http1, 5000, filter.DEFAULT_FUEL, null) orelse return error.TableFull;
+
+    // Buffer reuse: clobber the original bytes.
+    @memset(&path_buf, 'X');
+    @memset(&name_buf, 'X');
+    @memset(&value_buf, 'X');
+
+    const c = table.complete(token, "ok") orelse return error.NoCompletion;
+    try testing.expect(c.decision == .allow);
+    // The snapshot is independent of the (now-clobbered) source buffer.
+    try testing.expectEqualStrings("/enrich", c.req.path);
+    try testing.expectEqual(@as(usize, 1), c.req.headers.len);
+    try testing.expectEqualStrings("x-trace", c.req.headers[0].name);
+    try testing.expectEqualStrings("original-value", c.req.headers[0].value);
+}
+
+test "host_call table: oversized request fails the park closed" {
+    var pool = try filter.Pool.init(testing.allocator, FILTER_WASM, .{ .instances = 1 });
+    defer pool.deinit();
+    var table = Table{};
+
+    // A path longer than the snapshot buffer cannot be owned: park returns null
+    // and the instance must be released by the caller (fail closed).
+    var big: [SNAP_BUF_CAP + 16]u8 = undefined;
+    @memset(&big, 'a');
+    big[0] = '/';
+    const r = request.RequestView{ .method = .GET, .path = &big, .headers = &.{} };
+    const inst = pool.acquire() orelse return error.AcquireFailed;
+    // The probe parks only on "/enrich"; force the parked state directly so we
+    // exercise the snapshot bound rather than the guest's routing.
+    const parked = request.RequestView{ .method = .GET, .path = "/enrich", .headers = &.{} };
+    try testing.expect(filter.invokeOutcome(inst, &parked, filter.DEFAULT_FUEL) == .parked);
+    try testing.expect(table.park(inst, r, 1, 1, 0, .http1, 5000, filter.DEFAULT_FUEL, null) == null);
+    try testing.expectEqual(@as(usize, 0), table.liveCount());
     _ = filter.cancelPark(inst);
 }

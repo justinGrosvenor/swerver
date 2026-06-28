@@ -780,6 +780,17 @@ fn pgResume(ctx: *anyopaque, outcome: *const pg_client_mod.Outcome) void {
 /// and backpressure are served directly. The transport (C1) and the deadline
 /// tick call this. H1 only. Compiled only when wasm is enabled.
 fn wasmResume(server: *Server, completion: wasm_host_call_mod.Completion) void {
+    switch (completion.protocol) {
+        .http1 => {},
+        .http2, .http3 => {
+            // E2: wire H2/H3 delivery (queueHttp2Response / h3 stream send) for a
+            // resumed parked stream, keyed by completion.stream_id. E0 only makes
+            // the model per-stream; H1 is the only protocol that parks today, so a
+            // non-h1 completion is not expected here yet. The park slot was already
+            // freed by complete()/cancel(); nothing else to do.
+            return;
+        },
+    }
     const conn = server.io.getConnection(completion.conn_index) orelse return;
     if (conn.id != completion.conn_id) return; // slot recycled while parked
     if (conn.x402 != .wasm_parked) return;
@@ -815,8 +826,9 @@ fn wasmResume(server: *Server, completion: wasm_host_call_mod.Completion) void {
                 return;
             }
             // Re-run the pipeline with the resumed decision injected so the
-            // filter is skipped and the handler runs. The request view still
-            // points into the pinned read buffer.
+            // filter is skipped and the handler runs. completion.req is the
+            // park slot's OWNED snapshot (valid through this synchronous resume),
+            // not a borrow of the connection read buffer.
             var response_buf: [PG_RESUME_BUF_SIZE]u8 = undefined;
             var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
             const arena_handle = server.io.acquireBuffer();
@@ -841,6 +853,8 @@ fn wasmResume(server: *Server, completion: wasm_host_call_mod.Completion) void {
                     .table = if (build_options.enable_wasm) @ptrCast(&server.wasm_host_calls) else null,
                     .conn_index = completion.conn_index,
                     .conn_id = completion.conn_id,
+                    .stream_id = completion.stream_id, // 0 for H1
+                    .protocol = .http1,
                     .deadline_ms = server.now_ms + WASM_HOST_CALL_TIMEOUT_MS,
                     .resume_decision = completion.decision,
                 },
@@ -1645,6 +1659,8 @@ pub fn handleRead(server: *Server, index: u32) !void {
                     .table = @ptrCast(&server.wasm_host_calls),
                     .conn_index = conn.index,
                     .conn_id = conn.id,
+                    .stream_id = 0, // H1 sentinel
+                    .protocol = .http1,
                     .deadline_ms = server.now_ms + WASM_HOST_CALL_TIMEOUT_MS,
                     .start_fn = wasmStartThunk,
                     .start_ctx = @ptrCast(server),
@@ -1829,6 +1845,8 @@ pub fn handleRead(server: *Server, index: u32) !void {
                 .table = if (build_options.enable_wasm) @ptrCast(&server.wasm_host_calls) else null,
                 .conn_index = conn.index,
                 .conn_id = conn.id,
+                .stream_id = 0, // H1 sentinel
+                .protocol = .http1,
                 .deadline_ms = server.now_ms + WASM_HOST_CALL_TIMEOUT_MS,
                 .start_fn = if (build_options.enable_wasm) wasmStartThunk else null,
                 .start_ctx = if (build_options.enable_wasm) @ptrCast(server) else null,

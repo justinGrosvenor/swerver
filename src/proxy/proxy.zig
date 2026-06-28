@@ -33,7 +33,15 @@ pub const WasmBinding = struct {
     table: ?*anyopaque = null,
     conn_index: u32 = 0,
     conn_id: u64 = 0,
+    /// Stream within the connection. H1 uses the sentinel 0; H2/H3 (E2) pass the
+    /// real stream id so a parked stream resumes independently of its siblings.
+    stream_id: u32 = 0,
+    /// Protocol of the parked stream; stored on the park slot so `wasmResume`
+    /// routes response delivery (H1 queueResponse vs H2/H3 stream sends in E2).
+    protocol: middleware.Context.Protocol = .http1,
     deadline_ms: u64 = 0,
+    /// Opaque resumed-path context carried into the park slot (E1; null in E0).
+    resume_ctx: ?*anyopaque = null,
     resume_decision: ?middleware.Decision = null,
     start_fn: ?*const fn (ctx: *anyopaque, token: u32, request: []const u8) void = null,
     start_ctx: ?*anyopaque = null,
@@ -99,7 +107,7 @@ fn runWasmFilter(route: *const upstream.ProxyRoute, req_view: *const request.Req
                 .rate_limit_backpressure => |bp| bp.resp,
             },
             .parked => |call_request| {
-                if (table.park(inst, req_view.*, wb.conn_index, wb.conn_id, wb.deadline_ms, route.wasm_fuel)) |token| {
+                if (table.park(inst, req_view.*, wb.conn_index, wb.conn_id, wb.stream_id, wb.protocol, wb.deadline_ms, route.wasm_fuel, wb.resume_ctx)) |token| {
                     if (wb.start_fn) |start| start(wb.start_ctx.?, token, call_request);
                     return response.Response.parked;
                 }
