@@ -612,6 +612,13 @@ pub const Connection = struct {
     state: State = .initial,
     /// Is this a server-side connection?
     is_server: bool,
+    /// Stable per-connection id assigned by the pool at creation from a
+    /// monotonic counter (never reused). Used by the per-stream WASM park
+    /// model (E2b) as the `conn_id` key into the host_call table, and to
+    /// re-find this connection on resume (pool.findById). A stale completion
+    /// for a freed connection simply fails the lookup (the id is gone), which
+    /// is the H3 counterpart of the io-runtime generation check H1/H2 use.
+    id: u64 = 0,
     /// Original destination connection ID (for Initial packet validation)
     original_dcid: types.ConnectionId,
     /// Our connection ID
@@ -724,6 +731,20 @@ pub const Connection = struct {
     /// ACK processing opens the window.
     pending_send: ?PendingSend = null,
 
+    /// Stream ids the peer reset (RESET_STREAM) or asked us to stop sending
+    /// (STOP_SENDING) in the packet currently being processed. Surfaced to the
+    /// server via ProcessResult.reset_streams so a per-stream WASM filter park
+    /// (E2b) on that stream can be released (the H3 analog of H2 RST_STREAM ->
+    /// cancelForStream). Cleared per packet alongside the http3 events.
+    reset_stream_ids: [MAX_RESET_STREAMS]u64 = undefined,
+    reset_stream_count: usize = 0,
+
+    /// Cap on reset stream ids surfaced per packet. A packet carrying more
+    /// resets than this drops the overflow (the host-call deadline tick is the
+    /// backstop that still releases any missed park); bounded so the buffer is
+    /// cheap to carry by value on every connection.
+    pub const MAX_RESET_STREAMS = 16;
+
     pub const PendingSend = struct {
         stream_id: u64,
         data: []u8,
@@ -823,6 +844,30 @@ pub const Connection = struct {
     /// `recv_buffer.items`) is no longer referenced. Keeps the
     /// stream's memory footprint bounded without invalidating any
     /// live slice during the handler's run.
+    /// Record a peer-initiated stream reset (RESET_STREAM / STOP_SENDING) seen
+    /// while processing the current packet. Surfaced via resetStreams() so the
+    /// server can release any WASM filter parked on that stream (E2b). Silently
+    /// drops once the per-packet buffer is full (the host-call deadline tick is
+    /// the backstop for any park not released here).
+    pub fn recordResetStream(self: *Connection, stream_id: u64) void {
+        if (self.reset_stream_count >= self.reset_stream_ids.len) return;
+        self.reset_stream_ids[self.reset_stream_count] = stream_id;
+        self.reset_stream_count += 1;
+    }
+
+    /// Drop any reset stream ids recorded for the previous packet. Called per
+    /// packet (alongside the http3 event clear) so a packet only ever surfaces
+    /// resets carried by its own frames.
+    pub fn clearResetStreams(self: *Connection) void {
+        self.reset_stream_count = 0;
+    }
+
+    /// Stream ids the peer reset in the packet just processed (valid until the
+    /// next clearResetStreams). Surfaced to the server in ProcessResult.
+    pub fn resetStreams(self: *Connection) []const u64 {
+        return self.reset_stream_ids[0..self.reset_stream_count];
+    }
+
     pub fn clearH3RequestStream(self: *Connection, stream_id: u64) void {
         if (self.stream_manager) |*mgr| {
             if (mgr.getStream(stream_id)) |s| {
@@ -1675,6 +1720,29 @@ test "connection initialization" {
     try std.testing.expectEqual(@as(u8, 8), conn.our_cid.len);
     try std.testing.expect(conn.crypto_ctx.initial.client != null);
     try std.testing.expect(conn.crypto_ctx.initial.server != null);
+}
+
+test "reset stream surfacing: record, read, clear (E2b park release)" {
+    const allocator = std.testing.allocator;
+    const dcid = types.ConnectionId.init(&[_]u8{ 0x05, 0x06, 0x07, 0x08 });
+    var conn = Connection.init(allocator, true, dcid);
+    defer conn.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), conn.resetStreams().len);
+    conn.recordResetStream(0);
+    conn.recordResetStream(4);
+    const ids = conn.resetStreams();
+    try std.testing.expectEqual(@as(usize, 2), ids.len);
+    try std.testing.expectEqual(@as(u64, 0), ids[0]);
+    try std.testing.expectEqual(@as(u64, 4), ids[1]);
+
+    // Overflow past the per-packet cap is dropped, not a crash.
+    var i: usize = 0;
+    while (i < Connection.MAX_RESET_STREAMS + 8) : (i += 1) conn.recordResetStream(@intCast(i));
+    try std.testing.expectEqual(@as(usize, Connection.MAX_RESET_STREAMS), conn.resetStreams().len);
+
+    conn.clearResetStreams();
+    try std.testing.expectEqual(@as(usize, 0), conn.resetStreams().len);
 }
 
 test "peer-initiated stream limit uses our advertised limit, not the peer's" {
