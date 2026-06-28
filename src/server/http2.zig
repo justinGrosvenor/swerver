@@ -39,6 +39,23 @@ const router = @import("../router/router.zig");
 const clock = @import("../runtime/clock.zig");
 const buffer_pool = @import("../runtime/buffer_pool.zig");
 const write_queue = @import("write_queue.zig");
+const build_options = @import("build_options");
+const proxy_mod = @import("../proxy/proxy.zig");
+const wasm_filter_mod = if (build_options.enable_wasm) @import("../wasm/filter.zig") else struct {};
+
+/// WASM host-call timeout for an H2 stream park, mirroring the H1 dispatch
+/// deadline. A parked stream past this wall-clock deadline is failed closed by
+/// the housekeeping tick.
+const WASM_HOST_CALL_TIMEOUT_MS: u64 = 30_000;
+
+/// Transport start hook (router/proxy WasmBinding.start_fn) for H2 parks. Routes
+/// a freshly parked filter's host call to the Server's transport. `ctx` is the
+/// Server. Mirrors dispatch.wasmStartThunk; kept local so http2.zig owns its
+/// binding wiring without reaching into dispatch.zig privates.
+fn wasmStartThunkH2(ctx: *anyopaque, token: u32, req_bytes: []const u8) void {
+    const server: *Server = @ptrCast(@alignCast(ctx));
+    server.wasmStartHostCall(token, req_bytes);
+}
 
 pub fn matchesHttp2Preface(candidate: []const u8) bool {
     if (candidate.len == 0) return false;
@@ -304,6 +321,24 @@ pub fn handleHttp2Read(server: *Server, conn: *connection.Connection) !void {
                 .err => |err_event| {
                     if (err_event.stream_id != 0) {
                         sendRstStream(server, conn, err_event.stream_id, @intFromEnum(err_event.code));
+                    }
+                },
+                .stream_reset => |rst_event| {
+                    // Peer RST_STREAM: release any WASM filter parked on this
+                    // stream (E2a) so the pinned instance returns to its pool.
+                    // No-op (generation-checked) when nothing is parked. Also
+                    // drop any half-built pending request body for the stream.
+                    if (build_options.enable_wasm) {
+                        server.wasmCancelForStream(conn.index, conn.id, rst_event.stream_id);
+                    }
+                    for (h2_pending) |*slot| {
+                        if (slot.active and slot.stream_id == rst_event.stream_id) {
+                            if (slot.body_handle) |bh| {
+                                if (slot.body_is_body_pool) server.io.releaseBodyBuffer(bh) else server.io.releaseBuffer(bh);
+                            }
+                            slot.clear();
+                            break;
+                        }
                     }
                 },
             }
@@ -924,6 +959,19 @@ fn dispatchHttp2Request(
                 const l = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ ip4[0], ip4[1], ip4[2], ip4[3] }) catch "";
                 if (l.len > 0) client_ip_str = ip_buf[0..l.len];
             }
+            // Real per-stream park binding (E2a): a parking proxy filter suspends
+            // THIS stream and resumes via wasmResume's .http2 arm. The connection
+            // keeps multiplexing its other streams while this one waits.
+            const proxy_binding: proxy_mod.WasmBinding = if (build_options.enable_wasm) .{
+                .table = @ptrCast(&server.wasm_host_calls),
+                .conn_index = conn.index,
+                .conn_id = conn.id,
+                .stream_id = stream_id,
+                .protocol = .http2,
+                .deadline_ms = server.now_ms + WASM_HOST_CALL_TIMEOUT_MS,
+                .start_fn = wasmStartThunkH2,
+                .start_ctx = @ptrCast(server),
+            } else .{};
             var proxy_result = proxy.handle(
                 request_with_body,
                 &mw_ctx,
@@ -932,9 +980,18 @@ fn dispatchHttp2Request(
                 server.now_ms,
                 null,
                 null,
-                .{}, // no park binding: H2 has no per-stream park state (filter fails closed on park)
+                proxy_binding,
             );
             defer proxy_result.release();
+            // Park sentinel: the filter parked on a host_call. Leave the stream
+            // suspended (no frames queued, stream stays open); wasmResume delivers
+            // the response on this stream once the host call completes.
+            if (build_options.enable_wasm and proxy_result.resp.isParked()) {
+                if (server.wasmHasParkForStream(conn.index, conn.id, stream_id)) return;
+                // Sentinel without a live park (should not happen): fail closed.
+                try queueHttp2Response(server, conn, stream_id, Server.badRequestResponse(), hdr_request.method == .HEAD);
+                return;
+            }
             try queueHttp2Response(server, conn, stream_id, proxy_result.resp, hdr_request.method == .HEAD);
             return;
         }
@@ -953,10 +1010,234 @@ fn dispatchHttp2Request(
         .arena_handle = arena_handle,
         .buffer_ops = mw_ctx.buffer_ops,
     };
+    // Real per-stream park binding (E2a): a parking WASM filter suspends THIS
+    // stream (recorded in the host_call table, keyed by stream_id) and resumes
+    // via wasmResume's .http2 arm. The connection keeps multiplexing its other
+    // streams while this one waits.
+    if (build_options.enable_wasm) {
+        scratch.wasm = .{
+            .table = @ptrCast(&server.wasm_host_calls),
+            .conn_index = conn.index,
+            .conn_id = conn.id,
+            .stream_id = stream_id,
+            .protocol = .http2,
+            .deadline_ms = server.now_ms + WASM_HOST_CALL_TIMEOUT_MS,
+            .start_fn = wasmStartThunkH2,
+            .start_ctx = @ptrCast(server),
+        };
+    }
     const result = server.app_router.handle(request_with_body, &mw_ctx, &scratch);
     if (scratch.arena_handle) |handle| server.io.releaseBuffer(handle);
+    // Park sentinel: a filter parked on a host_call. Leave the stream suspended
+    // (no frames queued, stream stays open); wasmResume delivers the response on
+    // this stream once the host call completes. Checked before queueHttp2Response
+    // so the park sentinel is never serialized.
+    if (build_options.enable_wasm and result.resp.isParked()) {
+        if (server.wasmHasParkForStream(conn.index, conn.id, stream_id)) return;
+        // Sentinel without a live park (programmer error / orphaned park): fail
+        // closed on this stream and release any orphaned park to avoid a leak.
+        server.wasmCancelForStream(conn.index, conn.id, stream_id);
+        try queueHttp2Response(server, conn, stream_id, .{
+            .status = 500,
+            .headers = &.{},
+            .body = .{ .bytes = "Internal Server Error" },
+        }, hdr_request.method == .HEAD);
+        return;
+    }
     if (result.pause_reads_ms) |pause_ms| {
         conn.setRateLimitPause(server.now_ms, pause_ms);
     }
     try queueHttp2Response(server, conn, stream_id, result.resp, hdr_request.method == .HEAD);
+}
+
+// ---------------------------------------------------------------------------
+// Tests (E2a: HTTP/2 per-stream WASM filter park). Run with:
+//   zig build test -Denable-http2=true -Denable-wasm=true
+// Skipped (SkipZigTest) when either flag is off, since the path is gated on both.
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+const config = @import("../config.zig");
+
+/// Scan the connection's write queue (without consuming it) for a frame of
+/// `want_type` on `want_stream`, returning the frame payload if found. Used by
+/// the H2 park/resume tests to confirm a response landed on the right stream.
+fn findH2Frame(conn: *connection.Connection, want_type: http2.FrameType, want_stream: u32) ?[]const u8 {
+    const cap = conn.write_queue.len;
+    var c: usize = 0;
+    var idx: usize = conn.write_head;
+    while (c < conn.write_count) : ({
+        c += 1;
+        idx = (idx + 1) % cap;
+    }) {
+        const entry = conn.write_queue[idx];
+        var off: usize = 0;
+        while (off + 9 <= entry.len) {
+            const flen = (@as(usize, entry.handle.bytes[off]) << 16) |
+                (@as(usize, entry.handle.bytes[off + 1]) << 8) |
+                @as(usize, entry.handle.bytes[off + 2]);
+            const ftype = entry.handle.bytes[off + 3];
+            const sid = ((@as(u32, entry.handle.bytes[off + 5]) & 0x7f) << 24) |
+                (@as(u32, entry.handle.bytes[off + 6]) << 16) |
+                (@as(u32, entry.handle.bytes[off + 7]) << 8) |
+                @as(u32, entry.handle.bytes[off + 8]);
+            if (ftype == @intFromEnum(want_type) and sid == want_stream) {
+                if (off + 9 + flen <= entry.len) return entry.handle.bytes[off + 9 .. off + 9 + flen];
+                return entry.handle.bytes[off + 9 .. entry.len];
+            }
+            off += 9 + flen;
+        }
+    }
+    return null;
+}
+
+fn drainH2WriteQueue(server: *Server, conn: *connection.Connection) void {
+    while (conn.peekWrite()) |entry_ptr| {
+        const entry = entry_ptr.*;
+        server.io.releaseBuffer(entry.handle);
+        conn.popWrite();
+    }
+}
+
+fn h2EnrichHandler(_: *router.HandlerContext) response_mod.Response {
+    return .{ .status = 200, .headers = &.{}, .body = .{ .bytes = "enriched" } };
+}
+
+fn h2PlainHandler(_: *router.HandlerContext) response_mod.Response {
+    return .{ .status = 200, .headers = &.{}, .body = .{ .bytes = "plain-ok" } };
+}
+
+test "wasm h2: stream park then resume delivers on its stream; sibling flows while parked" {
+    if (build_options.enable_http2 and build_options.enable_wasm) {
+        const dispatch = @import("dispatch.zig");
+        const FILTER = @embedFile("../wasm/testdata/filter_probe.wasm");
+
+        var gpa = std.heap.DebugAllocator(.{}){};
+        defer _ = gpa.deinit();
+        const allocator = gpa.allocator();
+
+        var pool = try wasm_filter_mod.Pool.init(allocator, FILTER, .{ .instances = 2 });
+        defer pool.deinit();
+
+        var cfg = config.ServerConfig.default();
+        cfg.max_connections = 1;
+        cfg.buffer_pool = .{ .buffer_size = 16 * 1024, .buffer_count = 8 };
+
+        var app_router = router.Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+        try app_router.get("/enrich", h2EnrichHandler);
+        try app_router.get("/plain", h2PlainHandler);
+        _ = app_router.attachWasmFilter("/enrich", &pool, wasm_filter_mod.DEFAULT_FUEL);
+
+        var server = try Server.initWithRouter(allocator, cfg, app_router);
+        defer server.deinit();
+        server.wasm_mock_enabled = true;
+        server.wasm_mock_reply = "ok"; // probe resumes /enrich to .allow
+
+        const conn = server.io.acquireConnection(server.io.nowMs()) orelse return error.OutOfMemory;
+        defer if (conn.state != .closed) server.io.releaseConnection(conn);
+        conn.protocol = .http2;
+        var stack = http2.Stack.init();
+        _ = stack.openTestStream(1);
+        _ = stack.openTestStream(3);
+        conn.http2_stack = &stack;
+
+        // Stream 1 -> /enrich: the filter stages a host_call and PARKS. No frames
+        // are queued for it yet; the stream stays suspended.
+        const req1 = request.RequestView{ .method = .GET, .path = "/enrich", .headers = &.{} };
+        try dispatchHttp2Request(&server, conn, 1, req1, "");
+        try testing.expectEqual(@as(usize, 1), server.wasm_host_calls.liveCount());
+        try testing.expect(server.wasmHasParkForStream(conn.index, conn.id, 1));
+        try testing.expect(findH2Frame(conn, .headers, 1) == null);
+        try testing.expectEqual(@as(usize, 1), server.wasm_mock_count);
+
+        // Stream 3 -> /plain: a SIBLING stream completes immediately while stream
+        // 1 is still parked. The connection kept multiplexing.
+        const req3 = request.RequestView{ .method = .GET, .path = "/plain", .headers = &.{} };
+        try dispatchHttp2Request(&server, conn, 3, req3, "");
+        const sib_body = findH2Frame(conn, .data, 3) orelse return error.SiblingNotDelivered;
+        try testing.expectEqualStrings("plain-ok", sib_body);
+        // Stream 1 still parked, still no response.
+        try testing.expect(findH2Frame(conn, .headers, 1) == null);
+        try testing.expectEqual(@as(usize, 1), server.wasm_host_calls.liveCount());
+
+        // Complete the parked host call (mock): resumes stream 1 -> allow ->
+        // re-dispatch the handler -> deliver "enriched" on stream 1.
+        const n = server.wasm_mock_count;
+        var k: usize = 0;
+        while (k < n) : (k += 1) dispatch.wasmComplete(&server, server.wasm_mock_pending[k], "ok");
+        server.wasm_mock_count = 0;
+
+        try testing.expectEqual(@as(usize, 0), server.wasm_host_calls.liveCount()); // released
+        const enriched = findH2Frame(conn, .data, 1) orelse return error.ResumeNotDelivered;
+        try testing.expectEqualStrings("enriched", enriched);
+        // HEADERS for stream 1 present too.
+        try testing.expect(findH2Frame(conn, .headers, 1) != null);
+
+        drainH2WriteQueue(&server, conn);
+    } else return error.SkipZigTest;
+}
+
+test "wasm h2: RST_STREAM during park releases the pinned instance (no leak)" {
+    if (build_options.enable_http2 and build_options.enable_wasm) {
+        const FILTER = @embedFile("../wasm/testdata/filter_probe.wasm");
+
+        var gpa = std.heap.DebugAllocator(.{}){};
+        defer _ = gpa.deinit();
+        const allocator = gpa.allocator();
+
+        var pool = try wasm_filter_mod.Pool.init(allocator, FILTER, .{ .instances = 1 });
+        defer pool.deinit();
+
+        var cfg = config.ServerConfig.default();
+        cfg.max_connections = 1;
+        cfg.buffer_pool = .{ .buffer_size = 16 * 1024, .buffer_count = 8 };
+
+        var app_router = router.Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+        try app_router.get("/enrich", h2EnrichHandler);
+        _ = app_router.attachWasmFilter("/enrich", &pool, wasm_filter_mod.DEFAULT_FUEL);
+
+        var server = try Server.initWithRouter(allocator, cfg, app_router);
+        defer server.deinit();
+        server.wasm_mock_enabled = true;
+        server.wasm_mock_reply = "ok";
+
+        const conn = server.io.acquireConnection(server.io.nowMs()) orelse return error.OutOfMemory;
+        defer if (conn.state != .closed) server.io.releaseConnection(conn);
+        conn.protocol = .http2;
+        var stack = http2.Stack.init();
+        _ = stack.openTestStream(1);
+        conn.http2_stack = &stack;
+        conn.h2_pending = try allocator.create([connection.MAX_PENDING_H2_BODIES]connection.PendingH2Body);
+        defer allocator.destroy(conn.h2_pending.?);
+        conn.h2_pending.?.* = [_]connection.PendingH2Body{.{}} ** connection.MAX_PENDING_H2_BODIES;
+
+        // Park stream 1. The single pool instance is now pinned.
+        const req1 = request.RequestView{ .method = .GET, .path = "/enrich", .headers = &.{} };
+        try dispatchHttp2Request(&server, conn, 1, req1, "");
+        try testing.expectEqual(@as(usize, 1), server.wasm_host_calls.liveCount());
+
+        // Feed an RST_STREAM frame for stream 1 through the real read path. The
+        // stack emits a stream_reset event; handleHttp2Read calls cancelForStream,
+        // releasing the pinned instance back to the pool (no leak).
+        const rbuf = server.io.acquireBuffer() orelse return error.OutOfMemory;
+        conn.read_buffer = rbuf;
+        // The stack's ingest consumes the client connection preface before any
+        // frame, so prepend it ahead of the RST_STREAM.
+        @memcpy(rbuf.bytes[0..http2.Preface.len], http2.Preface);
+        var rst: [13]u8 = undefined;
+        const rst_len = try http2.writeRstStream(&rst, 1, 0x8); // CANCEL
+        @memcpy(rbuf.bytes[http2.Preface.len..][0..rst_len], rst[0..rst_len]);
+        conn.read_offset = 0;
+        conn.read_buffered_bytes = http2.Preface.len + rst_len;
+
+        try handleHttp2Read(&server, conn);
+
+        try testing.expectEqual(@as(usize, 0), server.wasm_host_calls.liveCount()); // released
+        // The freed instance is reacquirable from the single-instance pool.
+        try testing.expect(pool.acquire() != null);
+
+        drainH2WriteQueue(&server, conn);
+        server.io.releaseBuffer(rbuf);
+        conn.read_buffer = null;
+    } else return error.SkipZigTest;
 }

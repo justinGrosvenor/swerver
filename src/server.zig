@@ -619,6 +619,26 @@ pub const Server = struct {
         }
     }
 
+    /// Is a WASM filter parked on this specific stream (generation-checked)? Used
+    /// by the H2/H3 dispatch (E2) to confirm a park-sentinel response really
+    /// registered a park before suspending the stream.
+    pub fn wasmHasParkForStream(self: *Server, conn_index: u32, conn_id: u64, stream_id: u32) bool {
+        if (build_options.enable_wasm) {
+            return self.wasm_host_calls.hasParkForStream(conn_index, conn_id, stream_id);
+        }
+        return false;
+    }
+
+    /// Release a WASM park bound to a single multiplexed stream (RST_STREAM /
+    /// QUIC stream reset). The pinned instance is returned to its pool; the
+    /// connection's other parked streams are untouched. The per-stream
+    /// counterpart to wasmCancelForConn, used by H2/H3 (E2).
+    pub fn wasmCancelForStream(self: *Server, conn_index: u32, conn_id: u64, stream_id: u32) void {
+        if (build_options.enable_wasm) {
+            _ = self.wasm_host_calls.cancelForStream(conn_index, conn_id, stream_id);
+        }
+    }
+
     /// Transport start hook (set as WasmBinding.start_fn). Initiates the host
     /// call for a freshly parked filter. The real control-socket transport (C3)
     /// takes precedence: it writes the staged command line to the sandbox's
