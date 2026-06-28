@@ -778,7 +778,8 @@ fn pgResume(ctx: *anyopaque, outcome: *const pg_client_mod.Outcome) void {
 /// FILTER parked before the handler, so allow/modify RE-DISPATCH the request
 /// (re-enter router.handle with the filter skipped so the handler runs); reject
 /// and backpressure are served directly. The transport (C1) and the deadline
-/// tick call this. H1 only. Compiled only when wasm is enabled.
+/// tick call this. Routes delivery by completion.protocol: .http1 is implemented;
+/// .http2/.http3 are E2 stubs. Compiled only when wasm is enabled.
 fn wasmResume(server: *Server, completion: wasm_host_call_mod.Completion) void {
     switch (completion.protocol) {
         .http1 => {},

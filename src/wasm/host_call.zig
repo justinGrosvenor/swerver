@@ -2,11 +2,14 @@
 //!
 //! When a filter stages a host_call and parks, its instance is pinned
 //! (filter.invokeOutcome leaves it `.parked`) and an entry is recorded here,
-//! tying the pinned instance to the HTTP connection that is waiting. When the
+//! tying the pinned instance to the waiting (connection, stream) -- keyed by
+//! (conn_index, conn_id, stream_id, protocol) so HTTP/1, HTTP/2, and HTTP/3 all
+//! use one model (E0). The slot OWNS a snapshot of the request, so resume does
+//! not depend on a pinned read buffer (H2/H3 frame buffers get reused). When the
 //! outbound call completes on the reactor, `complete(token, result)` resumes the
 //! filter (re-enters on_resume) and yields the terminal Decision plus the
-//! connection linkage the server needs to deliver it. Failures, wall-clock
-//! deadlines, and client disconnects each release the pinned instance.
+//! (connection, stream) linkage the server needs to deliver it. Failures,
+//! wall-clock deadlines, and client disconnects each release the pinned instance.
 //!
 //! This is the transport-agnostic core: it knows nothing about sockets. The
 //! reactor transport (an async outbound client on the external-fd primitive) and
@@ -37,6 +40,15 @@ pub const Protocol = middleware.Context.Protocol;
 /// these bounds fails the park (the caller fails closed), matching the
 /// table-full behavior. method_raw + path + header name/value bytes + a small
 /// body all share `buf`.
+// Per-slot OWNED request snapshot bounds. A request whose method/path/headers/
+// body do not fit fails the park CLOSED rather than truncating (which could drop
+// an auth header and change a verdict). Kept at 4 KiB because the snapshot is
+// embedded by value (ReqSnapshot x Table.CAP lives inside Server); larger caps
+// push Server past the test thread's stack. 4 KiB covers typical requests; a
+// request with very large headers (big JWT + many cookies) on a PARKED route
+// currently fails closed. The tracked lift (task E0-FU in PLAN-NEXT.md) is to
+// heap-allocate the snapshot sized to the request -- removing both the ceiling
+// and the fixed footprint (parks are rare, so a per-park alloc is fine).
 const SNAP_BUF_CAP = 4096;
 const SNAP_MAX_HEADERS = 32;
 
