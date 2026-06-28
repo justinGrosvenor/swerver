@@ -4,7 +4,7 @@
 //!   - response body starting with "boom": set status 403 + replace body.
 //!   - response body == "transform-me": replace body with "transformed".
 //!   - request path "/raw": return 1 (opt out -> serve original unchanged).
-//!   - request path "/trap": trap (integer div by zero) -> host fails OPEN.
+//!   - request path "/trap": trap (a genuine OOB ABI pointer) -> host fails OPEN.
 //!   - request path "/spin": infinite loop (fuel trap) -> host fails OPEN.
 //!   - request path "/grow": memory.grow past the cap -> replace body with a
 //!     "grow-refused" marker (proves the cap holds inside on_response).
@@ -30,6 +30,17 @@ var path_buf: [1024]u8 = undefined;
 var body_buf: [4096]u8 = undefined;
 
 export fn on_request() i32 {
+    // For "/dual": stage a request-phase response header and return MODIFY (2).
+    // Combined with on_response (which stages its own header on the SAME pooled
+    // instance), this exercises the modify-headers-survive-the-response-phase fix
+    // (the request-phase header must not be clobbered when the instance is reused).
+    const plen = @min(get_path(&path_buf, path_buf.len), path_buf.len);
+    if (std.mem.eql(u8, path_buf[0..plen], "/dual")) {
+        const hn = "x-req-modify";
+        const hv = "from-on-request";
+        set_response_header(hn.ptr, hn.len, hv.ptr, hv.len);
+        return 2; // modify: stage response headers, continue the chain
+    }
     return 0; // allow: let the handler run, filter on the way out
 }
 

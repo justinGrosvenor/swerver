@@ -1028,15 +1028,23 @@ fn proxyForwardAndRespond(
 
     try http1_mod.queueResponse(server, conn, proxy_result.resp);
     if (conn.pending_body.len > 0) {
-        if (proxy_result.takeOwnedBuf()) |owned| {
-            // Large proxied response: the unsent tail points into the proxy's
-            // heap buffer. Take ownership so it outlives proxy_result.release();
-            // freed when the tail drains (handleWrite) or the connection closes.
+        // The unsent tail must outlive proxy_result.release(). It lives in the
+        // upstream heap buffer ONLY when the body was forwarded as-is; a Phase 2b
+        // on_response that REPLACED the body (or maybeCompress) repoints resp.body
+        // into the wasm instance scratch / compress scratch, which does NOT alias
+        // owned_buf and is released/reused after this call. So take the owned
+        // buffer ONLY when the tail actually lies within it; otherwise copy the
+        // tail into stable pool buffers now (while the scratch is still valid).
+        const tail = conn.pending_body;
+        const within_owned = if (proxy_result.owned_buf) |owned|
+            @intFromPtr(tail.ptr) >= @intFromPtr(owned.ptr) and
+                @intFromPtr(tail.ptr) + tail.len <= @intFromPtr(owned.ptr) + owned.len
+        else
+            false;
+        if (within_owned) {
             std.debug.assert(conn.pending_body_owned == null);
-            conn.pending_body_owned = owned;
+            conn.pending_body_owned = proxy_result.takeOwnedBuf();
         } else {
-            // Pool-buffer response: copy the tail out before proxy_result.release()
-            // frees the upstream buffer.
             http1_mod.materializePendingBody(server, conn);
         }
     }

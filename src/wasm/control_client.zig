@@ -159,16 +159,34 @@ pub const ControlClient = struct {
     /// newline that the line protocol requires is appended here.
     pub fn startCall(self: *ControlClient, io_rt: *io_mod.IoRuntime, token: Token, cmd: []const u8) void {
         // Security choke (D2-1): a Tier-1 wasm filter must not drive the Tier-2
-        // control plane. `cmd` is filter-supplied and written verbatim to the
-        // Nether control socket, where swerver is the PRIMARY (driving) client.
+        // control plane. `cmd` is filter-supplied bytes (the host_call payload,
+        // copied verbatim) written to the Nether control socket, where swerver is
+        // the PRIMARY (driving) client. The socket is a `\n`-delimited line
+        // protocol and issueAt appends one trailing `\n`, so this MUST stay a
+        // single line: an EMBEDDED `\n` (or `\r`) would be delivered to Nether as
+        // a SECOND command line, smuggling a reserved verb past the prefix check
+        // below (e.g. "lookup\n__shutdown__"). An embedded `0x1e` could also forge
+        // a reply trailer. Reject any such payload, fail-closed, before the verb
+        // check -- this covers both the immediate and the queued (copied) paths.
+        for (cmd) |b| {
+            if (b == '\n' or b == '\r' or b == RS) {
+                std.log.warn("wasm control ({s}): blocked filter host_call with an embedded control byte (newline/CR/0x1e); failing closed", .{self.path});
+                self.failOne(token);
+                return;
+            }
+        }
         // Nether reserves the `__verb__` namespace for control verbs
-        // (__shutdown__, __put__/__get__ against the HOST fs, __stats__, ...), so
-        // any payload whose first line begins with "__" is neutralized: fail the
-        // call closed and never let the bytes reach the socket. Normal shell
-        // commands and the `E2E ...` command are untouched; the handshake
-        // __info__ is sent internally by sendInfo, not via startCall.
-        if (std.mem.startsWith(u8, cmd, "__")) {
-            std.log.warn("wasm control ({s}): blocked reserved control verb from filter host_call (payload begins with \"__\"); failing closed", .{self.path});
+        // (__shutdown__, __put__/__get__ against the HOST fs, __stats__, ...).
+        // Neutralize any payload whose (whitespace-trimmed) first token begins
+        // with "__": fail the call closed, never let the bytes reach the socket.
+        // Trim leading whitespace first so " __shutdown__" cannot sneak past a
+        // downstream parser that trims. Normal shell + `E2E ...` commands are
+        // untouched; the handshake __info__ is sent internally, not via startCall.
+        var hs: usize = 0;
+        while (hs < cmd.len and (cmd[hs] == ' ' or cmd[hs] == '\t')) hs += 1;
+        const head = cmd[hs..];
+        if (std.mem.startsWith(u8, head, "__")) {
+            std.log.warn("wasm control ({s}): blocked reserved control verb from filter host_call (begins with \"__\"); failing closed", .{self.path});
             self.failOne(token);
             return;
         }
@@ -749,6 +767,38 @@ test "startCall: a reserved __verb__ payload fails closed and never enqueues" {
     cc.startCall(&io_rt, 12, "E2E /x tok");
     try testing.expectEqual(@as(usize, 1), cc.q_count);
     try testing.expect(Captured.failed == null);
+}
+
+test "startCall: embedded-newline and leading-ws control-verb injection is blocked" {
+    Captured.reset();
+    var dummy: u8 = 0;
+    var cc = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
+    cc.installResume(@ptrCast(&dummy), Captured.complete, Captured.fail);
+    var io_rt: io_mod.IoRuntime = undefined; // guard fails before any I/O
+
+    // CRITICAL regression: a filter must not smuggle a SECOND control line via an
+    // embedded newline. "lookup\n__shutdown__" would otherwise pass the prefix
+    // check (does not start with "__") and reach Nether as two lines, the second
+    // a reserved verb. The embedded-control-byte guard fails it closed.
+    const injections = [_][]const u8{
+        "lookup\n__shutdown__", // embedded LF -> second command line
+        "lookup\r\n__shutdown__", // CR + LF
+        "x\x1edenied", // embedded 0x1e -> forged reply trailer
+        " __shutdown__", // leading space before the reserved verb
+        "\t__put__ /etc/passwd /x", // leading tab
+    };
+    for (injections, 0..) |payload, i| {
+        Captured.reset();
+        cc.state = .ready; // would issue immediately if not blocked
+        cc.inflight = null;
+        cc.send_len = 0;
+        cc.q_count = 0;
+        cc.startCall(&io_rt, @intCast(100 + i), payload);
+        try testing.expectEqual(@as(?Token, @intCast(100 + i)), Captured.failed);
+        try testing.expectEqual(@as(usize, 0), cc.q_count); // never enqueued
+        try testing.expect(cc.inflight == null); // never issued
+        try testing.expectEqual(@as(usize, 0), cc.send_len); // nothing reached the socket
+    }
 }
 
 test "handleReadable: real fd read path parses a framed reply and completes" {

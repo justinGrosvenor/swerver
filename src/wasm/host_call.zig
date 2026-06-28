@@ -149,6 +149,12 @@ pub const Table = struct {
     // resuming the new occupant with the wrong host-call result.
     const INDEX_BITS = 8; // CAP (64) fits in 8 bits
     const INDEX_MASK: Token = (1 << INDEX_BITS) - 1;
+    // The index must fit in INDEX_BITS, else live()'s mask would alias slots and
+    // the generation could be truncated. Pin it at comptime so raising CAP past
+    // 256 is a compile error, not a silent token-aliasing bug.
+    comptime {
+        std.debug.assert(CAP <= INDEX_MASK + 1);
+    }
 
     const Slot = struct {
         active: bool = false,
@@ -193,7 +199,11 @@ pub const Table = struct {
         resume_fuel: i64,
         resume_ctx: ?*anyopaque,
     ) ?Token {
-        std.debug.assert(instance.state == .parked);
+        // Runtime fail-closed guard (NOT a debug assert, which compiles out in
+        // ReleaseFast): registering a non-parked instance would corrupt a live or
+        // idle instance on resume. Caller treats null as table-full -> cancelPark
+        // + 503. (Mirrors the same guard in filter.resumeCall.)
+        if (instance.state != .parked) return null;
         for (&self.slots, 0..) |*s, i| {
             if (!s.active) {
                 // Build the owned snapshot in-place first; bail (caller fails

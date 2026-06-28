@@ -21,10 +21,42 @@ const wasm_host_call = if (build_options.enable_wasm) @import("../wasm/host_call
 /// response gets serialized. Sized to hold the handler's max + the
 /// middleware chain's max + a WASM filter's request-modify and response-phase
 /// headers in one pass. See `Router.handle`.
-threadlocal var merged_headers_tls: [MAX_RESPONSE_HEADERS + middleware.Chain.MAX_MIDDLEWARE_HEADERS + MAX_RESPONSE_HEADERS + 2]response.Header = undefined;
+// Holds, in one pass: handler headers + middleware headers + the WASM
+// request-modify bucket + the WASM response-phase bucket + 2 x402 receipt
+// headers. Three MAX_RESPONSE_HEADERS buckets (handler, modify, response) so a
+// full handler plus both wasm buckets never silently truncates a (security) header.
+threadlocal var merged_headers_tls: [3 * MAX_RESPONSE_HEADERS + middleware.Chain.MAX_MIDDLEWARE_HEADERS + 2]response.Header = undefined;
+/// Stable copy of the request-phase WASM modify headers, taken BEFORE the
+/// response phase runs. The modify headers' name/value bytes live in the filter
+/// instance's scratch; the response phase reuses the SAME pooled instance and its
+/// resetStaging + on_response overwrite that scratch, so without this copy the
+/// modify headers would be clobbered (dropped/garbled) by the time of the merge.
+threadlocal var wasm_modify_hdr_tls: [MAX_RESPONSE_HEADERS]response.Header = undefined;
+threadlocal var wasm_modify_bytes_tls: [8192]u8 = undefined;
 threadlocal var x402_receipt_tls: response.Header = undefined;
 threadlocal var x402_receipt_v1_tls: response.Header = undefined;
 threadlocal var x402_has_receipt: bool = false;
+
+/// Copy WASM modify headers (name+value bytes) into a stable threadlocal so they
+/// survive the response phase reusing the same filter instance. Returns the
+/// stabilized slice (a prefix dropped on overflow, bounds-checked).
+fn stabilizeWasmModifyHeaders(src: []const response.Header) []const response.Header {
+    var off: usize = 0;
+    var n: usize = 0;
+    for (src) |h| {
+        if (n >= wasm_modify_hdr_tls.len) break;
+        if (off + h.name.len + h.value.len > wasm_modify_bytes_tls.len) break;
+        @memcpy(wasm_modify_bytes_tls[off..][0..h.name.len], h.name);
+        const name = wasm_modify_bytes_tls[off..][0..h.name.len];
+        off += h.name.len;
+        @memcpy(wasm_modify_bytes_tls[off..][0..h.value.len], h.value);
+        const value = wasm_modify_bytes_tls[off..][0..h.value.len];
+        off += h.value.len;
+        wasm_modify_hdr_tls[n] = .{ .name = name, .value = value };
+        n += 1;
+    }
+    return wasm_modify_hdr_tls[0..n];
+}
 
 /// Errors surfaced by `Router` registration and routing.
 ///
@@ -1278,6 +1310,13 @@ pub const Router = struct {
                 if (r.wasm_pool) |pool_ptr| {
                     const pool: *wasm_filter.Pool = @ptrCast(@alignCast(pool_ptr));
                     if (pool.hasResponseHook()) {
+                        // The response phase reuses the SAME pooled instance whose
+                        // scratch the request-phase modify headers point into;
+                        // copy them to stable storage BEFORE runResponse so the
+                        // merge below does not read clobbered bytes.
+                        if (wasm_modify_headers.len > 0) {
+                            wasm_modify_headers = stabilizeWasmModifyHeaders(wasm_modify_headers);
+                        }
                         const edit = pool.runResponse(&req, &result_resp, r.wasm_fuel);
                         if (edit.new_status) |s| result_resp.status = s;
                         if (edit.new_body) |b| result_resp.body = .{ .bytes = b };
@@ -2129,6 +2168,49 @@ test "wasm: Phase 2b response filter edits the handler response via handle" {
         // on_response saw the "boom" body -> 403 + replacement body.
         try std.testing.expectEqual(@as(u16, 403), result.resp.status);
         try std.testing.expectEqualStrings("blocked by edge", result.resp.bodyBytes());
+    } else return error.SkipZigTest;
+}
+
+test "wasm: on_request modify + on_response on the same instance both survive (no clobber)" {
+    if (build_options.enable_wasm) {
+        // Regression for the audit HIGH: the request-phase modify header's bytes
+        // live in the filter instance scratch; the response phase reuses the SAME
+        // pooled instance (instances=1) and overwrites that scratch. Without the
+        // stabilize-before-runResponse fix, the modify header is clobbered/dropped.
+        const RESP_FILTER = @embedFile("../wasm/testdata/response_probe.wasm");
+        var pool = try wasm_filter.Pool.init(std.testing.allocator, RESP_FILTER, .{ .instances = 1 });
+        defer pool.deinit();
+
+        var router = Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+        const handler = struct {
+            fn h(ctx: *HandlerContext) response.Response {
+                return ctx.text(200, "ok");
+            }
+        }.h;
+        try router.get("/dual", handler);
+        _ = router.attachWasmFilter("/dual", &pool, wasm_filter.DEFAULT_FUEL);
+
+        var response_buf: [RESPONSE_BUF_SIZE]u8 = undefined;
+        var response_headers: [MAX_RESPONSE_HEADERS]response.Header = undefined;
+        var arena_buf: [ARENA_BUF_SIZE]u8 = undefined;
+        var mw_ctx = middleware.Context{};
+        var scratch = HandlerScratch{ .response_buf = response_buf[0..], .response_headers = response_headers[0..], .arena_buf = arena_buf[0..] };
+        const req = request.RequestView{ .method = .GET, .path = "/dual", .headers = &.{} };
+        const result = router.handle(req, &mw_ctx, &scratch);
+
+        // BOTH the request-phase modify header and the response-phase header must
+        // be present and intact (the modify one was the clobber victim).
+        var saw_modify = false;
+        var saw_response = false;
+        for (result.resp.headers) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "x-req-modify")) {
+                saw_modify = true;
+                try std.testing.expectEqualStrings("from-on-request", h.value);
+            }
+            if (std.ascii.eqlIgnoreCase(h.name, "x-wasm-response")) saw_response = true;
+        }
+        try std.testing.expect(saw_modify); // not clobbered by the response phase
+        try std.testing.expect(saw_response);
     } else return error.SkipZigTest;
 }
 

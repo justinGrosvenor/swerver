@@ -411,6 +411,14 @@ fn hostGetHeader(rt: c.IM3Runtime, ctx: c.IM3ImportContext, sp: [*c]u64, mem: ?*
     return null;
 }
 
+/// Framing / hop-by-hop headers a filter must not stage (the server owns these;
+/// a staged copy would duplicate/conflict -> response smuggling).
+fn isFramingHeader(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "content-length") or
+        std.ascii.eqlIgnoreCase(name, "transfer-encoding") or
+        std.ascii.eqlIgnoreCase(name, "connection");
+}
+
 fn hostSetResponseHeader(rt: c.IM3Runtime, ctx: c.IM3ImportContext, sp: [*c]u64, mem: ?*anyopaque) callconv(.c) ?*const anyopaque {
     _ = ctx;
     const inst = active orelse return trap(TRAP_NO_ACTIVE);
@@ -421,6 +429,12 @@ fn hostSetResponseHeader(rt: c.IM3Runtime, ctx: c.IM3ImportContext, sp: [*c]u64,
     if (inst.staged_header_count >= inst.staged_headers.len) return null; // silently capped
     const name_src = guestView(rt, mem, name_ptr, name_len) orelse return trap(TRAP_OOB);
     const val_src = guestView(rt, mem, val_ptr, val_len) orelse return trap(TRAP_OOB);
+    // Drop framing / hop-by-hop headers a filter must not control: the server
+    // computes Content-Length from the body and owns connection framing, so a
+    // staged Content-Length / Transfer-Encoding (or Connection) would produce a
+    // conflicting duplicate -> response smuggling. Filters run untrusted code, so
+    // this is a real surface; ignore the staged header rather than emit it.
+    if (isFramingHeader(name_src)) return null;
     const name = inst.stash(name_src) orelse return null; // scratch full: drop
     const val = inst.stash(val_src) orelse return null;
     inst.staged_headers[inst.staged_header_count] = .{ .name = name, .value = val };
