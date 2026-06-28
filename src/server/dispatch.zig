@@ -48,10 +48,10 @@ const pg_client_mod = @import("../db/pg/client.zig");
 const pg_handler_api = @import("../db/pg/handler_api.zig");
 const wasm_host_call_mod = if (build_options.enable_wasm) @import("../wasm/host_call.zig") else struct {};
 const wasm_control_mod = if (build_options.enable_wasm) @import("../wasm/control_client.zig") else struct {};
-/// Wall-clock deadline for an in-flight WASM filter host call (design 10.0). The
-/// reactor tick fails closed past this; fuel bounds compute, this backstops a
-/// stalled host call (a slow/dead guest).
-const WASM_HOST_CALL_TIMEOUT_MS: u64 = 30_000;
+// The WASM filter host-call (park) deadline is configurable per-server via
+// `Server.wasm_host_call_deadline_ms` (default 30s). Binding sites below set the
+// park `deadline_ms` from it; the reactor tick fails the call closed past it
+// (fuel bounds compute, this backstops a stalled/dead guest).
 const http2_mod = @import("http2.zig");
 const http3_mod = @import("http3.zig");
 const preencoded = @import("preencoded.zig");
@@ -865,7 +865,7 @@ fn wasmResume(server: *Server, completion: wasm_host_call_mod.Completion) void {
                     .conn_id = completion.conn_id,
                     .stream_id = completion.stream_id, // 0 for H1
                     .protocol = .http1,
-                    .deadline_ms = server.now_ms + WASM_HOST_CALL_TIMEOUT_MS,
+                    .deadline_ms = server.now_ms + server.wasm_host_call_deadline_ms,
                     .resume_decision = completion.decision,
                 },
             };
@@ -1178,7 +1178,7 @@ fn wasmResumeHttp2(server: *Server, completion: wasm_host_call_mod.Completion) v
                         .conn_id = completion.conn_id,
                         .stream_id = stream_id,
                         .protocol = .http2,
-                        .deadline_ms = server.now_ms + WASM_HOST_CALL_TIMEOUT_MS,
+                        .deadline_ms = server.now_ms + server.wasm_host_call_deadline_ms,
                         .resume_decision = completion.decision,
                     },
                 };
@@ -1974,7 +1974,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
                     .conn_id = conn.id,
                     .stream_id = 0, // H1 sentinel
                     .protocol = .http1,
-                    .deadline_ms = server.now_ms + WASM_HOST_CALL_TIMEOUT_MS,
+                    .deadline_ms = server.now_ms + server.wasm_host_call_deadline_ms,
                     .resume_ctx = @ptrCast(&conn.wasm_proxy_resume),
                     .start_fn = wasmStartThunk,
                     .start_ctx = @ptrCast(server),
@@ -2088,7 +2088,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
                 .conn_id = conn.id,
                 .stream_id = 0, // H1 sentinel
                 .protocol = .http1,
-                .deadline_ms = server.now_ms + WASM_HOST_CALL_TIMEOUT_MS,
+                .deadline_ms = server.now_ms + server.wasm_host_call_deadline_ms,
                 .start_fn = if (build_options.enable_wasm) wasmStartThunk else null,
                 .start_ctx = if (build_options.enable_wasm) @ptrCast(server) else null,
             },

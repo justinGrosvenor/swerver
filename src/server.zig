@@ -130,6 +130,13 @@ pub const Server = struct {
     /// drives host calls over the sandbox's control socket (proto_version=1),
     /// superseding the mock. Build-flag-free slice; borrowed, must outlive run().
     wasm_control_socket_path: []const u8 = "",
+    /// Park (host_call) deadline in ms: how long a wasm filter may stay parked on
+    /// a host call before the host_call.Table fails it closed. Default 30s (the
+    /// historical hardcoded value). Plumbed into the H1/H2 binding `deadline_ms`
+    /// and into the ControlClient's per-command timeout so the transport does not
+    /// out-live the park. Lowerable (e.g. via the e2e env) so timeout assertions
+    /// do not wait 30s. Per-server today; a per-route field is a future refinement.
+    wasm_host_call_deadline_ms: u64 = 30_000,
     /// Per-worker control-socket client (the real C3 transport). Opaque so the
     /// Server struct needs no build-flag gating; a *wasm.control_client.ControlClient
     /// when enabled and a path is configured, else null.
@@ -683,6 +690,9 @@ pub const Server = struct {
             self.wasm_control_socket_path,
             wasm_control_mod.DEFAULT_SLOT,
         );
+        // Keep the transport's per-command budget aligned with the park deadline so
+        // the socket does not out-live the park (lets a test set a sub-second one).
+        cc.command_timeout_ms = self.wasm_host_call_deadline_ms;
         self.wasm_control = @ptrCast(cc);
         std.log.info("wasm control transport -> {s} (slot {d})", .{ self.wasm_control_socket_path, wasm_control_mod.DEFAULT_SLOT });
     }

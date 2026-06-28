@@ -68,6 +68,17 @@ pub fn main() !void {
     server.wasm_filter_specs = &specs;
     server.wasm_control_socket_path = sock_path;
 
+    // Optional override of the host_call (park) deadline so a timeout e2e does not
+    // wait the 30s default. Unset -> the built-in default stands.
+    if (envDup("WASM_HOST_CALL_DEADLINE_MS")) |v| {
+        const ms = std.fmt.parseInt(u64, std.mem.trim(u8, v, " \t\r\n"), 10) catch {
+            std.log.err("WASM_HOST_CALL_DEADLINE_MS is not a valid u64: '{s}'", .{v});
+            return error.BadDeadline;
+        };
+        server.wasm_host_call_deadline_ms = ms;
+        std.log.info("wasm host_call deadline overridden to {d} ms", .{ms});
+    }
+
     std.log.info("wasm proxy e2e on :{d} (/agent/* -> filter parks -> control {s} -> forward :{d})", .{ cfg.port, sock_path, up_port });
     try server.run(null);
 }

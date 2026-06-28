@@ -118,6 +118,10 @@ pub const ControlClient = struct {
     // Token whose reply we are currently reading (null = idle / handshaking).
     inflight: ?Token = null,
     command_deadline_ms: u64 = 0,
+    /// Per-command wall-clock budget. Defaults to COMMAND_TIMEOUT_MS (30s); the
+    /// server overrides it from `wasm_host_call_deadline_ms` so the transport does
+    /// not out-live the park deadline (lets a test set a sub-second timeout).
+    command_timeout_ms: u64 = COMMAND_TIMEOUT_MS,
     /// Non-zero while a complete bare ERR/OK command reply is buffered with no
     /// 0x1e: the deadline by which a 0x1e must arrive for it to count as framed.
     settle_deadline_ms: u64 = 0,
@@ -440,7 +444,7 @@ pub const ControlClient = struct {
         self.inflight = token;
         self.recv_len = 0;
         self.settle_deadline_ms = 0;
-        self.command_deadline_ms = now_ms + COMMAND_TIMEOUT_MS;
+        self.command_deadline_ms = now_ms + self.command_timeout_ms;
         _ = self.flushSend(io_rt, now_ms);
     }
 
@@ -775,4 +779,37 @@ test "handleReadable: real fd read path parses a framed reply and completes" {
     try testing.expectEqualStrings("user found\x1e0\n", Captured.body[0..Captured.body_len]);
     try testing.expect(cc.inflight == null);
     try testing.expectEqual(@as(usize, 0), cc.recv_len);
+}
+
+test "issueAt: command_deadline uses the configured command_timeout_ms (default + override)" {
+    var dummy: u8 = 0;
+    var io_rt: io_mod.IoRuntime = undefined; // touched only on the (unhit) fail path
+
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(@intCast(AF_UNIX), @intCast(std.posix.SOCK.STREAM), 0, &fds) != 0) return error.SocketpairFailed;
+    defer clock.closeFd(fds[0]);
+    defer clock.closeFd(fds[1]);
+    try net.setNonBlocking(fds[0]);
+
+    // Default (unset): the 30s const is the per-command budget.
+    {
+        var cc = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
+        cc.installResume(@ptrCast(&dummy), Captured.complete, Captured.fail);
+        cc.fd = fds[0];
+        cc.state = .ready;
+        try testing.expectEqual(COMMAND_TIMEOUT_MS, cc.command_timeout_ms);
+        cc.issueAt(&io_rt, 1_000, 5, "E2E /x tok");
+        try testing.expectEqual(@as(u64, 1_000 + COMMAND_TIMEOUT_MS), cc.command_deadline_ms);
+    }
+
+    // Override (server sets a sub-second budget): the deadline tracks it.
+    {
+        var cc = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
+        cc.installResume(@ptrCast(&dummy), Captured.complete, Captured.fail);
+        cc.fd = fds[0];
+        cc.state = .ready;
+        cc.command_timeout_ms = 250;
+        cc.issueAt(&io_rt, 1_000, 6, "E2E /x tok");
+        try testing.expectEqual(@as(u64, 1_250), cc.command_deadline_ms);
+    }
 }
