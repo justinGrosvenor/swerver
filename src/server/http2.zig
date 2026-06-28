@@ -321,6 +321,13 @@ pub fn handleHttp2Read(server: *Server, conn: *connection.Connection) !void {
                 .err => |err_event| {
                     if (err_event.stream_id != 0) {
                         sendRstStream(server, conn, err_event.stream_id, @intFromEnum(err_event.code));
+                        // Server-initiated stream RST: release any WASM filter
+                        // parked on it (E2a), same as a peer RST_STREAM, so a
+                        // later completion does not queue frames on a reset
+                        // stream and the pinned instance returns to its pool.
+                        if (build_options.enable_wasm) {
+                            server.wasmCancelForStream(conn.index, conn.id, err_event.stream_id);
+                        }
                     }
                 },
                 .stream_reset => |rst_event| {
@@ -988,8 +995,15 @@ fn dispatchHttp2Request(
             // the response on this stream once the host call completes.
             if (build_options.enable_wasm and proxy_result.resp.isParked()) {
                 if (server.wasmHasParkForStream(conn.index, conn.id, stream_id)) return;
-                // Sentinel without a live park (should not happen): fail closed.
-                try queueHttp2Response(server, conn, stream_id, Server.badRequestResponse(), hdr_request.method == .HEAD);
+                // Sentinel without a live park (programmer error / orphaned park):
+                // release any orphan and fail closed, mirroring the router orphan
+                // branch below (500, with the cancel to avoid an instance leak).
+                server.wasmCancelForStream(conn.index, conn.id, stream_id);
+                try queueHttp2Response(server, conn, stream_id, .{
+                    .status = 500,
+                    .headers = &.{},
+                    .body = .{ .bytes = "Internal Server Error" },
+                }, hdr_request.method == .HEAD);
                 return;
             }
             try queueHttp2Response(server, conn, stream_id, proxy_result.resp, hdr_request.method == .HEAD);
