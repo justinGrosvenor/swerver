@@ -1126,6 +1126,7 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
                 now_ms,
                 auth_info_ptr,
                 cert_dn,
+                .{}, // no park binding on the body-accumulation path yet (filter fails closed on park)
             );
             defer proxy_result.release();
 

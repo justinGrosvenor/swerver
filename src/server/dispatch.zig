@@ -798,6 +798,22 @@ fn wasmResume(server: *Server, completion: wasm_host_call_mod.Completion) void {
             if (bp.pause_reads) conn.setRateLimitPause(server.now_ms, bp.resume_after_ms);
         },
         .allow, .skip, .modify => {
+            // Proxy route? Re-forward through the proxy with the filter skipped
+            // (the upstream was never contacted at park time). Falls through to
+            // the embedded-Router re-dispatch when it is not a proxy route.
+            if (proxyResume(server, conn, completion)) {
+                // Restart I/O below (shared tail).
+                if (conn.write_count > 0) handleWrite(server, completion.conn_index) catch {};
+                const pc = server.io.getConnection(completion.conn_index) orelse return;
+                if (pc.id != completion.conn_id or pc.state == .closed) return;
+                if (pc.x402 == .none and pc.read_buffered_bytes > 0) handleRead(server, completion.conn_index) catch {};
+                const rc = server.io.getConnection(completion.conn_index) orelse return;
+                if (rc.id != completion.conn_id or rc.state == .closed) return;
+                if (!rc.close_after_write and rc.x402 == .none) {
+                    if (rc.fd) |pfd| server.io.rearmRecv(completion.conn_index, pfd);
+                }
+                return;
+            }
             // Re-run the pipeline with the resumed decision injected so the
             // filter is skipped and the handler runs. The request view still
             // points into the pinned read buffer.
@@ -854,6 +870,60 @@ fn wasmResume(server: *Server, completion: wasm_host_call_mod.Completion) void {
     if (!rconn.close_after_write and rconn.x402 == .none) {
         if (rconn.fd) |pfd| server.io.rearmRecv(completion.conn_index, pfd);
     }
+}
+
+/// Re-forward a parked PROXY request after its host call completed (resume to
+/// allow). Returns true if the parked request was a proxy route (handled here);
+/// false if not (the caller falls back to the embedded-Router re-dispatch).
+///
+/// Re-enters proxy.handle with the filter skipped (resume_decision injected) and
+/// queues the upstream response, mirroring the main-loop proxy tail (owned-buffer
+/// handling included). The upstream was not contacted at park time, so this is
+/// where the forward actually happens. v1 limitation: cache/otel/x402-settlement
+/// are NOT re-run on the resumed path (they apply to non-parked proxy requests);
+/// a route that both parks a filter and uses those features skips them on the
+/// parked request. Compiled only when wasm is enabled.
+fn proxyResume(server: *Server, conn: *connection.Connection, completion: wasm_host_call_mod.Completion) bool {
+    if (!build_options.enable_wasm) return false;
+    const proxy = server.proxy orelse return false;
+    const route = proxy.matchRoute(&completion.req) orelse return false;
+    if (route.wasm_pool == null) return false; // not a wasm-filtered proxy route
+
+    var ip_buf: [64]u8 = undefined;
+    var client_ip_str: ?[]const u8 = null;
+    if (conn.cached_peer_ip) |ip4| {
+        const n = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ ip4[0], ip4[1], ip4[2], ip4[3] }) catch "";
+        if (n.len > 0) client_ip_str = ip_buf[0..n.len];
+    }
+    var mw_ctx = middleware.Context{ .client_ip = conn.cached_peer_ip, .protocol = .http1 };
+    // resume_decision skips the filter; auth_info/cert_dn are not re-derived on
+    // the resumed path (v1) -- upstream auth injection is absent for parked reqs.
+    const binding = proxy_mod.WasmBinding{ .resume_decision = completion.decision };
+    var pr = proxy.handle(
+        completion.req,
+        &mw_ctx,
+        client_ip_str,
+        conn.tls_session != null,
+        server.now_ms,
+        null,
+        null,
+        binding,
+    );
+    defer pr.release();
+
+    http1_mod.queueResponse(server, conn, pr.resp) catch {
+        conn.close_after_write = true;
+        return true;
+    };
+    if (conn.pending_body.len > 0) {
+        if (pr.takeOwnedBuf()) |owned| {
+            std.debug.assert(conn.pending_body_owned == null);
+            conn.pending_body_owned = owned;
+        } else {
+            http1_mod.materializePendingBody(server, conn);
+        }
+    }
+    return true;
 }
 
 /// Fire WASM host-call wall-clock deadlines from the housekeeping tick: each
@@ -1567,6 +1637,18 @@ pub fn handleRead(server: *Server, index: u32) !void {
                 }
 
                 const otel_start = if (server.otel != null) clock.realtimeNanos() orelse 0 else 0;
+                // Park binding: a host_call filter on this proxy route parks
+                // (H1 only). On park, runWasmFilter registers in the table, kicks
+                // the transport (start_fn), and returns the park sentinel; we
+                // suspend the connection and let wasmResume re-forward on allow.
+                const proxy_wasm: proxy_mod.WasmBinding = if (build_options.enable_wasm) .{
+                    .table = @ptrCast(&server.wasm_host_calls),
+                    .conn_index = conn.index,
+                    .conn_id = conn.id,
+                    .deadline_ms = server.now_ms + WASM_HOST_CALL_TIMEOUT_MS,
+                    .start_fn = wasmStartThunk,
+                    .start_ctx = @ptrCast(server),
+                } else .{};
                 var proxy_result = proxy.handle(
                     parse.view,
                     &mw_ctx,
@@ -1575,8 +1657,18 @@ pub fn handleRead(server: *Server, index: u32) !void {
                     server.now_ms,
                     auth_info_ptr,
                     cert_dn,
+                    proxy_wasm,
                 );
                 defer proxy_result.release();
+
+                // Park sentinel from a proxy filter: suspend (set .wasm_parked)
+                // and stop the pipeline. Skip cache/otel/settlement/queueResponse;
+                // wasmResume re-forwards on allow. Same break semantics as the
+                // router park path below.
+                if (build_options.enable_wasm and proxy_result.resp.isParked()) {
+                    _ = http1_mod.handleParkSentinel(server, conn, proxy_result.resp);
+                    break;
+                }
 
                 // Cache store: cache successful GET responses
                 if (cache_cfg) |cc| {

@@ -257,6 +257,28 @@ pub fn build(b: *std.Build) void {
         if (b.args) |args| wasm_ctl_run.addArgs(args);
         const wasm_ctl_step = b.step("wasm-control-e2e", "Run the WASM round-trip server over the real control socket");
         wasm_ctl_step.dependOn(&wasm_ctl_run.step);
+
+        // WASM round-trip on a PROXY route (config path: loadAndAttachProxy). The
+        // filter parks, drives the control socket, and forwards to the upstream on
+        // resume. Loads the filter from WASM_FILTER_PATH; NETHER_CONTROL_SOCKET +
+        // UPSTREAM_PORT from env. `zig build wasm-proxy-e2e -Denable-wasm=true`.
+        const wasm_px_module = b.createModule(.{
+            .root_source_file = b.path("examples/wasm_proxy_e2e/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        wasm_px_module.addImport("swerver", swerver_module);
+        wasm_px_module.addOptions("build_options", options);
+        const wasm_px_exe = b.addExecutable(.{
+            .name = "swerver-wasm-proxy-e2e",
+            .root_module = wasm_px_module,
+        });
+        b.installArtifact(wasm_px_exe);
+        const wasm_px_run = b.addRunArtifact(wasm_px_exe);
+        if (b.args) |args| wasm_px_run.addArgs(args);
+        const wasm_px_step = b.step("wasm-proxy-e2e", "Run the WASM round-trip server on a proxy route");
+        wasm_px_step.dependOn(&wasm_px_run.step);
     }
 
     // --- check: compile everything without running ---

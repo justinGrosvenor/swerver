@@ -932,6 +932,7 @@ fn dispatchHttp2Request(
                 server.now_ms,
                 null,
                 null,
+                .{}, // no park binding: H2 has no per-stream park state (filter fails closed on park)
             );
             defer proxy_result.release();
             try queueHttp2Response(server, conn, stream_id, proxy_result.resp, hdr_request.method == .HEAD);

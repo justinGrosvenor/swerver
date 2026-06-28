@@ -278,6 +278,7 @@ fn handleHttp3Request(
                 server.now_ms,
                 null,
                 null,
+                .{}, // no park binding: H3 has no per-stream park state (filter fails closed on park)
             );
             defer proxy_result.release();
             sendHttp3ResponseFromResponse(server, udp_fd, conn, req.stream_id, peer_addr, proxy_result.resp);

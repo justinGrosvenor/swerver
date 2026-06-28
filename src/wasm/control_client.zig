@@ -316,7 +316,26 @@ pub const ControlClient = struct {
     /// command replies fire the completion. Leftover bytes are shifted to front.
     fn tryConsumeReply(self: *ControlClient, io_rt: *io_mod.IoRuntime, now_ms: u64) bool {
         const buf = self.recv_buf[0..self.recv_len];
-        const sep = std.mem.indexOfScalar(u8, buf, RS) orelse return false;
+        const sep = std.mem.indexOfScalar(u8, buf, RS) orelse {
+            // No frame separator yet. Framed replies (shell/guest commands,
+            // __info__) end with 0x1e<exit>\n; an unframed `ERR <reason>\n` (a
+            // control-layer rejection: bad command, observer gating, unknown
+            // __verb__) carries no 0x1e and would otherwise hang until the
+            // deadline. We only send framed-reply commands, so the only place a
+            // bare ERR is realistically reachable is the handshake -- guard it
+            // there (fail fast). In the command phase a leading "ERR" can be real
+            // multi-line output whose 0x1e has not arrived, so we keep waiting and
+            // let the per-command deadline backstop a pathological unframed reply.
+            // Mirrors nether-ctl's bare_status_line guard (~/nether 8fab515).
+            if (self.state == .info_wait and
+                std.mem.startsWith(u8, buf, "ERR ") and
+                std.mem.indexOfScalar(u8, buf, '\n') != null)
+            {
+                self.fail(io_rt, now_ms, "control handshake rejected (ERR)");
+                return true;
+            }
+            return false;
+        };
         // The trailer is 0x1e<digits>\n; wait until the newline lands.
         const nl_rel = std.mem.indexOfScalar(u8, buf[sep + 1 ..], '\n') orelse return false;
         const end = sep + 1 + nl_rel + 1; // one past the trailing newline
@@ -569,6 +588,22 @@ test "tryConsumeReply: partial trailer is not consumed until newline" {
     try testing.expect(cc.tryConsumeReply(&io_rt, 0));
     try testing.expectEqual(@as(?Token, 7), Captured.token);
     try testing.expectEqualStrings("data\x1e0\n", Captured.body[0..Captured.body_len]);
+}
+
+test "tryConsumeReply: a bare ERR at handshake fails fast (no hang)" {
+    Captured.reset();
+    var dummy: u8 = 0;
+    var cc = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
+    cc.installResume(@ptrCast(&dummy), Captured.complete, Captured.fail);
+    var io_rt: io_mod.IoRuntime = undefined; // fd<0, so fail() never touches it
+
+    cc.state = .info_wait;
+    const err = "ERR too many control clients\n"; // unframed, no 0x1e
+    @memcpy(cc.recv_buf[0..err.len], err);
+    cc.recv_len = err.len;
+    // Consumed (fast-fail) rather than waiting for the handshake deadline.
+    try testing.expect(cc.tryConsumeReply(&io_rt, 0));
+    try testing.expect(cc.state == .closed); // fail() -> scheduleRetry
 }
 
 test "startCall queues when not ready and fails closed when disabled" {

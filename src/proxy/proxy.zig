@@ -20,6 +20,24 @@ const build_options = @import("build_options");
 // WASM edge filters (design 10.0). Gated; ProxyRoute stores the pool as an
 // opaque pointer so this module compiles without the vendored wasm3 dependency.
 const wasm_filter = if (build_options.enable_wasm) @import("../wasm/filter.zig") else struct {};
+const wasm_host_call = if (build_options.enable_wasm) @import("../wasm/host_call.zig") else struct {};
+
+/// WASM park binding, threaded from the H1 dispatch layer into the proxy filter
+/// hook (mirror of router.WasmBinding). Empty (`.{}`) means no park support: the
+/// filter runs terminally and fails closed on a park (the path H2/H3 and the
+/// body-accumulation path use). When `table` + `start_fn` are wired (H1 dispatch),
+/// a parking filter registers in the table and returns the park sentinel;
+/// `resume_decision` carries the resumed decision on the re-dispatch after the
+/// host call completes (the filter is then skipped and the request forwarded).
+pub const WasmBinding = struct {
+    table: ?*anyopaque = null,
+    conn_index: u32 = 0,
+    conn_id: u64 = 0,
+    deadline_ms: u64 = 0,
+    resume_decision: ?middleware.Decision = null,
+    start_fn: ?*const fn (ctx: *anyopaque, token: u32, request: []const u8) void = null,
+    start_ctx: ?*anyopaque = null,
+};
 
 /// Map a proxy BodyView onto a RequestView body so a WASM filter can read it via
 /// body_len/read_body. Zero-copy: the two share the scattered-buffer layout.
@@ -44,21 +62,63 @@ var proxy_modify_warned = false;
 /// rewriting a proxied response is the Phase 2b response hook (on_response), which
 /// runs on the upstream response via runWasmResponseFilter and supersedes it. We
 /// log once and forward rather than silently dropping. See design 10.0.
-fn runWasmFilter(route: *const upstream.ProxyRoute, req_view: *const request.RequestView) ?response.Response {
-    if (build_options.enable_wasm) {
-        if (route.wasm_pool) |pool_ptr| {
-            const fpool: *wasm_filter.Pool = @ptrCast(@alignCast(pool_ptr));
-            switch (fpool.run(req_view, route.wasm_fuel)) {
-                .reject => |resp| return resp,
-                .modify => {
-                    if (!proxy_modify_warned) {
-                        proxy_modify_warned = true;
-                        std.log.warn("wasm filter returned modify on a proxy route; response-header injection is not supported on proxy routes yet, forwarding without the staged headers (embedded Router honors modify)", .{});
-                    }
-                },
-                else => {},
-            }
+/// Run the request-phase WASM filter for a proxy route. Returns:
+///   - null              -> proceed to forward,
+///   - Response.parked   -> the filter parked (the caller returns it; H1 dispatch
+///                          suspends the connection and resumes later),
+///   - any other Response -> a terminal reject/error to serve.
+/// With an empty binding (no table) the filter runs terminally and fails closed
+/// on a park (H2/H3 + the body path). With a table wired (H1 dispatch) a parking
+/// filter registers and returns the park sentinel; a `resume_decision` skips the
+/// filter on the post-host-call re-dispatch.
+fn runWasmFilter(route: *const upstream.ProxyRoute, req_view: *const request.RequestView, wb: WasmBinding) ?response.Response {
+    if (!build_options.enable_wasm) return null;
+    const pool_ptr = route.wasm_pool orelse return null;
+    const fpool: *wasm_filter.Pool = @ptrCast(@alignCast(pool_ptr));
+
+    // Re-dispatch after a completed host call: apply the resumed decision,
+    // skipping the filter. A proxy ignores request-phase modify headers (the
+    // response phase is the mechanism); allow/skip/modify all forward.
+    if (wb.resume_decision) |rd| {
+        return switch (rd) {
+            .allow, .skip, .modify => null,
+            .reject => |resp| resp,
+            .rate_limit_backpressure => |bp| bp.resp,
+        };
+    }
+
+    // Park-capable path (H1 dispatch wired the binding).
+    if (wb.table) |tbl_ptr| {
+        const table: *wasm_host_call.Table = @ptrCast(@alignCast(tbl_ptr));
+        const inst = fpool.acquire() orelse return forward.createErrorResponse(503);
+        switch (wasm_filter.invokeOutcome(inst, req_view, route.wasm_fuel)) {
+            .decision => |d| return switch (d) {
+                .allow, .skip => null,
+                .reject => |resp| resp,
+                .modify => null, // proxy ignores request-phase modify (see above)
+                .rate_limit_backpressure => |bp| bp.resp,
+            },
+            .parked => |call_request| {
+                if (table.park(inst, req_view.*, wb.conn_index, wb.conn_id, wb.deadline_ms, route.wasm_fuel)) |token| {
+                    if (wb.start_fn) |start| start(wb.start_ctx.?, token, call_request);
+                    return response.Response.parked;
+                }
+                _ = wasm_filter.cancelPark(inst); // table full: unpin, fail closed
+                return forward.createErrorResponse(503);
+            },
         }
+    }
+
+    // No binding (terminal caller: H2/H3, body path): fail closed on a park.
+    switch (fpool.run(req_view, route.wasm_fuel)) {
+        .reject => |resp| return resp,
+        .modify => {
+            if (!proxy_modify_warned) {
+                proxy_modify_warned = true;
+                std.log.warn("wasm filter returned modify on a proxy route; request-phase response-header injection is not honored on proxy routes (use the on_response Phase 2b hook instead); forwarding", .{});
+            }
+        },
+        else => {},
     }
     return null;
 }
@@ -540,6 +600,7 @@ pub const Proxy = struct {
         now_ms: u64,
         auth_info: ?*const auth_mod.AuthInfo,
         client_cert_dn: ?[]const u8,
+        wasm: WasmBinding,
     ) ProxyResult {
         _ = mw_ctx;
 
@@ -550,8 +611,9 @@ pub const Proxy = struct {
 
         // Per-route WASM edge filter (design 10.0): authenticate/policy-gate
         // before forwarding. This entry handles bodyless / small-body requests,
-        // so req.body already carries any body for body_len/read_body.
-        if (runWasmFilter(route, &req)) |resp| return .{ .resp = resp, .proxy = self };
+        // so req.body already carries any body for body_len/read_body. A parking
+        // filter returns the park sentinel (H1 dispatch suspends + resumes).
+        if (runWasmFilter(route, &req, wasm)) |resp| return .{ .resp = resp, .proxy = self };
 
         const effective_upstream = route.selectUpstream();
 
@@ -809,6 +871,7 @@ pub const Proxy = struct {
         now_ms: u64,
         auth_info: ?*const auth_mod.AuthInfo,
         client_cert_dn: ?[]const u8,
+        wasm: WasmBinding,
     ) ProxyResult {
         _ = mw_ctx;
 
@@ -824,7 +887,7 @@ pub const Proxy = struct {
         {
             var filter_req = req;
             filter_req.body = bodyViewToRequestBody(body_view);
-            if (runWasmFilter(route, &filter_req)) |resp| return .{ .resp = resp, .proxy = self };
+            if (runWasmFilter(route, &filter_req, wasm)) |resp| return .{ .resp = resp, .proxy = self };
         }
 
         const effective_upstream_b = route.selectUpstream();
@@ -1440,6 +1503,58 @@ test "wasm: proxy BodyView (scattered) is filter-readable via body ABI" {
             .body = bodyViewToRequestBody(bv2),
         };
         try std.testing.expect(pool.run(&r2, wasm_filter.DEFAULT_FUEL) == .allow);
+    } else return error.SkipZigTest;
+}
+
+test "wasm: proxy request filter parks, registers in the table, fires start_fn" {
+    if (build_options.enable_wasm) {
+        const FILTER = @embedFile("../wasm/testdata/filter_probe.wasm");
+        var pool = try wasm_filter.Pool.init(std.testing.allocator, FILTER, .{ .instances = 2 });
+        defer pool.deinit();
+        var route = upstream.ProxyRoute{
+            .path_prefix = "/enrich",
+            .upstream = "backend",
+            .wasm_pool = @ptrCast(&pool),
+            .wasm_fuel = wasm_filter.DEFAULT_FUEL,
+        };
+        var table = wasm_host_call.Table{};
+
+        const Rec = struct {
+            var token: ?u32 = null;
+            var req_bytes_len: usize = 0;
+            fn start(_: *anyopaque, t: u32, req_bytes: []const u8) void {
+                token = t;
+                req_bytes_len = req_bytes.len;
+            }
+        };
+        Rec.token = null;
+        var dummy: u8 = 0;
+        const binding = WasmBinding{
+            .table = @ptrCast(&table),
+            .conn_index = 5,
+            .conn_id = 99,
+            .deadline_ms = 1_000,
+            .start_fn = Rec.start,
+            .start_ctx = @ptrCast(&dummy),
+        };
+
+        // /enrich stages a host_call and parks.
+        const req = request.RequestView{ .method = .GET, .path = "/enrich", .headers = &.{} };
+        const out = runWasmFilter(&route, &req, binding);
+        try std.testing.expect(out != null and out.?.isParked());
+        try std.testing.expectEqual(@as(usize, 1), table.liveCount());
+        try std.testing.expectEqual(@as(?u32, 0), Rec.token); // first token
+        try std.testing.expect(Rec.req_bytes_len > 0); // staged command forwarded
+
+        // Resume decisions skip the filter: allow -> proceed (null), reject -> serve.
+        try std.testing.expect(runWasmFilter(&route, &req, .{ .resume_decision = .allow }) == null);
+        const rej = runWasmFilter(&route, &req, .{ .resume_decision = .{ .reject = .{
+            .status = 403,
+            .headers = &.{},
+            .body = .{ .bytes = "no" },
+        } } });
+        try std.testing.expect(rej != null);
+        try std.testing.expectEqual(@as(u16, 403), rej.?.status);
     } else return error.SkipZigTest;
 }
 
