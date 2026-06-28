@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const config = @import("../config.zig");
 const buffer_pool = @import("buffer_pool.zig");
 const clock = @import("clock.zig");
@@ -277,6 +278,30 @@ pub const Connection = struct {
     x402_held_hdr_count: u8 = 0,
     x402_held_body_offset: u16 = 0,
     x402_held_body_len: u32 = 0,
+    /// WASM proxy resumed-path context (E1). When a wasm filter on a PROXY route
+    /// parks, the main dispatch loop stashes here the post-`proxy.handle`
+    /// processing context (cache/otel/x402-settlement) so `proxyResume` can run
+    /// the same processing on resume that a non-parked forward runs (the resumed
+    /// forward would otherwise skip cache-store, the otel span, and settlement).
+    /// Mirrors the x402_held_* hold pattern: plain values owned by the
+    /// connection, valid across the park. Only written under enable_wasm; the
+    /// park binding's `resume_ctx` points at this field.
+    wasm_proxy_resume: WasmProxyResumeCtx = .{},
+
+    /// Carried-across-park context for the proxy resumed-path parity (E1). Holds
+    /// only what cannot be recomputed on resume: the route index (the rest of the
+    /// post-forward config is re-derived from it), the otel span start timestamp,
+    /// and whether x402 settlement is owed. The settlement payment header is NOT
+    /// stored (it borrows the request read buffer, which is reused after park);
+    /// it is re-derived from the owned request snapshot on resume. Compiled to a
+    /// zero-size empty struct when wasm is disabled so the default-build
+    /// Connection layout (load-bearing for the pipelined fast path -- see the
+    /// struct-level layout NOTE) is byte-for-byte unchanged.
+    pub const WasmProxyResumeCtx = if (build_options.enable_wasm) struct {
+        route_idx: usize = 0,
+        otel_start: i128 = 0,
+        needs_settlement: bool = false,
+    } else struct {};
 
     pub const X402State = enum(u8) {
         none,
@@ -406,6 +431,7 @@ pub const Connection = struct {
         self.x402_held_hdr_count = 0;
         self.x402_held_body_offset = 0;
         self.x402_held_body_len = 0;
+        self.wasm_proxy_resume = .{};
         // active_list_pos is set by ConnectionPool.acquire
     }
 

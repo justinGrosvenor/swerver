@@ -436,6 +436,33 @@ test "host_call table: completion carries stream_id + protocol sentinels for H1"
     try testing.expect(c.resume_ctx == null);
 }
 
+test "host_call table: resume_ctx is carried opaquely through park -> complete (E1)" {
+    var pool = try filter.Pool.init(testing.allocator, FILTER_WASM, .{ .instances = 1 });
+    defer pool.deinit();
+    var table = Table{};
+
+    // Stand-in for the proxy resumed-path context (E1): the dispatch loop stores
+    // a WasmProxyResumeCtx on the connection and points resume_ctx at it; the
+    // table must hand that exact pointer back in the Completion so proxyResume
+    // can read the stashed cache/otel/settlement context. We use a local struct
+    // (the table treats resume_ctx as ?*anyopaque) to assert the opaque carry
+    // without coupling the table to connection.zig.
+    const Ctx = struct { route_idx: usize, otel_start: i128, needs_settlement: bool };
+    var ctx = Ctx{ .route_idx = 3, .otel_start = 123, .needs_settlement = true };
+
+    const inst = pool.acquire() orelse return error.AcquireFailed;
+    const r = request.RequestView{ .method = .GET, .path = "/enrich", .headers = &.{} };
+    try testing.expect(filter.invokeOutcome(inst, &r, filter.DEFAULT_FUEL) == .parked);
+    const token = table.park(inst, r, 5, 6, 0, .http1, 5000, filter.DEFAULT_FUEL, @ptrCast(&ctx)) orelse return error.TableFull;
+
+    const c = table.complete(token, "ok") orelse return error.NoCompletion;
+    try testing.expect(c.decision == .allow);
+    const got: *Ctx = @ptrCast(@alignCast(c.resume_ctx orelse return error.NoCtx));
+    try testing.expectEqual(@as(usize, 3), got.route_idx);
+    try testing.expectEqual(@as(i128, 123), got.otel_start);
+    try testing.expect(got.needs_settlement);
+}
+
 test "host_call table: cancelForStream releases only the matching stream" {
     var pool = try filter.Pool.init(testing.allocator, FILTER_WASM, .{ .instances = 2 });
     defer pool.deinit();
