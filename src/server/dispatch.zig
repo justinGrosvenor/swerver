@@ -791,9 +791,11 @@ fn wasmResume(server: *Server, completion: wasm_host_call_mod.Completion) void {
             return;
         },
         .http3 => {
-            // E2b: wire H3 stream delivery (QUIC stream send) for a resumed
-            // parked stream. The park slot was already freed by complete()/
-            // cancel(); nothing else to do here yet.
+            // E2b: deliver a resumed parked H3 stream's response on its own QUIC
+            // stream via the h3 send path, keyed by the QUIC connection id +
+            // stream id. The connection kept multiplexing its other streams while
+            // this one was parked.
+            wasmResumeHttp3(server, completion);
             return;
         },
     }
@@ -1236,6 +1238,123 @@ fn proxyResumeHttp2(server: *Server, conn: *connection.Connection, completion: w
     );
     defer pr.release();
     http2_mod.queueHttp2Response(server, conn, completion.stream_id, pr.resp, completion.req.method == .HEAD) catch {};
+    return true;
+}
+
+/// Deliver a resumed parked HTTP/3 stream's filter Decision on its own QUIC
+/// stream (E2b). The H3 analog of wasmResumeHttp2: it routes delivery through
+/// the h3 send path (http3_mod.deliverResume), keyed by the QUIC connection id
+/// (completion.conn_id) + stream id, leaving the connection's other streams
+/// untouched (the connection kept multiplexing while this stream was parked).
+/// allow/modify RE-DISPATCH the request (proxy re-forward or router re-run with
+/// the filter skipped); reject/backpressure are served directly on the stream.
+/// The QUIC connection is re-found by id inside deliverResume; if it was freed
+/// while parked the delivery is a no-op. Compiled only when wasm is enabled.
+fn wasmResumeHttp3(server: *Server, completion: wasm_host_call_mod.Completion) void {
+    if (!build_options.enable_wasm) return;
+    const stream_id = completion.stream_id;
+    const conn_id = completion.conn_id;
+
+    switch (completion.decision) {
+        .reject => |resp| {
+            http3_mod.deliverResume(server, conn_id, stream_id, resp);
+        },
+        .rate_limit_backpressure => |bp| {
+            // Serve the backpressure response on this stream only. A
+            // connection-level read pause would stall sibling streams, so H3
+            // (like H2) does not pause the connection here; per-stream
+            // backpressure is a deferred refinement.
+            http3_mod.deliverResume(server, conn_id, stream_id, bp.resp);
+        },
+        .allow, .skip, .modify => {
+            // Proxy route? Re-forward with the filter skipped (the upstream was
+            // never contacted at park time). Falls through to the embedded-Router
+            // re-dispatch when it is not a proxy route.
+            if (proxyResumeHttp3(server, completion)) return;
+
+            // Re-run the router with the resumed decision injected so the filter
+            // is skipped and the handler runs. completion.req is the park slot's
+            // OWNED snapshot (valid through this synchronous resume), not a borrow
+            // of a reused frame buffer.
+            var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
+            var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
+            const needs_eager_arena = (completion.req.method != .GET and completion.req.method != .HEAD and completion.req.method != .DELETE);
+            const arena_handle = if (needs_eager_arena) server.io.acquireBuffer() else null;
+            var empty_arena: [0]u8 = undefined;
+            const arena_buf = if (arena_handle) |h| h.bytes else empty_arena[0..];
+            var mw_ctx = middleware.Context{
+                .protocol = .http3,
+                .is_tls = true, // QUIC is always TLS
+                .stream_id = stream_id,
+                .buffer_ops = .{
+                    .ctx = &server.io,
+                    .acquire = write_queue.acquireBufferOpaque,
+                    .release = write_queue.releaseBufferOpaque,
+                },
+            };
+            var scratch = router.HandlerScratch{
+                .response_buf = response_buf[0..],
+                .response_headers = response_headers[0..],
+                .arena_buf = arena_buf,
+                .arena_handle = arena_handle,
+                .buffer_ops = mw_ctx.buffer_ops,
+                .wasm = .{
+                    .table = @ptrCast(&server.wasm_host_calls),
+                    .conn_index = completion.conn_index,
+                    .conn_id = conn_id,
+                    .stream_id = stream_id,
+                    .protocol = .http3,
+                    .deadline_ms = server.now_ms + WASM_HOST_CALL_TIMEOUT_MS,
+                    .resume_decision = completion.decision,
+                },
+            };
+            const result = server.app_router.handle(completion.req, &mw_ctx, &scratch);
+            if (scratch.arena_handle) |h| server.io.releaseBuffer(h);
+            // The handler may itself park again (PG, or another host call): leave
+            // the stream suspended rather than sending the park sentinel.
+            if (result.resp.isParked()) {
+                if (server.wasmHasParkForStream(completion.conn_index, conn_id, stream_id)) return;
+                server.wasmCancelForStream(completion.conn_index, conn_id, stream_id);
+                http3_mod.deliverResume(server, conn_id, stream_id, response_mod.Response{
+                    .status = 500,
+                    .headers = &.{},
+                    .body = .{ .bytes = "Internal Server Error" },
+                });
+                return;
+            }
+            http3_mod.deliverResume(server, conn_id, stream_id, result.resp);
+        },
+    }
+}
+
+/// Re-forward a parked PROXY request on an HTTP/3 stream after its host call
+/// completed (resume to allow). Returns true if the parked request was a proxy
+/// route (handled here); false if not (the caller falls back to the
+/// embedded-Router re-dispatch). Mirrors proxyResumeHttp2 but delivers via the
+/// h3 send path on completion.stream_id. Compiled only when wasm is enabled.
+fn proxyResumeHttp3(server: *Server, completion: wasm_host_call_mod.Completion) bool {
+    if (!build_options.enable_wasm) return false;
+    const proxy = server.proxy orelse return false;
+    const route = proxy.matchRoute(&completion.req) orelse return false;
+    if (route.wasm_pool == null) return false; // not a wasm-filtered proxy route
+
+    var mw_ctx = middleware.Context{ .protocol = .http3, .is_tls = true, .stream_id = completion.stream_id };
+    // resume_decision skips the filter; the upstream was not contacted at park
+    // time, so this is where the forward actually happens. Cache/otel/x402 are
+    // not re-run on the resumed proxy path (H1/H2 parity, v1 limitation).
+    const binding = proxy_mod.WasmBinding{ .resume_decision = completion.decision };
+    var pr = proxy.handle(
+        completion.req,
+        &mw_ctx,
+        null,
+        true, // QUIC is always TLS
+        server.now_ms,
+        null,
+        null,
+        binding,
+    );
+    defer pr.release();
+    http3_mod.deliverResume(server, completion.conn_id, completion.stream_id, pr.resp);
     return true;
 }
 

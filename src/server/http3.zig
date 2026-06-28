@@ -36,6 +36,82 @@ const quic_handler = @import("../quic/handler.zig");
 const quic_connection = @import("../quic/connection.zig");
 const clock = @import("../runtime/clock.zig");
 const write_queue = @import("write_queue.zig");
+const build_options = @import("build_options");
+const proxy_mod = @import("../proxy/proxy.zig");
+const quic_crypto = @import("../quic/crypto.zig");
+const quic_types = @import("../quic/types.zig");
+const wasm_filter_mod = if (build_options.enable_wasm) @import("../wasm/filter.zig") else struct {};
+
+/// WASM host-call wall-clock deadline for an H3 stream park, mirroring the H1/H2
+/// dispatch deadline. A parked stream past this is failed closed by the
+/// reactor's wasmTick deadline backstop. Compiled in all builds (a plain int).
+const WASM_HOST_CALL_TIMEOUT_MS: u64 = 30_000;
+
+/// Sentinel `conn_index` for H3 parks in the per-stream host_call table (E2b).
+/// H1/H2 use the io-runtime connection slot index as `conn_index` and the slot
+/// generation as `conn_id`; H3 has no io-runtime connection (the QUIC connection
+/// lives in the QUIC pool), so it uses this fixed sentinel index for every H3
+/// park and the QUIC connection's stable `Connection.id` as `conn_id`. The
+/// sentinel keeps the H3 key space disjoint from any real io slot index, so a
+/// cancel/lookup never collides with an H1/H2 park. maxInt(u32) is never a valid
+/// io connection slot (those run 0..max_connections-1).
+const H3_CONN_INDEX: u32 = std.math.maxInt(u32);
+
+/// Transport start hook (router/proxy WasmBinding.start_fn) for H3 parks. Routes
+/// a freshly parked filter's host call to the Server's transport (control socket
+/// or mock). `ctx` is the Server. Mirrors http2.wasmStartThunkH2.
+fn wasmStartThunkH3(ctx: *anyopaque, token: u32, req_bytes: []const u8) void {
+    const server: *Server = @ptrCast(@alignCast(ctx));
+    server.wasmStartHostCall(token, req_bytes);
+}
+
+/// Reconstruct a `net.SockAddrStorage` (tagged ip4/ip6 union the send path
+/// wants) from the QUIC pool's flat `SockAddrStorage` (family + raw bytes). The
+/// flat storage holds the original sockaddr bytes verbatim (copied at ingest in
+/// `processOneDatagram`), so we reinterpret them by family, mirroring
+/// `net.recvfrom`. Used by the H3 park resume path, which sends off the datagram
+/// flow and so cannot thread the original peer address through.
+pub fn netPeerFromQuic(qaddr: *const quic_handler.connection_pool.SockAddrStorage) net.SockAddrStorage {
+    var storage: net.SockAddrStorage = .{ .ip6 = undefined };
+    const dst = std.mem.asBytes(&storage.ip6);
+    const src = std.mem.asBytes(qaddr);
+    const n = @min(dst.len, src.len);
+    @memset(dst, 0);
+    @memcpy(dst[0..n], src[0..n]);
+    const sa: *const std.posix.sockaddr = @ptrCast(&storage.ip6);
+    if (sa.family == std.posix.AF.INET) {
+        const sa4: *const net.SockAddrIn = @ptrCast(&storage.ip6);
+        storage = .{ .ip4 = sa4.* };
+    }
+    return storage;
+}
+
+/// Deliver a resumed parked H3 stream's response (E2b). Re-locates the QUIC
+/// connection by its stable id (the host_call `conn_id`), recovers the peer
+/// address, and sends `resp` on `stream_id` via the normal h3 encode/send path.
+/// No-op if the connection was freed while parked (the peer disconnected or the
+/// stream/connection was reset): the lookup fails and there is nobody to serve.
+/// Called from dispatch.wasmResumeHttp3, which runs off the datagram flow.
+pub fn deliverResume(server: *Server, conn_id: u64, stream_id: u32, resp: response_mod.Response) void {
+    const quic = &(server.quic orelse return);
+    const udp_fd = server.udp_fd orelse return;
+    const conn = quic.pool.findById(conn_id) orelse return;
+    const qaddr = quic.pool.getPeerAddr(conn) orelse return;
+    const peer = netPeerFromQuic(&qaddr);
+    sendHttp3ResponseFromResponse(server, udp_fd, conn, @as(u64, stream_id), peer, resp);
+}
+
+/// Release any WASM filter parked on a stream the peer reset (E2b). Called from
+/// the datagram path for each `ProcessResult.reset_streams` entry; the H3 analog
+/// of http2.zig releasing a park on RST_STREAM. No-op (generation-checked in the
+/// table) when nothing is parked on the stream. Compiled in all builds; the
+/// cancel itself is wasm-gated inside `wasmCancelForStream`.
+fn releaseResetParks(server: *Server, conn: *quic_connection.Connection, reset_streams: []const u64) void {
+    if (!build_options.enable_wasm) return;
+    for (reset_streams) |sid| {
+        server.wasmCancelForStream(H3_CONN_INDEX, conn.id, @truncate(sid));
+    }
+}
 
 /// Maximum datagrams to drain per handleDatagram call before
 /// yielding back to the event loop. Prevents starvation of TCP
@@ -186,6 +262,13 @@ fn processOneDatagram(
     // `clearH3RequestStream` — that's the first point at which
     // the body slice is no longer referenced.
     if (result.conn) |conn| {
+        // Peer reset a stream: release any per-stream WASM filter park on it
+        // (E2b) before dispatching this packet's request events, so a reset that
+        // arrives in the same packet as new work cannot resume onto a dead
+        // stream. No-op when nothing is parked.
+        if (build_options.enable_wasm and result.reset_streams.len > 0) {
+            releaseResetParks(server, conn, result.reset_streams);
+        }
         for (result.http3_events) |event| {
             switch (event) {
                 .request_ready => |req| {
@@ -210,6 +293,13 @@ fn processOneDatagram(
     // Handle connection state changes
     if (result.close_connection) {
         if (result.conn) |conn| {
+            // Release every per-stream WASM filter parked on this connection
+            // (E2b) before the QUIC connection is freed, so no instance leaks
+            // when the peer closes mid-park. O(1) when nothing is parked. The
+            // host-call deadline tick is the backstop for the idle-timeout
+            // cleanup path (pool.cleanup), which frees connections without a
+            // Server reference; a late completion there fails pool.findById.
+            if (build_options.enable_wasm) server.wasmCancelForConn(H3_CONN_INDEX, conn.id);
             quic.pool.removeConnection(conn);
         }
     }
@@ -270,6 +360,22 @@ fn handleHttp3Request(
     // `server.proxy` so non-proxy servers are unaffected. QUIC is always TLS.
     if (server.proxy) |proxy| {
         if (proxy.matchRoute(&req_view)) |_| {
+            const stream_id32: u32 = @truncate(req.stream_id);
+            // Real per-stream park binding (E2b): a parking proxy filter suspends
+            // THIS stream and resumes via wasmResume's .http3 arm, keyed by the
+            // QUIC connection id + stream id. Other streams on the connection keep
+            // flowing. The empty binding (`.{}`) is kept when wasm is off, where a
+            // parking filter fails closed.
+            const proxy_binding: proxy_mod.WasmBinding = if (build_options.enable_wasm) .{
+                .table = @ptrCast(&server.wasm_host_calls),
+                .conn_index = H3_CONN_INDEX,
+                .conn_id = conn.id,
+                .stream_id = stream_id32,
+                .protocol = .http3,
+                .deadline_ms = server.now_ms + WASM_HOST_CALL_TIMEOUT_MS,
+                .start_fn = wasmStartThunkH3,
+                .start_ctx = @ptrCast(server),
+            } else .{};
             var proxy_result = proxy.handle(
                 req_view,
                 &mw_ctx,
@@ -278,9 +384,20 @@ fn handleHttp3Request(
                 server.now_ms,
                 null,
                 null,
-                .{}, // no park binding: H3 has no per-stream park state (filter fails closed on park)
+                proxy_binding,
             );
             defer proxy_result.release();
+            // Park sentinel: the filter parked on a host_call. Leave the stream
+            // suspended (no frames sent, stream stays open); wasmResume delivers
+            // the response on this stream once the host call completes.
+            if (build_options.enable_wasm and proxy_result.resp.isParked()) {
+                if (server.wasmHasParkForStream(H3_CONN_INDEX, conn.id, stream_id32)) return;
+                // Sentinel without a live park (orphaned park): release any orphan
+                // and fail closed, mirroring the router orphan branch below.
+                server.wasmCancelForStream(H3_CONN_INDEX, conn.id, stream_id32);
+                sendHttp3ResponseFromResponse(server, udp_fd, conn, req.stream_id, peer_addr, Server.internalErrorResponse());
+                return;
+            }
             sendHttp3ResponseFromResponse(server, udp_fd, conn, req.stream_id, peer_addr, proxy_result.resp);
             return;
         }
@@ -298,8 +415,37 @@ fn handleHttp3Request(
         .arena_handle = arena_handle,
         .buffer_ops = mw_ctx.buffer_ops,
     };
+    // Real per-stream park binding (E2b): a parking WASM filter suspends THIS
+    // stream (recorded in the host_call table, keyed by the QUIC connection id +
+    // stream id) and resumes via wasmResume's .http3 arm. The connection keeps
+    // multiplexing its other streams while this one waits.
+    const stream_id32: u32 = @truncate(req.stream_id);
+    if (build_options.enable_wasm) {
+        scratch.wasm = .{
+            .table = @ptrCast(&server.wasm_host_calls),
+            .conn_index = H3_CONN_INDEX,
+            .conn_id = conn.id,
+            .stream_id = stream_id32,
+            .protocol = .http3,
+            .deadline_ms = server.now_ms + WASM_HOST_CALL_TIMEOUT_MS,
+            .start_fn = wasmStartThunkH3,
+            .start_ctx = @ptrCast(server),
+        };
+    }
     const result = server.app_router.handle(req_view, &mw_ctx, &scratch);
     if (scratch.arena_handle) |handle| server.io.releaseBuffer(handle);
+    // Park sentinel: a filter parked on a host_call. Leave the stream suspended
+    // (no frames sent, stream stays open); wasmResume delivers the response on
+    // this stream once the host call completes. Checked before the send so the
+    // park sentinel is never serialized.
+    if (build_options.enable_wasm and result.resp.isParked()) {
+        if (server.wasmHasParkForStream(H3_CONN_INDEX, conn.id, stream_id32)) return;
+        // Sentinel without a live park (orphaned park): fail closed on this
+        // stream and release any orphan to avoid an instance leak.
+        server.wasmCancelForStream(H3_CONN_INDEX, conn.id, stream_id32);
+        sendHttp3ResponseFromResponse(server, udp_fd, conn, req.stream_id, peer_addr, Server.internalErrorResponse());
+        return;
+    }
     const managed_handle: ?buffer_pool.BufferHandle = switch (result.resp.body) {
         .managed => |managed| managed.handle,
         else => null,
@@ -606,5 +752,221 @@ pub fn drainPendingSend(
     // If sendStreamData buffered a new pending_send (partial drain),
     // the old allocation can be freed — the new buffer is a fresh copy.
     alloc.free(data);
+}
+
+// ---------------------------------------------------------------------------
+// Tests (E2b: HTTP/3 per-stream WASM filter park). Run with:
+//   zig build test -Denable-tls=true -Denable-http3=true -Denable-wasm=true
+// (needs OpenSSL 3.5+ for the QUIC TLS symbols). Skipped (SkipZigTest) when
+// either flag is off, since the path is gated on both.
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+const config = @import("../config.zig");
+
+/// Build a flat QUIC pool address for 127.0.0.1:9999 by populating a net
+/// SockAddrIn and copying its bytes into the pool's flat storage exactly as the
+/// datagram ingest path does. Lets netPeerFromQuic reconstruct a sendable IPv4
+/// address in tests without depending on std.net (absent from the test module).
+fn testLoopbackQuicAddr() quic_handler.connection_pool.SockAddrStorage {
+    var sin: net.SockAddrIn = std.mem.zeroes(net.SockAddrIn);
+    sin.family = @intCast(std.posix.AF.INET);
+    sin.port = std.mem.nativeToBig(u16, 9999);
+    sin.addr = @bitCast([4]u8{ 127, 0, 0, 1 });
+    const ns: net.SockAddrStorage = .{ .ip4 = sin };
+    var q: quic_handler.connection_pool.SockAddrStorage = undefined;
+    @memset(std.mem.asBytes(&q), 0);
+    const src = std.mem.asBytes(&ns);
+    const n = @min(src.len, @sizeOf(@TypeOf(q)));
+    @memcpy(std.mem.asBytes(&q)[0..n], src[0..n]);
+    return q;
+}
+
+test "netPeerFromQuic: round-trips an IPv4 peer address" {
+    if (!build_options.enable_http3) return error.SkipZigTest;
+    const q = testLoopbackQuicAddr();
+    const peer = netPeerFromQuic(&q);
+    switch (peer) {
+        .ip4 => |sa| {
+            try testing.expectEqual(@as(u16, 9999), std.mem.bigToNative(u16, sa.port));
+            try testing.expectEqual([4]u8{ 127, 0, 0, 1 }, @as([4]u8, @bitCast(sa.addr)));
+        },
+        .ip6 => return error.WrongFamily,
+    }
+}
+
+fn h3EnrichHandler(_: *router.HandlerContext) response_mod.Response {
+    return .{ .status = 200, .headers = &.{}, .body = .{ .bytes = "enriched" } };
+}
+
+fn h3PlainHandler(_: *router.HandlerContext) response_mod.Response {
+    return .{ .status = 200, .headers = &.{}, .body = .{ .bytes = "plain-ok" } };
+}
+
+/// Heap-allocated test harness for the H3 park tests. The Server struct embeds
+/// the 64-slot host_call Table plus the H3 GSO batch buffer, so it must NOT live
+/// on the test thread's stack (it overflows it); we initInPlace it on the heap.
+/// Stands up a QUIC handler + bound UDP socket + a connected QUIC connection
+/// (stream manager + h3 stack + application keys + loopback peer) so the resume
+/// send path runs end-to-end (encode + sendto) without a real handshake.
+const TestH3Env = struct {
+    allocator: std.mem.Allocator,
+    server: *Server,
+    udp_fd: std.posix.fd_t,
+    conn: *quic_connection.Connection,
+    net_peer: net.SockAddrStorage,
+
+    fn init(allocator: std.mem.Allocator, app_router: router.Router) !TestH3Env {
+        var cfg = config.ServerConfig.default();
+        cfg.max_connections = 4;
+        cfg.buffer_pool = .{ .buffer_size = 16 * 1024, .buffer_count = 8 };
+
+        const server = try allocator.create(Server);
+        errdefer allocator.destroy(server);
+        try server.initInPlace(allocator, cfg, app_router);
+        server.wasm_mock_enabled = true;
+        server.wasm_mock_reply = "ok"; // probe resumes /enrich to .allow
+
+        server.quic = quic_handler.Handler.init(allocator, true, cfg.max_connections);
+        const udp_fd = try net.bindUdp("127.0.0.1", 0);
+        server.udp_fd = udp_fd;
+
+        const dcid = quic_types.ConnectionId.init(&[_]u8{ 0xa1, 0xa2, 0xa3, 0xa4 });
+        const conn = try server.quic.?.pool.createConnection(dcid, testLoopbackQuicAddr());
+        conn.initStreamManager(); // sets stream_manager + http3_stack
+        conn.state = .connected;
+        // Application keys so sendHttp3ResponseBytes does not early-return; the
+        // exact bytes are irrelevant (we never decrypt in-test).
+        conn.crypto_ctx.application.server = quic_crypto.deriveKeysFromSecret(&([_]u8{0x42} ** 32));
+
+        return .{
+            .allocator = allocator,
+            .server = server,
+            .udp_fd = udp_fd,
+            .conn = conn,
+            .net_peer = netPeerFromQuic(&(server.quic.?.pool.getPeerAddr(conn).?)),
+        };
+    }
+
+    fn deinit(self: *TestH3Env) void {
+        clock.closeFd(self.udp_fd);
+        self.server.deinit();
+        self.allocator.destroy(self.server);
+    }
+
+    fn dispatch(self: *TestH3Env, stream_id: u64, path: []const u8) void {
+        const hdrs = [_]http3.Header{ .{ .name = ":method", .value = "GET" }, .{ .name = ":path", .value = path } };
+        handleHttp3Request(self.server, self.udp_fd, self.conn, .{ .stream_id = stream_id, .headers = &hdrs, .body = "" }, self.net_peer);
+    }
+};
+
+fn testEnrichRouter(pool: *anyopaque, with_plain: bool) !router.Router {
+    var app_router = router.Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+    try app_router.get("/enrich", h3EnrichHandler);
+    if (with_plain) try app_router.get("/plain", h3PlainHandler);
+    _ = app_router.attachWasmFilter("/enrich", pool, wasm_filter_mod.DEFAULT_FUEL);
+    return app_router;
+}
+
+test "wasm h3: stream park then resume releases on its stream; sibling flows while parked" {
+    if (build_options.enable_http3 and build_options.enable_wasm) {
+        const dispatch_mod = @import("dispatch.zig");
+        const FILTER = @embedFile("../wasm/testdata/filter_probe.wasm");
+
+        var gpa = std.heap.DebugAllocator(.{}){};
+        defer _ = gpa.deinit();
+        const allocator = gpa.allocator();
+
+        var pool = try wasm_filter_mod.Pool.init(allocator, FILTER, .{ .instances = 2 });
+        defer pool.deinit();
+
+        var env = try TestH3Env.init(allocator, try testEnrichRouter(&pool, true));
+        defer env.deinit();
+        const server = env.server;
+        const conn = env.conn;
+
+        // Stream 0 -> /enrich: the filter stages a host_call and PARKS. No frames
+        // sent for it yet; the stream stays suspended.
+        env.dispatch(0, "/enrich");
+        try testing.expectEqual(@as(usize, 1), server.wasm_host_calls.liveCount());
+        try testing.expect(server.wasmHasParkForStream(H3_CONN_INDEX, conn.id, 0));
+        try testing.expectEqual(@as(usize, 1), server.wasm_mock_count);
+
+        // Stream 4 -> /plain: a SIBLING stream completes immediately while stream
+        // 0 is still parked. The connection kept multiplexing.
+        env.dispatch(4, "/plain");
+        try testing.expectEqual(@as(usize, 1), server.wasm_host_calls.liveCount());
+        try testing.expect(!server.wasmHasParkForStream(H3_CONN_INDEX, conn.id, 4));
+
+        // Complete the parked host call (mock): resumes stream 0 -> allow ->
+        // re-dispatch the handler -> deliver "enriched" on stream 0.
+        const k = server.wasm_mock_count;
+        var i: usize = 0;
+        while (i < k) : (i += 1) dispatch_mod.wasmComplete(server, server.wasm_mock_pending[i], "ok");
+        server.wasm_mock_count = 0;
+
+        try testing.expectEqual(@as(usize, 0), server.wasm_host_calls.liveCount()); // released
+        // The freed instance is reacquirable from the pool (no leak).
+        try testing.expect(pool.acquire() != null);
+    } else return error.SkipZigTest;
+}
+
+test "wasm h3: peer stream reset during park releases the pinned instance (no leak)" {
+    if (build_options.enable_http3 and build_options.enable_wasm) {
+        const FILTER = @embedFile("../wasm/testdata/filter_probe.wasm");
+
+        var gpa = std.heap.DebugAllocator(.{}){};
+        defer _ = gpa.deinit();
+        const allocator = gpa.allocator();
+
+        var pool = try wasm_filter_mod.Pool.init(allocator, FILTER, .{ .instances = 1 });
+        defer pool.deinit();
+
+        var env = try TestH3Env.init(allocator, try testEnrichRouter(&pool, false));
+        defer env.deinit();
+        const server = env.server;
+        const conn = env.conn;
+
+        // Park stream 0. The single pool instance is now pinned.
+        env.dispatch(0, "/enrich");
+        try testing.expectEqual(@as(usize, 1), server.wasm_host_calls.liveCount());
+
+        // A peer RESET_STREAM on stream 0 surfaces as a reset id; the datagram
+        // path drains it via releaseResetParks, releasing the pinned instance
+        // (the same code processOneDatagram runs for result.reset_streams).
+        conn.recordResetStream(0);
+        releaseResetParks(server, conn, conn.resetStreams());
+
+        try testing.expectEqual(@as(usize, 0), server.wasm_host_calls.liveCount()); // released
+        try testing.expect(pool.acquire() != null); // reacquirable from the 1-slot pool
+    } else return error.SkipZigTest;
+}
+
+test "wasm h3: connection close during park releases the pinned instance (no leak)" {
+    if (build_options.enable_http3 and build_options.enable_wasm) {
+        const FILTER = @embedFile("../wasm/testdata/filter_probe.wasm");
+
+        var gpa = std.heap.DebugAllocator(.{}){};
+        defer _ = gpa.deinit();
+        const allocator = gpa.allocator();
+
+        var pool = try wasm_filter_mod.Pool.init(allocator, FILTER, .{ .instances = 1 });
+        defer pool.deinit();
+
+        var env = try TestH3Env.init(allocator, try testEnrichRouter(&pool, false));
+        defer env.deinit();
+        const server = env.server;
+        const conn = env.conn;
+
+        env.dispatch(0, "/enrich");
+        try testing.expectEqual(@as(usize, 1), server.wasm_host_calls.liveCount());
+
+        // Connection close releases every park on the connection (the call the
+        // datagram path makes before pool.removeConnection on close_connection).
+        server.wasmCancelForConn(H3_CONN_INDEX, conn.id);
+
+        try testing.expectEqual(@as(usize, 0), server.wasm_host_calls.liveCount()); // released
+        try testing.expect(pool.acquire() != null);
+    } else return error.SkipZigTest;
 }
 

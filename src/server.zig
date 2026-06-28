@@ -921,6 +921,14 @@ pub const Server = struct {
         };
     }
 
+    pub fn internalErrorResponse() response_mod.Response {
+        return .{
+            .status = 500,
+            .headers = &[_]response_mod.Header{},
+            .body = .{ .bytes = "Internal Server Error\n" },
+        };
+    }
+
     pub fn notImplementedResponse() response_mod.Response {
         return .{
             .status = 501,
@@ -1446,7 +1454,9 @@ test "metrics middleware response queued for http1" {
     const chain = middleware.Chain.init(&.{metrics_mw.evaluate}, &.{});
     app_router.setMiddleware(chain);
 
-    var server = try Server.initWithRouter(allocator, cfg, app_router);
+    const server = try allocator.create(Server);
+    defer allocator.destroy(server);
+    try server.initInPlace(allocator, cfg, app_router);
     defer server.deinit();
 
     metrics_mw.getStore().* = .{};
@@ -1489,7 +1499,7 @@ test "metrics middleware response queued for http1" {
     const conn = server.io.acquireConnection(server.io.nowMs()) orelse return error.OutOfMemory;
     defer if (conn.state != .closed) server.io.releaseConnection(conn);
 
-    try http1_mod.queueResponse(&server, conn, result.resp);
+    try http1_mod.queueResponse(server, conn, result.resp);
     // Managed body fits alongside headers — combined into single write
     try std.testing.expectEqual(@as(u8, 1), conn.write_count);
 
@@ -1524,7 +1534,9 @@ test "metrics middleware response queued for http2" {
     const chain = middleware.Chain.init(&.{metrics_mw.evaluate}, &.{});
     app_router.setMiddleware(chain);
 
-    var server = try Server.initWithRouter(allocator, cfg, app_router);
+    const server = try allocator.create(Server);
+    defer allocator.destroy(server);
+    try server.initInPlace(allocator, cfg, app_router);
     defer server.deinit();
 
     metrics_mw.getStore().* = .{};
@@ -1573,7 +1585,7 @@ test "metrics middleware response queued for http2" {
     _ = stack.openTestStream(1);
     conn.http2_stack = &stack;
 
-    try http2_mod.queueHttp2Response(&server, conn, 1, result.resp, false);
+    try http2_mod.queueHttp2Response(server, conn, 1, result.resp, false);
     try std.testing.expect(conn.write_count >= 1);
 
     const expected = result.resp.bodyBytes();
@@ -1625,7 +1637,9 @@ test "metrics middleware end-to-end http1" {
     const chain = middleware.Chain.init(&.{metrics_mw.evaluate}, &.{});
     app_router.setMiddleware(chain);
 
-    var server = try Server.initWithRouter(allocator, cfg, app_router);
+    const server = try allocator.create(Server);
+    defer allocator.destroy(server);
+    try server.initInPlace(allocator, cfg, app_router);
     defer server.deinit();
 
     metrics_mw.getStore().* = .{};
@@ -1673,7 +1687,7 @@ test "metrics middleware end-to-end http1" {
     const conn = server.io.acquireConnection(server.io.nowMs()) orelse return error.OutOfMemory;
     defer if (conn.state != .closed) server.io.releaseConnection(conn);
 
-    try http1_mod.queueResponse(&server, conn, result.resp);
+    try http1_mod.queueResponse(server, conn, result.resp);
     // Managed body fits alongside headers — combined into single write
     try std.testing.expectEqual(@as(u8, 1), conn.write_count);
 
@@ -1707,7 +1721,9 @@ test "metrics middleware end-to-end http2" {
     const chain = middleware.Chain.init(&.{metrics_mw.evaluate}, &.{});
     app_router.setMiddleware(chain);
 
-    var server = try Server.initWithRouter(allocator, cfg, app_router);
+    const server = try allocator.create(Server);
+    defer allocator.destroy(server);
+    try server.initInPlace(allocator, cfg, app_router);
     defer server.deinit();
 
     metrics_mw.getStore().* = .{};
@@ -1770,7 +1786,7 @@ test "metrics middleware end-to-end http2" {
     conn.protocol = .http2;
     conn.http2_stack = &stack;
 
-    try http2_mod.queueHttp2Response(&server, conn, 1, result.resp, false);
+    try http2_mod.queueHttp2Response(server, conn, 1, result.resp, false);
     try std.testing.expect(conn.write_count >= 1);
 
     const expected = result.resp.bodyBytes();
@@ -1834,7 +1850,9 @@ test "http1 response bytes from write queue" {
         .require_payment = false,
         .payment_required_b64 = "",
     });
-    var server = try Server.initWithRouter(allocator, cfg, app_router);
+    const server = try allocator.create(Server);
+    defer allocator.destroy(server);
+    try server.initInPlace(allocator, cfg, app_router);
     defer server.deinit();
 
     const conn = server.io.acquireConnection(server.io.nowMs()) orelse return error.OutOfMemory;
@@ -1848,7 +1866,7 @@ test "http1 response bytes from write queue" {
         .body = .{ .bytes = "hi" },
     };
 
-    try http1_mod.queueResponse(&server, conn, resp);
+    try http1_mod.queueResponse(server, conn, resp);
     const bytes = try write_queue.drainWriteQueue(&server.io, conn, allocator);
     defer allocator.free(bytes);
 
@@ -1877,7 +1895,9 @@ test "http1 managed response bytes from write queue" {
         .require_payment = false,
         .payment_required_b64 = "",
     });
-    var server = try Server.initWithRouter(allocator, cfg, app_router);
+    const server = try allocator.create(Server);
+    defer allocator.destroy(server);
+    try server.initInPlace(allocator, cfg, app_router);
     defer server.deinit();
 
     const handle = server.io.acquireBuffer() orelse return error.OutOfMemory;
@@ -1895,7 +1915,7 @@ test "http1 managed response bytes from write queue" {
     const conn = server.io.acquireConnection(server.io.nowMs()) orelse return error.OutOfMemory;
     defer if (conn.state != .closed) server.io.releaseConnection(conn);
 
-    try http1_mod.queueResponse(&server, conn, resp);
+    try http1_mod.queueResponse(server, conn, resp);
     const bytes = try write_queue.drainWriteQueue(&server.io, conn, allocator);
     defer allocator.free(bytes);
 
