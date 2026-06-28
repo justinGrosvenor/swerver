@@ -42,6 +42,13 @@ const HANDSHAKE_TIMEOUT_MS: u64 = 5_000;
 /// Per-command wall-clock budget. On expiry the socket is dropped and rebuilt
 /// (a streamed command cannot be cancelled in place; reconnect frees the lane).
 const COMMAND_TIMEOUT_MS: u64 = 30_000;
+/// Settle window for an UNFRAMED command reply. A bare `ERR <reason>\n` (e.g.
+/// "agent not connected" before the guest is ready, or "unknown command") carries
+/// no 0x1e trailer. It could (rarely) be a framed reply whose 0x1e is still in
+/// flight, so on seeing a complete bare ERR/OK line we wait this long for a 0x1e
+/// before treating it as a bare reply and failing the call fast (vs. blocking the
+/// full COMMAND_TIMEOUT). Mirrors nether-ctl read_reply's SETTLE_MS.
+const SETTLE_MS: u64 = 500;
 const BACKOFF_START_MS: u64 = 250;
 const BACKOFF_MAX_MS: u64 = 5_000;
 
@@ -111,6 +118,9 @@ pub const ControlClient = struct {
     // Token whose reply we are currently reading (null = idle / handshaking).
     inflight: ?Token = null,
     command_deadline_ms: u64 = 0,
+    /// Non-zero while a complete bare ERR/OK command reply is buffered with no
+    /// 0x1e: the deadline by which a 0x1e must arrive for it to count as framed.
+    settle_deadline_ms: u64 = 0,
 
     // Connect/handshake deadline and reconnect backoff.
     deadline_ms: u64 = 0,
@@ -217,11 +227,19 @@ pub const ControlClient = struct {
             .connecting, .info_wait => if (now_ms >= self.deadline_ms) {
                 self.fail(io_rt, now_ms, "connect/handshake timeout");
             },
-            .ready => if (self.inflight != null and now_ms >= self.command_deadline_ms) {
-                // A streamed command cannot be cancelled in place; drop and
-                // rebuild the socket so the lane is not wedged. The token's park
-                // is failed here (no-op if the table already timed it out).
-                self.fail(io_rt, now_ms, "command timeout");
+            .ready => {
+                if (self.inflight != null and self.settle_deadline_ms != 0 and now_ms >= self.settle_deadline_ms) {
+                    // A bare ERR/OK command reply settled (no 0x1e arrived): it is
+                    // an unframed control-plane reply for this command (e.g. the
+                    // guest was not ready). Fail this call fast and consume the
+                    // line; the socket stays healthy for the next command.
+                    self.failBareReply(io_rt, now_ms);
+                } else if (self.inflight != null and now_ms >= self.command_deadline_ms) {
+                    // A streamed command cannot be cancelled in place; drop and
+                    // rebuild the socket so the lane is not wedged. The token's park
+                    // is failed here (no-op if the table already timed it out).
+                    self.fail(io_rt, now_ms, "command timeout");
+                }
             },
         }
     }
@@ -332,24 +350,30 @@ pub const ControlClient = struct {
         const buf = self.recv_buf[0..self.recv_len];
         const sep = std.mem.indexOfScalar(u8, buf, RS) orelse {
             // No frame separator yet. Framed replies (shell/guest commands,
-            // __info__) end with 0x1e<exit>\n; an unframed `ERR <reason>\n` (a
-            // control-layer rejection: bad command, observer gating, unknown
-            // __verb__) carries no 0x1e and would otherwise hang until the
-            // deadline. We only send framed-reply commands, so the only place a
-            // bare ERR is realistically reachable is the handshake -- guard it
-            // there (fail fast). In the command phase a leading "ERR" can be real
-            // multi-line output whose 0x1e has not arrived, so we keep waiting and
-            // let the per-command deadline backstop a pathological unframed reply.
-            // Mirrors nether-ctl's bare_status_line guard (~/nether 8fab515).
-            if (self.state == .info_wait and
-                std.mem.startsWith(u8, buf, "ERR ") and
-                std.mem.indexOfScalar(u8, buf, '\n') != null)
-            {
-                self.fail(io_rt, now_ms, "control handshake rejected (ERR)");
-                return true;
+            // __info__) end with 0x1e<exit>\n; an UNFRAMED `ERR <reason>\n` (a
+            // control-layer reply: bad/unknown command, observer gating, or
+            // "agent not connected" before the guest is ready) carries no 0x1e and
+            // would otherwise hang until the deadline. Guard a complete bare line:
+            if (std.mem.indexOfScalar(u8, buf, '\n') != null and bareStatusLine(buf)) {
+                // Handshake: __info__ never has ERR-prefixed framed output, so a
+                // bare ERR is unambiguously a rejection -- fail fast now.
+                if (self.state == .info_wait) {
+                    self.fail(io_rt, now_ms, "control handshake rejected (ERR)");
+                    return true;
+                }
+                // Command phase: a framed reply's output could (rarely) begin with
+                // "ERR" before its 0x1e arrives, so open a short settle window
+                // rather than failing immediately; tick() resolves it. Mirrors
+                // nether-ctl read_reply's SETTLE_MS disambiguation.
+                if (self.state == .ready and self.inflight != null and self.settle_deadline_ms == 0) {
+                    self.settle_deadline_ms = now_ms + SETTLE_MS;
+                }
             }
             return false;
         };
+        // A 0x1e arrived: this is a framed reply after all, so cancel any pending
+        // bare-reply settle window opened above.
+        self.settle_deadline_ms = 0;
         // The trailer is 0x1e<digits>\n; wait until the newline lands.
         const nl_rel = std.mem.indexOfScalar(u8, buf[sep + 1 ..], '\n') orelse return false;
         const end = sep + 1 + nl_rel + 1; // one past the trailing newline
@@ -415,8 +439,24 @@ pub const ControlClient = struct {
         self.send_off = 0;
         self.inflight = token;
         self.recv_len = 0;
+        self.settle_deadline_ms = 0;
         self.command_deadline_ms = now_ms + COMMAND_TIMEOUT_MS;
         _ = self.flushSend(io_rt, now_ms);
+    }
+
+    /// A bare ERR/OK command reply settled (no 0x1e). Fail the in-flight call
+    /// fast and consume the line; the socket stays healthy for the next command
+    /// (the control plane returned a complete unframed reply, not a desync).
+    fn failBareReply(self: *ControlClient, io_rt: *io_mod.IoRuntime, now_ms: u64) void {
+        const nl = std.mem.indexOfScalar(u8, self.recv_buf[0..self.recv_len], '\n');
+        const end = if (nl) |n| n + 1 else self.recv_len;
+        if (self.inflight) |t| {
+            self.inflight = null;
+            self.failOne(t);
+        }
+        self.settle_deadline_ms = 0;
+        self.consumeFront(end);
+        self.pumpQueue(io_rt, now_ms);
     }
 
     /// Write send_buf[send_off..send_len]; arm a writable wake on EAGAIN.
@@ -491,6 +531,15 @@ pub const ControlClient = struct {
         if (self.fail_fn) |ff| ff(self.resume_ctx.?, token);
     }
 };
+
+/// Is `buf` an unframed control-plane status line (a bare `ERR ...` / `OK ...`
+/// with no 0x1e trailer)? Used to distinguish a control-plane reply (e.g. "ERR
+/// agent not connected" before the guest is ready) from a framed command reply.
+/// Mirrors nether-ctl's bare_status_line. Caller has already established there is
+/// no 0x1e in the buffer.
+fn bareStatusLine(buf: []const u8) bool {
+    return std.mem.startsWith(u8, buf, "ERR ") or std.mem.startsWith(u8, buf, "OK ");
+}
 
 /// Verify a __info__ report carries `proto_version=1`. The report is a text
 /// block with one `proto_version=<n>` line (control-protocol.md).
@@ -618,6 +667,36 @@ test "tryConsumeReply: a bare ERR at handshake fails fast (no hang)" {
     // Consumed (fast-fail) rather than waiting for the handshake deadline.
     try testing.expect(cc.tryConsumeReply(&io_rt, 0));
     try testing.expect(cc.state == .closed); // fail() -> scheduleRetry
+}
+
+test "command-phase bare ERR settles and fails the call fast (guest not ready)" {
+    Captured.reset();
+    var dummy: u8 = 0;
+    var cc = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
+    cc.installResume(@ptrCast(&dummy), Captured.complete, Captured.fail);
+    var io_rt: io_mod.IoRuntime = undefined; // not dereferenced on these paths
+
+    // A command is in flight; the control plane returns an unframed ERR (no 0x1e)
+    // because the guest agent is not connected yet.
+    cc.state = .ready;
+    cc.inflight = 77;
+    const err = "ERR agent not connected (guest not ready)\n"; // no 0x1e
+    @memcpy(cc.recv_buf[0..err.len], err);
+    cc.recv_len = err.len;
+
+    // First pass: no 0x1e, but a complete bare ERR line -> opens the settle window
+    // (does NOT fail yet, in case a framed reply's 0x1e is merely in flight).
+    try testing.expect(!cc.tryConsumeReply(&io_rt, 1_000));
+    try testing.expect(cc.settle_deadline_ms != 0);
+    try testing.expect(Captured.failed == null);
+
+    // The settle window elapses with still no 0x1e -> fail the call fast, keep the
+    // socket healthy (ready) for the next command.
+    cc.tick(&io_rt, cc.settle_deadline_ms);
+    try testing.expectEqual(@as(?Token, 77), Captured.failed);
+    try testing.expect(cc.inflight == null);
+    try testing.expect(cc.state == .ready); // socket not torn down
+    try testing.expectEqual(@as(usize, 0), cc.recv_len); // ERR line consumed
 }
 
 test "startCall queues when not ready and fails closed when disabled" {
