@@ -211,6 +211,17 @@ pub const Table = struct {
         return false;
     }
 
+    /// Is there a live park for this specific stream (generation-checked)? The
+    /// per-stream counterpart to hasParkFor, used by the H2/H3 dispatch (E2) to
+    /// confirm a park-sentinel response really registered a park on the stream
+    /// before suspending it.
+    pub fn hasParkForStream(self: *Table, conn_index: u32, conn_id: u64, stream_id: u32) bool {
+        for (&self.slots) |*s| {
+            if (s.active and s.conn_index == conn_index and s.conn_id == conn_id and s.stream_id == stream_id) return true;
+        }
+        return false;
+    }
+
     /// The host call for `token` completed: resume the filter with `result` and
     /// return the terminal Decision + connection linkage. Frees the slot and
     /// releases the instance. Null if the token is stale/free (double complete).

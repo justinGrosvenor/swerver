@@ -190,6 +190,10 @@ pub const Event = union(enum) {
     ping: PingEvent,
     window_update_needed: WindowUpdateEvent,
     window_opened: WindowUpdateEvent,
+    /// A peer RST_STREAM closed a single stream. The dispatch layer uses it to
+    /// release any per-stream resource bound to that stream (e.g. a parked WASM
+    /// filter instance via cancelForStream) without tearing down the connection.
+    stream_reset: StreamResetEvent,
 };
 
 pub const HeadersEvent = struct {
@@ -207,6 +211,11 @@ pub const DataEvent = struct {
 pub const ErrorEvent = struct {
     stream_id: u32,
     code: ErrorCode,
+};
+
+pub const StreamResetEvent = struct {
+    /// The stream the peer reset (RST_STREAM).
+    stream_id: u32,
 };
 
 pub const SettingsEvent = struct {
@@ -1196,7 +1205,6 @@ pub const Stack = struct {
     const max_rst_streams_floor: u32 = 100;
 
     fn handleRstStream(self: *Stack, frame: Frame, events: []Event) FrameHandle {
-        _ = events;
         if (frame.payload.len != 4) return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
         if (frame.header.stream_id == 0) return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
         if (frame.header.stream_id > self.last_stream_id) return .{ .state = .err, .error_code = .protocol_error, .event_count = 0 };
@@ -1214,10 +1222,19 @@ pub const Stack = struct {
             }
         }
 
-        const stream = self.findStream(frame.header.stream_id) orelse
-            return .{ .state = .complete, .error_code = .none, .event_count = 0 };
-        stream.state = .closed;
-        return .{ .state = .complete, .error_code = .none, .event_count = 0 };
+        // Emit a stream_reset event so the dispatch layer can release any
+        // per-stream resource (e.g. a parked WASM filter) for this stream. Emit
+        // even when the stream is unknown to the stack: the host_call table is
+        // keyed independently and the cancel is a generation-checked no-op when
+        // nothing is parked.
+        const emit_reset = events.len > 0;
+        if (emit_reset) events[0] = .{ .stream_reset = .{ .stream_id = frame.header.stream_id } };
+        const ev_count: usize = if (emit_reset) 1 else 0;
+
+        if (self.findStream(frame.header.stream_id)) |stream| {
+            stream.state = .closed;
+        }
+        return .{ .state = .complete, .error_code = .none, .event_count = ev_count };
     }
 
     fn handlePing(self: *Stack, frame: Frame, events: []Event) FrameHandle {
