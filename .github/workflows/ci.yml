@@ -46,6 +46,13 @@ jobs:
         run: |
           zig build check -Denable-wasm=true --summary all
           zig build test -Denable-wasm=true --summary all
+      # H2 per-stream filter park (E2a) is gated on BOTH -Denable-wasm and
+      # -Denable-http2; the step above (wasm only) skips those tests. Run the
+      # combination so the H2 park/resume + RST-cancel tests actually execute.
+      - name: WASM + HTTP/2 check + test (-Denable-wasm -Denable-http2)
+        run: |
+          zig build check -Denable-wasm=true -Denable-http2=true --summary all
+          zig build test -Denable-wasm=true -Denable-http2=true --summary all
 
   test-macos:
     runs-on: macos-latest
@@ -72,6 +79,10 @@ jobs:
         run: |
           zig build check -Denable-wasm=true --summary all
           zig build test -Denable-wasm=true --summary all
+      - name: WASM + HTTP/2 check + test (-Denable-wasm -Denable-http2)
+        run: |
+          zig build check -Denable-wasm=true -Denable-http2=true --summary all
+          zig build test -Denable-wasm=true -Denable-http2=true --summary all
 
   cross-compile-linux:
     runs-on: macos-latest

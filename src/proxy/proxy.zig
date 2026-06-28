@@ -1551,7 +1551,7 @@ test "wasm: proxy request filter parks, registers in the table, fires start_fn" 
         const out = runWasmFilter(&route, &req, binding);
         try std.testing.expect(out != null and out.?.isParked());
         try std.testing.expectEqual(@as(usize, 1), table.liveCount());
-        try std.testing.expectEqual(@as(?u32, 0), Rec.token); // first token
+        try std.testing.expect(Rec.token != null); // start_fn fired with the park token
         try std.testing.expect(Rec.req_bytes_len > 0); // staged command forwarded
 
         // Resume decisions skip the filter: allow -> proceed (null), reject -> serve.

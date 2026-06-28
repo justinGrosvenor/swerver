@@ -807,6 +807,10 @@ fn wasmResume(server: *Server, completion: wasm_host_call_mod.Completion) void {
             http1_mod.queueResponse(server, conn, resp) catch {
                 conn.close_after_write = true;
             };
+            // The reject body borrows the resumed instance's staged scratch
+            // (released to .idle by resumeCall/cancel); copy any spilled tail to
+            // stable pool buffers before the next request reuses the instance.
+            if (conn.pending_body.len > 0) http1_mod.materializePendingBody(server, conn);
         },
         .rate_limit_backpressure => |bp| {
             http1_mod.queueResponse(server, conn, bp.resp) catch {
@@ -873,6 +877,10 @@ fn wasmResume(server: *Server, completion: wasm_host_call_mod.Completion) void {
                 http1_mod.queueResponse(server, conn, result.resp) catch {
                     conn.close_after_write = true;
                 };
+                // Same Phase 2b hazard as the main loop: a replaced response body
+                // borrows the (now-idle, soon-reused) instance scratch; copy any
+                // spilled tail into stable pool buffers before returning.
+                if (conn.pending_body.len > 0) http1_mod.materializePendingBody(server, conn);
             }
         },
     }
@@ -2098,6 +2106,14 @@ pub fn handleRead(server: *Server, index: u32) !void {
         // drain and write-readiness events.
         if (http1_mod.handleParkSentinel(server, conn, result.resp)) break;
         try http1_mod.queueResponse(server, conn, result.resp);
+        // A Phase 2b on_response filter can REPLACE the body with a slice that
+        // borrows the wasm instance's scratch, which invokeResponse releases to
+        // .idle immediately (reused by the next request). If the body did not fit
+        // the write queue, the spilled tail in conn.pending_body still borrows
+        // that scratch -> the next request would overwrite it (cross-request body
+        // corruption). Materialize the tail into stable pool buffers now, while
+        // the scratch is still valid. Mirrors the proxy path's tail handling.
+        if (conn.pending_body.len > 0) http1_mod.materializePendingBody(server, conn);
         if (server.otel) |otel_exp| {
             otel_exp.recordSpan(parse.view.method, parse.view.path, result.resp.status, otel_start, clock.realtimeNanos() orelse 0);
         }

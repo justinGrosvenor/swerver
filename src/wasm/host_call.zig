@@ -139,8 +139,24 @@ pub const Table = struct {
     /// also bounded implicitly by the instance pool sizes (each park pins one).
     pub const CAP = 64;
 
+    // Token layout: the low INDEX_BITS are the slot index, the rest a per-slot
+    // generation. The generation makes a token unique to ONE park. When a slot is
+    // freed (connection close, deadline, cancel) and later reused by a different
+    // request, the new park bumps the slot's generation, so a late or duplicate
+    // completion -- or a stale in-flight transport token for the PREVIOUS occupant
+    // (the ControlClient has no cancel-by-token, so a parked-then-disconnected
+    // request's reply can still arrive) -- is rejected by live() instead of
+    // resuming the new occupant with the wrong host-call result.
+    const INDEX_BITS = 8; // CAP (64) fits in 8 bits
+    const INDEX_MASK: Token = (1 << INDEX_BITS) - 1;
+
     const Slot = struct {
         active: bool = false,
+        /// Bumped each time the slot is claimed; packed into the token so a stale
+        /// token for a prior occupant fails the live() check. Wraps (u24 space is
+        /// ~16M parks per slot); a collision needs exactly that many reuses
+        /// between a stale token and its check, which cannot occur in practice.
+        generation: u24 = 0,
         instance: *filter.Instance = undefined,
         conn_index: u32 = 0,
         conn_id: u64 = 0,
@@ -183,6 +199,7 @@ pub const Table = struct {
                 // Build the owned snapshot in-place first; bail (caller fails
                 // closed) before claiming the slot if it does not fit.
                 const owned = buildSnapshot(&s.snap, req) orelse return null;
+                s.generation +%= 1; // unique to this park; stale tokens fail live()
                 s.active = true;
                 s.instance = instance;
                 s.conn_index = conn_index;
@@ -193,14 +210,15 @@ pub const Table = struct {
                 s.resume_fuel = resume_fuel;
                 s.resume_ctx = resume_ctx;
                 s.req = owned;
-                return @intCast(i);
+                return (@as(Token, s.generation) << INDEX_BITS) | @as(Token, @intCast(i));
             }
         }
         return null;
     }
 
-    /// Is there a live park for this connection (generation-checked)? Mirrors
-    /// PgClient.hasParkFor; used by handleParkSentinel to set `.wasm_parked`.
+    /// Is there a live park for this connection (matched by conn id, not the
+    /// token generation)? Mirrors PgClient.hasParkFor; used by handleParkSentinel
+    /// to set `.wasm_parked`.
     pub fn hasParkFor(self: *Table, conn_index: u32, conn_id: u64) bool {
         for (&self.slots) |*s| {
             if (s.active and s.conn_index == conn_index and s.conn_id == conn_id) return true;
@@ -244,7 +262,11 @@ pub const Table = struct {
 
     /// The client connection closed while a filter was parked on it: release the
     /// pinned instance, drop the entry, and DON'T produce a completion (there is
-    /// nobody to serve). Generation-checked. Returns true if one was found.
+    /// nobody to serve). Matched by conn id (all streams on the conn). Returns
+    /// true if at least one was found. NOTE: this does NOT cancel any in-flight
+    /// transport token for the freed slot(s); a late reply is rejected later by
+    /// live()'s generation check (a slot reused by a new park has a new
+    /// generation), so the new occupant is never resumed with a stale result.
     pub fn cancelForConn(self: *Table, conn_index: u32, conn_id: u64) bool {
         var found = false;
         for (&self.slots) |*s| {
@@ -260,7 +282,7 @@ pub const Table = struct {
     /// A single multiplexed stream closed (RST_STREAM / QUIC stream reset) while
     /// a filter was parked on it: release that one pinned instance and drop the
     /// entry, leaving the connection's other parked streams intact. The per-stream
-    /// counterpart to cancelForConn, used by H2/H3 (E2). Generation-checked.
+    /// counterpart to cancelForConn, used by H2/H3 (E2). Matched by stream id.
     /// Returns true if a matching park was found.
     pub fn cancelForStream(self: *Table, conn_index: u32, conn_id: u64, stream_id: u32) bool {
         for (&self.slots) |*s| {
@@ -301,9 +323,15 @@ pub const Table = struct {
     }
 
     fn live(self: *Table, token: Token) ?*Slot {
-        if (token >= self.slots.len) return null;
-        const s = &self.slots[token];
-        return if (s.active) s else null;
+        const idx = token & INDEX_MASK;
+        if (idx >= self.slots.len) return null;
+        const s = &self.slots[idx];
+        const gen: u24 = @truncate(token >> INDEX_BITS);
+        // Reject a stale token: the slot is free, or was reused by a later park
+        // (different generation). This is what stops request A's late host-call
+        // reply from resuming request B after B reused A's freed slot.
+        if (!s.active or s.generation != gen) return null;
+        return s;
     }
 
     /// Build a Completion from a (still-active) slot, carrying the stream key,
@@ -415,6 +443,32 @@ test "host_call table: cancelForConn releases without a completion" {
     try testing.expect(table.cancelForConn(9, 42) == true);
     try testing.expectEqual(@as(usize, 0), table.liveCount());
     try testing.expect(pool.acquire() != null);
+}
+
+test "host_call table: a stale token does not resume a reused slot (generation)" {
+    // Regression for the cross-request misattribution bug: request A parks, A's
+    // connection closes (slot freed), request B reuses the SAME slot, then A's
+    // late host-call reply arrives. complete(tokenA) must be rejected (stale
+    // generation) and must NOT resume B with A's result.
+    var pool = try filter.Pool.init(testing.allocator, FILTER_WASM, .{ .instances = 2 });
+    defer pool.deinit();
+    var table = Table{};
+
+    const token_a = try parkOne(&pool, &table, 1, 100, 5000); // A: conn 1
+    try testing.expect(table.cancelForConn(1, 100)); // A disconnects -> slot freed, token_a still outstanding
+    try testing.expectEqual(@as(usize, 0), table.liveCount());
+
+    const token_b = try parkOne(&pool, &table, 2, 200, 5000); // B reuses the freed slot
+    try testing.expect(token_a != token_b); // same index, different generation
+
+    // A's late reply lands on the reused slot index -> rejected as stale.
+    try testing.expect(table.complete(token_a, "ok") == null);
+    try testing.expectEqual(@as(usize, 1), table.liveCount()); // B still parked, untouched
+
+    // B's own completion still works and carries B's connection.
+    const c = table.complete(token_b, "ok") orelse return error.NoCompletion;
+    try testing.expectEqual(@as(u32, 2), c.conn_index);
+    try testing.expectEqual(@as(u64, 200), c.conn_id);
 }
 
 test "host_call table: full table returns null token" {

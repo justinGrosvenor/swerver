@@ -693,7 +693,11 @@ pub fn invokeOutcome(inst: *Instance, req: *const request.RequestView, fuel_budg
 /// Deliver a completed host-call result to a parked instance and re-enter its
 /// on_resume export, producing the terminal Decision. Releases the instance.
 pub fn resumeCall(inst: *Instance, result_bytes: []const u8, fuel_budget: i64) middleware.Decision {
-    std.debug.assert(inst.state == .parked);
+    // Runtime fail-closed guard (NOT a debug assert, which compiles out in
+    // release): resuming an instance that is not parked would corrupt a live or
+    // idle instance. The token generation in host_call.Table makes a stale resume
+    // unreachable, but this is the last-line defense if that ever regresses.
+    if (inst.state != .parked) return failClosed();
     const n = @min(result_bytes.len, inst.call_result_buf.len);
     @memcpy(inst.call_result_buf[0..n], result_bytes[0..n]);
     inst.call_result_len = n;
