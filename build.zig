@@ -210,6 +210,33 @@ pub fn build(b: *std.Build) void {
     const gateway_step = b.step("gateway", "Run gateway example");
     gateway_step.dependOn(&gateway_run.step);
 
+    // WASM edge-function e2e mock server (design 10.0). Only built with
+    // -Denable-wasm, since it imports swerver.wasm.*. Embeds the committed filter
+    // fixture and runs the mock host-call transport to validate park/resume over
+    // real HTTP. `zig build wasm-e2e -Denable-wasm=true`.
+    if (enable_wasm) {
+        const wasm_e2e_module = b.createModule(.{
+            .root_source_file = b.path("examples/wasm_e2e/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        wasm_e2e_module.addImport("swerver", swerver_module);
+        wasm_e2e_module.addOptions("build_options", options);
+        wasm_e2e_module.addAnonymousImport("filter_wasm", .{
+            .root_source_file = b.path("src/wasm/testdata/filter_probe.wasm"),
+        });
+        const wasm_e2e_exe = b.addExecutable(.{
+            .name = "swerver-wasm-e2e",
+            .root_module = wasm_e2e_module,
+        });
+        b.installArtifact(wasm_e2e_exe);
+        const wasm_e2e_run = b.addRunArtifact(wasm_e2e_exe);
+        if (b.args) |args| wasm_e2e_run.addArgs(args);
+        const wasm_e2e_step = b.step("wasm-e2e", "Run the WASM edge-function e2e mock server");
+        wasm_e2e_step.dependOn(&wasm_e2e_run.step);
+    }
+
     // --- check: compile everything without running ---
     // `zig build test` only compiles the unit-test binary, not the server
     // exe or the example exes. A changed public signature can therefore pass
