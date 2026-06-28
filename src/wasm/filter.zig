@@ -17,9 +17,20 @@
 //!   log(ptr, len)                                        diagnostic log line
 //!   host_call(ptr, len) -> i32                           stage an outbound call, park (Phase 3)
 //!   read_call_result(out_ptr, out_cap) -> len            read the call result in on_resume
+//! Response-phase imports (Phase 2b, valid only inside on_response):
+//!   get_response_status() -> i32                         the outgoing status
+//!   get_response_header(name_ptr,name_len,out_ptr,out_cap) -> len  response header (0=absent)
+//!   response_body_len() -> i32                           response body length (true total)
+//!   read_response_body(src_off,out_ptr,out_cap) -> len   copy a response-body window in
+//!   set_response_status(status)                          override the outgoing status
+//!   replace_response_body(ptr,len) -> i32                replace the body (0 ok, -1 too large)
+//!   (set_response_header also adds/overrides response headers in this phase)
 //! Guest exports:
 //!   on_request() -> i32   0=allow 1=reject 2=modify 3=parked (staged a host_call)
 //!   on_resume() -> i32    re-entered after a host call completes; 0/1/2 (Phase 3)
+//!   on_response() -> i32  optional; 0=apply staged response edits, nonzero=pass
+//!                         through unchanged. A TRAP here fails OPEN (the original
+//!                         response is served) -- the request already passed policy.
 //!
 //! Single-threaded worker: the active instance is a process-global, set around
 //! each invocation so the C host callbacks can reach the staging scratch and the
@@ -141,6 +152,9 @@ pub const Instance = struct {
     /// Phase 3 resume entry, re-entered after a host call completes. Optional:
     /// a filter that never parks does not export it.
     on_resume: ?c.IM3Function = null,
+    /// Phase 2b response hook, run after the handler/upstream produces a response.
+    /// Optional: a request-only filter does not export it.
+    on_response: ?c.IM3Function = null,
     state: State = .idle,
 
     // Per-invocation input (borrowed) and staged outputs (owned scratch).
@@ -170,6 +184,20 @@ pub const Instance = struct {
     call_result_len: usize = 0,
     call_result_buf: [CALL_RESULT_CAP]u8 = undefined,
 
+    // Phase 2b response phase. The outgoing response (borrowed) plus its body
+    // materialized lazily for reads, and the staged replacement body / status
+    // override. Response headers reuse staged_headers/scratch (this is a separate
+    // invocation, so resetStaging clears them first).
+    resp: ?*const response.Response = null,
+    resp_body_materialized: bool = false,
+    resp_body_view_len: usize = 0,
+    resp_body_full_len: usize = 0,
+    resp_body_buf: [MAX_BODY_VIEW]u8 = undefined,
+    resp_has_repl: bool = false,
+    resp_repl_len: usize = 0,
+    resp_repl_buf: [MAX_BODY_VIEW]u8 = undefined,
+    resp_new_status: u16 = 0,
+
     fn resetStaging(self: *Instance) void {
         self.staged_status = 0;
         self.staged_body_len = 0;
@@ -181,6 +209,25 @@ pub const Instance = struct {
         self.has_pending_call = false;
         self.pending_call_len = 0;
         self.call_result_len = 0;
+    }
+
+    fn resetResponseStaging(self: *Instance) void {
+        self.resp = null;
+        self.resp_body_materialized = false;
+        self.resp_body_view_len = 0;
+        self.resp_body_full_len = 0;
+        self.resp_has_repl = false;
+        self.resp_repl_len = 0;
+        self.resp_new_status = 0;
+    }
+
+    /// Materialize the response body into the bounded view buffer on first access.
+    fn ensureRespBody(self: *Instance) void {
+        if (self.resp_body_materialized) return;
+        self.resp_body_materialized = true;
+        const r = self.resp orelse return;
+        self.resp_body_full_len = r.bodyLen();
+        self.resp_body_view_len = materializeResponseBody(r.*, &self.resp_body_buf);
     }
 
     /// Materialize the request body into the bounded view buffer on first access.
@@ -231,6 +278,35 @@ fn materializeBody(body: request.RequestBody, dst: []u8) usize {
             return off;
         },
         .length_only => return 0,
+    }
+}
+
+/// Copy up to dst.len bytes of a response body into dst (scattered -> linear),
+/// returning the number copied. Mirrors materializeBody for the response side.
+fn materializeResponseBody(resp: response.Response, dst: []u8) usize {
+    switch (resp.body) {
+        .none => return 0,
+        .bytes => |s| {
+            const n = @min(s.len, dst.len);
+            @memcpy(dst[0..n], s[0..n]);
+            return n;
+        },
+        .managed => |m| {
+            const n = @min(m.len, dst.len);
+            @memcpy(dst[0..n], m.handle.bytes[0..n]);
+            return n;
+        },
+        .scattered => |b| {
+            var off: usize = 0;
+            for (b.handles, 0..) |handle, i| {
+                if (off >= dst.len) break;
+                const chunk_len = if (i == b.handles.len - 1) b.last_buf_len else b.buffer_size;
+                const take = @min(chunk_len, dst.len - off);
+                @memcpy(dst[off .. off + take], handle.bytes[0..take]);
+                off += take;
+            }
+            return off;
+        },
     }
 }
 
@@ -406,6 +482,105 @@ fn hostReadCallResult(rt: c.IM3Runtime, ctx: c.IM3ImportContext, sp: [*c]u64, me
     return null;
 }
 
+// --- Phase 2b response-phase host functions --------------------------------
+// These read `inst.resp` (the outgoing response) and stage edits. Valid only
+// inside on_response; `inst.resp` is null otherwise and they no-op / return 0.
+
+fn hostGetResponseStatus(rt: c.IM3Runtime, ctx: c.IM3ImportContext, sp: [*c]u64, mem: ?*anyopaque) callconv(.c) ?*const anyopaque {
+    _ = rt;
+    _ = ctx;
+    _ = mem;
+    const inst = active orelse return trap(TRAP_NO_ACTIVE);
+    const ret: *i32 = @ptrCast(@alignCast(sp));
+    ret.* = if (inst.resp) |r| @intCast(r.status) else 0;
+    return null;
+}
+
+fn hostGetResponseHeader(rt: c.IM3Runtime, ctx: c.IM3ImportContext, sp: [*c]u64, mem: ?*anyopaque) callconv(.c) ?*const anyopaque {
+    _ = ctx;
+    const inst = active orelse return trap(TRAP_NO_ACTIVE);
+    const ret: *i32 = @ptrCast(@alignCast(sp));
+    const name_ptr: u32 = @truncate(sp[1]);
+    const name_len: u32 = @truncate(sp[2]);
+    const out_ptr: u32 = @truncate(sp[3]);
+    const out_cap: u32 = @truncate(sp[4]);
+    const name = guestView(rt, mem, name_ptr, name_len) orelse return trap(TRAP_OOB);
+    const dst = guestView(rt, mem, out_ptr, out_cap) orelse return trap(TRAP_OOB);
+    const r = inst.resp orelse {
+        ret.* = 0;
+        return null;
+    };
+    for (r.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, name)) {
+            const n = @min(h.value.len, dst.len);
+            @memcpy(dst[0..n], h.value[0..n]);
+            ret.* = @intCast(h.value.len); // true length (copied = min)
+            return null;
+        }
+    }
+    ret.* = 0; // absent
+    return null;
+}
+
+fn hostResponseBodyLen(rt: c.IM3Runtime, ctx: c.IM3ImportContext, sp: [*c]u64, mem: ?*anyopaque) callconv(.c) ?*const anyopaque {
+    _ = rt;
+    _ = ctx;
+    _ = mem;
+    const inst = active orelse return trap(TRAP_NO_ACTIVE);
+    inst.ensureRespBody();
+    const ret: *i32 = @ptrCast(@alignCast(sp));
+    ret.* = @intCast(@min(inst.resp_body_full_len, @as(usize, std.math.maxInt(i32))));
+    return null;
+}
+
+fn hostReadResponseBody(rt: c.IM3Runtime, ctx: c.IM3ImportContext, sp: [*c]u64, mem: ?*anyopaque) callconv(.c) ?*const anyopaque {
+    _ = ctx;
+    const inst = active orelse return trap(TRAP_NO_ACTIVE);
+    inst.ensureRespBody();
+    const ret: *i32 = @ptrCast(@alignCast(sp));
+    const src_off: u32 = @truncate(sp[1]);
+    const out_ptr: u32 = @truncate(sp[2]);
+    const out_cap: u32 = @truncate(sp[3]);
+    const dst = guestView(rt, mem, out_ptr, out_cap) orelse return trap(TRAP_OOB);
+    if (src_off >= inst.resp_body_view_len) {
+        ret.* = 0;
+        return null;
+    }
+    const avail = inst.resp_body_view_len - src_off;
+    const n = @min(avail, dst.len);
+    @memcpy(dst[0..n], inst.resp_body_buf[src_off .. src_off + n]);
+    ret.* = @intCast(n);
+    return null;
+}
+
+fn hostSetResponseStatus(rt: c.IM3Runtime, ctx: c.IM3ImportContext, sp: [*c]u64, mem: ?*anyopaque) callconv(.c) ?*const anyopaque {
+    _ = rt;
+    _ = ctx;
+    _ = mem;
+    const inst = active orelse return trap(TRAP_NO_ACTIVE);
+    const status: u32 = @truncate(sp[0]);
+    inst.resp_new_status = @intCast(status);
+    return null;
+}
+
+fn hostReplaceResponseBody(rt: c.IM3Runtime, ctx: c.IM3ImportContext, sp: [*c]u64, mem: ?*anyopaque) callconv(.c) ?*const anyopaque {
+    _ = ctx;
+    const inst = active orelse return trap(TRAP_NO_ACTIVE);
+    const ret: *i32 = @ptrCast(@alignCast(sp));
+    const ptr: u32 = @truncate(sp[1]);
+    const len: u32 = @truncate(sp[2]);
+    const src = guestView(rt, mem, ptr, len) orelse return trap(TRAP_OOB);
+    if (src.len > inst.resp_repl_buf.len) {
+        ret.* = -1; // too large; the guest can shrink and retry
+        return null;
+    }
+    @memcpy(inst.resp_repl_buf[0..src.len], src);
+    inst.resp_repl_len = src.len;
+    inst.resp_has_repl = true;
+    ret.* = 0;
+    return null;
+}
+
 fn hostLog(rt: c.IM3Runtime, ctx: c.IM3ImportContext, sp: [*c]u64, mem: ?*anyopaque) callconv(.c) ?*const anyopaque {
     _ = ctx;
     const ptr: u32 = @truncate(sp[0]);
@@ -435,6 +610,14 @@ fn linkAbi(mod: *runtime.Module) Error!void {
     try mod.link("env", "log", "v(ii)", hostLog);
     try mod.link("env", "host_call", "i(ii)", hostHostCall);
     try mod.link("env", "read_call_result", "i(ii)", hostReadCallResult);
+    // Phase 2b response-phase imports. Linked unconditionally; a filter that
+    // does not import them just leaves them unresolved (link tolerates that).
+    try mod.link("env", "get_response_status", "i()", hostGetResponseStatus);
+    try mod.link("env", "get_response_header", "i(iiii)", hostGetResponseHeader);
+    try mod.link("env", "response_body_len", "i()", hostResponseBodyLen);
+    try mod.link("env", "read_response_body", "i(iii)", hostReadResponseBody);
+    try mod.link("env", "set_response_status", "v(i)", hostSetResponseStatus);
+    try mod.link("env", "replace_response_body", "i(ii)", hostReplaceResponseBody);
 }
 
 // --- Decision mapping -------------------------------------------------------
@@ -538,6 +721,51 @@ pub fn cancelPark(inst: *Instance) middleware.Decision {
     return failClosed();
 }
 
+/// The response-phase edit a filter staged. All slices borrow the instance's
+/// scratch and are valid until the instance is reused (after this response is
+/// serialized -- the same non-reentrancy invariant the request phase relies on).
+/// An all-null/empty value means "serve the original response unchanged".
+pub const ResponseEdit = struct {
+    new_status: ?u16 = null,
+    add_headers: []const response.Header = &.{},
+    new_body: ?[]const u8 = null,
+};
+
+/// Run the Phase 2b response hook on `inst` against the outgoing response.
+/// FAIL-OPEN: a trap, a missing on_response export, or a nonzero return all
+/// yield an empty edit (serve the original response unchanged). The request
+/// already passed policy, so a misbehaving response filter must not break the
+/// response. `req` is set so the filter can still read request metadata.
+pub fn invokeResponse(
+    inst: *Instance,
+    req: *const request.RequestView,
+    resp: *const response.Response,
+    fuel_budget: i64,
+) ResponseEdit {
+    inst.resetStaging();
+    inst.resetResponseStaging();
+    inst.req = req;
+    inst.resp = resp;
+    inst.state = .running;
+    active = inst;
+    defer {
+        active = null;
+        inst.state = .idle;
+    }
+
+    const on_response = inst.on_response orelse return .{}; // no hook: pass through
+
+    runtime.fuel.set(fuel_budget);
+    const code = runtime.callI32(on_response) catch return .{}; // trap: FAIL OPEN
+    if (code != 0) return .{}; // guest opted out: pass through unchanged
+
+    return .{
+        .new_status = if (inst.resp_new_status != 0) inst.resp_new_status else null,
+        .add_headers = inst.staged_headers[0..inst.staged_header_count],
+        .new_body = if (inst.resp_has_repl) inst.resp_repl_buf[0..inst.resp_repl_len] else null,
+    };
+}
+
 /// Terminal invocation for callers that cannot park (the synchronous router /
 /// proxy pre-hook today). A filter that parks here fails closed until the
 /// server-side resume path (Phase 3 reactor wiring) is in place.
@@ -586,6 +814,7 @@ pub const Pool = struct {
                 .module = mod,
                 .on_request = on_request,
                 .on_resume = mod.findOptional("on_resume"),
+                .on_response = mod.findOptional("on_response"),
             };
             built += 1;
         }
@@ -620,6 +849,25 @@ pub const Pool = struct {
         } };
         // invoke() resets state to .idle on return (releases the instance).
         return invoke(inst, req, fuel_budget);
+    }
+
+    /// True if this pool's module exports on_response (cheap gate so the router
+    /// skips the response phase entirely for request-only filters).
+    pub fn hasResponseHook(self: *const Pool) bool {
+        return self.instances.len > 0 and self.instances[0].on_response != null;
+    }
+
+    /// Run the response phase: acquire, runResponse, release. FAIL-OPEN on a busy
+    /// pool (returns an empty edit) -- a transient pool exhaustion must not break
+    /// a response that already passed policy.
+    pub fn runResponse(
+        self: *Pool,
+        req: *const request.RequestView,
+        resp: *const response.Response,
+        fuel_budget: i64,
+    ) ResponseEdit {
+        const inst = self.acquire() orelse return .{};
+        return invokeResponse(inst, req, resp, fuel_budget);
     }
 };
 
@@ -874,4 +1122,93 @@ test "filter: pool exhaustion -> 503" {
 
     a.state = .idle;
     b.state = .idle;
+}
+
+// --- Phase 2b response-phase tests -----------------------------------------
+
+const RESPONSE_WASM = @embedFile("testdata/response_probe.wasm");
+
+fn mkResp(status: u16, headers: []const response.Header, body: []const u8) response.Response {
+    return .{ .status = status, .headers = headers, .body = .{ .bytes = body } };
+}
+
+fn hdrValue(headers: []const response.Header, name: []const u8) ?[]const u8 {
+    for (headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
+    }
+    return null;
+}
+
+test "response phase: hasResponseHook distinguishes response- from request-only filters" {
+    var rp = try Pool.init(testing.allocator, RESPONSE_WASM, .{ .instances = 1 });
+    defer rp.deinit();
+    var fp = try Pool.init(testing.allocator, FILTER_WASM, .{ .instances = 1 });
+    defer fp.deinit();
+    try testing.expect(rp.hasResponseHook());
+    try testing.expect(!fp.hasResponseHook());
+}
+
+test "response phase: default path adds a header, body/status unchanged" {
+    var pool = try Pool.init(testing.allocator, RESPONSE_WASM, .{ .instances = 1 });
+    defer pool.deinit();
+    const req = mkReq(.GET, "/widgets", &.{});
+    const resp = mkResp(200, &.{}, "hello");
+    const edit = pool.runResponse(&req, &resp, DEFAULT_FUEL);
+    try testing.expect(edit.new_status == null);
+    try testing.expect(edit.new_body == null);
+    try testing.expectEqualStrings("applied", hdrValue(edit.add_headers, "x-wasm-response") orelse return error.NoHeader);
+}
+
+test "response phase: status override + body replace" {
+    var pool = try Pool.init(testing.allocator, RESPONSE_WASM, .{ .instances = 1 });
+    defer pool.deinit();
+    const req = mkReq(.GET, "/widgets", &.{});
+    const resp = mkResp(200, &.{}, "boom: sensitive data leaked");
+    const edit = pool.runResponse(&req, &resp, DEFAULT_FUEL);
+    try testing.expectEqual(@as(?u16, 403), edit.new_status);
+    try testing.expectEqualStrings("blocked by edge", edit.new_body orelse return error.NoBody);
+}
+
+test "response phase: body transform" {
+    var pool = try Pool.init(testing.allocator, RESPONSE_WASM, .{ .instances = 1 });
+    defer pool.deinit();
+    const req = mkReq(.GET, "/widgets", &.{});
+    const resp = mkResp(200, &.{}, "transform-me");
+    const edit = pool.runResponse(&req, &resp, DEFAULT_FUEL);
+    try testing.expect(edit.new_status == null);
+    try testing.expectEqualStrings("transformed", edit.new_body orelse return error.NoBody);
+}
+
+test "response phase: opt out (return nonzero) leaves the response unchanged" {
+    var pool = try Pool.init(testing.allocator, RESPONSE_WASM, .{ .instances = 1 });
+    defer pool.deinit();
+    const req = mkReq(.GET, "/raw", &.{});
+    const resp = mkResp(200, &.{}, "hello");
+    const edit = pool.runResponse(&req, &resp, DEFAULT_FUEL);
+    try testing.expect(edit.new_status == null);
+    try testing.expect(edit.new_body == null);
+    try testing.expectEqual(@as(usize, 0), edit.add_headers.len);
+}
+
+test "response phase: a trap fails OPEN (original response served)" {
+    var pool = try Pool.init(testing.allocator, RESPONSE_WASM, .{ .instances = 1 });
+    defer pool.deinit();
+    const req = mkReq(.GET, "/trap", &.{});
+    const resp = mkResp(200, &.{}, "hello");
+    const edit = pool.runResponse(&req, &resp, DEFAULT_FUEL);
+    // Fail-open: empty edit, the original response is served unchanged.
+    try testing.expect(edit.new_status == null);
+    try testing.expect(edit.new_body == null);
+    try testing.expectEqual(@as(usize, 0), edit.add_headers.len);
+}
+
+test "response phase: a request-only filter passes through (no on_response)" {
+    var pool = try Pool.init(testing.allocator, FILTER_WASM, .{ .instances = 1 });
+    defer pool.deinit();
+    const req = mkReq(.GET, "/widgets", &.{});
+    const resp = mkResp(200, &.{}, "hello");
+    const edit = pool.runResponse(&req, &resp, DEFAULT_FUEL);
+    try testing.expect(edit.new_status == null);
+    try testing.expect(edit.new_body == null);
+    try testing.expectEqual(@as(usize, 0), edit.add_headers.len);
 }

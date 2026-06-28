@@ -19,8 +19,9 @@ const wasm_host_call = if (build_options.enable_wasm) @import("../wasm/host_call
 /// Per-thread scratch for merging handler-returned headers with
 /// middleware-accumulated headers (security, CORS, etc.) before the
 /// response gets serialized. Sized to hold the handler's max + the
-/// middleware chain's max in one pass. See `Router.handle`.
-threadlocal var merged_headers_tls: [MAX_RESPONSE_HEADERS + middleware.Chain.MAX_MIDDLEWARE_HEADERS + 2]response.Header = undefined;
+/// middleware chain's max + a WASM filter's request-modify and response-phase
+/// headers in one pass. See `Router.handle`.
+threadlocal var merged_headers_tls: [MAX_RESPONSE_HEADERS + middleware.Chain.MAX_MIDDLEWARE_HEADERS + MAX_RESPONSE_HEADERS + 2]response.Header = undefined;
 threadlocal var x402_receipt_tls: response.Header = undefined;
 threadlocal var x402_receipt_v1_tls: response.Header = undefined;
 threadlocal var x402_has_receipt: bool = false;
@@ -1102,6 +1103,9 @@ pub const Router = struct {
         // scratch, valid until the response is serialized (single-threaded,
         // non-reentrant per worker).
         var wasm_modify_headers: []const response.Header = &.{};
+        // Response headers staged by a WASM filter's Phase 2b on_response hook.
+        // Same lifetime/merge discipline as wasm_modify_headers.
+        var wasm_response_headers: []const response.Header = &.{};
 
         var path_matched = false;
         for (self.routes[0..self.route_count]) |r| {
@@ -1255,6 +1259,24 @@ pub const Router = struct {
                     }
                 }
             }
+
+            // Phase 2b: response-phase WASM filter. Runs AFTER the handler
+            // produced result_resp and BEFORE the header merge, so its staged
+            // headers join the merge. Status/body edits apply directly (the
+            // server recomputes Content-Length from the replaced body). FAIL-OPEN:
+            // a trap leaves result_resp untouched (the request already passed
+            // policy). Only compiled with -Denable-wasm.
+            if (build_options.enable_wasm) {
+                if (r.wasm_pool) |pool_ptr| {
+                    const pool: *wasm_filter.Pool = @ptrCast(@alignCast(pool_ptr));
+                    if (pool.hasResponseHook()) {
+                        const edit = pool.runResponse(&req, &result_resp, r.wasm_fuel);
+                        if (edit.new_status) |s| result_resp.status = s;
+                        if (edit.new_body) |b| result_resp.body = .{ .bytes = b };
+                        wasm_response_headers = edit.add_headers;
+                    }
+                }
+            }
             break;
         }
 
@@ -1282,7 +1304,7 @@ pub const Router = struct {
         // per thread and the protocol layer serializes the response bytes
         // before the next request on the same thread.
         const mw_headers = self.middleware_chain.getResponseHeaders();
-        if (mw_headers.len > 0 or x402_has_receipt or wasm_modify_headers.len > 0) {
+        if (mw_headers.len > 0 or x402_has_receipt or wasm_modify_headers.len > 0 or wasm_response_headers.len > 0) {
             const handler_headers = result_resp.headers;
             const merge_cap = merged_headers_tls.len;
             var i: usize = 0;
@@ -1297,6 +1319,11 @@ pub const Router = struct {
                 i += 1;
             }
             for (wasm_modify_headers) |h| {
+                if (i >= merge_cap) break;
+                merged_headers_tls[i] = h;
+                i += 1;
+            }
+            for (wasm_response_headers) |h| {
                 if (i >= merge_cap) break;
                 merged_headers_tls[i] = h;
                 i += 1;
@@ -2062,6 +2089,38 @@ test "wasm: per-route filter allow / reject / modify via handle" {
             }
             try std.testing.expect(found);
         }
+    } else return error.SkipZigTest;
+}
+
+test "wasm: Phase 2b response filter edits the handler response via handle" {
+    if (build_options.enable_wasm) {
+        const RESP_FILTER = @embedFile("../wasm/testdata/response_probe.wasm");
+
+        var pool = try wasm_filter.Pool.init(std.testing.allocator, RESP_FILTER, .{ .instances = 1 });
+        defer pool.deinit();
+
+        var router = Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+        // The handler emits a body the response filter reacts to (per request path).
+        const handler = struct {
+            fn h(ctx: *HandlerContext) response.Response {
+                return ctx.text(200, "boom: secret");
+            }
+        }.h;
+        try router.get("/widgets", handler);
+        _ = router.attachWasmFilter("/widgets", &pool, wasm_filter.DEFAULT_FUEL);
+
+        var response_buf: [RESPONSE_BUF_SIZE]u8 = undefined;
+        var response_headers: [MAX_RESPONSE_HEADERS]response.Header = undefined;
+        var arena_buf: [ARENA_BUF_SIZE]u8 = undefined;
+
+        var mw_ctx = middleware.Context{};
+        var scratch = HandlerScratch{ .response_buf = response_buf[0..], .response_headers = response_headers[0..], .arena_buf = arena_buf[0..] };
+        const req = request.RequestView{ .method = .GET, .path = "/widgets", .headers = &.{} };
+        const result = router.handle(req, &mw_ctx, &scratch);
+
+        // on_response saw the "boom" body -> 403 + replacement body.
+        try std.testing.expectEqual(@as(u16, 403), result.resp.status);
+        try std.testing.expectEqualStrings("blocked by edge", result.resp.bodyBytes());
     } else return error.SkipZigTest;
 }
 

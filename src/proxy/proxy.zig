@@ -39,11 +39,11 @@ var proxy_modify_warned = false;
 
 /// Run a route's WASM edge filter (if any) against `req_view`. Returns a
 /// short-circuit Response when the filter rejects (or fails closed); null to
-/// proceed with forwarding. `.modify` (response-header injection) is not yet
-/// supported on the proxy path -- honoring it needs the staged headers captured
-/// past the instance release and merged into the upstream response (Phase 2b for
-/// the proxy). Rather than silently drop it (as before) we log once and forward;
-/// `.modify` is honored on the embedded Router today. See design 10.0.
+/// proceed with forwarding. A request-phase `.modify` (response-header injection
+/// from on_request) is not honored on the proxy path: the proper mechanism for
+/// rewriting a proxied response is the Phase 2b response hook (on_response), which
+/// runs on the upstream response via runWasmResponseFilter and supersedes it. We
+/// log once and forward rather than silently dropping. See design 10.0.
 fn runWasmFilter(route: *const upstream.ProxyRoute, req_view: *const request.RequestView) ?response.Response {
     if (build_options.enable_wasm) {
         if (route.wasm_pool) |pool_ptr| {
@@ -61,6 +61,46 @@ fn runWasmFilter(route: *const upstream.ProxyRoute, req_view: *const request.Req
         }
     }
     return null;
+}
+
+/// Merge buffer for response-phase WASM headers on the proxy path. Holds the
+/// upstream response headers plus the filter's staged headers; the repointed
+/// slice is valid until the response is serialized (single-threaded worker).
+threadlocal var wasm_resp_headers_tls: [128]response.Header = undefined;
+
+/// Phase 2b: run the response-phase WASM filter (on_response) on a proxied
+/// upstream response, BEFORE compression. Applies the filter's edits in place:
+/// status override, body replacement (the encoder recomputes Content-Length from
+/// the body -- normalize already stripped the upstream's), and added response
+/// headers (merged into the tls buffer). FAIL-OPEN: a trap leaves `resp`
+/// untouched (the request already passed policy). No-op without a response hook.
+fn runWasmResponseFilter(
+    route: *const upstream.ProxyRoute,
+    req_view: *const request.RequestView,
+    resp: *response.Response,
+) void {
+    if (!build_options.enable_wasm) return;
+    const pool_ptr = route.wasm_pool orelse return;
+    const fpool: *wasm_filter.Pool = @ptrCast(@alignCast(pool_ptr));
+    if (!fpool.hasResponseHook()) return;
+    const edit = fpool.runResponse(req_view, resp, route.wasm_fuel);
+    if (edit.new_status) |s| resp.status = s;
+    if (edit.new_body) |b| resp.body = .{ .bytes = b };
+    if (edit.add_headers.len > 0) {
+        const cap = wasm_resp_headers_tls.len;
+        var i: usize = 0;
+        for (resp.headers) |h| {
+            if (i >= cap) break;
+            wasm_resp_headers_tls[i] = h;
+            i += 1;
+        }
+        for (edit.add_headers) |h| {
+            if (i >= cap) break;
+            wasm_resp_headers_tls[i] = h;
+            i += 1;
+        }
+        resp.headers = wasm_resp_headers_tls[0..i];
+    }
 }
 
 /// Reverse Proxy Handler
@@ -735,6 +775,9 @@ pub const Proxy = struct {
                 pool.markServerSuccess(server_idx);
                 pool.release(c, now_ms, parsed.keep_alive);
 
+                // Phase 2b response filter runs before compression (sees the
+                // uncompressed body); maybeCompress copies its headers forward.
+                runWasmResponseFilter(route, &req, &normalized);
                 maybeCompress(&normalized, req.headers, self.response_header_bufs[resp_buf_idx][0..]);
                 if (route.mirror) |mirror_name| {
                     self.fireMirror(mirror_name, req, null, now_ms);
@@ -1003,6 +1046,7 @@ pub const Proxy = struct {
                 pool.markServerSuccess(server_idx_b);
                 pool.release(c, now_ms, parsed.keep_alive);
 
+                runWasmResponseFilter(route, &req, &normalized_b);
                 maybeCompress(&normalized_b, req.headers, self.response_header_bufs[resp_buf_idx][0..]);
                 if (route.mirror) |mirror_name| {
                     self.fireMirror(mirror_name, req, body_view, now_ms);
@@ -1396,5 +1440,35 @@ test "wasm: proxy BodyView (scattered) is filter-readable via body ABI" {
             .body = bodyViewToRequestBody(bv2),
         };
         try std.testing.expect(pool.run(&r2, wasm_filter.DEFAULT_FUEL) == .allow);
+    } else return error.SkipZigTest;
+}
+
+test "wasm: proxy Phase 2b response filter injects a header and rewrites a body" {
+    if (build_options.enable_wasm) {
+        const RESP_FILTER = @embedFile("../wasm/testdata/response_probe.wasm");
+        var pool = try wasm_filter.Pool.init(std.testing.allocator, RESP_FILTER, .{ .instances = 1 });
+        defer pool.deinit();
+        var route = upstream.ProxyRoute{
+            .path_prefix = "/api/",
+            .upstream = "backend",
+            .wasm_pool = @ptrCast(&pool),
+            .wasm_fuel = wasm_filter.DEFAULT_FUEL,
+        };
+        const req = request.RequestView{ .method = .GET, .path = "/api/widgets", .headers = &.{} };
+
+        // Default path: the response filter adds the x-wasm-response header.
+        var resp = response.Response{ .status = 200, .headers = &.{}, .body = .{ .bytes = "upstream body" } };
+        runWasmResponseFilter(&route, &req, &resp);
+        var found = false;
+        for (resp.headers) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "x-wasm-response")) found = true;
+        }
+        try std.testing.expect(found);
+
+        // "boom" body: the filter blocks it (403 + replacement body).
+        var resp2 = response.Response{ .status = 200, .headers = &.{}, .body = .{ .bytes = "boom leak" } };
+        runWasmResponseFilter(&route, &req, &resp2);
+        try std.testing.expectEqual(@as(u16, 403), resp2.status);
+        try std.testing.expectEqualStrings("blocked by edge", resp2.bodyBytes());
     } else return error.SkipZigTest;
 }
