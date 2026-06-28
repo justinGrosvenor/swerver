@@ -30,6 +30,7 @@ const config_file_mod = @import("config_file.zig");
 // opaque pointer so this file compiles without the vendored wasm3 dependency.
 const wasm_manager_mod = if (build_options.enable_wasm) @import("wasm/manager.zig") else struct {};
 const wasm_host_call_mod = if (build_options.enable_wasm) @import("wasm/host_call.zig") else struct {};
+const wasm_control_mod = if (build_options.enable_wasm) @import("wasm/control_client.zig") else struct {};
 const accept_mod = @import("server/accept.zig");
 const http3_mod = @import("server/http3.zig");
 const http2_mod = @import("server/http2.zig");
@@ -117,13 +118,22 @@ pub const Server = struct {
         if (build_options.enable_wasm) .{} else {},
     /// Mock host-call transport (e2e mock lane / C2 validation). When enabled, a
     /// parked filter is completed on the next housekeeping tick with
-    /// `wasm_mock_reply` instead of a real vsock call. Off in production; the real
-    /// vsock transport (C3) replaces this. The pending ring holds park tokens
-    /// awaiting mock completion.
+    /// `wasm_mock_reply` instead of a real call. Off in production; the real
+    /// control-socket transport (C3, `wasm_control`) takes precedence when set.
+    /// The pending ring holds park tokens awaiting mock completion.
     wasm_mock_enabled: bool = false,
     wasm_mock_reply: []const u8 = "ok",
     wasm_mock_pending: [64]u32 = undefined,
     wasm_mock_count: usize = 0,
+    /// Nether control-socket path for the real host-call transport (C3). When
+    /// non-empty and wasm is enabled, a ControlClient is built at run() start and
+    /// drives host calls over the sandbox's control socket (proto_version=1),
+    /// superseding the mock. Build-flag-free slice; borrowed, must outlive run().
+    wasm_control_socket_path: []const u8 = "",
+    /// Per-worker control-socket client (the real C3 transport). Opaque so the
+    /// Server struct needs no build-flag gating; a *wasm.control_client.ControlClient
+    /// when enabled and a path is configured, else null.
+    wasm_control: ?*anyopaque = null,
     /// Native PostgreSQL client (null unless the "postgres" config block
     /// is present).
     pg_client: ?*pg_client_mod.PgClient = null,
@@ -424,6 +434,9 @@ pub const Server = struct {
         // Free WASM filter pools after the proxy that referenced them.
         self.freeWasmManager(self.wasm_manager);
         self.wasm_manager = null;
+        // Tear down the control-socket transport (unregisters its fd, fails any
+        // in-flight parks closed) before the io runtime goes away.
+        self.teardownWasmControl();
         if (self.spare_fd) |fd| clock.closeFd(fd);
         // Close every bound listener. listener_fd aliases listeners_buf[0].fd
         // (multi-listener model), so we drive closing off the array only and do
@@ -607,16 +620,59 @@ pub const Server = struct {
     }
 
     /// Transport start hook (set as WasmBinding.start_fn). Initiates the host
-    /// call for a freshly parked filter. The mock transport just queues the token
-    /// for completion on the next tick; the real vsock transport (C3) issues the
-    /// guest call here. `request` is the staged outbound bytes (mock ignores them).
+    /// call for a freshly parked filter. The real control-socket transport (C3)
+    /// takes precedence: it writes the staged command line to the sandbox's
+    /// control socket and completes the park when the framed reply arrives. With
+    /// no control client configured, the mock transport queues the token for
+    /// completion on the next tick. `req_bytes` is the filter's staged outbound
+    /// command (must NOT be __-prefixed: Nether reserves __*__ for host control
+    /// commands and forwards unknown lines to the guest verbatim).
     pub fn wasmStartHostCall(self: *Server, token: u32, req_bytes: []const u8) void {
         if (build_options.enable_wasm) {
-            _ = req_bytes;
+            if (self.wasm_control) |p| {
+                const cc: *wasm_control_mod.ControlClient = @ptrCast(@alignCast(p));
+                cc.startCall(&self.io, token, req_bytes);
+                return;
+            }
             if (self.wasm_mock_enabled and self.wasm_mock_count < self.wasm_mock_pending.len) {
                 self.wasm_mock_pending[self.wasm_mock_count] = token;
                 self.wasm_mock_count += 1;
             }
+        }
+    }
+
+    /// Typed accessor for the control client (null when wasm is off or no path is
+    /// configured). Keeps the opaque field's casts in one place. The return type
+    /// is comptime-conditional so this signature compiles when wasm is disabled
+    /// (the body's wasm references sit past the pruned early return).
+    pub fn wasmControlClient(self: *Server) ?*(if (build_options.enable_wasm) wasm_control_mod.ControlClient else anyopaque) {
+        if (!build_options.enable_wasm) return null;
+        const p = self.wasm_control orelse return null;
+        return @ptrCast(@alignCast(p));
+    }
+
+    /// Build the control-socket client for this worker if a path is configured.
+    /// Called once at run() start (per worker, after fork), before the loop.
+    /// Idempotent: tears down any existing client first.
+    pub fn setupWasmControl(self: *Server) void {
+        if (!build_options.enable_wasm) return;
+        self.teardownWasmControl();
+        if (self.wasm_control_socket_path.len == 0) return;
+        const cc = self.allocator.create(wasm_control_mod.ControlClient) catch return;
+        cc.* = wasm_control_mod.ControlClient.init(
+            self.wasm_control_socket_path,
+            wasm_control_mod.DEFAULT_SLOT,
+        );
+        self.wasm_control = @ptrCast(cc);
+        std.log.info("wasm control transport -> {s} (slot {d})", .{ self.wasm_control_socket_path, wasm_control_mod.DEFAULT_SLOT });
+    }
+
+    fn teardownWasmControl(self: *Server) void {
+        if (!build_options.enable_wasm) return;
+        if (self.wasmControlClient()) |cc| {
+            cc.deinit(&self.io);
+            self.allocator.destroy(cc);
+            self.wasm_control = null;
         }
     }
 

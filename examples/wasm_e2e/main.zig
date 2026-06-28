@@ -50,11 +50,18 @@ pub fn main() !void {
         .build(alloc);
     defer server.deinit();
 
-    // Mock host-call transport: complete every parked filter with "ok" on the
-    // next tick (no Nether guest). The real vsock transport (C3) replaces this.
-    server.wasm_mock_enabled = true;
-    server.wasm_mock_reply = "ok";
-
-    std.log.info("wasm e2e mock server on :{d} (GET /enrich parks -> mock ok -> handler runs)", .{cfg.port});
+    // Transport selection. With NETHER_CONTROL_SOCKET set, drive the REAL
+    // control-socket transport (C3): host calls go to a running Nether sandbox's
+    // control socket and complete from its framed reply. Otherwise use the mock
+    // (complete every parked filter with "ok" on the next tick; no guest).
+    const sock_path: ?[]const u8 = if (std.c.getenv("NETHER_CONTROL_SOCKET")) |p| std.mem.span(p) else null;
+    if (sock_path) |path| {
+        server.wasm_control_socket_path = path;
+        std.log.info("wasm e2e server on :{d} (GET /enrich -> control socket {s} -> handler)", .{ cfg.port, path });
+    } else {
+        server.wasm_mock_enabled = true;
+        server.wasm_mock_reply = "ok";
+        std.log.info("wasm e2e mock server on :{d} (GET /enrich parks -> mock ok -> handler runs)", .{cfg.port});
+    }
     try server.run(null);
 }

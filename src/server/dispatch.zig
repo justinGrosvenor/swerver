@@ -47,6 +47,7 @@ const http1_mod = @import("http1.zig");
 const pg_client_mod = @import("../db/pg/client.zig");
 const pg_handler_api = @import("../db/pg/handler_api.zig");
 const wasm_host_call_mod = if (build_options.enable_wasm) @import("../wasm/host_call.zig") else struct {};
+const wasm_control_mod = if (build_options.enable_wasm) @import("../wasm/control_client.zig") else struct {};
 /// Wall-clock deadline for an in-flight WASM filter host call (design 10.0). The
 /// reactor tick fails closed past this; fuel bounds compute, this backstops a
 /// stalled host call (a slow/dead guest).
@@ -120,6 +121,14 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
     // its stable address once the loop owns it.
     if (server.pg_client) |pgc| pgc.installResume(@ptrCast(server), pgResume);
 
+    // Build the WASM control-socket transport (C3) for this worker and install
+    // its resume hooks. No-op when wasm is off or no control socket is set (the
+    // mock transport, if enabled, then drives completions instead).
+    server.setupWasmControl();
+    if (build_options.enable_wasm) {
+        if (server.wasmControlClient()) |cc| cc.installResume(@ptrCast(server), wasmCompleteThunk, wasmFailThunk);
+    }
+
     try server.io.start();
     // Eagerly start PG pool connects at worker boot. Otherwise the pool
     // relies on the first housekeeping tick, which is wall-clock gated and
@@ -127,6 +136,11 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
     // oversubscription — its slots stay .closed and the first request
     // routed to it (via SO_REUSEPORT) 503s with NotConnected.
     if (server.pg_client) |pgc| pgc.tick(&server.io, server.io.nowMs());
+    // Eagerly start the control-socket connect at worker boot (same rationale as
+    // the PG pool: don't wait for the first wall-clock-gated housekeeping tick).
+    if (build_options.enable_wasm) {
+        if (server.wasmControlClient()) |cc| cc.tick(&server.io, server.io.nowMs());
+    }
     server.refreshCachedDate();
     // Bind + register every effective listener. The effective set is the
     // explicit `listeners` array when present, else a single synthesized
@@ -334,8 +348,14 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
                     // case that ever changes.
                     if (io_mod.isExternalId(event.conn_id)) {
                         if (event.kernel_buffer) |kb| kb.release();
-                        if (server.pg_client) |pgc| {
-                            pgc.onEvent(&server.io, @intCast(event.conn_id & 0xFFFF_FFFF), event.kind);
+                        const slot: u32 = @intCast(event.conn_id & 0xFFFF_FFFF);
+                        // External-fd slots are partitioned by owner: the PG pool
+                        // owns 0..MAX_SLOTS-1; the WASM control socket takes the
+                        // next slot(s). Route by slot range.
+                        if (slot < pg_client_mod.MAX_SLOTS) {
+                            if (server.pg_client) |pgc| pgc.onEvent(&server.io, slot, event.kind);
+                        } else if (build_options.enable_wasm) {
+                            if (server.wasmControlClient()) |cc| cc.onEvent(&server.io, event.kind);
                         }
                         continue;
                     }
@@ -486,6 +506,9 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
             }
             if (server.pg_client) |pgc| {
                 pgc.tick(&server.io, now_ms);
+            }
+            if (build_options.enable_wasm) {
+                if (server.wasmControlClient()) |cc| cc.tick(&server.io, now_ms);
             }
             wasmTick(server, now_ms);
             if (server.otel) |otel_exp| {
@@ -854,10 +877,20 @@ fn wasmTick(server: *Server, now_ms: u64) void {
 }
 
 /// Transport start hook (router.WasmBinding.start_fn). Routes a freshly parked
-/// filter's host call to the Server's transport (mock or vsock).
+/// filter's host call to the Server's transport (control socket or mock).
 fn wasmStartThunk(ctx: *anyopaque, token: u32, request: []const u8) void {
     const server: *Server = @ptrCast(@alignCast(ctx));
     server.wasmStartHostCall(token, request);
+}
+
+/// ControlClient.CompleteFn adapter: the *anyopaque ctx is the Server.
+fn wasmCompleteThunk(ctx: *anyopaque, token: u32, result: []const u8) void {
+    wasmComplete(@ptrCast(@alignCast(ctx)), token, result);
+}
+
+/// ControlClient.FailFn adapter: fail the park closed (transport error).
+fn wasmFailThunk(ctx: *anyopaque, token: u32) void {
+    wasmFail(@ptrCast(@alignCast(ctx)), token);
 }
 
 /// Deliver a completed host call (success path). The transport calls this when
@@ -866,6 +899,16 @@ fn wasmStartThunk(ctx: *anyopaque, token: u32, request: []const u8) void {
 pub fn wasmComplete(server: *Server, token: u32, result: []const u8) void {
     if (build_options.enable_wasm) {
         if (server.wasm_host_calls.complete(token, result)) |c| wasmResume(server, c);
+    }
+}
+
+/// Fail a parked host call closed (transport failure: connect error, EOF,
+/// command timeout). Mirrors wasmComplete but cancels the park to a fail-closed
+/// Decision. A no-op if the token already resolved (e.g. the table deadline fired
+/// first), so a late/duplicate failure from the transport is harmless.
+pub fn wasmFail(server: *Server, token: u32) void {
+    if (build_options.enable_wasm) {
+        if (server.wasm_host_calls.cancel(token, .host_call_failed)) |c| wasmResume(server, c);
     }
 }
 
