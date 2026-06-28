@@ -144,6 +144,20 @@ pub const ControlClient = struct {
     /// outbound bytes (valid while parked); copied if queued. The trailing
     /// newline that the line protocol requires is appended here.
     pub fn startCall(self: *ControlClient, io_rt: *io_mod.IoRuntime, token: Token, cmd: []const u8) void {
+        // Security choke (D2-1): a Tier-1 wasm filter must not drive the Tier-2
+        // control plane. `cmd` is filter-supplied and written verbatim to the
+        // Nether control socket, where swerver is the PRIMARY (driving) client.
+        // Nether reserves the `__verb__` namespace for control verbs
+        // (__shutdown__, __put__/__get__ against the HOST fs, __stats__, ...), so
+        // any payload whose first line begins with "__" is neutralized: fail the
+        // call closed and never let the bytes reach the socket. Normal shell
+        // commands and the `E2E ...` command are untouched; the handshake
+        // __info__ is sent internally by sendInfo, not via startCall.
+        if (std.mem.startsWith(u8, cmd, "__")) {
+            std.log.warn("wasm control ({s}): blocked reserved control verb from filter host_call (payload begins with \"__\"); failing closed", .{self.path});
+            self.failOne(token);
+            return;
+        }
         if (self.state == .disabled) {
             self.failOne(token);
             return;
@@ -623,6 +637,35 @@ test "startCall queues when not ready and fails closed when disabled" {
     cc.state = .disabled;
     cc.startCall(&io_rt, 4, "lookup:user");
     try testing.expectEqual(@as(?Token, 4), Captured.failed);
+}
+
+test "startCall: a reserved __verb__ payload fails closed and never enqueues" {
+    Captured.reset();
+    var dummy: u8 = 0;
+    var cc = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
+    cc.installResume(@ptrCast(&dummy), Captured.complete, Captured.fail);
+    var io_rt: io_mod.IoRuntime = undefined; // never touched: the guard fails before any I/O
+
+    // The guard runs before any state/socket logic, so even a ready+idle socket
+    // (where a normal command would issue immediately) never sends a reserved
+    // verb: it fails the token closed and is neither issued nor enqueued. State
+    // is .ready here precisely to prove the guard short-circuits the issue path
+    // (and thus never touches the undefined io_rt).
+    cc.state = .ready;
+    cc.startCall(&io_rt, 11, "__shutdown__");
+    try testing.expectEqual(@as(?Token, 11), Captured.failed);
+    try testing.expectEqual(@as(usize, 0), cc.q_count); // not enqueued
+    try testing.expect(cc.inflight == null); // not issued
+    try testing.expectEqual(@as(usize, 0), cc.send_len); // nothing staged for the socket
+
+    // A normal E2E command is accepted as before: not connected yet, so it
+    // queues rather than failing. Proves the guard is scoped to the "__"
+    // namespace and leaves ordinary commands intact.
+    Captured.reset();
+    cc.state = .closed;
+    cc.startCall(&io_rt, 12, "E2E /x tok");
+    try testing.expectEqual(@as(usize, 1), cc.q_count);
+    try testing.expect(Captured.failed == null);
 }
 
 test "handleReadable: real fd read path parses a framed reply and completes" {
