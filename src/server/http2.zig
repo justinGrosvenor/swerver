@@ -43,10 +43,10 @@ const build_options = @import("build_options");
 const proxy_mod = @import("../proxy/proxy.zig");
 const wasm_filter_mod = if (build_options.enable_wasm) @import("../wasm/filter.zig") else struct {};
 
-/// WASM host-call timeout for an H2 stream park, mirroring the H1 dispatch
-/// deadline. A parked stream past this wall-clock deadline is failed closed by
-/// the housekeeping tick.
-const WASM_HOST_CALL_TIMEOUT_MS: u64 = 30_000;
+// The WASM host-call (park) deadline for an H2 stream is configurable per-server
+// via `Server.wasm_host_call_deadline_ms` (default 30s), mirroring the H1 path.
+// A parked stream past this wall-clock deadline is failed closed by the
+// housekeeping tick.
 
 /// Transport start hook (router/proxy WasmBinding.start_fn) for H2 parks. Routes
 /// a freshly parked filter's host call to the Server's transport. `ctx` is the
@@ -975,7 +975,7 @@ fn dispatchHttp2Request(
                 .conn_id = conn.id,
                 .stream_id = stream_id,
                 .protocol = .http2,
-                .deadline_ms = server.now_ms + WASM_HOST_CALL_TIMEOUT_MS,
+                .deadline_ms = server.now_ms + server.wasm_host_call_deadline_ms,
                 .start_fn = wasmStartThunkH2,
                 .start_ctx = @ptrCast(server),
             } else .{};
@@ -1035,7 +1035,7 @@ fn dispatchHttp2Request(
             .conn_id = conn.id,
             .stream_id = stream_id,
             .protocol = .http2,
-            .deadline_ms = server.now_ms + WASM_HOST_CALL_TIMEOUT_MS,
+            .deadline_ms = server.now_ms + server.wasm_host_call_deadline_ms,
             .start_fn = wasmStartThunkH2,
             .start_ctx = @ptrCast(server),
         };
