@@ -286,7 +286,7 @@ const WASM3_CFLAGS = [_][]const u8{
     "-O3",                  "-fno-sanitize=undefined",
 };
 
-/// wasm3 include paths only — needed by any module whose source @cImports
+/// wasm3 include paths only: needed by any module whose source @cImports
 /// wasm3.h (so translate-c can find the headers). Does not compile the C.
 fn addWasm3Headers(b: *std.Build, module: *std.Build.Module) void {
     module.addIncludePath(b.path("vendor/wasm3/source"));
@@ -340,7 +340,7 @@ fn addTestVariant(
     // tests.zig re-imports swerver source into the root test module, so when
     // wasm is on, the root module needs wasm3 headers for runtime.zig's
     // @cImport. The C objects come from swerver_module (linked), so headers
-    // only — never compile the C twice (duplicate symbols).
+    // only, never compiling the C twice (duplicate symbols).
     if (with_wasm) addWasm3Headers(b, test_module);
     return b.addTest(.{ .root_module = test_module });
 }
