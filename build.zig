@@ -235,6 +235,28 @@ pub fn build(b: *std.Build) void {
         if (b.args) |args| wasm_e2e_run.addArgs(args);
         const wasm_e2e_step = b.step("wasm-e2e", "Run the WASM edge-function e2e mock server");
         wasm_e2e_step.dependOn(&wasm_e2e_run.step);
+
+        // WASM round-trip server over the REAL control socket (C3 live lane).
+        // Loads the filter from WASM_FILTER_PATH and drives a Nether sandbox (or
+        // a protocol-faithful stub) over NETHER_CONTROL_SOCKET. No embedded
+        // fixture. `zig build wasm-control-e2e -Denable-wasm=true`.
+        const wasm_ctl_module = b.createModule(.{
+            .root_source_file = b.path("examples/wasm_control_e2e/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        wasm_ctl_module.addImport("swerver", swerver_module);
+        wasm_ctl_module.addOptions("build_options", options);
+        const wasm_ctl_exe = b.addExecutable(.{
+            .name = "swerver-wasm-control-e2e",
+            .root_module = wasm_ctl_module,
+        });
+        b.installArtifact(wasm_ctl_exe);
+        const wasm_ctl_run = b.addRunArtifact(wasm_ctl_exe);
+        if (b.args) |args| wasm_ctl_run.addArgs(args);
+        const wasm_ctl_step = b.step("wasm-control-e2e", "Run the WASM round-trip server over the real control socket");
+        wasm_ctl_step.dependOn(&wasm_ctl_run.step);
     }
 
     // --- check: compile everything without running ---
