@@ -37,18 +37,15 @@ pub const Protocol = middleware.Context.Protocol;
 /// so a per-slot copy is cheap, and owning it frees the resume path from
 /// depending on the connection's read buffer (H1) or a reused frame buffer
 /// (H2/H3) staying pinned. A request whose method/path/headers/body do not fit
-/// these bounds fails the park (the caller fails closed), matching the
-/// table-full behavior. method_raw + path + header name/value bytes + a small
-/// body all share `buf`.
-// Per-slot OWNED request snapshot bounds. A request whose method/path/headers/
-// body do not fit fails the park CLOSED rather than truncating (which could drop
-// an auth header and change a verdict). Kept at 4 KiB because the snapshot is
-// embedded by value (ReqSnapshot x Table.CAP lives inside Server); larger caps
-// push Server past the test thread's stack. 4 KiB covers typical requests; a
-// request with very large headers (big JWT + many cookies) on a PARKED route
-// currently fails closed. The tracked lift (task E0-FU in PLAN-NEXT.md) is to
-// heap-allocate the snapshot sized to the request -- removing both the ceiling
-// and the fixed footprint (parks are rare, so a per-park alloc is fine).
+/// these bounds fails the park CLOSED (rather than truncating, which could drop
+/// an auth header and change a verdict), matching the table-full behavior;
+/// method_raw + path + header name/value bytes + a small body all share `buf`.
+/// Kept at 4 KiB because the snapshot is embedded by value (ReqSnapshot x
+/// Table.CAP lives inside Server); larger caps push Server past the test thread's
+/// stack. A request with very large headers (big JWT + many cookies) on a PARKED
+/// route currently fails closed. The tracked lift (task E0-FU in PLAN-NEXT.md) is
+/// to heap-allocate the snapshot sized to the request -- removing both the
+/// ceiling and the fixed footprint.
 const SNAP_BUF_CAP = 4096;
 const SNAP_MAX_HEADERS = 32;
 
