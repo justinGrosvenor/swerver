@@ -887,17 +887,162 @@ fn wasmResume(server: *Server, completion: wasm_host_call_mod.Completion) void {
     }
 }
 
+/// Park-time context the proxy post-forward processing needs on resume. Holds
+/// only what cannot be recomputed from (server, conn, proxy, req, route_idx):
+/// the route index, the otel span start, and the live x402 evaluation result.
+/// The main loop builds this on the stack from its locals; proxyResume rebuilds
+/// it from the stashed connection.WasmProxyResumeCtx plus the owned snapshot.
+const ProxyPostCtx = struct {
+    route_idx: usize,
+    otel_start: i128,
+    x402_result: x402_mod.EvaluateResult,
+};
+
+/// Outcome of proxyForwardAndRespond: whether the response was served, or the
+/// connection parked for inline-receipt settlement (response held, delivered
+/// when settlement completes). The main loop ignores it (its loop tail is the
+/// same either way); proxyResume relies on conn.x402 (set to .settle_pending on
+/// a settle-park) to drive the I/O restart, so the enum is informational.
+const ProxyRespondOutcome = enum { responded, settle_parked };
+
+/// Run the post-`proxy.handle` processing the main dispatch loop performs after a
+/// proxy forward, factored out so the resumed (wasm-parked) proxy path runs it
+/// too: response-cache store/invalidate, the otel span, x402 settlement (incl.
+/// the inline-receipt settle-park via packHeldResponse), then queueResponse plus
+/// the owned-buffer tail. Behavior is identical to the inline tail it replaces.
+///
+/// On a settle-park it sets conn.x402 = .settle_pending, holds the response, and
+/// returns .settle_parked WITHOUT calling queueResponse (the held response is
+/// delivered when settlement completes); otherwise it queues the response and
+/// returns .responded. The vary keys and per-route config are recomputed from
+/// route_idx so both call sites pass a minimal context. Compiled in all builds
+/// (no wasm dependency).
+fn proxyForwardAndRespond(
+    server: *Server,
+    conn: *connection.Connection,
+    proxy: *proxy_mod.Proxy,
+    req: request_mod.RequestView,
+    proxy_result: *proxy_mod.ProxyResult,
+    pctx: ProxyPostCtx,
+) !ProxyRespondOutcome {
+    const route_idx = pctx.route_idx;
+    const cache_cfg = proxy.config.routes[route_idx].cache;
+
+    // Recompute the vary keys exactly as the pre-forward cache lookup did: base
+    // vary from config + the implicit accept-encoding key (the proxy may compress
+    // per the client's Accept-Encoding before the store below).
+    var vary_buf: [16][]const u8 = undefined;
+    const vary_keys: []const []const u8 = blk: {
+        const base_vary: []const []const u8 = if (cache_cfg) |cc| cc.vary else &.{};
+        const n = @min(base_vary.len, vary_buf.len - 1);
+        for (base_vary[0..n], 0..) |v, vi| vary_buf[vi] = v;
+        vary_buf[n] = "accept-encoding";
+        break :blk vary_buf[0 .. n + 1];
+    };
+
+    // Cache store: cache successful GET responses
+    if (cache_cfg) |cc| {
+        if (req.method == .GET and proxy_result.resp.status == 200) {
+            if (proxy.route_caches[route_idx]) |*rc| {
+                rc.store(
+                    req.path,
+                    req.headers,
+                    vary_keys,
+                    proxy_result.resp.status,
+                    proxy_result.resp.headers,
+                    proxy_result.resp.bodyBytes(),
+                    @as(u64, cc.ttl_s) * 1000,
+                    server.now_ms,
+                );
+            }
+        }
+    }
+    // Invalidate cache on mutating methods
+    if (cache_cfg != null and req.method != .GET and req.method != .HEAD) {
+        if (proxy.route_caches[route_idx]) |*rc| {
+            rc.invalidate(req.path);
+        }
+    }
+
+    if (server.otel) |otel_exp| {
+        otel_exp.recordSpan(req.method, req.path, proxy_result.resp.status, pctx.otel_start, clock.realtimeNanos() orelse 0);
+    }
+
+    // Settlement: submit async, optionally park for inline receipt
+    const x402_result = pctx.x402_result;
+    const x402_policy = proxy.route_x402_policies[route_idx];
+    const route_fac = proxy.route_facilitators[route_idx] orelse server.app_router.facilitator;
+    settle_blk: {
+        if (proxy_result.resp.status < 200 or proxy_result.resp.status >= 300) break :settle_blk;
+        if (!(x402_result == .allow and x402_result.allow.needs_settlement)) break :settle_blk;
+        const fac = route_fac orelse break :settle_blk;
+        const charge = for (proxy_result.resp.headers) |hdr| {
+            if (std.ascii.eqlIgnoreCase(hdr.name, "x-charge-amount")) break hdr.value;
+        } else "";
+        var settle_entry = x402_client.RequestEntry{ .kind = .settle, .conn_index = conn.index, .conn_id = conn.id };
+        fillSettleEntry(&settle_entry, fac, x402_result.allow.payment_header, &x402_policy, charge, req.path);
+        if (settle_entry.http_len == 0) break :settle_blk;
+
+        // Settle-park: hold response until settlement completes, then inject receipt header.
+        // Enabled by config (inline_receipt) or per-request header (X-Inline-Receipt: true).
+        const want_receipt = x402_policy.inline_receipt or for (req.headers) |hdr| {
+            if (std.ascii.eqlIgnoreCase(hdr.name, "x-inline-receipt")) break std.mem.eql(u8, hdr.value, "true");
+        } else false;
+        if (want_receipt and packHeldResponse(server, conn, proxy_result.resp)) {
+            if (x402_client.submit(settle_entry)) {
+                conn.x402 = .settle_pending;
+                server.io.setTimeoutPhase(conn, .write);
+                conn.phase_enter_ms = server.now_ms;
+                conn.markActive(server.now_ms);
+                return .settle_parked;
+            }
+            releaseHeldBuffer(server, conn);
+        }
+
+        // Fire-and-forget: submit settle without parking
+        if (!x402_client.submit(settle_entry)) {
+            x402_client.spillSettle(
+                x402_policy.gateway_id,
+                x402_policy.network,
+                x402_policy.asset,
+                if (charge.len > 0) charge else x402_policy.price,
+                "settle queue full",
+            );
+        }
+    }
+
+    try http1_mod.queueResponse(server, conn, proxy_result.resp);
+    if (conn.pending_body.len > 0) {
+        if (proxy_result.takeOwnedBuf()) |owned| {
+            // Large proxied response: the unsent tail points into the proxy's
+            // heap buffer. Take ownership so it outlives proxy_result.release();
+            // freed when the tail drains (handleWrite) or the connection closes.
+            std.debug.assert(conn.pending_body_owned == null);
+            conn.pending_body_owned = owned;
+        } else {
+            // Pool-buffer response: copy the tail out before proxy_result.release()
+            // frees the upstream buffer.
+            http1_mod.materializePendingBody(server, conn);
+        }
+    }
+    return .responded;
+}
+
 /// Re-forward a parked PROXY request after its host call completed (resume to
 /// allow). Returns true if the parked request was a proxy route (handled here);
 /// false if not (the caller falls back to the embedded-Router re-dispatch).
 ///
-/// Re-enters proxy.handle with the filter skipped (resume_decision injected) and
-/// queues the upstream response, mirroring the main-loop proxy tail (owned-buffer
-/// handling included). The upstream was not contacted at park time, so this is
-/// where the forward actually happens. v1 limitation: cache/otel/x402-settlement
-/// are NOT re-run on the resumed path (they apply to non-parked proxy requests);
-/// a route that both parks a filter and uses those features skips them on the
-/// parked request. Compiled only when wasm is enabled.
+/// Re-enters proxy.handle with the filter skipped (resume_decision injected) then
+/// runs the SAME post-forward processing the main loop runs via
+/// proxyForwardAndRespond -- response-cache store/invalidate, the otel span, and
+/// x402 settlement (incl. the inline-receipt settle-park) -- so a parked-then-
+/// allowed proxy request is cached/metered/settled like a non-parked one (E1).
+/// The upstream was not contacted at park time, so this is where the forward
+/// actually happens. The post-forward context is read from the connection's
+/// WasmProxyResumeCtx (stashed by the main loop, reached via completion.resume_ctx)
+/// plus the owned request snapshot. v1 limitation that REMAINS: auth_info/cert_dn
+/// are not re-derived, so upstream auth-header injection is absent for parked
+/// reqs. Compiled only when wasm is enabled.
 fn proxyResume(server: *Server, conn: *connection.Connection, completion: wasm_host_call_mod.Completion) bool {
     if (!build_options.enable_wasm) return false;
     const proxy = server.proxy orelse return false;
@@ -926,18 +1071,28 @@ fn proxyResume(server: *Server, conn: *connection.Connection, completion: wasm_h
     );
     defer pr.release();
 
-    http1_mod.queueResponse(server, conn, pr.resp) catch {
+    // Rebuild the post-forward context stashed by the main loop at park time. The
+    // resume_ctx pointer aliases this connection's WasmProxyResumeCtx; fall back
+    // to the field directly if a transport ever delivers a null ctx.
+    const rctx: *const connection.Connection.WasmProxyResumeCtx = if (completion.resume_ctx) |p|
+        @ptrCast(@alignCast(p))
+    else
+        &conn.wasm_proxy_resume;
+    // Reconstruct the x402 evaluation result from the carried needs_settlement
+    // flag (the result at park time is always .allow -- rejects fast-return before
+    // the forward). Re-point payment_header at the OWNED request snapshot; the
+    // original slice borrowed the now-reused read buffer.
+    const x402_result: x402_mod.EvaluateResult = .{ .allow = .{
+        .payment_header = x402_mod.findValidPaymentHeader(completion.req) orelse "",
+        .needs_settlement = rctx.needs_settlement,
+    } };
+    _ = proxyForwardAndRespond(server, conn, proxy, completion.req, &pr, .{
+        .route_idx = rctx.route_idx,
+        .otel_start = rctx.otel_start,
+        .x402_result = x402_result,
+    }) catch {
         conn.close_after_write = true;
-        return true;
     };
-    if (conn.pending_body.len > 0) {
-        if (pr.takeOwnedBuf()) |owned| {
-            std.debug.assert(conn.pending_body_owned == null);
-            conn.pending_body_owned = owned;
-        } else {
-            http1_mod.materializePendingBody(server, conn);
-        }
-    }
     return true;
 }
 
@@ -1652,6 +1807,20 @@ pub fn handleRead(server: *Server, index: u32) !void {
                 }
 
                 const otel_start = if (server.otel != null) clock.realtimeNanos() orelse 0 else 0;
+                // E1: stash the post-forward processing context BEFORE the
+                // forward so a wasm filter park on this proxy route can run
+                // cache-store/otel/settlement on resume (proxyResume reads this
+                // via the binding's resume_ctx). x402_result is always .allow
+                // here (rejects fast-returned above); carry only needs_settlement
+                // (the payment header is re-derived from the owned snapshot on
+                // resume). Harmless dead data when the filter does not park.
+                if (build_options.enable_wasm) {
+                    conn.wasm_proxy_resume = .{
+                        .route_idx = route_idx,
+                        .otel_start = otel_start,
+                        .needs_settlement = x402_result == .allow and x402_result.allow.needs_settlement,
+                    };
+                }
                 // Park binding: a host_call filter on this proxy route parks
                 // (H1 only). On park, runWasmFilter registers in the table, kicks
                 // the transport (start_fn), and returns the park sentinel; we
@@ -1663,6 +1832,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
                     .stream_id = 0, // H1 sentinel
                     .protocol = .http1,
                     .deadline_ms = server.now_ms + WASM_HOST_CALL_TIMEOUT_MS,
+                    .resume_ctx = @ptrCast(&conn.wasm_proxy_resume),
                     .start_fn = wasmStartThunk,
                     .start_ctx = @ptrCast(server),
                 } else .{};
@@ -1687,90 +1857,17 @@ pub fn handleRead(server: *Server, index: u32) !void {
                     break;
                 }
 
-                // Cache store: cache successful GET responses
-                if (cache_cfg) |cc| {
-                    if (parse.view.method == .GET and proxy_result.resp.status == 200) {
-                        if (proxy.route_caches[route_idx]) |*rc| {
-                            rc.store(
-                                parse.view.path,
-                                parse.view.headers,
-                                vary_keys,
-                                proxy_result.resp.status,
-                                proxy_result.resp.headers,
-                                proxy_result.resp.bodyBytes(),
-                                @as(u64, cc.ttl_s) * 1000,
-                                server.now_ms,
-                            );
-                        }
-                    }
-                }
-                // Invalidate cache on mutating methods
-                if (cache_cfg != null and parse.view.method != .GET and parse.view.method != .HEAD) {
-                    if (proxy.route_caches[route_idx]) |*rc| {
-                        rc.invalidate(parse.view.path);
-                    }
-                }
-
-                if (server.otel) |otel_exp| {
-                    otel_exp.recordSpan(parse.view.method, parse.view.path, proxy_result.resp.status, otel_start, clock.realtimeNanos() orelse 0);
-                }
-
-                // Settlement: submit async, optionally park for inline receipt
-                settle_blk: {
-                    if (proxy_result.resp.status < 200 or proxy_result.resp.status >= 300) break :settle_blk;
-                    if (!(x402_result == .allow and x402_result.allow.needs_settlement)) break :settle_blk;
-                    const fac = route_fac orelse break :settle_blk;
-                    const charge = for (proxy_result.resp.headers) |hdr| {
-                        if (std.ascii.eqlIgnoreCase(hdr.name, "x-charge-amount")) break hdr.value;
-                    } else "";
-                    var settle_entry = x402_client.RequestEntry{ .kind = .settle, .conn_index = conn.index, .conn_id = conn.id };
-                    fillSettleEntry(&settle_entry, fac, x402_result.allow.payment_header, &x402_policy, charge, parse.view.path);
-                    if (settle_entry.http_len == 0) break :settle_blk;
-
-                    // Settle-park: hold response until settlement completes, then inject receipt header.
-                    // Enabled by config (inline_receipt) or per-request header (X-Inline-Receipt: true).
-                    const want_receipt = x402_policy.inline_receipt or for (parse.view.headers) |hdr| {
-                        if (std.ascii.eqlIgnoreCase(hdr.name, "x-inline-receipt")) break std.mem.eql(u8, hdr.value, "true");
-                    } else false;
-                    if (want_receipt and packHeldResponse(server, conn, proxy_result.resp)) {
-                        if (x402_client.submit(settle_entry)) {
-                            conn.x402 = .settle_pending;
-                            server.io.setTimeoutPhase(conn, .write);
-                            conn.phase_enter_ms = server.now_ms;
-                            conn.markActive(server.now_ms);
-                            if (conn.read_buffered_bytes == 0) break;
-                            continue;
-                        }
-                        releaseHeldBuffer(server, conn);
-                    }
-
-                    // Fire-and-forget: submit settle without parking
-                    if (!x402_client.submit(settle_entry)) {
-                        x402_client.spillSettle(
-                            x402_policy.gateway_id,
-                            x402_policy.network,
-                            x402_policy.asset,
-                            if (charge.len > 0) charge else x402_policy.price,
-                            "settle queue full",
-                        );
-                    }
-                }
-
-                try http1_mod.queueResponse(server, conn, proxy_result.resp);
-                if (conn.pending_body.len > 0) {
-                    if (proxy_result.takeOwnedBuf()) |owned| {
-                        // Large proxied response: the unsent tail points into
-                        // the proxy's heap buffer. Take ownership so it
-                        // outlives proxy_result.release(); freed when the
-                        // tail drains (handleWrite) or the connection closes.
-                        std.debug.assert(conn.pending_body_owned == null);
-                        conn.pending_body_owned = owned;
-                    } else {
-                        // Pool-buffer response: copy the tail out before
-                        // proxy_result.release() frees the upstream buffer.
-                        http1_mod.materializePendingBody(server, conn);
-                    }
-                }
+                // Post-forward processing (cache store/invalidate, otel span,
+                // x402 settlement incl. the inline-receipt settle-park, then
+                // queueResponse + the owned-buffer tail), shared with the resumed
+                // (wasm-parked) proxy path so parity holds (E1). On a settle-park
+                // this sets conn.x402 = .settle_pending and holds the response;
+                // either outcome takes the same loop tail below.
+                _ = try proxyForwardAndRespond(server, conn, proxy, parse.view, &proxy_result, .{
+                    .route_idx = route_idx,
+                    .otel_start = otel_start,
+                    .x402_result = x402_result,
+                });
                 if (conn.read_buffered_bytes == 0) break;
                 continue;
             }
