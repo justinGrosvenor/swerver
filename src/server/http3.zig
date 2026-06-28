@@ -42,10 +42,9 @@ const quic_crypto = @import("../quic/crypto.zig");
 const quic_types = @import("../quic/types.zig");
 const wasm_filter_mod = if (build_options.enable_wasm) @import("../wasm/filter.zig") else struct {};
 
-/// WASM host-call wall-clock deadline for an H3 stream park, mirroring the H1/H2
-/// dispatch deadline. A parked stream past this is failed closed by the
-/// reactor's wasmTick deadline backstop. Compiled in all builds (a plain int).
-const WASM_HOST_CALL_TIMEOUT_MS: u64 = 30_000;
+// The WASM host-call (park) deadline for an H3 stream is configurable per-server
+// via `Server.wasm_host_call_deadline_ms` (default 30s, F2), mirroring H1/H2. A
+// parked stream past this is failed closed by the reactor's wasmTick backstop.
 
 /// Sentinel `conn_index` for H3 parks in the per-stream host_call table (E2b).
 /// H1/H2 use the io-runtime connection slot index as `conn_index` and the slot
@@ -372,7 +371,7 @@ fn handleHttp3Request(
                 .conn_id = conn.id,
                 .stream_id = stream_id32,
                 .protocol = .http3,
-                .deadline_ms = server.now_ms + WASM_HOST_CALL_TIMEOUT_MS,
+                .deadline_ms = server.now_ms + server.wasm_host_call_deadline_ms,
                 .start_fn = wasmStartThunkH3,
                 .start_ctx = @ptrCast(server),
             } else .{};
@@ -427,7 +426,7 @@ fn handleHttp3Request(
             .conn_id = conn.id,
             .stream_id = stream_id32,
             .protocol = .http3,
-            .deadline_ms = server.now_ms + WASM_HOST_CALL_TIMEOUT_MS,
+            .deadline_ms = server.now_ms + server.wasm_host_call_deadline_ms,
             .start_fn = wasmStartThunkH3,
             .start_ctx = @ptrCast(server),
         };

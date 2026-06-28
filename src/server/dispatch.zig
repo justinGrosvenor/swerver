@@ -1304,7 +1304,7 @@ fn wasmResumeHttp3(server: *Server, completion: wasm_host_call_mod.Completion) v
                     .conn_id = conn_id,
                     .stream_id = stream_id,
                     .protocol = .http3,
-                    .deadline_ms = server.now_ms + WASM_HOST_CALL_TIMEOUT_MS,
+                    .deadline_ms = server.now_ms + server.wasm_host_call_deadline_ms,
                     .resume_decision = completion.decision,
                 },
             };
