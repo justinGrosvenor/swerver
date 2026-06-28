@@ -1595,3 +1595,63 @@ test "wasm: proxy Phase 2b response filter injects a header and rewrites a body"
         try std.testing.expectEqualStrings("blocked by edge", resp2.bodyBytes());
     } else return error.SkipZigTest;
 }
+
+// --- D2 security probing through the proxy filter hook -----------------------
+
+test "D2-4 fail-closed: a trapping proxy request filter never forwards upstream" {
+    if (build_options.enable_wasm) {
+        const FILTER = @embedFile("../wasm/testdata/filter_probe.wasm");
+        var pool = try wasm_filter.Pool.init(std.testing.allocator, FILTER, .{ .instances = 2 });
+        defer pool.deinit();
+        var route = upstream.ProxyRoute{
+            .path_prefix = "/",
+            .upstream = "backend",
+            .wasm_pool = @ptrCast(&pool),
+            .wasm_fuel = 200_000,
+        };
+        // runWasmFilter returns null to mean "forward to upstream". A trapping
+        // filter must NEVER return null -- it must return a fail-closed reject
+        // (500) so the upstream is never reached.
+        for ([_][]const u8{ "/oob", "/loop" }) |p| {
+            const req = request.RequestView{ .method = .GET, .path = p, .headers = &.{} };
+            const out = runWasmFilter(&route, &req, .{});
+            try std.testing.expect(out != null);
+            try std.testing.expectEqual(@as(u16, 500), out.?.status);
+        }
+    } else return error.SkipZigTest;
+}
+
+test "D2-5 fail-closed: proxy filter pool exhaustion -> 503 then recovery" {
+    if (build_options.enable_wasm) {
+        const FILTER = @embedFile("../wasm/testdata/filter_probe.wasm");
+        var pool = try wasm_filter.Pool.init(std.testing.allocator, FILTER, .{ .instances = 1 });
+        defer pool.deinit();
+        var route = upstream.ProxyRoute{
+            .path_prefix = "/enrich",
+            .upstream = "backend",
+            .wasm_pool = @ptrCast(&pool),
+            .wasm_fuel = wasm_filter.DEFAULT_FUEL,
+        };
+        var table = wasm_host_call.Table{};
+        const binding = WasmBinding{
+            .table = @ptrCast(&table),
+            .conn_index = 1,
+            .conn_id = 1,
+            .deadline_ms = 9_999_999,
+        };
+        const req = request.RequestView{ .method = .GET, .path = "/enrich", .headers = &.{} };
+
+        // Pin the only instance: the park path's acquire() fails -> fail closed 503.
+        const pinned = pool.acquire() orelse return error.AcquireFailed;
+        const out = runWasmFilter(&route, &req, binding);
+        try std.testing.expect(out != null);
+        try std.testing.expectEqual(@as(u16, 503), out.?.status);
+        try std.testing.expectEqual(@as(usize, 0), table.liveCount()); // nothing parked
+
+        // Release -> recovery: the filter now parks (registers in the table).
+        pinned.state = .idle;
+        const out2 = runWasmFilter(&route, &req, binding);
+        try std.testing.expect(out2 != null and out2.?.isParked());
+        try std.testing.expectEqual(@as(usize, 1), table.liveCount());
+    } else return error.SkipZigTest;
+}
