@@ -602,3 +602,51 @@ test "host_call table: oversized request fails the park closed" {
     try testing.expectEqual(@as(usize, 0), table.liveCount());
     _ = filter.cancelPark(inst);
 }
+
+// --- D2 security probing: park-path fail-closed + exhaustion recovery --------
+
+test "D2-4 park path: a trap inside on_resume fails the completion closed (500)" {
+    // The async resume path (Table.complete -> filter.resumeCall) must fail
+    // CLOSED when the resumed guest traps: the parked request never slips through
+    // as .allow, and the instance is released (no pinned leak).
+    var pool = try filter.Pool.init(testing.allocator, FILTER_WASM, .{ .instances = 1 });
+    defer pool.deinit();
+    var table = Table{};
+    const token = try parkOne(&pool, &table, 1, 1, 5000);
+    // The fixture's on_resume traps on a "trap" result.
+    const c = table.complete(token, "trap") orelse return error.NoCompletion;
+    try testing.expect(c.decision != .allow);
+    try testing.expect(c.decision == .reject);
+    try testing.expectEqual(@as(u16, 500), c.decision.reject.status);
+    try testing.expectEqual(@as(usize, 0), table.liveCount());
+    // Released, reusable (the single-instance pool can be acquired again).
+    try testing.expect(pool.acquire() != null);
+}
+
+test "D2-5 park table: full fails closed, then recovers after a slot frees" {
+    var pool = try filter.Pool.init(testing.allocator, FILTER_WASM, .{ .instances = Table.CAP + 2 });
+    defer pool.deinit();
+    var table = Table{};
+
+    var tokens: [Table.CAP]Token = undefined;
+    var i: u32 = 0;
+    while (i < Table.CAP) : (i += 1) tokens[i] = try parkOne(&pool, &table, i, i, 5000);
+    try testing.expectEqual(@as(usize, Table.CAP), table.liveCount());
+
+    // Table full: a fresh park returns null; the caller fails closed (cancelPark).
+    const inst = pool.acquire() orelse return error.AcquireFailed;
+    const r = request.RequestView{ .method = .GET, .path = "/enrich", .headers = &.{} };
+    try testing.expect(filter.invokeOutcome(inst, &r, filter.DEFAULT_FUEL) == .parked);
+    try testing.expect(table.park(inst, r, 999, 999, 0, .http1, 5000, filter.DEFAULT_FUEL, null) == null);
+    _ = filter.cancelPark(inst);
+    try testing.expectEqual(@as(usize, Table.CAP), table.liveCount());
+
+    // Free one slot -> a later park succeeds (recovery; no leak of the freed slot).
+    try testing.expect(table.cancel(tokens[0], .timed_out) != null);
+    try testing.expectEqual(@as(usize, Table.CAP - 1), table.liveCount());
+    const inst2 = pool.acquire() orelse return error.AcquireFailed;
+    try testing.expect(filter.invokeOutcome(inst2, &r, filter.DEFAULT_FUEL) == .parked);
+    const tok = table.park(inst2, r, 1000, 1000, 0, .http1, 5000, filter.DEFAULT_FUEL, null);
+    try testing.expect(tok != null);
+    try testing.expectEqual(@as(usize, Table.CAP), table.liveCount());
+}

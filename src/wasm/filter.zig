@@ -1216,3 +1216,235 @@ test "response phase: a request-only filter passes through (no on_response)" {
     try testing.expect(edit.new_body == null);
     try testing.expectEqual(@as(usize, 0), edit.add_headers.len);
 }
+
+// ---------------------------------------------------------------------------
+// D2 security probing (D2-2 fuel/memory bombs, D2-3 ABI fuzz, D2-4 fail-closed/
+// fail-open invariant, D2-5 resource exhaustion). These EXTEND the coverage
+// above: they exercise the response phase, the host_call/replace length caps,
+// and make the core fail-closed (request) / fail-open (response) invariant
+// explicit, including recovery after a fault.
+// ---------------------------------------------------------------------------
+
+// --- D2-2: fuel / memory bombs ---------------------------------------------
+
+test "D2-2 request phase: memory.grow past the cap returns -1, no worker OOM" {
+    // The default 64-page cap; the fixture starts well below it. A grow far past
+    // the cap must return -1 (wasm spec) and leave linear memory untouched,
+    // rather than OOMing the worker.
+    var pool = try Pool.init(testing.allocator, FILTER_WASM, .{ .instances = 1 });
+    defer pool.deinit();
+    const inst = pool.acquire() orelse return error.AcquireFailed;
+    const r = mkReq(.GET, "/x", &.{});
+    inst.req = &r;
+    active = inst;
+    defer {
+        active = null;
+        inst.state = .idle;
+    }
+    runtime.fuel.unlimited();
+    const grow = inst.module.findOptional("grow_pages") orelse return error.FunctionNotFound;
+    const before = inst.module.memoryPages();
+    try testing.expectEqual(@as(i32, -1), try runtime.callI32_2(grow, 100_000, 0));
+    try testing.expectEqual(before, inst.module.memoryPages());
+    // A small in-cap grow still succeeds: the cap is a ceiling, not a hard no.
+    try testing.expect(try runtime.callI32_2(grow, 1, 0) >= 0);
+}
+
+test "D2-2 response phase: a fuel-exhausting spin in on_response fails OPEN" {
+    var pool = try Pool.init(testing.allocator, RESPONSE_WASM, .{ .instances = 1 });
+    defer pool.deinit();
+    const req = mkReq(.GET, "/spin", &.{});
+    const resp = mkResp(200, &.{}, "original body");
+    // A bounded budget must trap the spin rather than hang the worker; a trapped
+    // on_response fails OPEN -> empty edit -> the original response is served.
+    const edit = pool.runResponse(&req, &resp, 200_000);
+    try testing.expect(edit.new_status == null);
+    try testing.expect(edit.new_body == null);
+    try testing.expectEqual(@as(usize, 0), edit.add_headers.len);
+    // The pool is still usable after the trapped response invocation.
+    const req2 = mkReq(.GET, "/widgets", &.{});
+    const e2 = pool.runResponse(&req2, &resp, DEFAULT_FUEL);
+    try testing.expectEqualStrings("applied", hdrValue(e2.add_headers, "x-wasm-response") orelse return error.NoHeader);
+}
+
+test "D2-2 response phase: memory.grow past the cap inside on_response returns -1" {
+    var pool = try Pool.init(testing.allocator, RESPONSE_WASM, .{ .instances = 1 });
+    defer pool.deinit();
+    const before = pool.instances[0].module.memoryPages();
+    const req = mkReq(.GET, "/grow", &.{});
+    const resp = mkResp(200, &.{}, "original body");
+    const edit = pool.runResponse(&req, &resp, DEFAULT_FUEL);
+    // The guest saw -1 from the over-cap grow (recorded in the body); the worker
+    // did not OOM and linear memory did not actually grow.
+    try testing.expectEqualStrings("grow-refused", edit.new_body orelse return error.NoBody);
+    try testing.expectEqual(before, pool.instances[0].module.memoryPages());
+}
+
+// --- D2-3: ABI fuzz at scale (request host_call + response phase) -----------
+
+// Out-of-bounds (ptr,len) pairs reused across every fuzzed import. Boundary,
+// straddle, far-pointer, oversized-len, and near-u32-max (sum-overflow) cases.
+fn oobCases(mem_bytes: u32) [5][2]u32 {
+    return .{
+        .{ mem_bytes, 1 }, // ptr exactly at end
+        .{ mem_bytes -| 4, 64 }, // straddles the end
+        .{ 0x7FFF_FFF0, 0x1000 }, // far pointer
+        .{ 0, mem_bytes + 1 }, // length past end
+        .{ 0xFFFF_FFF0, 0x20 }, // ptr+len overflows u32 (caught by u64 math)
+    };
+}
+
+test "D2-3 ABI fuzz: host_call OOB always traps; over-cap length returns -1" {
+    var pool = try Pool.init(testing.allocator, FILTER_WASM, .{ .instances = 1 });
+    defer pool.deinit();
+    const inst = pool.acquire() orelse return error.AcquireFailed;
+    const r = mkReq(.GET, "/x", &.{});
+    inst.req = &r;
+    active = inst;
+    defer {
+        active = null;
+        inst.state = .idle;
+    }
+    runtime.fuel.unlimited();
+    const probe = inst.module.findOptional("host_call_probe") orelse return error.FunctionNotFound;
+    const mem_bytes: u32 = inst.module.memoryPages() * runtime.PAGE_SIZE;
+
+    // In-bounds, within CALL_REQUEST_CAP (4096): accepted (0).
+    try testing.expectEqual(@as(i32, 0), try runtime.callI32_2(probe, 0, 16));
+    // In-bounds but longer than the cap: -1 (not an overflow, not a host OOB).
+    try testing.expectEqual(@as(i32, -1), try runtime.callI32_2(probe, 0, 5000));
+    // Every out-of-bounds pair traps.
+    for (oobCases(mem_bytes)) |cse| {
+        try testing.expectError(runtime.Error.Trap, runtime.callI32_2(probe, @bitCast(cse[0]), @bitCast(cse[1])));
+    }
+}
+
+test "D2-3 ABI fuzz: response-phase pointers always trap out of bounds" {
+    var pool = try Pool.init(testing.allocator, RESPONSE_WASM, .{ .instances = 1 });
+    defer pool.deinit();
+    const inst = pool.acquire() orelse return error.AcquireFailed;
+    const req = mkReq(.GET, "/widgets", &.{});
+    const hdrs = [_]response.Header{.{ .name = "x-test", .value = "v" }};
+    const resp = mkResp(200, &hdrs, "response body bytes");
+    inst.req = &req;
+    inst.resp = &resp;
+    active = inst;
+    defer {
+        active = null;
+        inst.state = .idle;
+    }
+    runtime.fuel.unlimited();
+    const mem_bytes: u32 = inst.module.memoryPages() * runtime.PAGE_SIZE;
+
+    const names = [_][:0]const u8{ "rp_read_resp_body", "rp_get_header_out", "rp_get_header_name", "rp_replace_body" };
+    for (names) |fname| {
+        const f = inst.module.findOptional(fname) orelse return error.FunctionNotFound;
+        // In-bounds (offset/ptr 0, small len) is accepted (no trap).
+        _ = try runtime.callI32_2(f, 0, 8);
+        // Every out-of-bounds pair must trap (no host OOB read/write, no UB).
+        for (oobCases(mem_bytes)) |cse| {
+            try testing.expectError(runtime.Error.Trap, runtime.callI32_2(f, @bitCast(cse[0]), @bitCast(cse[1])));
+        }
+    }
+}
+
+test "D2-3 ABI fuzz: replace_response_body over the staging cap returns -1" {
+    var pool = try Pool.init(testing.allocator, RESPONSE_WASM, .{ .instances = 1 });
+    defer pool.deinit();
+    const inst = pool.acquire() orelse return error.AcquireFailed;
+    const req = mkReq(.GET, "/widgets", &.{});
+    const resp = mkResp(200, &.{}, "body");
+    inst.req = &req;
+    inst.resp = &resp;
+    active = inst;
+    defer {
+        active = null;
+        inst.state = .idle;
+    }
+    runtime.fuel.unlimited();
+    const f = inst.module.findOptional("rp_replace_body") orelse return error.FunctionNotFound;
+    const cap: i32 = @intCast(MAX_BODY_VIEW); // resp_repl_buf staging cap (64 KiB)
+    // Exactly at the cap, in bounds: accepted (0).
+    try testing.expectEqual(@as(i32, 0), try runtime.callI32_2(f, 0, cap));
+    // One byte past the cap, still in linear-memory bounds: -1 (no overflow).
+    try testing.expectEqual(@as(i32, -1), try runtime.callI32_2(f, 0, cap + 1));
+}
+
+// --- D2-4: THE CORE -- fail-closed (request) / fail-open (response) ----------
+
+test "D2-4 fail-closed: a request-phase trap is NEVER .allow (reject 500)" {
+    var pool = try Pool.init(testing.allocator, FILTER_WASM, .{ .instances = 2 });
+    defer pool.deinit();
+    // /oob traps on an OOB ABI pointer; /loop traps on fuel exhaustion. Neither
+    // may slip through as .allow -- both must fail closed with a reject.
+    for ([_][]const u8{ "/oob", "/loop" }) |p| {
+        const r = mkReq(.GET, p, &.{});
+        const d = pool.run(&r, 200_000);
+        try testing.expect(d != .allow);
+        try testing.expect(d == .reject);
+        try testing.expectEqual(@as(u16, 500), d.reject.status);
+    }
+    // Recovery: a normal request still works after the trapped invocations.
+    const ok = mkReq(.GET, "/public", &.{});
+    try testing.expect(pool.run(&ok, DEFAULT_FUEL) == .allow);
+}
+
+test "D2-4 fail-open: a response-phase trap yields an empty edit (serve original)" {
+    var pool = try Pool.init(testing.allocator, RESPONSE_WASM, .{ .instances = 1 });
+    defer pool.deinit();
+    const orig = mkResp(207, &.{}, "ORIGINAL-BODY");
+    // Both a div-by-zero trap (/trap) and a fuel-trap (/spin) must fail OPEN:
+    // no status override, no body replacement, no added headers -> the caller
+    // serves `orig` unchanged.
+    for ([_][]const u8{ "/trap", "/spin" }) |p| {
+        const rq = mkReq(.GET, p, &.{});
+        const edit = pool.runResponse(&rq, &orig, 200_000);
+        try testing.expect(edit.new_status == null);
+        try testing.expect(edit.new_body == null);
+        try testing.expectEqual(@as(usize, 0), edit.add_headers.len);
+    }
+}
+
+test "D2-4 fail-closed: a trap inside on_resume fails closed (resumeCall 500)" {
+    var pool = try Pool.init(testing.allocator, FILTER_WASM, .{ .instances = 1 });
+    defer pool.deinit();
+    const inst = pool.acquire() orelse return error.AcquireFailed;
+    const r = mkReq(.GET, "/enrich", &.{});
+    try testing.expect(invokeOutcome(inst, &r, DEFAULT_FUEL) == .parked);
+    // The fixture's on_resume traps when handed a "trap" result; resumeCall must
+    // map that to a fail-closed reject (never a stale allow) and release it.
+    const d = resumeCall(inst, "trap", DEFAULT_FUEL);
+    try testing.expect(d == .reject);
+    try testing.expectEqual(@as(u16, 500), d.reject.status);
+    try testing.expectEqual(Instance.State.idle, inst.state);
+    try testing.expect(pool.acquire() != null);
+    inst.state = .idle;
+}
+
+// --- D2-5: resource exhaustion (deterministic) ------------------------------
+
+test "D2-5 pool exhaustion -> 503 then recovery, no instance leak" {
+    var pool = try Pool.init(testing.allocator, FILTER_WASM, .{ .instances = 2 });
+    defer pool.deinit();
+    const a = pool.acquire() orelse return error.AcquireFailed;
+    const b = pool.acquire() orelse return error.AcquireFailed;
+    try testing.expect(pool.acquire() == null);
+
+    // Exhausted: fail closed with 503 (never allow through with no instance).
+    const r = mkReq(.GET, "/public", &.{});
+    const d = pool.run(&r, DEFAULT_FUEL);
+    try testing.expect(d == .reject);
+    try testing.expectEqual(@as(u16, 503), d.reject.status);
+
+    // Release one -> recovery: the next request succeeds.
+    a.state = .idle;
+    try testing.expect(pool.run(&r, DEFAULT_FUEL) == .allow);
+
+    // No leak: after a successful run every instance is back to idle.
+    b.state = .idle;
+    var idle: usize = 0;
+    for (pool.instances) |*i| {
+        if (i.state == .idle) idle += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), idle);
+}

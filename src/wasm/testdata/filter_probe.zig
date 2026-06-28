@@ -97,11 +97,37 @@ export fn abi_probe(ptr: u32, len: u32) i32 {
     return 0;
 }
 
+/// ABI-fuzz entry for host_call: hand the host an arbitrary (ptr, len). An
+/// out-of-bounds pair must trap; an in-bounds pair longer than the host's
+/// CALL_REQUEST_CAP must return -1 (not overflow). Returns host_call's result.
+export fn host_call_probe(ptr: u32, len: u32) i32 {
+    return host_call(@ptrFromInt(ptr), len);
+}
+
+/// Resource-bomb entry: ask the host to grow linear memory by `n` pages. The
+/// host memory cap must refuse an over-cap growth with -1 (wasm spec) rather
+/// than OOMing the worker. Returns the previous page count, or -1 if refused.
+/// Two args so the host's 2-arg call helper (callI32_2) can drive it; `_pad`
+/// is unused.
+export fn grow_pages(n: u32, _pad: u32) i32 {
+    _ = _pad;
+    return @intCast(@wasmMemoryGrow(0, n));
+}
+
 // Phase 3 resume entry: read the host-call result and decide. "ok" -> allow,
-// anything else -> reject 403.
+// "trap" -> deliberately trap (so the table resume path's fail-closed handling
+// can be proven), anything else -> reject 403.
 export fn on_resume() i32 {
     const n = read_call_result(&result_buf, result_buf.len);
-    if (std.mem.startsWith(u8, result_buf[0..n], "ok")) {
+    const res = result_buf[0..n];
+    if (std.mem.startsWith(u8, res, "trap")) {
+        // A trap inside on_resume must fail CLOSED (resumeCall returns 500). Use a
+        // genuine host trap (an OOB ABI pointer); a div-by-zero would be folded
+        // away by the optimizer (the divisor is a provably-zero global).
+        _ = get_path(@ptrFromInt(0xFFFF0000), 16);
+        return 0;
+    }
+    if (std.mem.startsWith(u8, res, "ok")) {
         return 0; // allow
     }
     const msg = "enrichment denied";

@@ -2233,3 +2233,117 @@ test "wasm: filter park registers in table and fires the transport start hook" {
         try std.testing.expect(c.decision == .allow);
     } else return error.SkipZigTest;
 }
+
+// --- D2 security probing through router.handle -------------------------------
+
+test "D2-4 fail-closed: a trapping request filter never reaches the handler (router.handle)" {
+    if (build_options.enable_wasm) {
+        const FILTER = @embedFile("../wasm/testdata/filter_probe.wasm");
+        var pool = try wasm_filter.Pool.init(std.testing.allocator, FILTER, .{ .instances = 2 });
+        defer pool.deinit();
+
+        var router = Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+        const H = struct {
+            var ran: bool = false;
+            fn h(_: *HandlerContext) response.Response {
+                ran = true;
+                return response.Response.ok();
+            }
+        };
+        H.ran = false;
+        try router.get("/oob", H.h);
+        try router.get("/loop", H.h);
+        // /oob traps on an OOB ABI pointer; /loop traps on fuel exhaustion.
+        try std.testing.expectEqual(@as(usize, 1), router.attachWasmFilter("/oob", &pool, wasm_filter.DEFAULT_FUEL));
+        try std.testing.expectEqual(@as(usize, 1), router.attachWasmFilter("/loop", &pool, 200_000));
+
+        var response_buf: [RESPONSE_BUF_SIZE]u8 = undefined;
+        var response_headers: [MAX_RESPONSE_HEADERS]response.Header = undefined;
+        var arena_buf: [ARENA_BUF_SIZE]u8 = undefined;
+        for ([_][]const u8{ "/oob", "/loop" }) |p| {
+            var mw_ctx = middleware.Context{};
+            var scratch = HandlerScratch{ .response_buf = response_buf[0..], .response_headers = response_headers[0..], .arena_buf = arena_buf[0..] };
+            const req = request.RequestView{ .method = .GET, .path = p, .headers = &.{} };
+            const result = router.handle(req, &mw_ctx, &scratch);
+            // Fail closed: 500, and the handler was NEVER invoked.
+            try std.testing.expectEqual(@as(u16, 500), result.resp.status);
+        }
+        try std.testing.expect(!H.ran);
+    } else return error.SkipZigTest;
+}
+
+test "D2-4 fail-open: a trapping response filter serves the original response (router.handle)" {
+    if (build_options.enable_wasm) {
+        const RESP_FILTER = @embedFile("../wasm/testdata/response_probe.wasm");
+        var pool = try wasm_filter.Pool.init(std.testing.allocator, RESP_FILTER, .{ .instances = 1 });
+        defer pool.deinit();
+
+        var router = Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+        const handler = struct {
+            fn h(ctx: *HandlerContext) response.Response {
+                return ctx.text(202, "keep-me");
+            }
+        }.h;
+        // The fixture's on_response traps for request path "/trap".
+        try router.get("/trap", handler);
+        _ = router.attachWasmFilter("/trap", &pool, wasm_filter.DEFAULT_FUEL);
+
+        var response_buf: [RESPONSE_BUF_SIZE]u8 = undefined;
+        var response_headers: [MAX_RESPONSE_HEADERS]response.Header = undefined;
+        var arena_buf: [ARENA_BUF_SIZE]u8 = undefined;
+        var mw_ctx = middleware.Context{};
+        var scratch = HandlerScratch{ .response_buf = response_buf[0..], .response_headers = response_headers[0..], .arena_buf = arena_buf[0..] };
+        const req = request.RequestView{ .method = .GET, .path = "/trap", .headers = &.{} };
+        const result = router.handle(req, &mw_ctx, &scratch);
+        // The response phase failed OPEN: the handler's original response is served
+        // unchanged (status + body), because the request already passed policy.
+        try std.testing.expectEqual(@as(u16, 202), result.resp.status);
+        try std.testing.expectEqualStrings("keep-me", result.resp.bodyBytes());
+    } else return error.SkipZigTest;
+}
+
+test "D2-5 fail-closed: pool exhaustion -> 503 then recovery (router.handle)" {
+    if (build_options.enable_wasm) {
+        const FILTER = @embedFile("../wasm/testdata/filter_probe.wasm");
+        var pool = try wasm_filter.Pool.init(std.testing.allocator, FILTER, .{ .instances = 1 });
+        defer pool.deinit();
+
+        var router = Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+        const H = struct {
+            var ran: bool = false;
+            fn h(_: *HandlerContext) response.Response {
+                ran = true;
+                return response.Response.ok();
+            }
+        };
+        H.ran = false;
+        try router.get("/public", H.h);
+        _ = router.attachWasmFilter("/public", &pool, wasm_filter.DEFAULT_FUEL);
+
+        var response_buf: [RESPONSE_BUF_SIZE]u8 = undefined;
+        var response_headers: [MAX_RESPONSE_HEADERS]response.Header = undefined;
+        var arena_buf: [ARENA_BUF_SIZE]u8 = undefined;
+
+        // Pin the only instance so the route's pool is exhausted.
+        const pinned = pool.acquire() orelse return error.AcquireFailed;
+        {
+            var mw_ctx = middleware.Context{};
+            var scratch = HandlerScratch{ .response_buf = response_buf[0..], .response_headers = response_headers[0..], .arena_buf = arena_buf[0..] };
+            const req = request.RequestView{ .method = .GET, .path = "/public", .headers = &.{} };
+            const result = router.handle(req, &mw_ctx, &scratch);
+            try std.testing.expectEqual(@as(u16, 503), result.resp.status);
+        }
+        try std.testing.expect(!H.ran); // never reached the handler while exhausted
+
+        // Release -> recovery: the next request runs the handler.
+        pinned.state = .idle;
+        {
+            var mw_ctx = middleware.Context{};
+            var scratch = HandlerScratch{ .response_buf = response_buf[0..], .response_headers = response_headers[0..], .arena_buf = arena_buf[0..] };
+            const req = request.RequestView{ .method = .GET, .path = "/public", .headers = &.{} };
+            const result = router.handle(req, &mw_ctx, &scratch);
+            try std.testing.expectEqual(@as(u16, 200), result.resp.status);
+        }
+        try std.testing.expect(H.ran);
+    } else return error.SkipZigTest;
+}
