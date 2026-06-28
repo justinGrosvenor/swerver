@@ -561,7 +561,15 @@ pub const WasmBinding = struct {
     table: ?*anyopaque = null,
     conn_index: u32 = 0,
     conn_id: u64 = 0,
+    /// Stream within the connection. H1 uses the sentinel 0; H2/H3 (E2) pass the
+    /// real stream id so a parked stream resumes independently of its siblings.
+    stream_id: u32 = 0,
+    /// Protocol of the parked stream; stored on the park slot so `wasmResume`
+    /// routes response delivery (H1 queueResponse vs H2/H3 stream sends in E2).
+    protocol: middleware.Context.Protocol = .http1,
     deadline_ms: u64 = 0,
+    /// Opaque resumed-path context carried into the park slot (E1; null in E0).
+    resume_ctx: ?*anyopaque = null,
     resume_decision: ?middleware.Decision = null,
     /// Transport start hook: invoked when a filter parks, with the park token and
     /// the guest-encoded outbound request (the staged host_call bytes). The
@@ -1205,7 +1213,7 @@ pub const Router = struct {
                                 // dispatch layer's handleParkSentinel sets
                                 // .wasm_parked and the transport drives the host
                                 // call to completion -> wasmResume.
-                                if (table.park(inst, req, scratch.wasm.conn_index, scratch.wasm.conn_id, scratch.wasm.deadline_ms, r.wasm_fuel)) |token| {
+                                if (table.park(inst, req, scratch.wasm.conn_index, scratch.wasm.conn_id, scratch.wasm.stream_id, scratch.wasm.protocol, scratch.wasm.deadline_ms, r.wasm_fuel, scratch.wasm.resume_ctx)) |token| {
                                     if (scratch.wasm.start_fn) |start| {
                                         start(scratch.wasm.start_ctx.?, token, call_request);
                                     }
