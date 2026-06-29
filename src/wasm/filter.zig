@@ -131,6 +131,12 @@ pub const Config = struct {
     /// fan-out, host_call.Table.CAP).
     instances: usize = 1,
     max_memory_pages: u32 = DEFAULT_MAX_MEMORY_PAGES,
+    /// S3: opt-in fail-closed for the on_response hook. The response phase fails
+    /// OPEN by default (a trap serves the original response unchanged) because
+    /// the request already passed policy. But a redaction/scrub filter that
+    /// traps would then LEAK the un-redacted response. Set this for such filters
+    /// so a response-phase trap serves a 503 instead of the original.
+    response_fail_closed: bool = false,
 };
 
 /// Stable ABI method codes (independent of request.Method's declaration order).
@@ -769,6 +775,10 @@ pub const ResponseEdit = struct {
     new_status: ?u16 = null,
     add_headers: []const response.Header = &.{},
     new_body: ?[]const u8 = null,
+    /// S3: the on_response hook TRAPPED (distinct from an empty edit, which means
+    /// "serve original unchanged" after a clean pass). A caller whose pool is
+    /// response_fail_closed must serve a 503 instead of the original response.
+    trapped: bool = false,
 };
 
 /// Run the Phase 2b response hook on `inst` against the outgoing response.
@@ -796,7 +806,10 @@ pub fn invokeResponse(
     const on_response = inst.on_response orelse return .{}; // no hook: pass through
 
     runtime.fuel.set(fuel_budget);
-    const code = runtime.callI32(on_response) catch return .{}; // trap: FAIL OPEN
+    // trap: signal it via .trapped so a response_fail_closed pool can serve a 503;
+    // the default (fail-open) caller still treats an empty/trapped edit as
+    // "serve original unchanged".
+    const code = runtime.callI32(on_response) catch return .{ .trapped = true };
     if (code != 0) return .{}; // guest opted out: pass through unchanged
 
     return .{
@@ -827,6 +840,8 @@ pub const Pool = struct {
     instances: []Instance,
     /// The module bytes are referenced (not copied) by wasm3; the pool owns them.
     wasm_bytes: []u8,
+    /// S3: serve a 503 (not the original response) when the on_response hook traps.
+    response_fail_closed: bool = false,
 
     pub fn init(alloc: std.mem.Allocator, wasm_bytes: []const u8, config: Config) Error!Pool {
         // Clamp to at least one instance. A zero count is a config error (it
@@ -859,7 +874,7 @@ pub const Pool = struct {
             built += 1;
         }
 
-        return .{ .alloc = alloc, .instances = instances, .wasm_bytes = owned };
+        return .{ .alloc = alloc, .instances = instances, .wasm_bytes = owned, .response_fail_closed = config.response_fail_closed };
     }
 
     pub fn deinit(self: *Pool) void {
@@ -1240,6 +1255,25 @@ test "response phase: a trap fails OPEN (original response served)" {
     try testing.expect(edit.new_status == null);
     try testing.expect(edit.new_body == null);
     try testing.expectEqual(@as(usize, 0), edit.add_headers.len);
+    // S3: the trap is now SIGNALED (the default fail-open caller ignores it, but a
+    // response_fail_closed pool uses it to serve a 503 instead of the original).
+    try testing.expect(edit.trapped);
+}
+
+test "S3: response_fail_closed pool sets the flag; trap signaled, clean pass not" {
+    var pool = try Pool.init(testing.allocator, RESPONSE_WASM, .{ .instances = 1, .response_fail_closed = true });
+    defer pool.deinit();
+    // The opt-in flag is recorded on the pool for the caller to consult.
+    try testing.expect(pool.response_fail_closed);
+    // A trapping on_response signals .trapped (caller will serve 503, not leak).
+    const tr = mkReq(.GET, "/trap", &.{});
+    const resp = mkResp(200, &.{}, "secret-original-body");
+    const edit = pool.runResponse(&tr, &resp, DEFAULT_FUEL);
+    try testing.expect(edit.trapped);
+    // A clean pass is NOT trapped, so fail-closed must not fire on success.
+    const ok = mkReq(.GET, "/widgets", &.{});
+    const e2 = pool.runResponse(&ok, &resp, DEFAULT_FUEL);
+    try testing.expect(!e2.trapped);
 }
 
 test "response phase: a request-only filter passes through (no on_response)" {

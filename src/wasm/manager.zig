@@ -27,6 +27,8 @@ pub const Spec = struct {
     /// See filter.Config.instances: 1 suffices for the sync Phase-1 model.
     instances: usize = 1,
     fuel: i64 = filter.DEFAULT_FUEL,
+    /// S3: serve a 503 when the on_response hook traps (default fail-open).
+    response_fail_closed: bool = false,
 };
 
 /// Largest module file the manager will load (sanity bound, not a wasm limit).
@@ -57,10 +59,10 @@ pub const Manager = struct {
 
     /// Build a pool from in-memory module bytes and record the binding. Core of
     /// the disk `load` path; also directly usable when bytes are embedded.
-    pub fn addPool(self: *Manager, match: []const u8, bytes: []const u8, instances: usize, fuel: i64) Error!*filter.Pool {
+    pub fn addPool(self: *Manager, match: []const u8, bytes: []const u8, instances: usize, fuel: i64, response_fail_closed: bool) Error!*filter.Pool {
         const pool = try self.alloc.create(filter.Pool);
         errdefer self.alloc.destroy(pool);
-        pool.* = try filter.Pool.init(self.alloc, bytes, .{ .instances = instances });
+        pool.* = try filter.Pool.init(self.alloc, bytes, .{ .instances = instances, .response_fail_closed = response_fail_closed });
         errdefer pool.deinit();
 
         const match_copy = try self.alloc.dupe(u8, match);
@@ -75,7 +77,7 @@ pub const Manager = struct {
     pub fn load(self: *Manager, spec: Spec) Error!*filter.Pool {
         const bytes = readModule(self.alloc, spec.module_path) catch return Error.ModuleReadFailed;
         defer self.alloc.free(bytes);
-        return self.addPool(spec.match, bytes, spec.instances, spec.fuel);
+        return self.addPool(spec.match, bytes, spec.instances, spec.fuel, spec.response_fail_closed);
     }
 
     /// Load every spec and attach to an embedded Router by route pattern. This
@@ -150,7 +152,7 @@ test "manager owns pool, attaches to router by pattern, filters" {
     try router.get("/api/orders", handler);
 
     // addPool exercises the in-memory core; load() layers a disk read on top.
-    const pool = try mgr.addPool("/api/orders", fixture, 2, filter.DEFAULT_FUEL);
+    const pool = try mgr.addPool("/api/orders", fixture, 2, filter.DEFAULT_FUEL, false);
     try testing.expectEqual(@as(usize, 1), router.attachWasmFilter("/api/orders", pool, filter.DEFAULT_FUEL));
 
     // /api/orders without key -> filter rejects 401.
@@ -228,13 +230,13 @@ test "reload teardown ordering: old manager freed, new routes keep filtering" {
     var routes_b = [_]upstream.ProxyRoute{.{ .path_prefix = "/api/", .upstream = "backend" }};
 
     var mgr1 = Manager.init(testing.allocator);
-    const p1 = try mgr1.addPool("/api/", fixture, 1, filter.DEFAULT_FUEL);
+    const p1 = try mgr1.addPool("/api/", fixture, 1, filter.DEFAULT_FUEL, false);
     routes_a[0].wasm_pool = p1;
     routes_a[0].wasm_fuel = filter.DEFAULT_FUEL;
 
     var mgr2 = Manager.init(testing.allocator);
     defer mgr2.deinit();
-    const p2 = try mgr2.addPool("/api/", fixture, 1, filter.DEFAULT_FUEL);
+    const p2 = try mgr2.addPool("/api/", fixture, 1, filter.DEFAULT_FUEL, false);
     routes_b[0].wasm_pool = p2;
     routes_b[0].wasm_fuel = filter.DEFAULT_FUEL;
 

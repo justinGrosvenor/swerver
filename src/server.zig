@@ -585,7 +585,10 @@ pub const Server = struct {
     /// to `routes` (the proxy route table, mutated in place). Returns the opaque
     /// manager pointer, or null if wasm is disabled / no specs. A spec that
     /// fails to load is logged and skipped (its route then runs unfiltered).
-    fn buildWasmManager(
+    // pub so the admin reload path (admin.zig writeConfigAndReload) can rebuild
+    // the manager too; both reload paths must rebuild it or a route edit leaves
+    // filters detached (fail-open). Keep the two call sites in sync.
+    pub fn buildWasmManager(
         self: *Server,
         specs: []const config_file_mod.WasmFilterConfig,
         routes: []upstream_mod.ProxyRoute,
@@ -600,9 +603,17 @@ pub const Server = struct {
                 .module_path = w.module_path,
                 .instances = w.instances,
                 .fuel = w.fuel,
+                .response_fail_closed = w.response_fail_closed,
             }};
             const n = mgr.loadAndAttachProxy(routes, &one) catch {
-                std.log.err("wasm filter '{s}': failed to load module '{s}'", .{ w.match, w.module_path });
+                // S2: do NOT continue with the route unfiltered (fail-open). Mark
+                // every route this spec targets as wasm_required so it fails
+                // CLOSED (503) at request time instead of forwarding past a
+                // security filter that never loaded.
+                std.log.warn("wasm filter '{s}': failed to load module '{s}'; routes matching '{s}' will FAIL CLOSED (503), not run unfiltered", .{ w.match, w.module_path, w.match });
+                for (routes) |*r| {
+                    if (std.mem.eql(u8, r.path_prefix, w.match)) r.wasm_required = true;
+                }
                 continue;
             };
             std.log.info("wasm filter '{s}' -> {s} ({d} route(s), {d} instances)", .{ w.match, w.module_path, n, w.instances });
@@ -610,7 +621,7 @@ pub const Server = struct {
         return @ptrCast(mgr);
     }
 
-    fn freeWasmManager(self: *Server, ptr: ?*anyopaque) void {
+    pub fn freeWasmManager(self: *Server, ptr: ?*anyopaque) void {
         if (!build_options.enable_wasm) return;
         if (ptr) |p| {
             const mgr: *wasm_manager_mod.Manager = @ptrCast(@alignCast(p));
@@ -1443,6 +1454,28 @@ pub const Server = struct {
         self.io.releaseConnection(conn);
     }
 };
+
+test "S2: a wasm filter whose module fails to load fails its routes closed" {
+    if (!build_options.enable_wasm) return;
+    // buildWasmManager only reads self.allocator; an otherwise-undefined Server
+    // is sufficient to exercise the load-failure marking in isolation.
+    var srv: Server = undefined;
+    srv.allocator = std.testing.allocator;
+    var routes = [_]upstream_mod.ProxyRoute{
+        .{ .path_prefix = "/guarded", .upstream = "u" },
+        .{ .path_prefix = "/open", .upstream = "u" },
+    };
+    const specs = [_]config_file_mod.WasmFilterConfig{
+        .{ .match = "/guarded", .module_path = "/nonexistent/does-not-exist.wasm" },
+    };
+    const mgr = srv.buildWasmManager(&specs, &routes);
+    defer srv.freeWasmManager(mgr);
+    // The guarded route must fail CLOSED (wasm_required), not run unfiltered.
+    try std.testing.expect(routes[0].wasm_required);
+    try std.testing.expect(routes[0].wasm_pool == null);
+    // An unrelated route is untouched.
+    try std.testing.expect(!routes[1].wasm_required);
+}
 
 test "metrics middleware response queued for http1" {
     var gpa = std.heap.DebugAllocator(.{}){};

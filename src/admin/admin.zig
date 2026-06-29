@@ -436,20 +436,32 @@ fn writeConfigAndReload(server: *Server, alloc: std.mem.Allocator, tree: std.jso
 
         const old_proxy = server.proxy;
         const old_arena = server.reload_arena;
+        const old_wasm = server.wasm_manager;
         server.proxy = proxy_ptr;
         server.reload_arena = loaded.arena;
+
+        // Rebuild the WASM filter pools for the new route table, then free the
+        // old manager AFTER the old proxy (whose routes referenced the old
+        // pools). This MUST mirror Server.applyPendingReload: without it an
+        // admin route/upstream edit leaves every route with wasm_pool == null,
+        // silently disabling all Tier-1 filters (fail-open).
+        server.wasm_manager = server.buildWasmManager(loaded.wasm_filters, @constCast(loaded.routes));
 
         if (old_proxy) |old| {
             old.deinit();
             server.allocator.destroy(old);
         }
         if (old_arena) |*oa| oa.deinit();
+        server.freeWasmManager(old_wasm);
     } else if (loaded.upstreams.len == 0 and loaded.routes.len == 0) {
         if (server.proxy) |old| {
             old.deinit();
             server.allocator.destroy(old);
             server.proxy = null;
         }
+        // Proxy removed: tear down its filter pools too (mirror applyPendingReload).
+        server.freeWasmManager(server.wasm_manager);
+        server.wasm_manager = null;
         if (server.reload_arena) |*old_arena| old_arena.deinit();
         server.reload_arena = loaded.arena;
     } else {

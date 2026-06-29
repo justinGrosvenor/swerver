@@ -59,6 +59,10 @@ pub const WasmFilterConfig = struct {
     instances: usize = 1,
     /// Per-invocation fuel budget (loop back-edges).
     fuel: i64 = 5_000_000,
+    /// S3: serve a 503 when the on_response hook traps, instead of the original
+    /// response (default fail-open). Set this for redaction/scrub filters so a
+    /// response-phase trap cannot leak the un-redacted response.
+    response_fail_closed: bool = false,
 };
 
 pub const LoadedConfig = struct {
@@ -539,6 +543,7 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
             .module_path = w.module,
             .instances = instances,
             .fuel = fuel,
+            .response_fail_closed = w.response_fail_closed orelse false,
         };
     }
 
@@ -653,6 +658,7 @@ const WasmFilterJson = struct {
     module: []const u8,
     instances: ?usize = null,
     fuel: ?i64 = null,
+    response_fail_closed: ?bool = null,
 };
 
 const ServerJson = struct {

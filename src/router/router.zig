@@ -1326,6 +1326,15 @@ pub const Router = struct {
                             wasm_modify_headers = stabilizeWasmModifyHeaders(wasm_modify_headers);
                         }
                         const edit = pool.runResponse(&req, &result_resp, r.wasm_fuel);
+                        // S3: a trapping response hook fails OPEN by default; a
+                        // pool marked response_fail_closed serves a fresh 503
+                        // instead so a redaction/scrub trap cannot leak the
+                        // original response body or headers.
+                        if (edit.trapped and pool.response_fail_closed) {
+                            result_resp = .{ .status = 503, .headers = &.{}, .body = .{ .bytes = "edge function response error" } };
+                            wasm_response_headers = &.{};
+                            break;
+                        }
                         if (edit.new_status) |s| result_resp.status = s;
                         if (edit.new_body) |b| result_resp.body = .{ .bytes = b };
                         wasm_response_headers = edit.add_headers;

@@ -92,7 +92,13 @@ const WasmShortCircuit = struct {
 
 fn runWasmFilter(route: *const upstream.ProxyRoute, req_view: *const request.RequestView, wb: WasmBinding) ?WasmShortCircuit {
     if (!build_options.enable_wasm) return null;
-    const pool_ptr = route.wasm_pool orelse return null;
+    const pool_ptr = route.wasm_pool orelse {
+        // S2: the configured filter for this route failed to load. Fail CLOSED
+        // (503) rather than forwarding unfiltered. buildWasmManager sets
+        // wasm_required on routes whose module failed to load.
+        if (route.wasm_required) return .{ .resp = forward.createErrorResponse(503) };
+        return null;
+    };
     const fpool: *wasm_filter.Pool = @ptrCast(@alignCast(pool_ptr));
 
     // Re-dispatch after a completed host call: apply the resumed decision,
@@ -174,6 +180,14 @@ fn runWasmResponseFilter(
     const fpool: *wasm_filter.Pool = @ptrCast(@alignCast(pool_ptr));
     if (!fpool.hasResponseHook()) return;
     const edit = fpool.runResponse(req_view, resp, route.wasm_fuel);
+    // S3: a trapping response hook fails OPEN by default (serve original); for a
+    // redaction/scrub filter that would leak the un-redacted response, so a pool
+    // marked response_fail_closed serves a fresh 503 instead (drops the original
+    // body AND headers -- no partial leak).
+    if (edit.trapped and fpool.response_fail_closed) {
+        resp.* = forward.createErrorResponse(503);
+        return;
+    }
     if (edit.new_status) |s| resp.status = s;
     if (edit.new_body) |b| resp.body = .{ .bytes = b };
     if (edit.add_headers.len > 0) {

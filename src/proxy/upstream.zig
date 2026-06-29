@@ -141,6 +141,11 @@ pub const ProxyRoute = struct {
     /// Set by the filter manager at startup; null means no filter. See proxy.zig.
     wasm_pool: ?*anyopaque = null,
     wasm_fuel: i64 = 0,
+    /// Set when a configured filter for this route FAILED to load. The route
+    /// then fails CLOSED (503) instead of forwarding unfiltered: a security
+    /// filter that silently no-ops is worse than a hard error. See proxy.zig
+    /// runWasmFilter and server.zig buildWasmManager.
+    wasm_required: bool = false,
 
     /// Resolve the upstream name, applying traffic split if configured.
     pub fn selectUpstream(self: *const ProxyRoute) []const u8 {
