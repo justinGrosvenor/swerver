@@ -337,6 +337,14 @@ pub const Server = struct {
             self.static_cache = std.StringHashMap(StaticCacheEntry).init(allocator);
         }
 
+        // Bind the WASM host-call park table to the worker allocator: each park
+        // now heap-allocates a request-sized owned snapshot (freed on slot reuse
+        // and at the table's deinit during Server.deinit), replacing the old fixed
+        // per-slot embed.
+        if (build_options.enable_wasm) {
+            self.wasm_host_calls.allocator = allocator;
+        }
+
         // Wire the (now stable-addressed) tls_provider into the QUIC handler
         // so each new connection can bootstrap a TLS session via initTls.
         // This must happen after self.* assignment so we can take a pointer
@@ -444,6 +452,8 @@ pub const Server = struct {
         // Tear down the control-socket transport (unregisters its fd, fails any
         // in-flight parks closed) before the io runtime goes away.
         self.teardownWasmControl();
+        // Reclaim any owned park snapshots (live parks + deferred-free buffers).
+        if (build_options.enable_wasm) self.wasm_host_calls.deinit();
         if (self.spare_fd) |fd| clock.closeFd(fd);
         // Close every bound listener. listener_fd aliases listeners_buf[0].fd
         // (multi-listener model), so we drive closing off the array only and do

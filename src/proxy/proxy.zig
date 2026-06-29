@@ -1525,7 +1525,8 @@ test "wasm: proxy request filter parks, registers in the table, fires start_fn" 
             .wasm_pool = @ptrCast(&pool),
             .wasm_fuel = wasm_filter.DEFAULT_FUEL,
         };
-        var table = wasm_host_call.Table{};
+        var table = wasm_host_call.Table.init(std.testing.allocator);
+        defer table.deinit();
 
         const Rec = struct {
             var token: ?u32 = null;
@@ -1632,7 +1633,8 @@ test "D2-5 fail-closed: proxy filter pool exhaustion -> 503 then recovery" {
             .wasm_pool = @ptrCast(&pool),
             .wasm_fuel = wasm_filter.DEFAULT_FUEL,
         };
-        var table = wasm_host_call.Table{};
+        var table = wasm_host_call.Table.init(std.testing.allocator);
+        defer table.deinit();
         const binding = WasmBinding{
             .table = @ptrCast(&table),
             .conn_index = 1,
