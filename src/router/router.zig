@@ -2260,7 +2260,8 @@ test "wasm: filter park registers in table and fires the transport start hook" {
         const FILTER = @embedFile("../wasm/testdata/filter_probe.wasm");
         var pool = try wasm_filter.Pool.init(std.testing.allocator, FILTER, .{ .instances = 1 });
         defer pool.deinit();
-        var table = wasm_host_call.Table{};
+        var table = wasm_host_call.Table.init(std.testing.allocator);
+        defer table.deinit();
 
         var router = Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
         const handler = struct {
