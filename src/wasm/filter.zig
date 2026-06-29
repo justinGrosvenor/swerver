@@ -958,9 +958,35 @@ pub const Pool = struct {
 
 const testing = std.testing;
 const FILTER_WASM = @embedFile("testdata/filter_probe.wasm");
+// The canonical examples/wasm_filter SDK example, built through abi.zig (D2).
+// Loading it exercises EVERY host import via abi.zig's signatures, so this is the
+// drift guard: if abi.zig and linkAbi disagree, Pool.init's lazy compile of the
+// exports fails and these tests fail. Rebuild with testdata/build_probe.sh.
+const ABI_EXAMPLE_WASM = @embedFile("testdata/abi_example_filter.wasm");
 
 fn mkReq(method: request.Method, path: []const u8, headers: []const request.Header) request.RequestView {
     return .{ .method = method, .path = path, .headers = headers };
+}
+
+test "D2: abi.zig SDK example links (all signatures match linkAbi) and runs" {
+    var pool = try Pool.init(testing.allocator, ABI_EXAMPLE_WASM, .{ .instances = 1 });
+    defer pool.deinit();
+    // Pool.init lazily compiles on_request / on_resume / on_response. Each compile
+    // validates the host-import signatures those exports reference, so reaching
+    // here at all means abi.zig's 17 externs match the host linkAbi. on_resume
+    // (read_call_result) and on_response (the 6 response-phase imports) are the
+    // ones a request-only test would never exercise:
+    try testing.expect(pool.instances[0].on_resume != null);
+    try testing.expect(pool.instances[0].on_response != null);
+    try testing.expect(pool.hasResponseHook());
+    // And it runs end to end through the abi.zig helpers: /secure with no
+    // Authorization rejects 401; /public allows.
+    const denied = mkReq(.GET, "/secure/x", &.{});
+    const d = pool.run(&denied, DEFAULT_FUEL);
+    try testing.expect(d == .reject);
+    try testing.expectEqual(@as(u16, 401), d.reject.status);
+    const ok = mkReq(.GET, "/public", &.{});
+    try testing.expect(pool.run(&ok, DEFAULT_FUEL) == .allow);
 }
 
 test "filter: allow path" {
