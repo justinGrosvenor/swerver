@@ -20,6 +20,7 @@ const io_mod = @import("../runtime/io.zig");
 const net = @import("../runtime/net.zig");
 const clock = @import("../runtime/clock.zig");
 const host_call = @import("host_call.zig");
+const filter = @import("filter.zig");
 
 pub const Token = host_call.Token;
 
@@ -32,8 +33,21 @@ pub const DEFAULT_SLOT: u32 = 4;
 /// Reports and shell commands end with 0x1e<exit-code>\n.
 const RS: u8 = 0x1e;
 
-/// Buffers. Replies are bounded; an overflow before the trailer fails the call.
+/// Buffers. A reply larger than RECV_CAP is DRAINED to its frame boundary (the
+/// agent always emits the 0x1e<exit>\n trailer; it truncates the body, not the
+/// frame -- control-protocol.md "Output bound"), so the socket stays clean and
+/// the call still completes with the exit verdict.
 const RECV_CAP = 64 * 1024;
+/// The delivered command reply must fit the filter's result buffer WITH its
+/// trailer, or resumeCall's head-copy would drop the 0x1e<exit> trailer and the
+/// filter would lose the verdict (the R2 bug). Truncate the body to fit, never
+/// the trailer.
+const DELIVER_CAP = filter.CALL_RESULT_CAP;
+/// Scratch for discarding over-cap body while scanning for the trailer.
+const DRAIN_CAP = 8 * 1024;
+/// Upper bound on a trailer (0x1e + decimal exit code + \n), kept across drain
+/// reads so a trailer split between reads is still found.
+const TRAILER_MAX = 32;
 const CMD_CAP = 4 * 1024; // a queued command line (control commands are short)
 const QUEUE_CAP = host_call.Table.CAP; // at most one queued per parked filter
 
@@ -104,6 +118,13 @@ pub const ControlClient = struct {
     // Receive accumulator for the current reply (info report or command output).
     recv_buf: [RECV_CAP]u8 = undefined,
     recv_len: usize = 0,
+
+    // R2 drain state: when a command reply overflows recv_buf before its trailer,
+    // we retain recv_buf[0..recv_len] as the (truncated) body prefix and read the
+    // rest here, discarding overflow while scanning for the 0x1e<exit>\n trailer.
+    draining: bool = false,
+    drain_buf: [DRAIN_CAP]u8 = undefined,
+    drain_len: usize = 0,
 
     // Current outbound command (partial-write safe).
     send_buf: [CMD_CAP]u8 = undefined,
@@ -335,6 +356,8 @@ pub const ControlClient = struct {
     fn sendInfo(self: *ControlClient, io_rt: *io_mod.IoRuntime, now_ms: u64) void {
         self.state = .info_wait;
         self.recv_len = 0;
+        self.draining = false;
+        self.drain_len = 0;
         self.deadline_ms = now_ms + HANDSHAKE_TIMEOUT_MS;
         const msg = "__info__\n";
         @memcpy(self.send_buf[0..msg.len], msg);
@@ -346,7 +369,32 @@ pub const ControlClient = struct {
     /// Readable in info_wait (parse the report) or ready (read command output).
     fn handleReadable(self: *ControlClient, io_rt: *io_mod.IoRuntime, now_ms: u64) void {
         while (true) {
+            if (self.draining) {
+                // drainOverflow returns true once it delivered the truncated reply
+                // (loop again for pipelined bytes), false on EAGAIN / terminal fail.
+                if (!self.drainOverflow(io_rt, now_ms)) return;
+                continue;
+            }
             if (self.recv_len >= self.recv_buf.len) {
+                // recv_buf is full and tryConsumeReply found no 0x1e in it (else the
+                // frame would already be consumed). The agent always emits the
+                // trailer (it bounds the body, not the frame), so for an in-flight
+                // command DRAIN to the frame boundary instead of failing closed --
+                // keeping the socket clean and still completing with the exit code.
+                if (self.state == .ready and self.inflight != null) {
+                    // Seed the drain scratch with the tail of recv_buf so a trailer
+                    // straddling the buffer boundary (its 0x1e landed here but the
+                    // \n is still incoming) is still found by drainOverflow. recv_len
+                    // shrinks by the seed; the body is being truncated anyway.
+                    const seed = @min(self.recv_len, TRAILER_MAX - 1);
+                    @memcpy(self.drain_buf[0..seed], self.recv_buf[self.recv_len - seed ..]);
+                    self.drain_len = seed;
+                    self.recv_len -= seed;
+                    self.draining = true;
+                    continue;
+                }
+                // Handshake report, or no in-flight call: a reply this large with no
+                // trailer is anomalous; fail and let tick() rebuild the lane.
                 return self.fail(io_rt, now_ms, "reply exceeded buffer before trailer");
             }
             const rc = std.posix.system.read(self.fd, self.recv_buf[self.recv_len..].ptr, self.recv_buf.len - self.recv_len);
@@ -362,6 +410,83 @@ pub const ControlClient = struct {
                 // A reply was consumed; loop to drain any pipelined bytes.
                 if (self.state != .ready) return;
             }
+        }
+    }
+
+    /// Deliver an in-flight command reply, truncating the BODY (never the trailer)
+    /// so the delivered frame fits the filter's result buffer. `body_len` is the
+    /// retained output length in recv_buf[0..]; `trailer` is the 0x1e<exit>\n bytes
+    /// (which may alias recv_buf past body_len, so it is copied out first). Mirrors
+    /// the nether-side max_output_bytes contract one level down (R2).
+    fn deliverCommandReply(self: *ControlClient, body_len: usize, trailer: []const u8) void {
+        const tn: usize = @min(trailer.len, TRAILER_MAX);
+        const max_body: usize = if (DELIVER_CAP > tn) DELIVER_CAP - tn else 0;
+        const keep = @min(body_len, max_body);
+        if (keep < body_len)
+            std.log.warn("wasm control ({s}): agent reply body {d}B over result cap {d}B; body truncated, exit trailer kept", .{ self.path, body_len, DELIVER_CAP });
+        var tbuf: [TRAILER_MAX]u8 = undefined;
+        @memcpy(tbuf[0..tn], trailer[0..tn]);
+        @memcpy(self.recv_buf[keep .. keep + tn], tbuf[0..tn]);
+        if (self.inflight) |t| {
+            self.inflight = null;
+            if (self.complete_fn) |cf| cf(self.resume_ctx.?, t, self.recv_buf[0 .. keep + tn]);
+        }
+    }
+
+    /// Read and DISCARD over-cap reply body, scanning for the 0x1e<exit>\n trailer
+    /// the agent always emits. On finding it, deliver a body-truncated reply (the
+    /// exit verdict preserved) and resume normal reads. Returns true when a reply
+    /// was delivered, false on EAGAIN (wait for the next read event) or a terminal
+    /// failure. The COMMAND_TIMEOUT (tick) bounds a guest that never sends a trailer.
+    fn drainOverflow(self: *ControlClient, io_rt: *io_mod.IoRuntime, now_ms: u64) bool {
+        while (true) {
+            if (std.mem.indexOfScalar(u8, self.drain_buf[0..self.drain_len], RS)) |sep| {
+                if (std.mem.indexOfScalar(u8, self.drain_buf[sep + 1 .. self.drain_len], '\n')) |nl_rel| {
+                    const tend = sep + 1 + nl_rel + 1;
+                    self.deliverCommandReply(self.recv_len, self.drain_buf[sep..tend]);
+                    // Bytes after the trailer are the next reply: move them to recv_buf.
+                    const leftover = self.drain_buf[tend..self.drain_len];
+                    self.draining = false;
+                    self.recv_len = leftover.len;
+                    std.mem.copyForwards(u8, self.recv_buf[0..leftover.len], leftover);
+                    self.drain_len = 0;
+                    self.pumpQueue(io_rt, now_ms);
+                    return true;
+                }
+                // 0x1e seen, \n not yet. A real trailer is 0x1e<exit>\n (tiny). If
+                // more than TRAILER_MAX bytes already follow this 0x1e with no \n,
+                // it is NOT a trailer start (a literal 0x1e in the untrusted guest's
+                // output) -> skip past it and keep scanning, so a hostile guest
+                // cannot wedge the drain into a zero-length read / spurious EOF.
+                if (self.drain_len - sep > TRAILER_MAX) {
+                    const past = sep + 1;
+                    std.mem.copyForwards(u8, self.drain_buf[0 .. self.drain_len - past], self.drain_buf[past..self.drain_len]);
+                    self.drain_len -= past;
+                } else if (sep > 0) {
+                    // Plausible partial trailer: keep it at the front, read its \n.
+                    std.mem.copyForwards(u8, self.drain_buf[0 .. self.drain_len - sep], self.drain_buf[sep..self.drain_len]);
+                    self.drain_len -= sep;
+                }
+            } else if (self.drain_len == self.drain_buf.len) {
+                // No trailer in a full scratch: a trailer could straddle reads, so
+                // retain the last TRAILER_MAX-1 bytes and discard the rest.
+                const keep = TRAILER_MAX - 1;
+                std.mem.copyForwards(u8, self.drain_buf[0..keep], self.drain_buf[self.drain_len - keep ..]);
+                self.drain_len = keep;
+            }
+            const rc = std.posix.system.read(self.fd, self.drain_buf[self.drain_len..].ptr, self.drain_buf.len - self.drain_len);
+            if (rc < 0) {
+                const e = std.posix.errno(rc);
+                if (e == .AGAIN) return false;
+                if (e == .INTR) continue;
+                self.fail(io_rt, now_ms, "read error (draining)");
+                return false;
+            }
+            if (rc == 0) {
+                self.fail(io_rt, now_ms, "control socket closed (EOF, draining)");
+                return false;
+            }
+            self.drain_len += @intCast(rc);
         }
     }
 
@@ -420,9 +545,11 @@ pub const ControlClient = struct {
                 // filter owns interpreting it. The transport only uses the
                 // trailer to detect completeness. resumeCall copies the bytes
                 // synchronously, so the slice is consumed before we shift.
-                if (token) |t| {
-                    self.inflight = null;
-                    if (self.complete_fn) |cf| cf(self.resume_ctx.?, t, buf[0..end]);
+                if (token != null) {
+                    // Truncate the body if needed so the delivered frame fits the
+                    // filter's result cap WITH the trailer (R2); consume the FULL
+                    // original frame from recv_buf regardless.
+                    self.deliverCommandReply(sep, buf[sep..end]);
                 }
                 self.consumeFront(end);
                 self.pumpQueue(io_rt, now_ms);
@@ -461,6 +588,8 @@ pub const ControlClient = struct {
         self.send_off = 0;
         self.inflight = token;
         self.recv_len = 0;
+        self.draining = false;
+        self.drain_len = 0;
         self.settle_deadline_ms = 0;
         self.command_deadline_ms = now_ms + self.command_timeout_ms;
         _ = self.flushSend(io_rt, now_ms);
@@ -523,6 +652,8 @@ pub const ControlClient = struct {
         }
         self.failAll();
         self.recv_len = 0;
+        self.draining = false;
+        self.drain_len = 0;
         self.send_len = 0;
         self.send_off = 0;
         self.scheduleRetry(now_ms, reason);
@@ -599,11 +730,18 @@ const Captured = struct {
     var body: [256]u8 = undefined;
     var body_len: usize = 0;
     var failed: ?Token = null;
+    // R2: a delivered result can be up to the filter's result cap, larger than
+    // `body`. Record its full length + last bytes to assert truncation + trailer.
+    var last_len: usize = 0;
+    var tail: [16]u8 = undefined;
+    var tail_len: usize = 0;
 
     fn reset() void {
         token = null;
         body_len = 0;
         failed = null;
+        last_len = 0;
+        tail_len = 0;
     }
     fn complete(ctx: *anyopaque, t: Token, result: []const u8) void {
         _ = ctx;
@@ -611,6 +749,10 @@ const Captured = struct {
         const n = @min(result.len, body.len);
         @memcpy(body[0..n], result[0..n]);
         body_len = n;
+        last_len = result.len;
+        const tn = @min(result.len, tail.len);
+        @memcpy(tail[0..tn], result[result.len - tn ..]);
+        tail_len = tn;
     }
     fn fail(ctx: *anyopaque, t: Token) void {
         _ = ctx;
@@ -829,6 +971,88 @@ test "handleReadable: real fd read path parses a framed reply and completes" {
     try testing.expectEqualStrings("user found\x1e0\n", Captured.body[0..Captured.body_len]);
     try testing.expect(cc.inflight == null);
     try testing.expectEqual(@as(usize, 0), cc.recv_len);
+}
+
+test "R2: an over-cap command reply is body-truncated but keeps its exit trailer" {
+    Captured.reset();
+    var dummy: u8 = 0;
+    var cc = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
+    cc.installResume(@ptrCast(&dummy), Captured.complete, Captured.fail);
+    var io_rt: io_mod.IoRuntime = undefined;
+
+    cc.state = .ready;
+    cc.inflight = 5;
+    // A body larger than the filter result cap, then a 0x1e<exit>\n trailer. The
+    // naive head-copy in resumeCall would drop the trailer (and the exit verdict);
+    // the transport must truncate the BODY and keep the trailer.
+    const body_n = DELIVER_CAP + 4096;
+    @memset(cc.recv_buf[0..body_n], 'a');
+    const trailer = "\x1e7\n";
+    @memcpy(cc.recv_buf[body_n .. body_n + trailer.len], trailer);
+    cc.recv_len = body_n + trailer.len;
+
+    try testing.expect(cc.tryConsumeReply(&io_rt, 0));
+    try testing.expectEqual(@as(?Token, 5), Captured.token);
+    // Delivered frame fits the result cap, and ends with the exit trailer.
+    try testing.expect(Captured.last_len <= DELIVER_CAP);
+    try testing.expect(Captured.last_len > 0);
+    try testing.expectEqualStrings("\x1e7\n", Captured.tail[Captured.tail_len - 3 .. Captured.tail_len]);
+    try testing.expectEqual(@as(usize, 0), cc.recv_len);
+}
+
+test "R2: a reply larger than the recv buffer drains to the trailer; socket stays clean" {
+    Captured.reset();
+    var dummy: u8 = 0;
+    var cc = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
+    cc.installResume(@ptrCast(&dummy), Captured.complete, Captured.fail);
+    var io_rt: io_mod.IoRuntime = undefined;
+
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(@intCast(AF_UNIX), @intCast(std.posix.SOCK.STREAM), 0, &fds) != 0) return error.SocketpairFailed;
+    defer clock.closeFd(fds[0]);
+    defer clock.closeFd(fds[1]);
+    try net.setNonBlocking(fds[0]);
+    try net.setNonBlocking(fds[1]); // writer non-blocking so a full sndbuf cannot deadlock the test
+
+    cc.fd = fds[0];
+    cc.state = .ready;
+    cc.inflight = 11;
+
+    // Push a body well over RECV_CAP plus its trailer, interleaving reader drains
+    // so neither side blocks. Writes that EAGAIN trigger a drain to make room.
+    const total = RECV_CAP + 16 * 1024; // > the 64 KiB recv buffer
+    var chunk: [4096]u8 = undefined;
+    @memset(&chunk, 'x');
+    var pushed: usize = 0;
+    var guard: usize = 0;
+    while (pushed < total and guard < 100_000) : (guard += 1) {
+        const want = @min(chunk.len, total - pushed);
+        const rc = std.posix.system.write(fds[1], chunk[0..want].ptr, want);
+        if (rc > 0) pushed += @intCast(rc);
+        cc.handleReadable(&io_rt, 0);
+    }
+    // The trailer (retry on EAGAIN, draining the reader between attempts).
+    const trailer = "\x1e3\n";
+    var toff: usize = 0;
+    while (toff < trailer.len and guard < 100_000) : (guard += 1) {
+        const rc = std.posix.system.write(fds[1], trailer[toff..].ptr, trailer.len - toff);
+        if (rc > 0) toff += @intCast(rc);
+        cc.handleReadable(&io_rt, 0);
+    }
+
+    try testing.expectEqual(@as(?Token, 11), Captured.token);
+    try testing.expect(Captured.last_len <= DELIVER_CAP); // body discarded, trailer kept
+    try testing.expectEqualStrings("\x1e3\n", Captured.tail[Captured.tail_len - 3 .. Captured.tail_len]);
+    try testing.expect(!cc.draining);
+    try testing.expectEqual(@as(usize, 0), cc.recv_len); // socket left clean
+
+    // Prove the socket is healthy: a normal follow-up reply completes the next call.
+    Captured.reset();
+    cc.inflight = 12;
+    try net.sendAll(fds[1], "ok\x1e0\n");
+    cc.handleReadable(&io_rt, 0);
+    try testing.expectEqual(@as(?Token, 12), Captured.token);
+    try testing.expectEqualStrings("ok\x1e0\n", Captured.body[0..Captured.body_len]);
 }
 
 test "issueAt: command_deadline uses the configured command_timeout_ms (default + override)" {

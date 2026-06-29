@@ -75,7 +75,11 @@ const MAX_BODY_VIEW = 64 * 1024;
 /// result delivered back on resume. Both live in the pinned instance across the
 /// park, so they are bounded.
 const CALL_REQUEST_CAP = 4096;
-const CALL_RESULT_CAP = 16 * 1024;
+/// The result buffer delivered to on_resume. resumeCall head-copies up to this
+/// many bytes, so the control transport must size its delivered frame to fit
+/// (keeping the 0x1e<exit> trailer) or the filter loses the verdict. pub so
+/// control_client can honor it (R2).
+pub const CALL_RESULT_CAP = 16 * 1024;
 
 /// Default per-invocation fuel budget (loop back-edges). Tunable per-route in
 /// config; sized here to be generous for a metadata filter while still bounding
