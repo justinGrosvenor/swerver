@@ -1006,6 +1006,11 @@ fn dispatchHttp2Request(
                 }, hdr_request.method == .HEAD);
                 return;
             }
+            // Pool/park-table exhaustion: serve the 503 AND pause reads briefly
+            // so a flood self-throttles (G2), mirroring the router-result path.
+            if (proxy_result.pause_reads_ms) |pause_ms| {
+                conn.setRateLimitPause(server.now_ms, pause_ms);
+            }
             try queueHttp2Response(server, conn, stream_id, proxy_result.resp, hdr_request.method == .HEAD);
             return;
         }

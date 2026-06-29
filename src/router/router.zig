@@ -1222,8 +1222,13 @@ pub const Router = struct {
                         // Park-capable path (H1 dispatch wired the binding).
                         const table: *wasm_host_call.Table = @ptrCast(@alignCast(tbl_ptr));
                         const inst = pool.acquire() orelse {
+                            // Pool exhausted. Fail closed (503) AND apply
+                            // connection backpressure: pause reads briefly so a
+                            // flood self-throttles instead of burning the event
+                            // loop fast-failing excess parks (the G2 cliff). The
+                            // 503 is still served; the connection is just paced.
                             result_resp = .{ .status = 503, .headers = &.{}, .body = .{ .bytes = "edge function pool exhausted" } };
-                            return .{ .resp = result_resp };
+                            return .{ .resp = result_resp, .pause_reads_ms = wasm_filter.POOL_BACKPRESSURE_MS };
                         };
                         switch (wasm_filter.invokeOutcome(inst, &req, r.wasm_fuel)) {
                             .decision => |d| switch (d) {
@@ -1251,10 +1256,13 @@ pub const Router = struct {
                                     }
                                     return .{ .resp = response.Response.parked };
                                 }
-                                // Park table full: unpin and fail closed.
+                                // Park table full: unpin and fail closed (503),
+                                // plus connection backpressure (pause reads
+                                // briefly) so the flood self-throttles rather
+                                // than re-hammering the exhausted table.
                                 _ = wasm_filter.cancelPark(inst);
                                 result_resp = .{ .status = 503, .headers = &.{}, .body = .{ .bytes = "edge function park table full" } };
-                                return .{ .resp = result_resp };
+                                return .{ .resp = result_resp, .pause_reads_ms = wasm_filter.POOL_BACKPRESSURE_MS };
                             },
                         }
                     } else {
@@ -2428,5 +2436,74 @@ test "D2-5 fail-closed: pool exhaustion -> 503 then recovery (router.handle)" {
             try std.testing.expectEqual(@as(u16, 200), result.resp.status);
         }
         try std.testing.expect(H.ran);
+    } else return error.SkipZigTest;
+}
+
+test "G2 backpressure: park-capable pool exhaustion -> 503 WITH pause_reads (router.handle)" {
+    if (build_options.enable_wasm) {
+        const FILTER = @embedFile("../wasm/testdata/filter_probe.wasm");
+        var pool = try wasm_filter.Pool.init(std.testing.allocator, FILTER, .{ .instances = 1 });
+        defer pool.deinit();
+        var table = wasm_host_call.Table.init(std.testing.allocator);
+        defer table.deinit();
+
+        var router = Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+        const H = struct {
+            var ran: bool = false;
+            fn h(_: *HandlerContext) response.Response {
+                ran = true;
+                return response.Response.ok();
+            }
+        };
+        H.ran = false;
+        try router.get("/enrich", H.h);
+        _ = router.attachWasmFilter("/enrich", &pool, wasm_filter.DEFAULT_FUEL);
+
+        var response_buf: [RESPONSE_BUF_SIZE]u8 = undefined;
+        var response_headers: [MAX_RESPONSE_HEADERS]response.Header = undefined;
+        var arena_buf: [ARENA_BUF_SIZE]u8 = undefined;
+
+        // Pin the only instance so the park-capable hook's acquire() fails. With
+        // the park table wired (start_fn set) the hook reaches the exhaustion
+        // branch under test (not the terminal pool.run path).
+        const pinned = pool.acquire() orelse return error.AcquireFailed;
+        {
+            var mw_ctx = middleware.Context{};
+            var scratch = HandlerScratch{
+                .response_buf = response_buf[0..],
+                .response_headers = response_headers[0..],
+                .arena_buf = arena_buf[0..],
+                .wasm = .{
+                    .table = @ptrCast(&table),
+                    .conn_index = 1,
+                    .conn_id = 1,
+                    .deadline_ms = 9_999_999,
+                    .start_fn = struct {
+                        fn start(_: *anyopaque, _: u32, _: []const u8) void {}
+                    }.start,
+                    .start_ctx = @ptrCast(&table),
+                },
+            };
+            const req = request.RequestView{ .method = .GET, .path = "/enrich", .headers = &.{} };
+            const result = router.handle(req, &mw_ctx, &scratch);
+            // Fail closed is preserved: still a 503, handler never ran.
+            try std.testing.expectEqual(@as(u16, 503), result.resp.status);
+            try std.testing.expect(!H.ran);
+            // NEW (G2): exhaustion now ALSO paces the connection -- a non-null
+            // pause window, not a bare reject. This is the cliff-smoothing signal
+            // the transport turns into conn.setRateLimitPause.
+            try std.testing.expect(result.pause_reads_ms != null);
+            try std.testing.expectEqual(wasm_filter.POOL_BACKPRESSURE_MS, result.pause_reads_ms.?);
+        }
+
+        // Release -> recovery: the next request is no longer paced.
+        pinned.state = .idle;
+        {
+            var mw_ctx = middleware.Context{};
+            var scratch = HandlerScratch{ .response_buf = response_buf[0..], .response_headers = response_headers[0..], .arena_buf = arena_buf[0..] };
+            const req = request.RequestView{ .method = .GET, .path = "/enrich", .headers = &.{} };
+            const result = router.handle(req, &mw_ctx, &scratch);
+            try std.testing.expect(result.pause_reads_ms == null);
+        }
     } else return error.SkipZigTest;
 }

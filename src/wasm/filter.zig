@@ -97,6 +97,16 @@ pub const DEFAULT_FUEL: i64 = 5_000_000;
 /// returns -1 to the guest instead of OOMing the worker.
 pub const DEFAULT_MAX_MEMORY_PAGES: u32 = 64;
 
+/// Backpressure window (ms) applied to a connection when the filter pool (or the
+/// park Table) is exhausted on a park-capable hook. Instead of CPU-burning an
+/// immediate 503 for every excess request under a flood (which starves the few
+/// real completions and collapses goodput, the G2 "concurrency cliff"), the
+/// exhausted hook STILL fails closed (serves the 503) but ALSO pauses reads on
+/// that connection for this window so the flood self-throttles. Reuses the
+/// existing rate_limit_backpressure / setRateLimitPause path. Kept short so a
+/// transient burst recovers quickly once instances free up.
+pub const POOL_BACKPRESSURE_MS: u64 = 50;
+
 /// Per-pool resource bounds. Fuel is per-invocation (passed to run); memory cap
 /// and instance count are fixed at pool construction.
 pub const Config = struct {
@@ -107,6 +117,18 @@ pub const Config = struct {
     /// memory. Phase 3 (parked host calls) is what needs N > 1: a parked filter
     /// pins its instance while the request is suspended, so the pool size caps
     /// concurrent parked filters.
+    ///
+    /// SIZING (Tier-2 fan-out): size `instances` to the expected number of
+    /// CONCURRENT parked (Tier-2) requests for this filter. Each parked request
+    /// pins exactly one instance for the WHOLE host-call round-trip, so the pool
+    /// is the concurrency ceiling for parks: once all instances are pinned the
+    /// next park is refused (now with connection backpressure instead of a bare
+    /// 503, see POOL_BACKPRESSURE_MS). The park Table (`host_call.Table.CAP`,
+    /// currently 64) is the HARD ceiling across all filters on a worker, so
+    /// sizing a single filter's pool above CAP buys nothing. Cost: each extra
+    /// instance reserves another `max_memory_pages` (default 4 MiB) of linear
+    /// memory per worker. Rule of thumb: instances = min(expected concurrent
+    /// fan-out, host_call.Table.CAP).
     instances: usize = 1,
     max_memory_pages: u32 = DEFAULT_MAX_MEMORY_PAGES,
 };

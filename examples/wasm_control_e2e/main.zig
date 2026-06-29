@@ -35,6 +35,15 @@ fn envDup(name: [*:0]const u8) ?[]const u8 {
     return if (std.c.getenv(name)) |p| std.mem.span(p) else null;
 }
 
+/// Filter pool size from WASM_INSTANCES (default 4), so the concurrency-cliff
+/// benchmark (G2) can sweep the park concurrency ceiling without a rebuild. Each
+/// parked request pins one instance for the whole round-trip; see
+/// wasm.filter.Config.instances for sizing guidance.
+fn envInstances(default: usize) usize {
+    const s = envDup("WASM_INSTANCES") orelse return default;
+    return std.fmt.parseInt(usize, s, 10) catch default;
+}
+
 pub fn main() !void {
     const alloc = std.heap.c_allocator;
 
@@ -58,7 +67,7 @@ pub fn main() !void {
     const specs = [_]swerver.wasm.manager.Spec{.{
         .match = ROUTE,
         .module_path = filter_path,
-        .instances = 4,
+        .instances = envInstances(4),
     }};
     const n = try manager.loadAndAttachRouter(&router, &specs);
     if (n == 0) {

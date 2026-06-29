@@ -24,6 +24,15 @@ fn envDup(name: [*:0]const u8) ?[]const u8 {
     return if (std.c.getenv(name)) |p| std.mem.span(p) else null;
 }
 
+/// Filter pool size from WASM_INSTANCES (default 4), so the concurrency-cliff
+/// benchmark (G2) can sweep the park concurrency ceiling without a rebuild. Each
+/// parked request pins one instance for the whole round-trip; see
+/// wasm.filter.Config.instances for sizing guidance.
+fn envInstances(default: usize) usize {
+    const s = envDup("WASM_INSTANCES") orelse return default;
+    return std.fmt.parseInt(usize, s, 10) catch default;
+}
+
 fn healthHandler(ctx: *swerver.router.HandlerContext) swerver.response.Response {
     return ctx.text(200, "ok\n");
 }
@@ -63,7 +72,7 @@ pub fn main() !void {
     const specs = [_]swerver.config_file.WasmFilterConfig{.{
         .match = "/agent/",
         .module_path = filter_path,
-        .instances = 4,
+        .instances = envInstances(4),
     }};
     server.wasm_filter_specs = &specs;
     server.wasm_control_socket_path = sock_path;

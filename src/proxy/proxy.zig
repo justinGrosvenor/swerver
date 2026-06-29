@@ -79,7 +79,18 @@ var proxy_modify_warned = false;
 /// on a park (H2/H3 + the body path). With a table wired (H1 dispatch) a parking
 /// filter registers and returns the park sentinel; a `resume_decision` skips the
 /// filter on the post-host-call re-dispatch.
-fn runWasmFilter(route: *const upstream.ProxyRoute, req_view: *const request.RequestView, wb: WasmBinding) ?response.Response {
+/// A short-circuit outcome from the request-phase WASM filter: a Response to
+/// serve instead of forwarding, plus an optional connection-backpressure window
+/// (set on pool/park-table exhaustion so the caller pauses reads, smoothing the
+/// G2 concurrency cliff). `pause_reads_ms == null` means serve `resp` with no
+/// pacing (the prior behavior for reject/error). Returning `null` from
+/// runWasmFilter still means "proceed to forward".
+const WasmShortCircuit = struct {
+    resp: response.Response,
+    pause_reads_ms: ?u64 = null,
+};
+
+fn runWasmFilter(route: *const upstream.ProxyRoute, req_view: *const request.RequestView, wb: WasmBinding) ?WasmShortCircuit {
     if (!build_options.enable_wasm) return null;
     const pool_ptr = route.wasm_pool orelse return null;
     const fpool: *wasm_filter.Pool = @ptrCast(@alignCast(pool_ptr));
@@ -90,36 +101,47 @@ fn runWasmFilter(route: *const upstream.ProxyRoute, req_view: *const request.Req
     if (wb.resume_decision) |rd| {
         return switch (rd) {
             .allow, .skip, .modify => null,
-            .reject => |resp| resp,
-            .rate_limit_backpressure => |bp| bp.resp,
+            .reject => |resp| .{ .resp = resp },
+            .rate_limit_backpressure => |bp| .{ .resp = bp.resp },
         };
     }
 
     // Park-capable path (H1 dispatch wired the binding).
     if (wb.table) |tbl_ptr| {
         const table: *wasm_host_call.Table = @ptrCast(@alignCast(tbl_ptr));
-        const inst = fpool.acquire() orelse return forward.createErrorResponse(503);
+        // Pool exhausted: fail closed (503) AND apply connection backpressure
+        // (pause reads briefly) so a flood self-throttles instead of burning the
+        // event loop fast-failing excess parks (the G2 cliff). The 503 is still
+        // served; the connection is just paced.
+        const inst = fpool.acquire() orelse return .{
+            .resp = forward.createErrorResponse(503),
+            .pause_reads_ms = wasm_filter.POOL_BACKPRESSURE_MS,
+        };
         switch (wasm_filter.invokeOutcome(inst, req_view, route.wasm_fuel)) {
             .decision => |d| return switch (d) {
                 .allow, .skip => null,
-                .reject => |resp| resp,
+                .reject => |resp| .{ .resp = resp },
                 .modify => null, // proxy ignores request-phase modify (see above)
-                .rate_limit_backpressure => |bp| bp.resp,
+                .rate_limit_backpressure => |bp| .{ .resp = bp.resp },
             },
             .parked => |call_request| {
                 if (table.park(inst, req_view.*, wb.conn_index, wb.conn_id, wb.stream_id, wb.protocol, wb.deadline_ms, route.wasm_fuel, wb.resume_ctx)) |token| {
                     if (wb.start_fn) |start| start(wb.start_ctx.?, token, call_request);
-                    return response.Response.parked;
+                    return .{ .resp = response.Response.parked };
                 }
-                _ = wasm_filter.cancelPark(inst); // table full: unpin, fail closed
-                return forward.createErrorResponse(503);
+                // Park table full: unpin, fail closed (503) + backpressure.
+                _ = wasm_filter.cancelPark(inst);
+                return .{
+                    .resp = forward.createErrorResponse(503),
+                    .pause_reads_ms = wasm_filter.POOL_BACKPRESSURE_MS,
+                };
             },
         }
     }
 
     // No binding (terminal caller: H2/H3, body path): fail closed on a park.
     switch (fpool.run(req_view, route.wasm_fuel)) {
-        .reject => |resp| return resp,
+        .reject => |resp| return .{ .resp = resp },
         .modify => {
             if (!proxy_modify_warned) {
                 proxy_modify_warned = true;
@@ -621,7 +643,7 @@ pub const Proxy = struct {
         // before forwarding. This entry handles bodyless / small-body requests,
         // so req.body already carries any body for body_len/read_body. A parking
         // filter returns the park sentinel (H1 dispatch suspends + resumes).
-        if (runWasmFilter(route, &req, wasm)) |resp| return .{ .resp = resp, .proxy = self };
+        if (runWasmFilter(route, &req, wasm)) |sc| return .{ .resp = sc.resp, .proxy = self, .pause_reads_ms = sc.pause_reads_ms };
 
         const effective_upstream = route.selectUpstream();
 
@@ -895,7 +917,7 @@ pub const Proxy = struct {
         {
             var filter_req = req;
             filter_req.body = bodyViewToRequestBody(body_view);
-            if (runWasmFilter(route, &filter_req, wasm)) |resp| return .{ .resp = resp, .proxy = self };
+            if (runWasmFilter(route, &filter_req, wasm)) |sc| return .{ .resp = sc.resp, .proxy = self, .pause_reads_ms = sc.pause_reads_ms };
         }
 
         const effective_upstream_b = route.selectUpstream();
@@ -1257,6 +1279,12 @@ pub const Proxy = struct {
 pub const ProxyResult = struct {
     resp: response.Response,
     proxy: *Proxy,
+    /// Connection-backpressure window (ms) requested by the request-phase WASM
+    /// filter on pool/park-table exhaustion: serve `resp` (a fail-closed 503)
+    /// AND pause reads on the connection for this long so a flood self-throttles
+    /// (the G2 cliff). null = no pacing (the common path). The transport applies
+    /// it via conn.setRateLimitPause, mirroring router HandleResult.pause_reads_ms.
+    pause_reads_ms: ?u64 = null,
     /// Response buffer index to release, or null if none held.
     resp_buf_idx: ?usize = null,
     /// Heap allocation backing `resp` when the upstream response outgrew
@@ -1550,7 +1578,7 @@ test "wasm: proxy request filter parks, registers in the table, fires start_fn" 
         // /enrich stages a host_call and parks.
         const req = request.RequestView{ .method = .GET, .path = "/enrich", .headers = &.{} };
         const out = runWasmFilter(&route, &req, binding);
-        try std.testing.expect(out != null and out.?.isParked());
+        try std.testing.expect(out != null and out.?.resp.isParked());
         try std.testing.expectEqual(@as(usize, 1), table.liveCount());
         try std.testing.expect(Rec.token != null); // start_fn fired with the park token
         try std.testing.expect(Rec.req_bytes_len > 0); // staged command forwarded
@@ -1563,7 +1591,7 @@ test "wasm: proxy request filter parks, registers in the table, fires start_fn" 
             .body = .{ .bytes = "no" },
         } } });
         try std.testing.expect(rej != null);
-        try std.testing.expectEqual(@as(u16, 403), rej.?.status);
+        try std.testing.expectEqual(@as(u16, 403), rej.?.resp.status);
     } else return error.SkipZigTest;
 }
 
@@ -1617,7 +1645,7 @@ test "D2-4 fail-closed: a trapping proxy request filter never forwards upstream"
             const req = request.RequestView{ .method = .GET, .path = p, .headers = &.{} };
             const out = runWasmFilter(&route, &req, .{});
             try std.testing.expect(out != null);
-            try std.testing.expectEqual(@as(u16, 500), out.?.status);
+            try std.testing.expectEqual(@as(u16, 500), out.?.resp.status);
         }
     } else return error.SkipZigTest;
 }
@@ -1647,13 +1675,18 @@ test "D2-5 fail-closed: proxy filter pool exhaustion -> 503 then recovery" {
         const pinned = pool.acquire() orelse return error.AcquireFailed;
         const out = runWasmFilter(&route, &req, binding);
         try std.testing.expect(out != null);
-        try std.testing.expectEqual(@as(u16, 503), out.?.status);
+        try std.testing.expectEqual(@as(u16, 503), out.?.resp.status);
         try std.testing.expectEqual(@as(usize, 0), table.liveCount()); // nothing parked
+        // G2: the 503 now also carries a connection-backpressure window so the
+        // proxy path paces the flood (conn.setRateLimitPause) instead of
+        // CPU-burning bare 503s. Fail-closed (the 503) is unchanged.
+        try std.testing.expect(out.?.pause_reads_ms != null);
+        try std.testing.expectEqual(wasm_filter.POOL_BACKPRESSURE_MS, out.?.pause_reads_ms.?);
 
         // Release -> recovery: the filter now parks (registers in the table).
         pinned.state = .idle;
         const out2 = runWasmFilter(&route, &req, binding);
-        try std.testing.expect(out2 != null and out2.?.isParked());
+        try std.testing.expect(out2 != null and out2.?.resp.isParked());
         try std.testing.expectEqual(@as(usize, 1), table.liveCount());
     } else return error.SkipZigTest;
 }
