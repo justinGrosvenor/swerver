@@ -673,6 +673,18 @@ fn failClosed() middleware.Decision {
     } };
 }
 
+threadlocal var trap_log_count: u64 = 0;
+
+/// Log WHY a guest trapped (the wasm3 trap message, e.g. an out-of-bounds ABI
+/// pointer or fuel exhaustion) so a fail-closed 500 is diagnosable instead of
+/// opaque. Exponential-backoff sampled (logs at occurrences 1,2,4,8,...) so a
+/// buggy or hostile filter that traps on every request cannot flood the log.
+fn logTrap(phase: []const u8, path: []const u8) void {
+    trap_log_count += 1;
+    if (trap_log_count & (trap_log_count - 1) != 0) return;
+    std.log.warn("wasm filter trapped in {s} -> fail-closed: {s} [path={s}, occurrence #{d}]", .{ phase, runtime.lastTrap(), path, trap_log_count });
+}
+
 fn buildDecision(inst: *Instance, code: Decision) middleware.Decision {
     return switch (code) {
         DECISION_ALLOW => .allow,
@@ -712,6 +724,7 @@ pub fn invokeOutcome(inst: *Instance, req: *const request.RequestView, fuel_budg
 
     runtime.fuel.set(fuel_budget);
     const code = runtime.callI32(inst.on_request) catch {
+        logTrap("on_request", req.path);
         active = null;
         inst.state = .idle;
         return .{ .decision = failClosed() };
@@ -755,7 +768,13 @@ pub fn resumeCall(inst: *Instance, result_bytes: []const u8, fuel_budget: i64) m
         inst.state = .idle;
     }
     runtime.fuel.set(fuel_budget);
-    const code = runtime.callI32(on_resume) catch return failClosed();
+    const code = runtime.callI32(on_resume) catch {
+        // NOT inst.req.path here: on the async resume path inst.req is the stale
+        // original request (the owned snapshot lives on the host_call slot, not
+        // on the instance), so dereferencing it would be a use-after-free.
+        logTrap("on_resume", "(parked; request not retained on instance)");
+        return failClosed();
+    };
     return buildDecision(inst, code);
 }
 
@@ -809,7 +828,10 @@ pub fn invokeResponse(
     // trap: signal it via .trapped so a response_fail_closed pool can serve a 503;
     // the default (fail-open) caller still treats an empty/trapped edit as
     // "serve original unchanged".
-    const code = runtime.callI32(on_response) catch return .{ .trapped = true };
+    const code = runtime.callI32(on_response) catch {
+        logTrap("on_response", req.path);
+        return .{ .trapped = true };
+    };
     if (code != 0) return .{}; // guest opted out: pass through unchanged
 
     return .{
@@ -985,6 +1007,20 @@ test "filter: out-of-bounds host call traps -> fail closed (500)" {
     const d = pool.run(&r, DEFAULT_FUEL);
     try testing.expect(d == .reject);
     try testing.expectEqual(@as(u16, 500), d.reject.status);
+}
+
+test "D1: a guest trap records a diagnostic message (not an opaque 500)" {
+    var pool = try Pool.init(testing.allocator, FILTER_WASM, .{ .instances = 1 });
+    defer pool.deinit();
+    const r = mkReq(.GET, "/oob", &.{});
+    const d = pool.run(&r, DEFAULT_FUEL);
+    try testing.expect(d == .reject);
+    // The trap reason is captured (logTrap logs it; here we assert it is non-empty
+    // so a fail-closed 500 is diagnosable rather than silent). The OOB ABI traps
+    // carry the "out of bounds" message.
+    const msg = runtime.lastTrap();
+    try testing.expect(msg.len > 0);
+    try testing.expect(std.mem.indexOf(u8, msg, "out of bounds") != null);
 }
 
 test "filter: runaway loop hits fuel -> fail closed (500)" {

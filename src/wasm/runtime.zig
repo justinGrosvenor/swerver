@@ -22,11 +22,32 @@ pub const Error = error{
     LoadModule,
     LinkFunction,
     FunctionNotFound,
+    /// An export EXISTS but failed wasm3's lazy compile/validation (distinct from
+    /// FunctionNotFound = no such export). Most often a post-MVP wasm feature the
+    /// vendored wasm3 cannot compile (e.g. reference_types). The real m3 message
+    /// is logged where this is raised; see find()/findOptional().
+    CompileFailed,
     CallFailed,
     Trap,
     NoMemory,
     MemoryCapTooSmall,
 };
+
+/// Render a wasm3 result (a const char* error message, or null) as a Zig slice.
+fn m3Msg(r: c.M3Result) []const u8 {
+    if (r == null) return "(none)";
+    const s: [*:0]const u8 = @ptrCast(r);
+    return std.mem.span(s);
+}
+
+/// The message from the most recent guest trap on this worker thread. callI32 /
+/// callI32_2 / callVoidTraps set it before returning a trap so the filter layer
+/// can log WHY a guest trapped (e.g. an out-of-bounds ABI pointer) instead of an
+/// opaque 500. Valid only immediately after a trapping call.
+threadlocal var last_trap_msg: []const u8 = "";
+pub fn lastTrap() []const u8 {
+    return last_trap_msg;
+}
 
 /// wasm linear-memory page size (64 KiB), per the wasm spec.
 pub const PAGE_SIZE: u32 = 65536;
@@ -111,20 +132,45 @@ pub const Module = struct {
     ) Error!void {
         const r = c.m3_LinkRawFunction(self.module, namespace, name, signature, func);
         // SuppressLookupFailure (an unused import) is fine; a real link error is not.
-        if (r != null and r != c.m3Err_functionLookupFailed) return Error.LinkFunction;
+        if (r != null and r != c.m3Err_functionLookupFailed) {
+            // Name the import + expected signature + the real m3 message. Without
+            // this a wrong host-import signature surfaces only as an opaque
+            // LinkFunction error (and a Zig stack trace naming nothing).
+            std.log.warn("wasm: linking host import '{s}.{s}' (signature '{s}') failed: {s} (filter declared this import with a mismatched signature?)", .{ namespace, name, signature, m3Msg(r) });
+            return Error.LinkFunction;
+        }
     }
 
     /// Resolve an exported function once (off the hot path); reuse the handle.
     pub fn find(self: *Module, name: [:0]const u8) Error!c.IM3Function {
         var f: c.IM3Function = undefined;
-        if (c.m3_FindFunction(&f, self.runtime, name) != null) return Error.FunctionNotFound;
+        const r = c.m3_FindFunction(&f, self.runtime, name);
+        if (r != null) {
+            // m3_FindFunction compiles lazily, so a non-null result can be EITHER
+            // a missing export OR a real compile/validation failure. Distinguish
+            // them: flattening both to FunctionNotFound hid (for hours) the fact
+            // that a filter using a post-MVP feature wasm3 cannot compile (e.g.
+            // reference_types) had simply failed to compile. See ISSUES.md R1.
+            if (r != c.m3Err_functionLookupFailed) {
+                std.log.warn("wasm: export '{s}' present but failed to compile: {s} (uses a wasm feature the runtime cannot compile? rebuild the filter with -mcpu=mvp)", .{ name, m3Msg(r) });
+                return Error.CompileFailed;
+            }
+            return Error.FunctionNotFound;
+        }
         return f;
     }
 
-    /// Try to resolve; null if the export is absent (e.g. optional `spin`).
+    /// Try to resolve; null if the export is absent (e.g. optional `spin`). A
+    /// present-but-uncompilable export is logged (else a broken on_response /
+    /// on_resume would be silently treated as "absent" -> hook quietly skipped).
     pub fn findOptional(self: *Module, name: [:0]const u8) ?c.IM3Function {
         var f: c.IM3Function = undefined;
-        if (c.m3_FindFunction(&f, self.runtime, name) != null) return null;
+        const r = c.m3_FindFunction(&f, self.runtime, name);
+        if (r != null) {
+            if (r != c.m3Err_functionLookupFailed)
+                std.log.warn("wasm: optional export '{s}' present but failed to compile: {s} (rebuild the filter with -mcpu=mvp?)", .{ name, m3Msg(r) });
+            return null;
+        }
         return f;
     }
 
@@ -166,7 +212,11 @@ pub const Module = struct {
 
 /// Call an export taking no args and returning one i32. Set fuel first.
 pub fn callI32(func: c.IM3Function) Error!i32 {
-    if (c.m3_CallV(func) != null) return Error.Trap;
+    const r = c.m3_CallV(func);
+    if (r != null) {
+        last_trap_msg = m3Msg(r);
+        return Error.Trap;
+    }
     var result: i32 = 0;
     if (c.m3_GetResultsV(func, &result) != null) return Error.CallFailed;
     return result;
@@ -175,7 +225,12 @@ pub fn callI32(func: c.IM3Function) Error!i32 {
 /// Call an export taking no args, returning nothing. Returns true if it trapped
 /// (e.g. fuel exhausted). Set fuel first.
 pub fn callVoidTraps(func: c.IM3Function) bool {
-    return c.m3_CallV(func) != null;
+    const r = c.m3_CallV(func);
+    if (r != null) {
+        last_trap_msg = m3Msg(r);
+        return true;
+    }
+    return false;
 }
 
 /// Call an export taking two i32 args and returning one i32 (non-varargs
@@ -184,7 +239,11 @@ pub fn callI32_2(func: c.IM3Function, a0: i32, a1: i32) Error!i32 {
     var x0 = a0;
     var x1 = a1;
     var argv = [_]?*const anyopaque{ &x0, &x1 };
-    if (c.m3_Call(func, 2, &argv) != null) return Error.Trap;
+    const r = c.m3_Call(func, 2, &argv);
+    if (r != null) {
+        last_trap_msg = m3Msg(r);
+        return Error.Trap;
+    }
     var result: i32 = 0;
     var retv = [_]?*const anyopaque{&result};
     if (c.m3_GetResults(func, 1, &retv) != null) return Error.CallFailed;
