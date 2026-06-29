@@ -2265,6 +2265,8 @@ pub fn handleRead(server: *Server, index: u32) !void {
     if (!server.io.capabilities().delivers_read_data and
         conn.read_buffered_bytes == 0 and
         conn.canEnqueueWrite() and
+        !conn.read_paused and
+        conn.resume_read_at_ms == 0 and
         !conn.close_after_write)
     {
         conn.read_offset = 0;

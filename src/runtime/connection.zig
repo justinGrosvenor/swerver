@@ -498,6 +498,16 @@ pub const Connection = struct {
     pub fn canRead(self: *Connection, backpressure: config.Backpressure, now_ms: u64) bool {
         self.updateReadBackpressure(backpressure);
         self.checkRateLimitResume(now_ms);
+        // read_paused has TWO independent writers: updateReadBackpressure
+        // toggles it on buffer water marks, and setRateLimitPause sets it for
+        // a time-based pause (rate limiting, x402 settle, the G2 park-pool
+        // backpressure). updateReadBackpressure runs first and clears
+        // read_paused the instant the read buffer drains below low-water,
+        // which for a closed-loop client is ALWAYS true right after a response
+        // is written. So the time pause must be gated on resume_read_at_ms
+        // (zeroed by checkRateLimitResume once it expires), not on read_paused
+        // alone, or it would be wiped before it ever throttles anything.
+        if (self.resume_read_at_ms > 0) return false;
         return !self.read_paused;
     }
 
