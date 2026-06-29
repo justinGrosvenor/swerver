@@ -84,6 +84,35 @@ jobs:
           zig build check -Denable-wasm=true -Denable-http2=true --summary all
           zig build test -Denable-wasm=true -Denable-http2=true --summary all
 
+  # H3 + WASM is the one combination the stock runners cannot cover. The E2b
+  # park tests (src/server/http3.zig, gated on -Denable-http3 AND -Denable-wasm)
+  # link the QUIC TLS symbols SSL_set_quic_tls_cbs / _transport_params /
+  # _early_data_enabled, which only exist in OpenSSL 3.5+. ubuntu-latest ships
+  # OpenSSL 3.0, so even `zig build check` of that combo fails to link there and
+  # those tests would run local-only. Build inside a Debian trixie image (ships
+  # OpenSSL 3.5.x) so the H3+wasm tests both COMPILE and RUN on Linux in CI.
+  test-h3-wasm-container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      # The image carries OpenSSL 3.5+ and Zig ${{ env.ZIG_VERSION }} (pinned in
+      # the Dockerfile to match env.ZIG_VERSION above and build.zig.zon).
+      - name: Build H3 + OpenSSL 3.5 image
+        run: docker build -f .github/docker/h3-openssl35.Dockerfile -t swerver-h3-openssl35 .
+      # check links the H3+wasm test binaries (the QUIC TLS symbols resolve here),
+      # then test actually RUNS the E2b park/resume + frame-encoding tests. The
+      # repo is bind-mounted so zig's cache lands in the workspace. seccomp is
+      # unconfined because Docker's default profile blocks io_uring syscalls
+      # (see MEMORY.md docker_seccomp_iouring), which the native paths may touch.
+      - name: H3 + WASM check + test (-Denable-tls -Denable-http3 -Denable-wasm)
+        run: |
+          docker run --rm --security-opt seccomp=unconfined \
+            -v "$PWD":/work -w /work swerver-h3-openssl35 \
+            sh -c "zig build check -Denable-tls=true -Denable-http3=true -Denable-wasm=true --summary all && zig build test -Denable-tls=true -Denable-http3=true -Denable-wasm=true --summary all"
+
   cross-compile-linux:
     runs-on: macos-latest
     timeout-minutes: 10
