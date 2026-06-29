@@ -263,6 +263,14 @@ pub const Table = struct {
         // idle instance on resume. Caller treats null as table-full -> cancelPark
         // + 503. (Mirrors the same guard in filter.resumeCall.)
         if (instance.state != .parked) return null;
+        // LOAD-BEARING for the deferred-free lifecycle: park reuses the LOWEST-index
+        // free slot, and tick() emits its completions in ascending slot order while
+        // wasmTick consumes them in that same order. Together this guarantees a tail
+        // re-park during a batched-completion resume can only reclaim an
+        // already-consumed lower-index buffer, never a still-pending higher-index
+        // completion's buffer. Do NOT change this to a free-list / LIFO policy
+        // without also changing tick()'s emission/consumption order, or the
+        // tick-batch path can use-after-free.
         for (&self.slots, 0..) |*s, i| {
             if (!s.active) {
                 // Reclaim the prior occupant's deferred-free buffer (its Completion
