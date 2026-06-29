@@ -2127,6 +2127,13 @@ pub fn handleRead(server: *Server, index: u32) !void {
                     break;
                 }
 
+                // Pool/park-table exhaustion: the proxy filter served a 503 and
+                // asked for connection backpressure. Pause reads so the flood
+                // self-throttles (G2). Mirrors the router HandleResult path below.
+                if (proxy_result.pause_reads_ms) |pause_ms| {
+                    conn.setRateLimitPause(server.now_ms, pause_ms);
+                }
+
                 // Post-forward processing (cache store/invalidate, otel span,
                 // x402 settlement incl. the inline-receipt settle-park, then
                 // queueResponse + the owned-buffer tail), shared with the resumed

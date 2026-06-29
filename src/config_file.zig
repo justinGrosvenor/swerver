@@ -47,7 +47,15 @@ pub const WasmFilterConfig = struct {
     /// Path to the .wasm module on disk.
     module_path: []const u8,
     /// Pre-instantiated instances per worker. 1 suffices under the synchronous
-    /// Phase-1 model; raise only once Phase 3 parking lands (see filter.Config).
+    /// Phase-1 model; raise it for parking (Tier-2) filters. SIZING: a parked
+    /// request pins one instance for the whole host-call round-trip, so size
+    /// `instances` to the expected CONCURRENT Tier-2 fan-out for this filter.
+    /// Once all instances are pinned the next park is refused with connection
+    /// backpressure (a 503 plus a brief read-pause) rather than a CPU-burning
+    /// bare 503, so the pool size sets the smooth-degradation ceiling. The park
+    /// table CAP (host_call.Table.CAP, currently 64) is the hard ceiling across
+    /// all filters on a worker; sizing above it buys nothing. Each extra
+    /// instance reserves ~4 MiB of linear memory. See filter.Config.instances.
     instances: usize = 1,
     /// Per-invocation fuel budget (loop back-edges).
     fuel: i64 = 5_000_000,

@@ -397,6 +397,10 @@ fn handleHttp3Request(
                 sendHttp3ResponseFromResponse(server, udp_fd, conn, req.stream_id, peer_addr, Server.internalErrorResponse());
                 return;
             }
+            // On pool/park-table exhaustion proxy_result.pause_reads_ms is set,
+            // but H3/QUIC multiplexes every connection over one shared UDP socket
+            // with no per-connection read-pause (unlike TCP), so the backpressure
+            // window does not apply here: the 503 stays a plain fail-closed reject.
             sendHttp3ResponseFromResponse(server, udp_fd, conn, req.stream_id, peer_addr, proxy_result.resp);
             return;
         }
