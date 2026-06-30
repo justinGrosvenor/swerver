@@ -329,6 +329,11 @@ pub const Table = struct {
     /// is stale/free (double complete).
     pub fn complete(self: *Table, token: Token, result: []const u8) ?Completion {
         const s = self.live(token) orelse return null;
+        // D1b: re-point the instance at the OWNED request snapshot before resuming.
+        // The original request is async-gone by now; on_resume reading request
+        // metadata (get_path etc.) would otherwise dereference the stale pointer.
+        // The slot (and s.req's backing buffers) outlive this synchronous resume.
+        s.instance.req = &s.req;
         const decision = filter.resumeCall(s.instance, result, s.resume_fuel);
         const out = self.completionFor(s, decision);
         s.active = false;

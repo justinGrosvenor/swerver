@@ -597,7 +597,22 @@ pub const Server = struct {
         if (specs.len == 0) return null;
         const mgr = self.allocator.create(wasm_manager_mod.Manager) catch return null;
         mgr.* = wasm_manager_mod.Manager.init(self.allocator);
-        for (specs) |w| {
+        for (specs, 0..) |w, wi| {
+            // S4: one filter per route. A duplicate `match` would attach a second
+            // pool over the first (or, if the second fails to load, be silently
+            // skipped while the first still serves -- a fail-open). Warn; only the
+            // first spec for a match takes effect.
+            var dup = false;
+            for (specs[0..wi]) |prev| {
+                if (std.mem.eql(u8, prev.match, w.match)) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) {
+                std.log.warn("wasm filter '{s}': duplicate match (a route binds one filter); ignoring this spec, the first wins", .{w.match});
+                continue;
+            }
             var one = [_]wasm_manager_mod.Spec{.{
                 .match = w.match,
                 .module_path = w.module_path,
@@ -616,7 +631,14 @@ pub const Server = struct {
                 }
                 continue;
             };
-            std.log.info("wasm filter '{s}' -> {s} ({d} route(s), {d} instances)", .{ w.match, w.module_path, n, w.instances });
+            if (n == 0) {
+                // O3: the match resolved to NO proxy route, so the filter is loaded
+                // but never runs. This is almost always a config typo; warn loudly
+                // rather than the silent info line it used to be.
+                std.log.warn("wasm filter '{s}' (module '{s}') matched NO route (no proxy route has path_prefix '{s}'); it will never run", .{ w.match, w.module_path, w.match });
+            } else {
+                std.log.info("wasm filter '{s}' -> {s} ({d} route(s), {d} instances)", .{ w.match, w.module_path, n, w.instances });
+            }
         }
         return @ptrCast(mgr);
     }
