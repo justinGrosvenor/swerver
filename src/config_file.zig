@@ -70,6 +70,11 @@ pub const LoadedConfig = struct {
     upstreams: []const upstream_mod.Upstream,
     routes: []const upstream_mod.ProxyRoute,
     wasm_filters: []const WasmFilterConfig,
+    /// Tier-2 control-socket path ("" = none); borrows `arena`. Applied to the
+    /// Server in main.zig so parking filters can drive a real sandbox from config.
+    wasm_control_socket: []const u8,
+    /// Park deadline in ms (0 = use the Server default).
+    wasm_host_call_deadline_ms: u64,
     arena: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *LoadedConfig) void {
@@ -552,6 +557,9 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
         .upstreams = upstreams_out,
         .routes = routes_out,
         .wasm_filters = wasm_out,
+        // Borrows the parsed-JSON arena (same lifetime as wasm_filters' paths).
+        .wasm_control_socket = file_cfg.wasm_control_socket orelse "",
+        .wasm_host_call_deadline_ms = file_cfg.wasm_host_call_deadline_ms orelse 0,
         .arena = arena,
     };
 }
@@ -651,6 +659,13 @@ const FileConfig = struct {
     upstreams: ?[]const UpstreamJson = null,
     routes: ?[]const RouteJson = null,
     wasm_filters: ?[]const WasmFilterJson = null,
+    /// Nether Tier-2 control-socket path. Set this to enable the real host-call
+    /// transport for parking wasm filters from a config-driven deployment (it was
+    /// previously settable only via the embedded Zig API). One global socket per
+    /// server, matching the single-ControlClient transport.
+    wasm_control_socket: ?[]const u8 = null,
+    /// Park (host_call) deadline in ms before a parked filter fails closed.
+    wasm_host_call_deadline_ms: ?u64 = null,
 };
 
 const WasmFilterJson = struct {
@@ -1245,6 +1260,28 @@ test "parse otel config" {
     try std.testing.expectEqual(@as(u32, 10), loaded.server_config.otel.flush_interval_s);
     try std.testing.expectEqual(@as(u16, 50), loaded.server_config.otel.sample_rate);
     try std.testing.expectEqual(@as(u16, 128), loaded.server_config.otel.max_batch_size);
+}
+
+test "O1: wasm_control_socket + deadline parse from config" {
+    const json =
+        \\{
+        \\  "wasm_control_socket": "/run/nether/agent.sock",
+        \\  "wasm_host_call_deadline_ms": 5000,
+        \\  "wasm_filters": [{ "match": "/agent/", "module": "./f.wasm" }]
+        \\}
+    ;
+    var loaded = try parseJsonFromBytes(std.testing.allocator, json);
+    defer loaded.deinit();
+    try std.testing.expectEqualStrings("/run/nether/agent.sock", loaded.wasm_control_socket);
+    try std.testing.expectEqual(@as(u64, 5000), loaded.wasm_host_call_deadline_ms);
+    try std.testing.expectEqual(@as(usize, 1), loaded.wasm_filters.len);
+}
+
+test "O1: absent wasm_control_socket defaults to empty (transport off)" {
+    var loaded = try parseJsonFromBytes(std.testing.allocator, "{}");
+    defer loaded.deinit();
+    try std.testing.expectEqualStrings("", loaded.wasm_control_socket);
+    try std.testing.expectEqual(@as(u64, 0), loaded.wasm_host_call_deadline_ms);
 }
 
 test "parse postgres config" {

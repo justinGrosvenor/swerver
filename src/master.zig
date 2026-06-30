@@ -71,6 +71,11 @@ pub const Master = struct {
     /// WASM edge-filter specs (design 10.0), propagated to each worker, which
     /// builds its own per-worker filter pools at run() start.
     wasm_filter_specs: []const config_file_mod.WasmFilterConfig = &.{},
+    /// Tier-2 control-socket path + park deadline, propagated to each worker so a
+    /// config-driven multi-process deployment can drive a real sandbox. Each
+    /// worker builds its own ControlClient. "" / 0 leave the Server defaults.
+    wasm_control_socket_path: []const u8 = "",
+    wasm_host_call_deadline_ms: u64 = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -176,6 +181,8 @@ pub const Master = struct {
             };
             srv.config_source = self.config_source;
             srv.wasm_filter_specs = self.wasm_filter_specs;
+            srv.wasm_control_socket_path = self.wasm_control_socket_path;
+            if (self.wasm_host_call_deadline_ms != 0) srv.wasm_host_call_deadline_ms = self.wasm_host_call_deadline_ms;
 
             srv.run(null) catch |err| {
                 std.log.err("[w{d}] server error: {}", .{ worker_id, err });

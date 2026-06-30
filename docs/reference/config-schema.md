@@ -334,6 +334,53 @@ Proxy routes, matched by path prefix (and optional host). Every route must refer
 
 ---
 
+## `wasm_filters[]`
+
+WASM edge filters (design 10.0) run at the edge before forwarding, to allow /
+reject / modify a request, and optionally park on a Tier-2 sandbox host call.
+Config-attached filters bind to **proxy routes** (matched by `path_prefix`); a
+`match` that resolves to no route is logged and the filter never runs. Author
+filters with the `examples/wasm_filter/abi.zig` binding (build with `-mcpu=mvp`).
+Requires a build with WASM enabled.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `match` | string | *required* | Proxy route `path_prefix` to attach to. |
+| `module` | string | *required* | Path to the `.wasm` module on disk. |
+| `instances` | integer | `1` | Pre-instantiated instances per worker. Size to the expected CONCURRENT parked (Tier-2) requests; the next park past the pool gets backpressure. |
+| `fuel` | integer | `5000000` | Per-invocation loop-back-edge budget; exhaustion fails closed. |
+| `response_fail_closed` | bool | `false` | Serve a 503 if the `on_response` hook traps (default fails open, serving the original response). Set for redaction/scrub filters. |
+
+## `wasm_control_socket`
+
+Top-level string (default `""`). The Nether Tier-2 control-socket path. Set it to
+enable the real host-call transport so parking filters drive a sandbox; empty
+leaves the transport off (a parking filter then fails closed). One global socket
+per server.
+
+## `wasm_host_call_deadline_ms`
+
+Top-level integer (default `30000`). How long a filter may stay parked on a host
+call before it fails closed. Also bounds the control-socket per-command timeout.
+
+### Two-tier example
+
+```json
+{
+  "upstreams": [{ "name": "api", "servers": [{ "address": "127.0.0.1", "port": 9001 }] }],
+  "routes": [{ "path_prefix": "/agent/", "upstream": "api" }],
+  "wasm_filters": [{ "match": "/agent/", "module": "./agent_filter.wasm", "instances": 8 }],
+  "wasm_control_socket": "/run/nether/agent.sock",
+  "wasm_host_call_deadline_ms": 5000
+}
+```
+
+A request to `/agent/*` runs `agent_filter.wasm`, which may park on a host call
+over `/run/nether/agent.sock`; on allow it forwards to the `api` upstream. See
+`examples/two-tier.config.json`.
+
+---
+
 ## Hot reload
 
 Config is hot-reloaded on `SIGHUP` (routes, upstreams, and value-typed settings such as timeouts and limits). See [Deployment](../operations/deployment.md).

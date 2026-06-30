@@ -137,12 +137,19 @@ pub fn main(init: std.process.Init) !void {
     // at server run() start. Empty slice when none configured or wasm is off.
     const wasm_specs: []const swerver.config_file.WasmFilterConfig =
         if (loaded_config) |lc| lc.wasm_filters else &.{};
+    // Tier-2 control-socket transport (design 10.0): enables parking wasm filters
+    // to drive a real Nether sandbox from a config-driven deployment. Borrows the
+    // loaded_config arena, which outlives run() (deinit is deferred at fn top).
+    const wasm_ctl_socket: []const u8 = if (loaded_config) |lc| lc.wasm_control_socket else "";
+    const wasm_deadline_ms: u64 = if (loaded_config) |lc| lc.wasm_host_call_deadline_ms else 0;
 
     if (cfg.workers != 1) {
         // Multi-process mode
         var master = try swerver.Master.init(allocator, cfg, app_router, proxy_ptr);
         master.config_source = config_source;
         master.wasm_filter_specs = wasm_specs;
+        master.wasm_control_socket_path = wasm_ctl_socket;
+        master.wasm_host_call_deadline_ms = wasm_deadline_ms;
         defer master.deinit();
         try master.run(args.run_for_ms);
     } else {
@@ -160,6 +167,8 @@ pub fn main(init: std.process.Init) !void {
         }
         srv.config_source = config_source;
         srv.wasm_filter_specs = wasm_specs;
+        srv.wasm_control_socket_path = wasm_ctl_socket;
+        if (wasm_deadline_ms != 0) srv.wasm_host_call_deadline_ms = wasm_deadline_ms;
         try srv.run(args.run_for_ms);
     }
 }
