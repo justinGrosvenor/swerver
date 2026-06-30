@@ -383,11 +383,19 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
                 @memcpy(ext_copy, ext_list.items);
                 extensions_json = ext_copy;
             }
+            // O9: name the route + missing field instead of a bare ConfigParseError
+            // (which left the operator with only a Zig stack trace).
+            const x402_missing: ?[]const u8 =
+                if (x.price == null) "price" else if (x.asset == null) "asset" else if (x.network == null) "network" else if (x.pay_to == null) "pay_to" else null;
+            if (x402_missing) |field| {
+                std.log.err("config: route '{s}' x402 is missing required field '{s}' (x402 requires price + asset + network + pay_to)", .{ r.path_prefix, field });
+                return error.ConfigParseError;
+            }
             route_x402 = .{
-                .price = x.price orelse return error.ConfigParseError,
-                .asset = x.asset orelse return error.ConfigParseError,
-                .network = x.network orelse return error.ConfigParseError,
-                .pay_to = x.pay_to orelse return error.ConfigParseError,
+                .price = x.price.?,
+                .asset = x.asset.?,
+                .network = x.network.?,
+                .pay_to = x.pay_to.?,
                 .scheme = x.scheme orelse "exact",
                 .max_timeout_seconds = x.max_timeout_seconds orelse 60,
                 .settlement_url = x.settlement_url orelse "",

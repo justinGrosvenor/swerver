@@ -631,15 +631,16 @@ fn hostLog(rt: c.IM3Runtime, ctx: c.IM3ImportContext, sp: [*c]u64, mem: ?*anyopa
     _ = ctx;
     const ptr: u32 = @truncate(sp[0]);
     const len: u32 = @truncate(sp[1]);
-    // Always bounds-check (an out-of-bounds log pointer must still trap), but
-    // only emit in Debug. The message is guest-controlled and a guest can call
-    // log() up to its fuel budget; a blocking, locked stderr write per call is a
-    // log-spam/noise vector, so release builds drop the output (still trapping
-    // on OOB). A future ABI revision can route this to a rate-limited sink.
+    // Always bounds-check (an out-of-bounds log pointer must still trap). D5: emit
+    // through std.log at DEBUG level under the `wasm_filter` scope instead of the
+    // old hard `builtin.mode == .Debug` gate. This makes filter logs available in
+    // a release build when the operator raises the log level (previously
+    // impossible -- they were compiled out), while staying off by default. The
+    // message is guest-controlled, but the per-invocation fuel budget bounds how
+    // many times a filter can call log() in one request, so this is not an
+    // unbounded spam vector.
     const msg = guestView(rt, mem, ptr, len) orelse return trap(TRAP_OOB);
-    if (builtin.mode == .Debug) {
-        std.debug.print("[wasm] {s}\n", .{msg});
-    }
+    std.log.scoped(.wasm_filter).debug("{s}", .{msg});
     return null;
 }
 
