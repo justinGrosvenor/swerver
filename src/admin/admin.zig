@@ -68,20 +68,20 @@ pub fn pollAdmin(server: *Server) void {
     const total_read = n;
 
     const req = parseHttpRequest(req_buf[0..total_read]) orelse {
-        _ = writeHttpResponse(client, 400, "{\"error\":\"bad request\"}");
+        _ = writeHttpResponse(client, 400, "{\"error\":\"bad request\"}", "application/json");
         return;
     };
 
     if (server.cfg.admin.api_key.len > 0) {
         if (!checkApiKey(req.headers_start, req.headers_end, req_buf[0..total_read], server.cfg.admin.api_key)) {
-            _ = writeHttpResponse(client, 401, "{\"error\":\"unauthorized\"}");
+            _ = writeHttpResponse(client, 401, "{\"error\":\"unauthorized\"}", "application/json");
             return;
         }
     }
 
     var resp_buf: [MAX_RESPONSE]u8 = undefined;
     const result = dispatch(server, req.method, req.path, req.body(req_buf[0..total_read]), &resp_buf);
-    _ = writeHttpResponse(client, result.status, result.body);
+    _ = writeHttpResponse(client, result.status, result.body, result.content_type);
 }
 
 fn setTimeouts(fd: std.posix.fd_t) void {
@@ -90,7 +90,7 @@ fn setTimeouts(fd: std.posix.fd_t) void {
     _ = std.posix.system.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv), @sizeOf(std.posix.timeval));
 }
 
-fn writeHttpResponse(fd: std.posix.fd_t, status: u16, json_body: []const u8) bool {
+fn writeHttpResponse(fd: std.posix.fd_t, status: u16, json_body: []const u8, content_type: []const u8) bool {
     var hdr_buf: [256]u8 = undefined;
     const status_text = switch (status) {
         200 => "OK",
@@ -103,7 +103,7 @@ fn writeHttpResponse(fd: std.posix.fd_t, status: u16, json_body: []const u8) boo
         500 => "Internal Server Error",
         else => "OK",
     };
-    const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ status, status_text, json_body.len }) catch return false;
+    const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ status, status_text, content_type, json_body.len }) catch return false;
     _ = writeAll(fd, hdr) catch return false;
     _ = writeAll(fd, json_body) catch return false;
     return true;
@@ -127,6 +127,7 @@ fn writeAll(fd: std.posix.fd_t, data: []const u8) !void {
 const DispatchResult = struct {
     status: u16,
     body: []const u8,
+    content_type: []const u8 = "application/json",
 };
 
 fn dispatch(server: *Server, method: Method, path: []const u8, body: []const u8, buf: []u8) DispatchResult {
@@ -148,6 +149,9 @@ fn dispatch(server: *Server, method: Method, path: []const u8, body: []const u8,
     }
     if (startsWith(path, "/v1/status")) {
         return getStatus(server, buf);
+    }
+    if (startsWith(path, "/v1/metrics")) {
+        return getMetrics(server, buf);
     }
     if (startsWith(path, "/v1/usage")) {
         return switch (method) {
@@ -379,10 +383,55 @@ fn deleteUpstream(server: *Server, path: []const u8, buf: []u8) DispatchResult {
 fn getStatus(server: *Server, buf: []u8) DispatchResult {
     const route_count: usize = if (server.proxy) |p| p.config.routes.len else 0;
     const upstream_count: usize = if (server.proxy) |p| p.config.upstreams.len else 0;
-    const n = std.fmt.bufPrint(buf, "{{\"status\":\"ok\",\"routes\":{d},\"upstreams\":{d},\"port\":{d},\"workers\":{d}}}", .{
-        route_count, upstream_count, server.cfg.port, server.cfg.workers,
+    // O7: surface Tier-2 park-table + filter-pool saturation so an operator can
+    // see fan-out backing up BEFORE it 503s (all-zero when wasm is compiled out).
+    const w = server.wasmObservability();
+    const n = std.fmt.bufPrint(buf, "{{\"status\":\"ok\",\"routes\":{d},\"upstreams\":{d},\"port\":{d},\"workers\":{d}," ++
+        "\"wasm\":{{\"park_active\":{d},\"park_capacity\":{d},\"pool_instances\":{d},\"pool_pinned\":{d},\"control_configured\":{},\"control_ready\":{}}}}}", .{
+        route_count,    upstream_count,   server.cfg.port, server.cfg.workers,
+        w.park_active,  w.park_capacity,  w.pool_instances, w.pool_pinned,
+        w.control_configured, w.control_ready,
     }) catch return .{ .status = 200, .body = "{\"status\":\"ok\"}" };
     return .{ .status = 200, .body = n };
+}
+
+// O6: Prometheus metrics on the admin listener -- a config/proxy-mode deployment
+// has no embedded-router /metrics, so this is the only scrape surface. Includes
+// the O7 Tier-2 gauges.
+fn getMetrics(server: *Server, buf: []u8) DispatchResult {
+    const route_count: usize = if (server.proxy) |p| p.config.routes.len else 0;
+    const upstream_count: usize = if (server.proxy) |p| p.config.upstreams.len else 0;
+    const w = server.wasmObservability();
+    const body = std.fmt.bufPrint(buf,
+        \\# HELP swerver_routes Configured proxy routes.
+        \\# TYPE swerver_routes gauge
+        \\swerver_routes {d}
+        \\# HELP swerver_upstreams Configured upstreams.
+        \\# TYPE swerver_upstreams gauge
+        \\swerver_upstreams {d}
+        \\# HELP swerver_wasm_park_active Live Tier-2 parks (host-call table occupancy).
+        \\# TYPE swerver_wasm_park_active gauge
+        \\swerver_wasm_park_active {d}
+        \\# HELP swerver_wasm_park_capacity Park-table hard ceiling across all filters.
+        \\# TYPE swerver_wasm_park_capacity gauge
+        \\swerver_wasm_park_capacity {d}
+        \\# HELP swerver_wasm_pool_instances Total edge-filter instances.
+        \\# TYPE swerver_wasm_pool_instances gauge
+        \\swerver_wasm_pool_instances {d}
+        \\# HELP swerver_wasm_pool_pinned Edge-filter instances pinned (busy or parked).
+        \\# TYPE swerver_wasm_pool_pinned gauge
+        \\swerver_wasm_pool_pinned {d}
+        \\# HELP swerver_wasm_control_ready Tier-2 control transport connected (1/0).
+        \\# TYPE swerver_wasm_control_ready gauge
+        \\swerver_wasm_control_ready {d}
+        \\
+    , .{
+        route_count,     upstream_count,
+        w.park_active,   w.park_capacity,
+        w.pool_instances, w.pool_pinned,
+        @as(u8, if (w.control_ready) 1 else 0),
+    }) catch return .{ .status = 500, .body = "metrics render failed\n", .content_type = "text/plain" };
+    return .{ .status = 200, .body = body, .content_type = "text/plain; version=0.0.4" };
 }
 
 fn getUsage(buf: []u8, reset: bool) DispatchResult {
@@ -645,6 +694,21 @@ fn writeRouteJson(buf: []u8, route: upstream_mod.ProxyRoute) usize {
         }
         off += copyInto(buf[off..], "}");
     }
+    // O8: read back the chain an operator configured -- auth method, x402 pricing,
+    // and the wasm-filter binding. These were invisible in the route view before,
+    // so a config could not be verified through the admin API.
+    off += copyInto(buf[off..], ",\"auth\":\"");
+    off += copyInto(buf[off..], @tagName(route.auth));
+    off += copyInto(buf[off..], "\"");
+    if (route.x402) |x| {
+        off += copyInto(buf[off..], ",\"x402\":{\"price\":\"");
+        off += copyEscaped(buf[off..], x.price);
+        off += copyInto(buf[off..], "\",\"network\":\"");
+        off += copyEscaped(buf[off..], x.network);
+        off += copyInto(buf[off..], "\"}");
+    }
+    off += copyInto(buf[off..], if (route.wasm_pool != null) ",\"wasm_filter\":true" else ",\"wasm_filter\":false");
+    if (route.wasm_required) off += copyInto(buf[off..], ",\"wasm_required\":true");
     off += copyInto(buf[off..], "}");
     return off;
 }
@@ -788,6 +852,23 @@ test "writeRouteJson produces valid JSON" {
     const json = buf[0..n];
     try std.testing.expect(std.mem.indexOf(u8, json, "\"path_prefix\":\"/api/\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"upstream\":\"backend\"") != null);
+    // O8: the binding read-back fields are always present.
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"auth\":\"none\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"wasm_filter\":false") != null);
+}
+
+test "O8: writeRouteJson reads back auth + x402 bindings" {
+    var buf: [512]u8 = undefined;
+    const route = upstream_mod.ProxyRoute{
+        .path_prefix = "/paid/",
+        .upstream = "backend",
+        .auth = .{ .api_key = .{ .keys = &.{}, .header_name = "X-API-Key" } },
+        .x402 = .{ .price = "$0.001", .asset = "USDC", .network = "base-sepolia", .pay_to = "0xabc" },
+    };
+    const n = writeRouteJson(&buf, route);
+    const json = buf[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"auth\":\"api_key\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"x402\":{\"price\":\"$0.001\",\"network\":\"base-sepolia\"}") != null);
 }
 
 test "writeUpstreamJson produces valid JSON" {

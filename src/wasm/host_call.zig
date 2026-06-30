@@ -230,6 +230,16 @@ pub const Table = struct {
         return .{ .allocator = allocator };
     }
 
+    /// Live parks right now (for observability). CAP is the hard ceiling across
+    /// all filters on the worker; nearing it means Tier-2 fan-out is backing up.
+    pub fn activeCount(self: *const Table) usize {
+        var n: usize = 0;
+        for (&self.slots) |*s| {
+            if (s.active) n += 1;
+        }
+        return n;
+    }
+
     /// Reclaim every owned snapshot still held by a slot (live parks plus the
     /// deferred-free buffer of the last occupant of any reused slot). The worker
     /// is single-threaded and torn down with no park mid-resume, so no Completion

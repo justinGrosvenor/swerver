@@ -48,6 +48,17 @@ pub const Manager = struct {
         return .{ .alloc = alloc };
     }
 
+    /// Aggregate instance counts across all filter pools, for observability.
+    pub fn instanceTotals(self: *const Manager) struct { total: usize, pinned: usize } {
+        var total: usize = 0;
+        var pinned: usize = 0;
+        for (self.entries.items) |e| {
+            total += e.pool.instanceCount();
+            pinned += e.pool.pinnedCount();
+        }
+        return .{ .total = total, .pinned = pinned };
+    }
+
     pub fn deinit(self: *Manager) void {
         for (self.entries.items) |*e| {
             e.pool.deinit();

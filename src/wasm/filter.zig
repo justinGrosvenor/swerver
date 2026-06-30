@@ -938,6 +938,21 @@ pub const Pool = struct {
         return self.instances.len > 0 and self.instances[0].on_response != null;
     }
 
+    /// Total instances in this pool (the park-concurrency ceiling for the filter).
+    pub fn instanceCount(self: *const Pool) usize {
+        return self.instances.len;
+    }
+
+    /// Instances NOT idle (running or pinned by a park). At == instanceCount the
+    /// next park is refused with backpressure (observability for saturation).
+    pub fn pinnedCount(self: *const Pool) usize {
+        var n: usize = 0;
+        for (self.instances) |*inst| {
+            if (inst.state != .idle) n += 1;
+        }
+        return n;
+    }
+
     /// Run the response phase: acquire, runResponse, release. FAIL-OPEN on a busy
     /// pool (returns an empty edit) -- a transient pool exhaustion must not break
     /// a response that already passed policy.

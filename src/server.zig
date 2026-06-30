@@ -643,6 +643,34 @@ pub const Server = struct {
         return @ptrCast(mgr);
     }
 
+    /// WASM edge-function observability snapshot for the admin API / metrics.
+    /// Build-flag-aware: all-zero / false when wasm is compiled out.
+    pub const WasmObservability = struct {
+        park_active: usize = 0,
+        park_capacity: usize = 0,
+        pool_instances: usize = 0,
+        pool_pinned: usize = 0,
+        control_configured: bool = false,
+        control_ready: bool = false,
+    };
+
+    pub fn wasmObservability(self: *Server) WasmObservability {
+        if (!build_options.enable_wasm) return .{};
+        var o = WasmObservability{
+            .park_capacity = wasm_host_call_mod.Table.CAP,
+            .park_active = self.wasm_host_calls.activeCount(),
+            .control_configured = self.wasm_control_socket_path.len > 0,
+        };
+        if (self.wasm_manager) |p| {
+            const mgr: *wasm_manager_mod.Manager = @ptrCast(@alignCast(p));
+            const t = mgr.instanceTotals();
+            o.pool_instances = t.total;
+            o.pool_pinned = t.pinned;
+        }
+        if (self.wasmControlClient()) |cc| o.control_ready = cc.isReady();
+        return o;
+    }
+
     pub fn freeWasmManager(self: *Server, ptr: ?*anyopaque) void {
         if (!build_options.enable_wasm) return;
         if (ptr) |p| {
