@@ -680,6 +680,40 @@ pub const Server = struct {
         }
     }
 
+    /// Fail-closed completions drained from the park table by a config reload.
+    /// Two-step by design: cancel BEFORE the old manager is freed (the pinned
+    /// instances live in its pools), deliver AFTER the new manager is in place
+    /// (delivery re-drives connection I/O, and a pipelined request dispatched
+    /// during that re-drive may park again; it must land in the NEW pools).
+    pub const WasmDrainedParks = if (build_options.enable_wasm) struct {
+        completions: [wasm_host_call_mod.Table.CAP]wasm_host_call_mod.Completion = undefined,
+        count: usize = 0,
+    } else struct {};
+
+    /// Reload step 1: cancel every live wasm park, releasing each pinned
+    /// instance back to its (old) pool while that memory is still valid. The
+    /// returned completions reference only slot-owned snapshots, never the
+    /// instances, so they survive freeing the old manager.
+    pub fn wasmCancelAllParks(self: *Server) WasmDrainedParks {
+        var drained = WasmDrainedParks{};
+        if (build_options.enable_wasm) {
+            drained.count = self.wasm_host_calls.cancelAll(&drained.completions);
+            if (drained.count > 0) {
+                std.log.warn("config reload: cancelling {d} in-flight wasm park(s) fail-closed", .{drained.count});
+            }
+        }
+        return drained;
+    }
+
+    /// Reload step 2: answer the cancelled parks (fail-closed 500s) through
+    /// dispatch's park-resume delivery, which also restarts each connection's
+    /// I/O. The slot-owned snapshots are reclaimed lazily on slot reuse.
+    pub fn wasmDeliverDrainedParks(self: *Server, drained: *const WasmDrainedParks) void {
+        if (build_options.enable_wasm) {
+            for (drained.completions[0..drained.count]) |c| dispatch.wasmResume(self, c);
+        }
+    }
+
     /// Is a WASM filter parked on this connection (generation-checked)? Used by
     /// handleParkSentinel to set `.wasm_parked`.
     pub fn wasmHasParkFor(self: *Server, conn_index: u32, conn_id: u64) bool {
@@ -725,6 +759,14 @@ pub const Server = struct {
     /// completion on the next tick. `req_bytes` is the filter's staged outbound
     /// command (must NOT be __-prefixed: Nether reserves __*__ for host control
     /// commands and forwards unknown lines to the guest verbatim).
+    /// WasmBinding.start_fn adapter: `ctx` is the Server. The canonical thunk
+    /// for park sites outside dispatch.zig (the protocol files keep local
+    /// copies for now; consolidation is a tracked cleanup).
+    pub fn wasmStartThunk(ctx: *anyopaque, token: u32, req_bytes: []const u8) void {
+        const self: *Server = @ptrCast(@alignCast(ctx));
+        self.wasmStartHostCall(token, req_bytes);
+    }
+
     pub fn wasmStartHostCall(self: *Server, token: u32, req_bytes: []const u8) void {
         if (build_options.enable_wasm) {
             if (self.wasm_control) |p| {
@@ -820,6 +862,14 @@ pub const Server = struct {
             };
             proxy_ptr.* = new_proxy;
 
+            // Cancel in-flight wasm parks BEFORE any old state is freed: the
+            // pinned instances live in the old manager's pools, and parked
+            // requests hold across event-loop iterations, so "never
+            // mid-request" does not cover them. Their fail-closed responses
+            // are delivered after the swap (below), so any pipelined request
+            // re-driven by that delivery parks against the NEW pools.
+            const drained_parks = self.wasmCancelAllParks();
+
             const old_proxy = self.proxy;
             const old_arena = self.reload_arena;
             const old_wasm = self.wasm_manager;
@@ -828,8 +878,9 @@ pub const Server = struct {
 
             // Rebuild the WASM filter pools for the new route table, then free
             // the old manager AFTER the old proxy is gone (its routes referenced
-            // the old pools). Safe: applyPendingReload runs in the event loop,
-            // never mid-request, so no in-flight filter holds an old instance.
+            // the old pools). Parked filters were cancelled above; nothing else
+            // holds an old instance (applyPendingReload runs in the event loop,
+            // never mid-request).
             self.wasm_manager = self.buildWasmManager(loaded.wasm_filters, @constCast(loaded.routes));
 
             if (old_proxy) |old| {
@@ -839,6 +890,7 @@ pub const Server = struct {
             if (old_arena) |*oa| oa.deinit();
             self.freeWasmManager(old_wasm);
             self.needs_peer_ip = true;
+            self.wasmDeliverDrainedParks(&drained_parks);
 
             const source = self.config_source.?;
             const src_label: []const u8 = switch (source) {
@@ -850,6 +902,9 @@ pub const Server = struct {
             });
         } else {
             if (self.proxy != null and loaded.upstreams.len == 0 and loaded.routes.len == 0) {
+                // Same park drain as the rebuild branch: release pinned
+                // instances before their pools are freed, answer after.
+                const drained_parks = self.wasmCancelAllParks();
                 if (self.proxy) |old| {
                     old.deinit();
                     self.allocator.destroy(old);
@@ -861,6 +916,7 @@ pub const Server = struct {
                 if (self.reload_arena) |*old_arena| old_arena.deinit();
                 self.reload_arena = loaded.arena;
                 self.needs_peer_ip = self.app_router.middleware_chain.post.len > 0;
+                self.wasmDeliverDrainedParks(&drained_parks);
                 std.log.info("Config reloaded (proxy removed)", .{});
             } else {
                 loaded.deinit();

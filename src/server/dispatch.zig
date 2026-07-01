@@ -498,6 +498,41 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
                 }
                 if (timeout_result.count < timeout_result.to_close.len) break;
             }
+            // Lift expired time-based read pauses (rate-limit 429 pacing,
+            // filter/pool backpressure windows). canRead() blocks while
+            // resume_read_at_ms is pending, and on edge-triggered epoll or
+            // native io_uring no further read event fires for request bytes
+            // that arrived during the pause (the edge/CQE was already
+            // consumed); without this sweep the connection would hang until
+            // the idle timeout. handleRead drains socket or seeded buffer
+            // bytes; the recv re-arm is double-arm-guarded in the backend.
+            {
+                var expired: [64]struct { idx: u32, id: u64 } = undefined;
+                sweep: while (true) {
+                    var n: usize = 0;
+                    for (server.io.connections.activeConnections()) |idx| {
+                        const c = server.io.getConnection(idx) orelse continue;
+                        if (c.resume_read_at_ms > 0 and now_ms >= c.resume_read_at_ms) {
+                            c.resume_read_at_ms = 0;
+                            c.read_paused = false;
+                            expired[n] = .{ .idx = idx, .id = c.id };
+                            n += 1;
+                            if (n == expired.len) break;
+                        }
+                    }
+                    for (expired[0..n]) |e| {
+                        const c = server.io.getConnection(e.idx) orelse continue;
+                        if (c.id != e.id or c.state == .closed) continue;
+                        handleRead(server, e.idx) catch {};
+                        const rc = server.io.getConnection(e.idx) orelse continue;
+                        if (rc.id != e.id or rc.state == .closed) continue;
+                        if (!rc.close_after_write and rc.x402 == .none) {
+                            if (rc.fd) |pfd| server.io.rearmRecv(e.idx, pfd);
+                        }
+                    }
+                    if (n < expired.len) break :sweep;
+                }
+            }
             if (server.quic) |*q| {
                 q.cleanup();
             }
@@ -780,7 +815,7 @@ fn pgResume(ctx: *anyopaque, outcome: *const pg_client_mod.Outcome) void {
 /// and backpressure are served directly. The transport (C1) and the deadline
 /// tick call this. Routes delivery by completion.protocol: .http1 is implemented;
 /// .http2/.http3 are E2 stubs. Compiled only when wasm is enabled.
-fn wasmResume(server: *Server, completion: wasm_host_call_mod.Completion) void {
+pub fn wasmResume(server: *Server, completion: wasm_host_call_mod.Completion) void {
     switch (completion.protocol) {
         .http1 => {},
         .http2 => {
@@ -813,6 +848,7 @@ fn wasmResume(server: *Server, completion: wasm_host_call_mod.Completion) void {
             // (released to .idle by resumeCall/cancel); copy any spilled tail to
             // stable pool buffers before the next request reuses the instance.
             if (conn.pending_body.len > 0) http1_mod.materializePendingBody(server, conn);
+            recordResumeSpan(server, completion, resp.status);
         },
         .rate_limit_backpressure => |bp| {
             http1_mod.queueResponse(server, conn, bp.resp) catch {
@@ -825,16 +861,7 @@ fn wasmResume(server: *Server, completion: wasm_host_call_mod.Completion) void {
             // (the upstream was never contacted at park time). Falls through to
             // the embedded-Router re-dispatch when it is not a proxy route.
             if (proxyResume(server, conn, completion)) {
-                // Restart I/O below (shared tail).
-                if (conn.write_count > 0) handleWrite(server, completion.conn_index) catch {};
-                const pc = server.io.getConnection(completion.conn_index) orelse return;
-                if (pc.id != completion.conn_id or pc.state == .closed) return;
-                if (pc.x402 == .none and pc.read_buffered_bytes > 0) handleRead(server, completion.conn_index) catch {};
-                const rc = server.io.getConnection(completion.conn_index) orelse return;
-                if (rc.id != completion.conn_id or rc.state == .closed) return;
-                if (!rc.close_after_write and rc.x402 == .none) {
-                    if (rc.fd) |pfd| server.io.rearmRecv(completion.conn_index, pfd);
-                }
+                restartConnIo(server, completion.conn_index, completion.conn_id);
                 return;
             }
             // Re-run the pipeline with the resumed decision injected so the
@@ -881,24 +908,51 @@ fn wasmResume(server: *Server, completion: wasm_host_call_mod.Completion) void {
                 };
                 // Same Phase 2b hazard as the main loop: a replaced response body
                 // borrows the (now-idle, soon-reused) instance scratch; copy any
-                // spilled tail into stable pool buffers before returning.
-                if (conn.pending_body.len > 0) http1_mod.materializePendingBody(server, conn);
+                // spilled tail into stable pool buffers before returning. Stable
+                // .bytes sources keep the lazy drain (same gate as the main loop).
+                if (result.wasm_body_borrowed and conn.pending_body.len > 0) http1_mod.materializePendingBody(server, conn);
+                recordResumeSpan(server, completion, result.resp.status);
             }
         },
     }
 
     // Restart connection I/O (same tail as pgResume): flush, drain pipelined
     // requests buffered behind the park, re-arm recv.
-    if (conn.write_count > 0) handleWrite(server, completion.conn_index) catch {};
-    const postconn = server.io.getConnection(completion.conn_index) orelse return;
-    if (postconn.id != completion.conn_id or postconn.state == .closed) return;
+    restartConnIo(server, completion.conn_index, completion.conn_id);
+}
+
+/// Record the OTel span for a parked-and-resumed H1 ROUTER request. The span
+/// start was stashed on the connection at park time (WasmProxyResumeCtx, which
+/// the router binding also points its resume_ctx at); without this, exactly the
+/// slow (parked) requests would be invisible to tracing. The proxy resume path
+/// records its span in proxyForwardAndRespond instead.
+fn recordResumeSpan(server: *Server, completion: wasm_host_call_mod.Completion, status: u16) void {
+    if (!build_options.enable_wasm) return;
+    const otel_exp = server.otel orelse return;
+    const rctx_ptr = completion.resume_ctx orelse return;
+    const rctx: *const connection.Connection.WasmProxyResumeCtx = @ptrCast(@alignCast(rctx_ptr));
+    otel_exp.recordSpan(completion.req.method, completion.req.path, status, rctx.otel_start, clock.realtimeNanos() orelse 0);
+}
+
+/// Restart a connection's I/O after an out-of-event-loop completion (park
+/// resume, expired read pause): flush queued writes, drain any pipelined
+/// request bytes buffered behind the suspension, and re-arm recv (the native
+/// io_uring backend uses single-shot recv, so the normal re-arm was skipped
+/// when the pipeline loop broke). Generation-checked; safe to call on a
+/// connection that closed in the meantime.
+fn restartConnIo(server: *Server, conn_index: u32, conn_id: u64) void {
+    const conn = server.io.getConnection(conn_index) orelse return;
+    if (conn.id != conn_id or conn.state == .closed) return;
+    if (conn.write_count > 0) handleWrite(server, conn_index) catch {};
+    const postconn = server.io.getConnection(conn_index) orelse return;
+    if (postconn.id != conn_id or postconn.state == .closed) return;
     if (postconn.x402 == .none and postconn.read_buffered_bytes > 0) {
-        handleRead(server, completion.conn_index) catch {};
+        handleRead(server, conn_index) catch {};
     }
-    const rconn = server.io.getConnection(completion.conn_index) orelse return;
-    if (rconn.id != completion.conn_id or rconn.state == .closed) return;
+    const rconn = server.io.getConnection(conn_index) orelse return;
+    if (rconn.id != conn_id or rconn.state == .closed) return;
     if (!rconn.close_after_write and rconn.x402 == .none) {
-        if (rconn.fd) |pfd| server.io.rearmRecv(completion.conn_index, pfd);
+        if (rconn.fd) |pfd| server.io.rearmRecv(conn_index, pfd);
     }
 }
 
@@ -941,6 +995,14 @@ fn proxyForwardAndRespond(
     pctx: ProxyPostCtx,
 ) !ProxyRespondOutcome {
     const route_idx = pctx.route_idx;
+    // The resume path replays a route_idx captured at park time. Reload drains
+    // parks before swapping the proxy, so a stale index should be unreachable;
+    // guard anyway: indexing a shorter route table with it is OOB, and a
+    // reordered one applies another route's cache/x402 policy.
+    if (route_idx >= proxy.config.routes.len) {
+        try http1_mod.queueResponse(server, conn, Server.internalErrorResponse());
+        return .responded;
+    }
     const cache_cfg = proxy.config.routes[route_idx].cache;
 
     // Recompute the vary keys exactly as the pre-forward cache lookup did: base
@@ -1195,7 +1257,16 @@ fn wasmResumeHttp2(server: *Server, completion: wasm_host_call_mod.Completion) v
                 const result = server.app_router.handle(completion.req, &mw_ctx, &scratch);
                 if (scratch.arena_handle) |h| server.io.releaseBuffer(h);
                 if (result.pause_reads_ms) |pause_ms| conn.setRateLimitPause(server.now_ms, pause_ms);
-                http2_mod.queueHttp2Response(server, conn, stream_id, result.resp, is_head) catch {};
+                // The handler may itself park again: leave the stream suspended
+                // rather than serializing the park sentinel (H3-resume parity).
+                // A sentinel with no live park is failed closed.
+                if (result.resp.isParked()) {
+                    if (server.wasmHasParkForStream(completion.conn_index, completion.conn_id, stream_id)) return;
+                    server.wasmCancelForStream(completion.conn_index, completion.conn_id, stream_id);
+                    http2_mod.queueHttp2Response(server, conn, stream_id, Server.internalErrorResponse(), is_head) catch {};
+                } else {
+                    http2_mod.queueHttp2Response(server, conn, stream_id, result.resp, is_head) catch {};
+                }
             }
         },
     }
@@ -1711,7 +1782,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
     var memo_path: []const u8 = "";
 
     while (conn.state != .closed and conn.read_buffered_bytes > 0 and conn.canEnqueueWrite() and !conn.hasPendingFile()) {
-        if (conn.x402 == .pending or conn.x402 == .settle_pending or conn.x402 == .db_parked) break;
+        if (conn.x402 == .pending or conn.x402 == .settle_pending or conn.x402 == .db_parked or conn.x402 == .wasm_parked) break;
         // Opportunistic inline write drain: push enqueued responses
         // to the kernel while still processing pipelined requests.
         // At low connection counts (e.g. 512 conns / 64 workers =
@@ -2202,6 +2273,13 @@ pub fn handleRead(server: *Server, index: u32) !void {
         const arena_handle = if (needs_eager_arena) server.io.acquireBuffer() else null;
         var empty_arena: [0]u8 = undefined;
         const arena_buf = if (arena_handle) |handle| handle.bytes else empty_arena[0..];
+        const otel_start = if (server.otel != null) clock.realtimeNanos() orelse 0 else 0;
+        // Stash the span start across a possible park so the router resume path
+        // can record the span too (the proxy path stashes route_idx/settlement
+        // the same way). Harmless dead data when the filter does not park.
+        if (build_options.enable_wasm) {
+            conn.wasm_proxy_resume = .{ .route_idx = 0, .otel_start = otel_start, .needs_settlement = false };
+        }
         var scratch = router.HandlerScratch{
             .response_buf = response_buf[0..],
             .response_headers = response_headers[0..],
@@ -2223,11 +2301,11 @@ pub fn handleRead(server: *Server, index: u32) !void {
                 .stream_id = 0, // H1 sentinel
                 .protocol = .http1,
                 .deadline_ms = server.now_ms + server.wasm_host_call_deadline_ms,
+                .resume_ctx = if (build_options.enable_wasm) @ptrCast(&conn.wasm_proxy_resume) else null,
                 .start_fn = if (build_options.enable_wasm) wasmStartThunk else null,
                 .start_ctx = if (build_options.enable_wasm) @ptrCast(server) else null,
             },
         };
-        const otel_start = if (server.otel != null) clock.realtimeNanos() orelse 0 else 0;
         const result = server.app_router.handle(parse.view, &mw_ctx, &scratch);
         if (scratch.arena_handle) |handle| server.io.releaseBuffer(handle);
         if (result.pause_reads_ms) |pause_ms| {
@@ -2246,8 +2324,12 @@ pub fn handleRead(server: *Server, index: u32) !void {
         // the write queue, the spilled tail in conn.pending_body still borrows
         // that scratch -> the next request would overwrite it (cross-request body
         // corruption). Materialize the tail into stable pool buffers now, while
-        // the scratch is still valid. Mirrors the proxy path's tail handling.
-        if (conn.pending_body.len > 0) http1_mod.materializePendingBody(server, conn);
+        // the scratch is still valid. Gated on wasm_body_borrowed: stable .bytes
+        // sources must keep the lazy pending_body drain (materializing them
+        // truncates any tail past the write-queue capacity and force-closes).
+        if (build_options.enable_wasm and result.wasm_body_borrowed and conn.pending_body.len > 0) {
+            http1_mod.materializePendingBody(server, conn);
+        }
         if (server.otel) |otel_exp| {
             otel_exp.recordSpan(parse.view.method, parse.view.path, result.resp.status, otel_start, clock.realtimeNanos() orelse 0);
         }
@@ -2267,6 +2349,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
         conn.canEnqueueWrite() and
         !conn.read_paused and
         conn.resume_read_at_ms == 0 and
+        conn.x402 == .none and
         !conn.close_after_write)
     {
         conn.read_offset = 0;

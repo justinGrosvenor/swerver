@@ -828,6 +828,11 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
     /// having one SQE in flight per connection at a time.
     pub fn rearmRecv(self: *IoUringNativeBackend, conn_id: u32, fd: i32) void {
         if (conn_id >= self.recv_armed.len) return;
+        // Single-shot recv: exactly one SQE in flight per connection. Callers
+        // that re-drive out of the event loop (park resume, expired read
+        // pause) cannot know whether the event tail already re-armed, so
+        // skip when armed instead of stacking a second recv.
+        if (self.recv_armed[conn_id]) return;
         self.armRecv(conn_id, fd) catch {};
     }
 

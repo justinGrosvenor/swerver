@@ -483,6 +483,11 @@ fn writeConfigAndReload(server: *Server, alloc: std.mem.Allocator, tree: std.jso
         };
         proxy_ptr.* = new_proxy;
 
+        // Cancel in-flight wasm parks BEFORE freeing old state (their pinned
+        // instances live in the old manager's pools) and answer them after
+        // the swap, mirroring Server.applyPendingReload.
+        const drained_parks = server.wasmCancelAllParks();
+
         const old_proxy = server.proxy;
         const old_arena = server.reload_arena;
         const old_wasm = server.wasm_manager;
@@ -502,7 +507,9 @@ fn writeConfigAndReload(server: *Server, alloc: std.mem.Allocator, tree: std.jso
         }
         if (old_arena) |*oa| oa.deinit();
         server.freeWasmManager(old_wasm);
+        server.wasmDeliverDrainedParks(&drained_parks);
     } else if (loaded.upstreams.len == 0 and loaded.routes.len == 0) {
+        const drained_parks = server.wasmCancelAllParks();
         if (server.proxy) |old| {
             old.deinit();
             server.allocator.destroy(old);
@@ -513,6 +520,7 @@ fn writeConfigAndReload(server: *Server, alloc: std.mem.Allocator, tree: std.jso
         server.wasm_manager = null;
         if (server.reload_arena) |*old_arena| old_arena.deinit();
         server.reload_arena = loaded.arena;
+        server.wasmDeliverDrainedParks(&drained_parks);
     } else {
         loaded.deinit();
     }

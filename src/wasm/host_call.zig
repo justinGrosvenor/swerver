@@ -273,6 +273,12 @@ pub const Table = struct {
         // idle instance on resume. Caller treats null as table-full -> cancelPark
         // + 503. (Mirrors the same guard in filter.resumeCall.)
         if (instance.state != .parked) return null;
+        // Reject a second park keyed to the same (conn, stream): the transports
+        // track at most one park per H1 connection / H2-H3 stream, so a
+        // duplicate would strand its completion (the first resume clears the
+        // park state and the second is dropped by the resume-path guards,
+        // leaving that request unanswered until deadline). Fail closed instead.
+        if (self.hasParkForStream(conn_index, conn_id, stream_id)) return null;
         // LOAD-BEARING for the deferred-free lifecycle: park reuses the LOWEST-index
         // free slot, and tick() emits its completions in ascending slot order while
         // wasmTick consumes them in that same order. Together this guarantees a tail
@@ -406,6 +412,28 @@ pub const Table = struct {
         for (&self.slots) |*s| {
             if (n >= out.len) break;
             if (s.active and now_ms >= s.deadline_ms) {
+                const decision = filter.cancelPark(s.instance);
+                out[n] = self.completionFor(s, decision);
+                n += 1;
+                s.active = false;
+            }
+        }
+        return n;
+    }
+
+    /// Cancel EVERY live park: release each pinned instance and emit a
+    /// fail-closed completion into `out` (size it at CAP to drain in one
+    /// call). Config reload uses this before freeing the filter pools the
+    /// pinned instances live in: the instances must be released while that
+    /// memory is still valid, and the parked requests still get an answer.
+    /// The returned completions hold only the decision and the slot-owned
+    /// request snapshot (no instance references), so the caller may deliver
+    /// them after the old pools are freed.
+    pub fn cancelAll(self: *Table, out: []Completion) usize {
+        var n: usize = 0;
+        for (&self.slots) |*s| {
+            if (n >= out.len) break;
+            if (s.active) {
                 const decision = filter.cancelPark(s.instance);
                 out[n] = self.completionFor(s, decision);
                 n += 1;
@@ -659,6 +687,64 @@ test "host_call table: cancelForStream releases only the matching stream" {
     try testing.expectEqual(@as(usize, 2), table.liveCount());
     // Matching stream: only that one is released.
     try testing.expect(table.cancelForStream(1, 1, 7) == true);
+    try testing.expectEqual(@as(usize, 1), table.liveCount());
+}
+
+test "host_call table: a second park on the same (conn, stream) key is rejected" {
+    var pool = try filter.Pool.init(testing.allocator, FILTER_WASM, .{ .instances = 2 });
+    defer pool.deinit();
+    var table = Table.init(testing.allocator);
+    defer table.deinit();
+
+    _ = try parkOne(&pool, &table, 1, 100, 5000);
+    try testing.expectEqual(@as(usize, 1), table.liveCount());
+
+    // Duplicate key (same conn_index, conn_id, stream 0): rejected so the
+    // second request cannot strand its completion behind the first resume.
+    const inst = pool.acquire() orelse return error.AcquireFailed;
+    const r = request.RequestView{ .method = .GET, .path = "/enrich", .headers = &.{} };
+    try testing.expect(filter.invokeOutcome(inst, &r, filter.DEFAULT_FUEL) == .parked);
+    try testing.expect(table.park(inst, r, 1, 100, 0, .http1, 5000, filter.DEFAULT_FUEL, null) == null);
+    _ = filter.cancelPark(inst);
+    try testing.expectEqual(@as(usize, 1), table.liveCount());
+
+    // Same conn, DIFFERENT stream (the H2/H3 shape): allowed.
+    const inst2 = pool.acquire() orelse return error.AcquireFailed;
+    try testing.expect(filter.invokeOutcome(inst2, &r, filter.DEFAULT_FUEL) == .parked);
+    try testing.expect(table.park(inst2, r, 1, 100, 7, .http2, 5000, filter.DEFAULT_FUEL, null) != null);
+    try testing.expectEqual(@as(usize, 2), table.liveCount());
+}
+
+test "host_call table: cancelAll drains every park fail-closed (reload path)" {
+    var pool = try filter.Pool.init(testing.allocator, FILTER_WASM, .{ .instances = 4 });
+    defer pool.deinit();
+    var table = Table.init(testing.allocator);
+    defer table.deinit();
+
+    const t1 = try parkOne(&pool, &table, 1, 100, 5000);
+    _ = try parkOne(&pool, &table, 2, 200, 5000);
+    _ = try parkOne(&pool, &table, 3, 300, 5000);
+    try testing.expectEqual(@as(usize, 3), table.liveCount());
+
+    // Drain (what both config-reload paths do before freeing the old manager):
+    // every park yields a fail-closed completion and its instance is unpinned
+    // (back to .idle -> re-acquirable), leaving the table empty.
+    var out: [Table.CAP]Completion = undefined;
+    const n = table.cancelAll(&out);
+    try testing.expectEqual(@as(usize, 3), n);
+    try testing.expectEqual(@as(usize, 0), table.liveCount());
+    for (out[0..n]) |c| {
+        try testing.expect(c.decision == .reject);
+        try testing.expectEqual(@as(u16, 500), c.decision.reject.status);
+    }
+    // The drained completions still carry usable owned snapshots.
+    try testing.expect(std.mem.eql(u8, out[0].req.path, "/enrich"));
+
+    // Stale tokens from before the drain are dead (generation/active check).
+    try testing.expect(table.complete(t1, "ok") == null);
+
+    // The unpinned instances are reusable: a fresh park succeeds.
+    _ = try parkOne(&pool, &table, 9, 900, 5000);
     try testing.expectEqual(@as(usize, 1), table.liveCount());
 }
 

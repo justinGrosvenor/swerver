@@ -90,6 +90,11 @@ pub const RouteResult = struct {
     resp: response.Response,
     /// If non-null, pause reads for this many milliseconds (rate limiting)
     pause_reads_ms: ?u64 = null,
+    /// True when a Phase 2b on_response filter replaced the body with a slice
+    /// that borrows the wasm instance's scratch (released to .idle already).
+    /// The caller must copy any write-queue spill (conn.pending_body) into
+    /// stable buffers before the instance serves another request.
+    wasm_body_borrowed: bool = false,
 };
 
 /// Signature of every route handler swerver dispatches. Handlers are
@@ -1146,6 +1151,9 @@ pub const Router = struct {
         // Response headers staged by a WASM filter's Phase 2b on_response hook.
         // Same lifetime/merge discipline as wasm_modify_headers.
         var wasm_response_headers: []const response.Header = &.{};
+        // Set when on_response replaced the body with instance-scratch bytes;
+        // surfaced via RouteResult.wasm_body_borrowed.
+        var wasm_body_borrowed = false;
 
         var path_matched = false;
         for (self.routes[0..self.route_count]) |r| {
@@ -1336,7 +1344,10 @@ pub const Router = struct {
                             break;
                         }
                         if (edit.new_status) |s| result_resp.status = s;
-                        if (edit.new_body) |b| result_resp.body = .{ .bytes = b };
+                        if (edit.new_body) |b| {
+                            result_resp.body = .{ .bytes = b };
+                            wasm_body_borrowed = true;
+                        }
                         wasm_response_headers = edit.add_headers;
                     }
                 }
@@ -1415,7 +1426,7 @@ pub const Router = struct {
             self.middleware_chain.executePost(mw_ctx, req, result_resp, elapsed_ns);
         }
 
-        return .{ .resp = result_resp, .pause_reads_ms = result_pause };
+        return .{ .resp = result_resp, .pause_reads_ms = result_pause, .wasm_body_borrowed = wasm_body_borrowed };
     }
 
     /// Quick O(route_count) check: does ANY registered route's path
@@ -2185,6 +2196,10 @@ test "wasm: Phase 2b response filter edits the handler response via handle" {
         // on_response saw the "boom" body -> 403 + replacement body.
         try std.testing.expectEqual(@as(u16, 403), result.resp.status);
         try std.testing.expectEqualStrings("blocked by edge", result.resp.bodyBytes());
+        // The replacement body borrows the instance scratch; the flag tells the
+        // dispatch tail to materialize any write-queue spill (stable .bytes
+        // responses must NOT set it, or large-response streaming would truncate).
+        try std.testing.expect(result.wasm_body_borrowed);
     } else return error.SkipZigTest;
 }
 

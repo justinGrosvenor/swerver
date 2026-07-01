@@ -4,8 +4,11 @@
 set -e
 cd "$(dirname "$0")"
 ZIG="${ZIG:-$HOME/Library/zig/0.16.0/zig}"
+# -mcpu=mvp is REQUIRED on every filter build: Zig's default wasm CPU enables
+# reference_types, which the vendored wasm3 cannot compile (loads fail with an
+# opaque FunctionNotFound).
 for m in probe filter_probe response_probe; do
-    "$ZIG" build-exe "$m.zig" -target wasm32-freestanding -fno-entry -rdynamic \
+    "$ZIG" build-exe "$m.zig" -target wasm32-freestanding -mcpu=mvp -fno-entry -rdynamic \
         -OReleaseSmall -femit-bin="$m.wasm"
     echo "wrote $m.wasm ($(wc -c < "$m.wasm") bytes)"
 done

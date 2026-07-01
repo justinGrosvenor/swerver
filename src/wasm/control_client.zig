@@ -138,6 +138,18 @@ pub const ControlClient = struct {
 
     // Token whose reply we are currently reading (null = idle / handshaking).
     inflight: ?Token = null,
+    /// True while startCall is on the stack. startCall runs INSIDE the parking
+    /// filter's dispatch frame (router/proxy park site -> start_fn -> here), so
+    /// a synchronous failOne would re-enter the resume path before the park
+    /// sentinel has registered: H1 silently swallows the fail (request hangs to
+    /// deadline), H2/H3 queue a 500 and then the sentinel branch queues a
+    /// second one on the same stream. failOne defers instead while this is set;
+    /// the tokens drain on the next tick/onEvent, off any dispatch frame.
+    in_start_call: bool = false,
+    /// Tokens whose fail-closed delivery was deferred by failOne (see
+    /// in_start_call). Capacity CAP: every deferred token is a live park.
+    pending_fail: [host_call.Table.CAP]Token = undefined,
+    pending_fail_count: usize = 0,
     command_deadline_ms: u64 = 0,
     /// Per-command wall-clock budget. Defaults to COMMAND_TIMEOUT_MS (30s); the
     /// server overrides it from `wasm_host_call_deadline_ms` so the transport does
@@ -165,6 +177,7 @@ pub const ControlClient = struct {
     }
 
     pub fn deinit(self: *ControlClient, io_rt: *io_mod.IoRuntime) void {
+        self.drainPendingFails();
         self.failAll();
         if (self.fd >= 0) {
             io_rt.unregisterExternalFd(self.fd) catch {};
@@ -179,6 +192,12 @@ pub const ControlClient = struct {
     /// outbound bytes (valid while parked); copied if queued. The trailing
     /// newline that the line protocol requires is appended here.
     pub fn startCall(self: *ControlClient, io_rt: *io_mod.IoRuntime, token: Token, cmd: []const u8) void {
+        // Any failure below (guard rejection, disabled lane, queue overflow, or
+        // a write error inside issue -> fail -> failAll) must NOT resume the
+        // park synchronously: we are still inside the park site's dispatch
+        // frame. failOne defers to pending_fail while this flag is set.
+        self.in_start_call = true;
+        defer self.in_start_call = false;
         // Security choke (D2-1): a Tier-1 wasm filter must not drive the Tier-2
         // control plane. `cmd` is filter-supplied bytes (the host_call payload,
         // copied verbatim) written to the Nether control socket, where swerver is
@@ -239,6 +258,7 @@ pub const ControlClient = struct {
     /// Single entry point from the dispatch loop for events tagged with this
     /// client's external-fd slot. Mirrors PgClient.onEvent.
     pub fn onEvent(self: *ControlClient, io_rt: *io_mod.IoRuntime, kind: io_mod.EventKind) void {
+        self.drainPendingFails();
         if (self.fd < 0) return; // stale event after a close
         const now_ms = io_rt.nowMs();
         switch (kind) {
@@ -264,6 +284,7 @@ pub const ControlClient = struct {
     /// Housekeeping: (re)connect, enforce the connect/handshake deadline and the
     /// per-command timeout. Called from the dispatch loop's housekeeping block.
     pub fn tick(self: *ControlClient, io_rt: *io_mod.IoRuntime, now_ms: u64) void {
+        self.drainPendingFails();
         switch (self.state) {
             .disabled => {},
             .closed => if (now_ms >= self.retry_at_ms) self.startConnect(io_rt, now_ms),
@@ -681,7 +702,26 @@ pub const ControlClient = struct {
     }
 
     fn failOne(self: *ControlClient, token: Token) void {
+        // Mid-startCall fails are deferred (see in_start_call): delivering now
+        // would re-enter the dispatch frame that is still parking this request.
+        if (self.in_start_call and self.pending_fail_count < self.pending_fail.len) {
+            self.pending_fail[self.pending_fail_count] = token;
+            self.pending_fail_count += 1;
+            return;
+        }
         if (self.fail_fn) |ff| ff(self.resume_ctx.?, token);
+    }
+
+    /// Deliver fails deferred by failOne during startCall. Called from tick and
+    /// onEvent -- both run off any dispatch frame, after the park site returned
+    /// its sentinel and the transport registered the park, so each token yields
+    /// exactly one fail-closed response on every protocol.
+    fn drainPendingFails(self: *ControlClient) void {
+        while (self.pending_fail_count > 0) {
+            self.pending_fail_count -= 1;
+            const t = self.pending_fail[self.pending_fail_count];
+            if (self.fail_fn) |ff| ff(self.resume_ctx.?, t);
+        }
     }
 };
 
@@ -876,9 +916,14 @@ test "startCall queues when not ready and fails closed when disabled" {
     try testing.expectEqual(@as(usize, 1), cc.q_count);
     try testing.expect(Captured.failed == null);
 
-    // Disabled backend: fail closed immediately.
+    // Disabled backend: fail closed, but DEFERRED -- startCall runs inside the
+    // parking dispatch frame, so the fail must not resume synchronously. It is
+    // delivered on the next tick/onEvent drain.
     cc.state = .disabled;
     cc.startCall(&io_rt, 4, "lookup:user");
+    try testing.expect(Captured.failed == null); // not synchronous
+    try testing.expectEqual(@as(usize, 1), cc.pending_fail_count);
+    cc.drainPendingFails();
     try testing.expectEqual(@as(?Token, 4), Captured.failed);
 }
 
@@ -896,6 +941,9 @@ test "startCall: a reserved __verb__ payload fails closed and never enqueues" {
     // (and thus never touches the undefined io_rt).
     cc.state = .ready;
     cc.startCall(&io_rt, 11, "__shutdown__");
+    try testing.expect(Captured.failed == null); // deferred, never inline (reentrancy)
+    try testing.expectEqual(@as(usize, 1), cc.pending_fail_count);
+    cc.drainPendingFails();
     try testing.expectEqual(@as(?Token, 11), Captured.failed);
     try testing.expectEqual(@as(usize, 0), cc.q_count); // not enqueued
     try testing.expect(cc.inflight == null); // not issued
@@ -936,6 +984,8 @@ test "startCall: embedded-newline and leading-ws control-verb injection is block
         cc.send_len = 0;
         cc.q_count = 0;
         cc.startCall(&io_rt, @intCast(100 + i), payload);
+        try testing.expect(Captured.failed == null); // deferred, never inline (reentrancy)
+        cc.drainPendingFails();
         try testing.expectEqual(@as(?Token, @intCast(100 + i)), Captured.failed);
         try testing.expectEqual(@as(usize, 0), cc.q_count); // never enqueued
         try testing.expect(cc.inflight == null); // never issued
