@@ -966,6 +966,49 @@ fn connectBlockingResolved(resolved: ResolvedAddr, timeout_ms: u32) ConnectError
     return fd;
 }
 
+/// Longest UNIX-domain socket path swerver accepts. sun_path is 104 bytes on
+/// macOS/BSD (108 on Linux) including the NUL terminator; 103 is portable.
+pub const UNIX_PATH_MAX = 103;
+
+/// Connect to a UNIX-domain stream socket with a timeout (blocking). The unix
+/// analogue of connectBlocking for upstream proxying (tenant microVM data
+/// sockets, local backends). No SSRF/private-address validation applies: paths
+/// are validated at config-parse / registration time by the caller.
+pub fn connectUnixBlocking(path: []const u8, timeout_ms: u32) ConnectError!std.posix.fd_t {
+    if (!isSupportedPlatform()) return error.UnsupportedPlatform;
+    if (path.len == 0 or path.len > UNIX_PATH_MAX) return error.UnsupportedAddress;
+
+    const domain: c_uint = @intCast(std.posix.AF.UNIX);
+    const fd = std.posix.system.socket(domain, std.posix.SOCK.STREAM, 0);
+    if (fd < 0) return error.SocketFailed;
+    errdefer clock.closeFd(fd);
+
+    setNonBlocking(fd) catch return error.SocketFailed;
+
+    var sa: std.posix.sockaddr.un = .{ .path = undefined };
+    @memset(&sa.path, 0);
+    @memcpy(sa.path[0..path.len], path);
+
+    const rc = std.posix.system.connect(fd, @ptrCast(&sa), @sizeOf(std.posix.sockaddr.un));
+    if (rc == 0) {
+        clearNonBlocking(fd) catch return error.SocketFailed;
+        return fd;
+    }
+
+    const errno = std.posix.errno(rc);
+    if (errno != .INPROGRESS) return error.ConnectFailed;
+
+    if (!pollWriteReady(fd, timeout_ms)) return error.Timeout;
+
+    var err_val: c_int = 0;
+    var err_len: std.posix.socklen_t = @sizeOf(c_int);
+    const gso_rc = std.posix.system.getsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.ERROR, @ptrCast(&err_val), &err_len);
+    if (gso_rc != 0 or err_val != 0) return error.ConnectFailed;
+
+    clearNonBlocking(fd) catch return error.SocketFailed;
+    return fd;
+}
+
 /// Set send/recv timeouts on a blocking socket.
 pub fn setSocketTimeouts(fd: std.posix.fd_t, send_ms: u32, recv_ms: u32) void {
     const send_tv = msToTimeval(send_ms);
@@ -1091,6 +1134,49 @@ test "getLocalPort reports the bound listener port" {
     if (accepted < 0) return error.SkipZigTest;
     defer clock.closeFd(accepted);
     try std.testing.expectEqual(bound, getLocalPort(accepted).?);
+}
+
+test "connectUnixBlocking: connects to a bound listener, echoes, and fails fast on ENOENT" {
+    if (!isSupportedPlatform()) return error.SkipZigTest;
+    // Short path: AF_UNIX sun_path is ~104 bytes; keep it well under.
+    var path_buf: [64]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "/tmp/sw_ux_{d}.sock", .{std.c.getpid()}) catch return error.SkipZigTest;
+    _ = std.c.unlink(path.ptr);
+    defer _ = std.c.unlink(path.ptr);
+
+    // Bind + listen a unix stream socket (raw syscalls; std.net helpers vary).
+    const lfd_rc = std.posix.system.socket(@intCast(std.posix.AF.UNIX), std.posix.SOCK.STREAM, 0);
+    if (lfd_rc < 0) return error.SkipZigTest;
+    const lfd: std.posix.fd_t = @intCast(lfd_rc);
+    defer clock.closeFd(lfd);
+    var sa: std.posix.sockaddr.un = .{ .path = undefined };
+    @memset(&sa.path, 0);
+    @memcpy(sa.path[0..path.len], path);
+    if (std.posix.system.bind(lfd, @ptrCast(&sa), @sizeOf(std.posix.sockaddr.un)) != 0) return error.SkipZigTest;
+    if (std.posix.system.listen(lfd, 4) != 0) return error.SkipZigTest;
+
+    const cfd = try connectUnixBlocking(path, 1000);
+    defer clock.closeFd(cfd);
+
+    // Accept and echo a byte through to prove the stream works both ways.
+    var peer: std.posix.sockaddr.un = undefined;
+    var plen: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.un);
+    const afd_rc = std.posix.system.accept(lfd, @ptrCast(&peer), &plen);
+    if (afd_rc < 0) return error.SkipZigTest;
+    const afd: std.posix.fd_t = @intCast(afd_rc);
+    defer clock.closeFd(afd);
+
+    try sendAll(cfd, "ping");
+    var rbuf: [8]u8 = undefined;
+    const rn = std.posix.system.read(afd, &rbuf, rbuf.len);
+    try std.testing.expectEqual(@as(isize, 4), rn);
+    try std.testing.expectEqualStrings("ping", rbuf[0..4]);
+
+    // Missing socket path fails fast (no timeout wait).
+    try std.testing.expectError(error.ConnectFailed, connectUnixBlocking("/tmp/sw_ux_missing.sock", 1000));
+    // Oversized path is rejected before any syscall.
+    const long = [_]u8{'a'} ** (UNIX_PATH_MAX + 1);
+    try std.testing.expectError(error.UnsupportedAddress, connectUnixBlocking(&long, 1000));
 }
 
 test "parseGroSegmentSize reads UDP_GRO cmsg" {

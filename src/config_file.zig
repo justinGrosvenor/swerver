@@ -10,6 +10,7 @@ const consul_mod = @import("proxy/consul.zig");
 const body_schema_mod = @import("middleware/body_schema.zig");
 const clock = @import("runtime/clock.zig");
 const pg_client_mod = @import("db/pg/client.zig");
+const net_mod = @import("runtime/net.zig");
 
 /// Config file schema version. Bump the minor component when fields are
 /// added (backward-compatible), the major component when a field is
@@ -287,16 +288,35 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
         if (u.servers.len > balancer_mod.Balancer.MAX_SERVERS) return error.ConfigParseError;
         const servers_out = try alloc.alloc(upstream_mod.Server, u.servers.len);
         for (u.servers, 0..) |s, si| {
-            // Validate server address doesn't contain control characters
-            if (!isSafeHttpValue(s.address)) return error.ConfigParseError;
-            servers_out[si] = .{
-                .address = s.address,
-                .port = s.port,
-                .weight = s.weight orelse 1,
-                .max_fails = s.max_fails orelse 3,
-                .fail_timeout_ms = s.fail_timeout_ms orelse 30_000,
-                .backup = s.backup orelse false,
-            };
+            // A server is EITHER a unix-socket path OR an address+port, not both.
+            if (s.unix) |uxp| {
+                if (s.address != null or s.port != null) return error.ConfigParseError;
+                if (uxp.len == 0 or uxp.len > net_mod.UNIX_PATH_MAX) return error.ConfigParseError;
+                if (uxp[0] != '/') return error.ConfigParseError; // absolute path
+                if (!isSafeHttpValue(uxp)) return error.ConfigParseError;
+                servers_out[si] = .{
+                    .address = "",
+                    .port = 0,
+                    .unix_path = uxp,
+                    .weight = s.weight orelse 1,
+                    .max_fails = s.max_fails orelse 3,
+                    .fail_timeout_ms = s.fail_timeout_ms orelse 30_000,
+                    .backup = s.backup orelse false,
+                };
+            } else {
+                const addr = s.address orelse return error.ConfigParseError;
+                const port = s.port orelse return error.ConfigParseError;
+                // Validate server address doesn't contain control characters
+                if (!isSafeHttpValue(addr)) return error.ConfigParseError;
+                servers_out[si] = .{
+                    .address = addr,
+                    .port = port,
+                    .weight = s.weight orelse 1,
+                    .max_fails = s.max_fails orelse 3,
+                    .fail_timeout_ms = s.fail_timeout_ms orelse 30_000,
+                    .backup = s.backup orelse false,
+                };
+            }
         }
 
         var health_check: ?upstream_mod.HealthCheck = null;
@@ -842,8 +862,9 @@ const ConsulDiscoveryJson = struct {
 };
 
 const ServerEntryJson = struct {
-    address: []const u8,
-    port: u16,
+    address: ?[]const u8 = null,
+    port: ?u16 = null,
+    unix: ?[]const u8 = null,
     weight: ?u16 = null,
     max_fails: ?u16 = null,
     fail_timeout_ms: ?u32 = null,
@@ -1060,6 +1081,41 @@ test "parse full config with upstreams and routes" {
     try std.testing.expect(loaded.routes[0].rewrite != null);
     try std.testing.expectEqualStrings("/api", loaded.routes[0].rewrite.?.pattern);
     try std.testing.expectEqualStrings("", loaded.routes[0].rewrite.?.replacement);
+}
+
+test "parse unix-socket upstream server" {
+    const json =
+        \\{
+        \\  "upstreams": [{
+        \\    "name": "vm",
+        \\    "servers": [ { "unix": "/tmp/vm-42.sock" } ]
+        \\  }],
+        \\  "routes": [{ "path_prefix": "/", "upstream": "vm" }]
+        \\}
+    ;
+    var loaded = try parseJsonFromBytes(std.testing.allocator, json);
+    defer loaded.deinit();
+    try std.testing.expectEqualStrings("/tmp/vm-42.sock", loaded.upstreams[0].servers[0].unix_path);
+    try std.testing.expectEqualStrings("", loaded.upstreams[0].servers[0].address);
+    try std.testing.expectEqual(@as(u16, 0), loaded.upstreams[0].servers[0].port);
+}
+
+test "reject unix + address on the same server, and non-absolute unix path" {
+    const both =
+        \\{ "upstreams": [{ "name": "x", "servers": [ { "unix": "/s.sock", "address": "1.2.3.4", "port": 80 } ] }],
+        \\  "routes": [{ "path_prefix": "/", "upstream": "x" }] }
+    ;
+    try std.testing.expectError(error.ConfigParseError, parseJsonFromBytes(std.testing.allocator, both));
+    const rel =
+        \\{ "upstreams": [{ "name": "x", "servers": [ { "unix": "relative.sock" } ] }],
+        \\  "routes": [{ "path_prefix": "/", "upstream": "x" }] }
+    ;
+    try std.testing.expectError(error.ConfigParseError, parseJsonFromBytes(std.testing.allocator, rel));
+    const neither =
+        \\{ "upstreams": [{ "name": "x", "servers": [ { "weight": 2 } ] }],
+        \\  "routes": [{ "path_prefix": "/", "upstream": "x" }] }
+    ;
+    try std.testing.expectError(error.ConfigParseError, parseJsonFromBytes(std.testing.allocator, neither));
 }
 
 test "parse empty config uses defaults" {

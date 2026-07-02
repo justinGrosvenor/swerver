@@ -34,10 +34,14 @@ pub const Upstream = struct {
 
 /// Individual backend server definition
 pub const Server = struct {
-    /// Server address (hostname or IP)
+    /// Server address (hostname or IP). Ignored when `unix_path` is set.
     address: []const u8,
-    /// Server port
+    /// Server port. Ignored when `unix_path` is set.
     port: u16,
+    /// UNIX-domain stream socket path (empty = TCP via address:port). Used for
+    /// on-host backends: tenant microVM data sockets, local daemons. Validated
+    /// at config parse (absolute, <= net.UNIX_PATH_MAX); no SSRF check applies.
+    unix_path: []const u8 = "",
     /// Weight for weighted load balancing (higher = more traffic)
     weight: u16 = 1,
     /// Number of failures before marking unavailable

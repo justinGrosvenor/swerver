@@ -49,6 +49,15 @@ pub const WasmBinding = struct {
 
 /// Map a proxy BodyView onto a RequestView body so a WASM filter can read it via
 /// body_len/read_body. Zero-copy: the two share the scattered-buffer layout.
+/// Connect to a backend server: UNIX-domain when the server carries a socket
+/// path, else TCP. The single choke point for the request path, handleWithBody,
+/// and the mirror; unix paths skip SSRF validation (they are vetted at config
+/// parse / tenant registration, and isPrivateAddress is meaningless for them).
+fn connectToServer(server: *const upstream.Server, connect_ms: u32, allow_private: bool) net.ConnectError!std.posix.fd_t {
+    if (server.unix_path.len > 0) return net.connectUnixBlocking(server.unix_path, connect_ms);
+    return net.proxyConnect(server.address, server.port, connect_ms, allow_private);
+}
+
 fn bodyViewToRequestBody(bv: forward.BodyView) request.RequestBody {
     return switch (bv) {
         .slice => |s| .{ .slice = s },
@@ -732,9 +741,8 @@ pub const Proxy = struct {
                     return .{ .resp = forward.createErrorResponse(503), .proxy = self };
                 };
 
-                const fd = net.proxyConnect(
-                    connect_server.address,
-                    connect_server.port,
+                const fd = connectToServer(
+                    connect_server,
                     route.timeouts.connect_ms,
                     upstream_def.allow_private,
                 ) catch {
@@ -1001,9 +1009,8 @@ pub const Proxy = struct {
                     return .{ .resp = forward.createErrorResponse(503), .proxy = self };
                 };
 
-                const fd = net.proxyConnect(
-                    connect_server_b.address,
-                    connect_server_b.port,
+                const fd = connectToServer(
+                    connect_server_b,
                     route.timeouts.connect_ms,
                     upstream_def_b.allow_private,
                 ) catch {
@@ -1204,7 +1211,7 @@ pub const Proxy = struct {
         const selection = bal_m.select(null, now_ms) orelse return;
         const server_m = selection.server;
 
-        const fd = net.proxyConnect(server_m.address, server_m.port, 500, upstream_m.allow_private) catch return;
+        const fd = connectToServer(server_m, 500, upstream_m.allow_private) catch return;
         defer clock.closeFd(fd);
 
         const dummy_route = upstream.ProxyRoute{
