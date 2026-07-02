@@ -544,6 +544,7 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
             }
             if (build_options.enable_wasm) {
                 if (server.wasmControlClient()) |cc| cc.tick(&server.io, now_ms);
+                _ = server.tenant_registry.evictIdle(now_ms, server.tenant_idle_ttl_ms);
             }
             wasmTick(server, now_ms);
             if (server.otel) |otel_exp| {
@@ -1143,7 +1144,24 @@ fn proxyResume(server: *Server, conn: *connection.Connection, completion: wasm_h
     var mw_ctx = middleware.Context{ .client_ip = conn.cached_peer_ip, .protocol = .http1 };
     // resume_decision skips the filter; auth_info/cert_dn are not re-derived on
     // the resumed path (v1) -- upstream auth injection is absent for parked reqs.
-    const binding = proxy_mod.WasmBinding{ .resume_decision = completion.decision };
+    // For a tenant route the resumed filter may have named the VM socket via
+    // set_upstream (completion.upstream_override): carry it + the registry so
+    // proxy.handle forwards this request there and records the warm mapping.
+    // The path is validated against socket_dir before it is trusted.
+    const tenant_override: ?[]const u8 = blk: {
+        const ovr = completion.upstream_override orelse break :blk null;
+        const tc = route.tenant orelse break :blk null;
+        if (tc.socket_dir.len == 0 or !std.mem.startsWith(u8, ovr, tc.socket_dir)) {
+            std.log.warn("wasm tenant: filter named socket '{s}' outside socket_dir '{s}'; ignoring", .{ ovr, tc.socket_dir });
+            break :blk null;
+        }
+        break :blk ovr;
+    };
+    const binding = proxy_mod.WasmBinding{
+        .resume_decision = completion.decision,
+        .tenant_registry = @ptrCast(&server.tenant_registry),
+        .upstream_override = tenant_override,
+    };
     var pr = proxy.handle(
         completion.req,
         &mw_ctx,
@@ -2176,6 +2194,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
                     .resume_ctx = @ptrCast(&conn.wasm_proxy_resume),
                     .start_fn = wasmStartThunk,
                     .start_ctx = @ptrCast(server),
+                    .tenant_registry = @ptrCast(&server.tenant_registry),
                 } else .{};
                 var proxy_result = proxy.handle(
                     parse.view,

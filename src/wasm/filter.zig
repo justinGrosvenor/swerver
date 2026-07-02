@@ -81,6 +81,10 @@ const CALL_REQUEST_CAP = 4096;
 /// control_client can honor it (R2).
 pub const CALL_RESULT_CAP = 16 * 1024;
 
+/// Max length of a set_upstream socket path (>= net.UNIX_PATH_MAX with slack).
+/// Staged in the pinned instance and copied into the park slot on resume.
+pub const UPSTREAM_PATH_CAP = 256;
+
 /// Default per-invocation fuel budget (loop back-edges). Tunable per-route in
 /// config; sized here to be generous for a metadata filter while still bounding
 /// a runaway loop in well under a millisecond.
@@ -216,6 +220,13 @@ pub const Instance = struct {
     call_result_len: usize = 0,
     call_result_buf: [CALL_RESULT_CAP]u8 = undefined,
 
+    // Tenant-as-upstream (park-concurrency Phase 1): a UNIX socket path the guest
+    // stages via set_upstream (in on_request or on_resume). The park machinery
+    // copies it out at resume; the resumed request is forwarded there. Opaque to
+    // the guest otherwise.
+    staged_upstream_len: usize = 0,
+    staged_upstream_buf: [UPSTREAM_PATH_CAP]u8 = undefined,
+
     // Phase 2b response phase. The outgoing response (borrowed) plus its body
     // materialized lazily for reads, and the staged replacement body / status
     // override. Response headers reuse staged_headers/scratch (this is a separate
@@ -241,6 +252,7 @@ pub const Instance = struct {
         self.has_pending_call = false;
         self.pending_call_len = 0;
         self.call_result_len = 0;
+        self.staged_upstream_len = 0;
     }
 
     fn resetResponseStaging(self: *Instance) void {
@@ -514,6 +526,39 @@ fn hostHostCall(rt: c.IM3Runtime, ctx: c.IM3ImportContext, sp: [*c]u64, mem: ?*a
     return null;
 }
 
+// Tenant-as-upstream (park-concurrency Phase 1): the guest stages the UNIX
+// socket path of the microVM this request should be forwarded to (typically in
+// on_resume, after reading the Tier-2 cold-start reply). The park machinery
+// copies it out on resume; proxyResume validates it against the route's
+// socket_dir before forwarding. Returns 0 on success, -1 if empty, over
+// UPSTREAM_PATH_CAP, or containing a NUL (an invalid socket path).
+fn hostSetUpstream(rt: c.IM3Runtime, ctx: c.IM3ImportContext, sp: [*c]u64, mem: ?*anyopaque) callconv(.c) ?*const anyopaque {
+    _ = ctx;
+    const inst = active orelse return trap(TRAP_NO_ACTIVE);
+    const ret: *i32 = @ptrCast(@alignCast(sp));
+    const ptr: u32 = @truncate(sp[1]);
+    const len: u32 = @truncate(sp[2]);
+    const src = guestView(rt, mem, ptr, len) orelse return trap(TRAP_OOB);
+    if (src.len == 0 or src.len > inst.staged_upstream_buf.len) {
+        ret.* = -1;
+        return null;
+    }
+    if (std.mem.indexOfScalar(u8, src, 0) != null) {
+        ret.* = -1;
+        return null;
+    }
+    @memcpy(inst.staged_upstream_buf[0..src.len], src);
+    inst.staged_upstream_len = src.len;
+    ret.* = 0;
+    return null;
+}
+
+/// The socket path the guest staged via set_upstream (empty slice if none).
+/// Read by the park table at resume time.
+pub fn stagedUpstream(inst: *const Instance) []const u8 {
+    return inst.staged_upstream_buf[0..inst.staged_upstream_len];
+}
+
 // Phase 3: in on_resume, copy the host-call result into guest memory.
 fn hostReadCallResult(rt: c.IM3Runtime, ctx: c.IM3ImportContext, sp: [*c]u64, mem: ?*anyopaque) callconv(.c) ?*const anyopaque {
     _ = ctx;
@@ -657,6 +702,9 @@ fn linkAbi(mod: *runtime.Module) Error!void {
     try mod.link("env", "log", "v(ii)", hostLog);
     try mod.link("env", "host_call", "i(ii)", hostHostCall);
     try mod.link("env", "read_call_result", "i(ii)", hostReadCallResult);
+    // Tenant-as-upstream (Phase 1). Linked unconditionally; filters that do not
+    // import it leave it unresolved (link tolerates that).
+    try mod.link("env", "set_upstream", "i(ii)", hostSetUpstream);
     // Phase 2b response-phase imports. Linked unconditionally; a filter that
     // does not import them just leaves them unresolved (link tolerates that).
     try mod.link("env", "get_response_status", "i()", hostGetResponseStatus);

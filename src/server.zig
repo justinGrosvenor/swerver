@@ -21,6 +21,7 @@ const request = @import("protocol/request.zig");
 const metrics_mw = @import("middleware/metrics_mw.zig");
 const proxy_mod = @import("proxy/proxy.zig");
 const upstream_mod = @import("proxy/upstream.zig");
+const tenant_mod = @import("proxy/tenant.zig");
 const forward_mod = @import("proxy/forward.zig");
 const preencoded = @import("server/preencoded.zig");
 const server_tls = @import("server/tls.zig");
@@ -141,6 +142,15 @@ pub const Server = struct {
     /// Server struct needs no build-flag gating; a *wasm.control_client.ControlClient
     /// when enabled and a path is configured, else null.
     wasm_control: ?*anyopaque = null,
+    /// Per-worker tenant-to-microVM affinity registry (park-concurrency Phase 1).
+    /// Survives config reload (route table churn must not drop warm VM mappings).
+    /// Inline; void when wasm is compiled out (tenant routing is reached only via
+    /// the wasm cold-start park).
+    tenant_registry: if (build_options.enable_wasm) tenant_mod.TenantRegistry else void =
+        if (build_options.enable_wasm) .{} else {},
+    /// Idle TTL for tenant registry entries (housekeeping reaps older mappings).
+    /// Default 10 min; the supervisor owns actual VM reclaim.
+    tenant_idle_ttl_ms: u64 = 600_000,
     /// Native PostgreSQL client (null unless the "postgres" config block
     /// is present).
     pg_client: ?*pg_client_mod.PgClient = null,
@@ -652,6 +662,10 @@ pub const Server = struct {
         pool_pinned: usize = 0,
         control_configured: bool = false,
         control_ready: bool = false,
+        tenants_active: usize = 0,
+        tenant_hits: u64 = 0,
+        tenant_misses: u64 = 0,
+        tenant_evictions: u64 = 0,
     };
 
     pub fn wasmObservability(self: *Server) WasmObservability {
@@ -660,6 +674,10 @@ pub const Server = struct {
             .park_capacity = wasm_host_call_mod.Table.CAP,
             .park_active = self.wasm_host_calls.activeCount(),
             .control_configured = self.wasm_control_socket_path.len > 0,
+            .tenants_active = self.tenant_registry.count(),
+            .tenant_hits = self.tenant_registry.hits,
+            .tenant_misses = self.tenant_registry.misses,
+            .tenant_evictions = self.tenant_registry.evictions,
         };
         if (self.wasm_manager) |p| {
             const mgr: *wasm_manager_mod.Manager = @ptrCast(@alignCast(p));
@@ -845,7 +863,7 @@ pub const Server = struct {
         self.cfg.timeouts = new.timeouts;
         self.cfg.limits = new.limits;
 
-        if (loaded.upstreams.len > 0 and loaded.routes.len > 0) {
+        if (loaded.routes.len > 0 and (loaded.upstreams.len > 0 or upstream_mod.anyTenantRoute(loaded.routes))) {
             var new_proxy = proxy_mod.Proxy.init(self.allocator, .{
                 .upstreams = loaded.upstreams,
                 .routes = loaded.routes,

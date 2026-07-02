@@ -59,6 +59,7 @@ pub const raw = struct {
     pub extern "env" fn log(ptr: [*]const u8, len: u32) void;
     pub extern "env" fn host_call(ptr: [*]const u8, len: u32) i32;
     pub extern "env" fn read_call_result(out_ptr: [*]u8, out_cap: u32) u32;
+    pub extern "env" fn set_upstream(ptr: [*]const u8, len: u32) i32;
     // Response-phase imports (valid in on_response).
     pub extern "env" fn get_response_status() i32;
     pub extern "env" fn get_response_header(name_ptr: [*]const u8, name_len: u32, out_ptr: [*]u8, out_cap: u32) u32;
@@ -140,6 +141,15 @@ pub fn hostCall(cmd: []const u8) bool {
 pub fn callResult(buf: []u8) []const u8 {
     const n = raw.read_call_result(buf.ptr, @intCast(buf.len));
     return buf[0..clampLen(n, buf.len)];
+}
+
+/// Tenant-as-upstream (park-concurrency Phase 1): name the UNIX socket path of
+/// the microVM this request should be forwarded to (typically in on_resume after
+/// reading the Tier-2 cold-start reply). Then `return abi.ALLOW;`. The host
+/// validates the path against the route's configured socket_dir. Returns false
+/// if the path is empty, over 256 bytes, or contains a NUL.
+pub fn setUpstream(socket_path: []const u8) bool {
+    return raw.set_upstream(socket_path.ptr, @intCast(socket_path.len)) == 0;
 }
 
 pub const CallResultParts = struct {

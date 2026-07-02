@@ -116,7 +116,7 @@ pub fn main(init: std.process.Init) !void {
     // Heap-allocate so applyReload() can destroy()/replace it uniformly.
     var proxy_ptr: ?*swerver.proxy.handler.Proxy = null;
     if (loaded_config) |lc| {
-        if (lc.upstreams.len > 0 and lc.routes.len > 0) {
+        if (lc.routes.len > 0 and (lc.upstreams.len > 0 or swerver.proxy.upstream.anyTenantRoute(lc.routes))) {
             const p = try allocator.create(swerver.proxy.handler.Proxy);
             p.* = try swerver.proxy.handler.Proxy.init(allocator, .{
                 .upstreams = lc.upstreams,

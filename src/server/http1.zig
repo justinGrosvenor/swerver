@@ -1141,6 +1141,7 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
                 .resume_ctx = @ptrCast(&conn.wasm_proxy_resume),
                 .start_fn = server_mod.Server.wasmStartThunk,
                 .start_ctx = @ptrCast(server),
+                .tenant_registry = @ptrCast(&server.tenant_registry),
             } else .{};
             var proxy_result = proxy.handleWithBody(
                 hparse.view,

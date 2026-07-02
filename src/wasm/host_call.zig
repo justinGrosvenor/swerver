@@ -148,6 +148,12 @@ pub const Completion = struct {
     /// E1 populates it with the proxy's cache/otel/x402-settlement context so the
     /// resumed forward can run the post-`proxy.handle` processing.
     resume_ctx: ?*anyopaque,
+    /// Tenant-as-upstream (park-concurrency Phase 1): a UNIX socket path the
+    /// resumed cold-start filter named via set_upstream. Points into the park
+    /// slot's owned buffer (valid through the synchronous resume, like `req`);
+    /// null when the filter set nothing. proxyResume validates it against the
+    /// route's socket_dir before forwarding + registering the tenant mapping.
+    upstream_override: ?[]const u8 = null,
 };
 
 /// Why a park ended without a host-call result (all fail closed).
@@ -206,6 +212,12 @@ pub const Table = struct {
         /// (frees whatever remains). Freeing it earlier would dangle Completion.req.
         snap_buf: ?[]u8 = null,
         snap_headers: ?[]request.Header = null,
+        /// Tenant-as-upstream: a socket path the resumed filter staged via
+        /// set_upstream, copied out of the instance at complete() time (the
+        /// instance is idled by resumeCall and may be re-acquired). Same
+        /// synchronous-consume lifetime as the snapshot; surfaced in Completion.
+        upstream_buf: [filter.UPSTREAM_PATH_CAP]u8 = undefined,
+        upstream_len: usize = 0,
 
         /// Free the slot's owned snapshot (no-op if already reclaimed). Called at
         /// slot reuse (park) and Table.deinit -- NEVER from the park-end paths
@@ -351,6 +363,20 @@ pub const Table = struct {
         // The slot (and s.req's backing buffers) outlive this synchronous resume.
         s.instance.req = &s.req;
         const decision = filter.resumeCall(s.instance, result, s.resume_fuel);
+        // Copy any set_upstream staging out of the instance BEFORE it is reused:
+        // resumeCall idled it, so the pool may re-acquire and clobber the staging.
+        // Only the resume-to-forward decisions carry it.
+        s.upstream_len = 0;
+        switch (decision) {
+            .allow, .skip, .modify => {
+                const staged = filter.stagedUpstream(s.instance);
+                if (staged.len > 0 and staged.len <= s.upstream_buf.len) {
+                    @memcpy(s.upstream_buf[0..staged.len], staged);
+                    s.upstream_len = staged.len;
+                }
+            },
+            else => {},
+        }
         const out = self.completionFor(s, decision);
         s.active = false;
         return out;
@@ -479,6 +505,7 @@ pub const Table = struct {
             .decision = decision,
             .req = s.req,
             .resume_ctx = s.resume_ctx,
+            .upstream_override = if (s.upstream_len > 0) s.upstream_buf[0..s.upstream_len] else null,
         };
     }
 };
@@ -713,6 +740,34 @@ test "host_call table: a second park on the same (conn, stream) key is rejected"
     try testing.expect(filter.invokeOutcome(inst2, &r, filter.DEFAULT_FUEL) == .parked);
     try testing.expect(table.park(inst2, r, 1, 100, 7, .http2, 5000, filter.DEFAULT_FUEL, null) != null);
     try testing.expectEqual(@as(usize, 2), table.liveCount());
+}
+
+test "host_call table: complete carries the filter's set_upstream override" {
+    var pool = try filter.Pool.init(testing.allocator, FILTER_WASM, .{ .instances = 2 });
+    defer pool.deinit();
+    var table = Table.init(testing.allocator);
+    defer table.deinit();
+
+    // Park on /tenant (the probe stages a host_call and parks).
+    const inst = pool.acquire() orelse return error.AcquireFailed;
+    const r = request.RequestView{ .method = .GET, .path = "/tenant", .headers = &.{} };
+    try testing.expect(filter.invokeOutcome(inst, &r, filter.DEFAULT_FUEL) == .parked);
+    const token = table.park(inst, r, 1, 1, 0, .http1, 5000, filter.DEFAULT_FUEL, null) orelse return error.TableFull;
+
+    // The supervisor reply names the VM socket; on_resume calls set_upstream and
+    // allows. The completion must carry the socket path as the override.
+    const c = table.complete(token, "/tmp/vm-7.sock\x1e0\n") orelse return error.NoCompletion;
+    try testing.expect(c.decision == .allow);
+    try testing.expect(c.upstream_override != null);
+    try testing.expectEqualStrings("/tmp/vm-7.sock", c.upstream_override.?);
+
+    // A non-tenant park (reject decision) carries no override.
+    const inst2 = pool.acquire() orelse return error.AcquireFailed;
+    const r2 = request.RequestView{ .method = .GET, .path = "/enrich", .headers = &.{} };
+    try testing.expect(filter.invokeOutcome(inst2, &r2, filter.DEFAULT_FUEL) == .parked);
+    const token2 = table.park(inst2, r2, 2, 2, 0, .http1, 5000, filter.DEFAULT_FUEL, null) orelse return error.TableFull;
+    const c2 = table.complete(token2, "denied\x1e0\n") orelse return error.NoCompletion;
+    try testing.expect(c2.upstream_override == null);
 }
 
 test "host_call table: cancelAll drains every park fail-closed (reload path)" {

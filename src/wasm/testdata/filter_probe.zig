@@ -15,6 +15,7 @@ extern "env" fn body_len() i32;
 extern "env" fn read_body(src_off: u32, out_ptr: [*]u8, out_cap: u32) u32;
 extern "env" fn host_call(ptr: [*]const u8, len: u32) i32;
 extern "env" fn read_call_result(out_ptr: [*]u8, out_cap: u32) u32;
+extern "env" fn set_upstream(ptr: [*]const u8, len: u32) i32;
 extern "env" fn set_response_header(name_ptr: [*]const u8, name_len: u32, val_ptr: [*]const u8, val_len: u32) void;
 extern "env" fn respond(status: u32, body_ptr: [*]const u8, body_len: u32) void;
 extern "env" fn log(ptr: [*]const u8, len: u32) void;
@@ -33,6 +34,14 @@ export fn on_request() i32 {
     // based on the result the host delivers.
     if (std.mem.startsWith(u8, path, "/enrich")) {
         const q = "lookup:user";
+        _ = host_call(q.ptr, q.len);
+        return 3; // parked
+    }
+
+    // Tenant-as-upstream cold start: park on a supervisor "ensure" host call;
+    // on_resume names the VM socket from the reply via set_upstream, then allows.
+    if (std.mem.startsWith(u8, path, "/tenant")) {
+        const q = "ensure tenant";
         _ = host_call(q.ptr, q.len);
         return 3; // parked
     }
@@ -120,6 +129,16 @@ export fn grow_pages(n: u32, _pad: u32) i32 {
 export fn on_resume() i32 {
     const n = read_call_result(&result_buf, result_buf.len);
     const res = result_buf[0..n];
+
+    // Tenant cold start: the reply frame is "<socket_path>0x1e<exit>\n". Name
+    // the VM socket (the body before the trailer) and allow the forward.
+    const rplen = @min(get_path(&path_buf, path_buf.len), path_buf.len);
+    if (std.mem.startsWith(u8, path_buf[0..rplen], "/tenant")) {
+        const sep = std.mem.indexOfScalar(u8, res, 0x1e) orelse res.len;
+        _ = set_upstream(res[0..sep].ptr, @intCast(sep));
+        return 0; // allow -> forward to the named socket
+    }
+
     if (std.mem.startsWith(u8, res, "trap")) {
         // A trap inside on_resume must fail CLOSED (resumeCall returns 500). Use a
         // genuine host trap (an OOB ABI pointer); a div-by-zero would be folded

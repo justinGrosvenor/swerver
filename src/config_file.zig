@@ -490,10 +490,30 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
             route_headers.set_request = hdrs;
         }
 
+        var route_tenant: ?upstream_mod.TenantRouting = null;
+        if (r.tenant) |tj| {
+            // socket_dir is the trust boundary for supervisor-named sockets.
+            if (tj.socket_dir.len == 0 or tj.socket_dir[0] != '/') return error.ConfigParseError;
+            if (!isSafeHttpValue(tj.socket_dir)) return error.ConfigParseError;
+            const hdr = tj.header orelse "host";
+            if (!isSafeHttpValue(hdr)) return error.ConfigParseError;
+            // A tenant route forwards per-request to a microVM; a static
+            // upstream, traffic split, cache, or mirror is undefined here.
+            if (traffic_split != null or route_cache != null or r.mirror != null) return error.ConfigParseError;
+            route_tenant = .{
+                .header = hdr,
+                .socket_dir = tj.socket_dir,
+                .skip_filter_when_warm = tj.skip_filter_when_warm orelse true,
+            };
+        }
+
         routes_out[ri] = .{
             .path_prefix = r.path_prefix,
             .host = r.host,
-            .upstream = r.upstream,
+            // Tenant routes carry no static upstream; use a sentinel that the
+            // name-validation loop skips.
+            .upstream = r.upstream orelse "",
+            .tenant = route_tenant,
             .rewrite = rewrite,
             .headers = route_headers,
             .timeouts = .{
@@ -514,8 +534,14 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
         };
     }
 
-    // Validate that every route references a valid upstream name
+    // Validate that every route references a valid upstream name. Tenant routes
+    // forward to a per-request microVM instead of a named upstream, so they are
+    // exempt (and must NOT carry one).
     for (routes_out) |route| {
+        if (route.tenant != null) {
+            if (route.upstream.len != 0) return error.ConfigParseError;
+            continue;
+        }
         var found = false;
         for (upstreams_out) |u| {
             if (std.mem.eql(u8, route.upstream, u.name)) {
@@ -896,7 +922,10 @@ const HeaderJson = struct {
 const RouteJson = struct {
     path_prefix: []const u8,
     host: ?[]const u8 = null,
-    upstream: []const u8,
+    /// Optional when `tenant` is set (the upstream is a per-request microVM);
+    /// otherwise required.
+    upstream: ?[]const u8 = null,
+    tenant: ?TenantJson = null,
     rewrite_pattern: ?[]const u8 = null,
     rewrite_replacement: ?[]const u8 = null,
     connect_timeout_ms: ?u32 = null,
@@ -913,6 +942,12 @@ const RouteJson = struct {
     mirror: ?[]const u8 = null,
     upstream_headers: ?[]const HeaderJson = null,
     retry: ?RetryJson = null,
+};
+
+const TenantJson = struct {
+    header: ?[]const u8 = null,
+    socket_dir: []const u8,
+    skip_filter_when_warm: ?bool = null,
 };
 
 const RetryJson = struct {
@@ -1116,6 +1151,37 @@ test "reject unix + address on the same server, and non-absolute unix path" {
         \\  "routes": [{ "path_prefix": "/", "upstream": "x" }] }
     ;
     try std.testing.expectError(error.ConfigParseError, parseJsonFromBytes(std.testing.allocator, neither));
+}
+
+test "parse tenant route (no upstream required) and reject invalid combos" {
+    const ok =
+        \\{
+        \\  "routes": [{
+        \\    "path_prefix": "/",
+        \\    "tenant": { "header": "x-tenant", "socket_dir": "/run/vms/" }
+        \\  }]
+        \\}
+    ;
+    var loaded = try parseJsonFromBytes(std.testing.allocator, ok);
+    defer loaded.deinit();
+    try std.testing.expect(loaded.routes[0].tenant != null);
+    try std.testing.expectEqualStrings("x-tenant", loaded.routes[0].tenant.?.header);
+    try std.testing.expectEqualStrings("/run/vms/", loaded.routes[0].tenant.?.socket_dir);
+    try std.testing.expect(loaded.routes[0].tenant.?.skip_filter_when_warm);
+    try std.testing.expectEqualStrings("", loaded.routes[0].upstream); // sentinel
+
+    // socket_dir is required and must be absolute.
+    const no_dir =
+        \\{ "routes": [{ "path_prefix": "/", "tenant": { "header": "x-tenant", "socket_dir": "" } }] }
+    ;
+    try std.testing.expectError(error.ConfigParseError, parseJsonFromBytes(std.testing.allocator, no_dir));
+
+    // A tenant route must not also carry a static upstream.
+    const with_up =
+        \\{ "upstreams": [{ "name":"api","servers":[{"address":"1.2.3.4","port":80}] }],
+        \\  "routes": [{ "path_prefix": "/", "upstream": "api", "tenant": { "socket_dir": "/run/vms/" } }] }
+    ;
+    try std.testing.expectError(error.ConfigParseError, parseJsonFromBytes(std.testing.allocator, with_up));
 }
 
 test "parse empty config uses defaults" {

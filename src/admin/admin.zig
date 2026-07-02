@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const net = @import("../runtime/net.zig");
 const clock = @import("../runtime/clock.zig");
 const upstream_mod = @import("../proxy/upstream.zig");
@@ -146,6 +147,10 @@ fn dispatch(server: *Server, method: Method, path: []const u8, body: []const u8,
             .DELETE => deleteUpstream(server, path, buf),
             else => .{ .status = 405, .body = "{\"error\":\"method not allowed\"}" },
         };
+    }
+    if (startsWith(path, "/v1/tenants")) {
+        if (method != .GET) return .{ .status = 405, .body = "{\"error\":\"method not allowed\"}" };
+        return listTenants(server, buf);
     }
     if (startsWith(path, "/v1/status")) {
         return getStatus(server, buf);
@@ -387,10 +392,12 @@ fn getStatus(server: *Server, buf: []u8) DispatchResult {
     // see fan-out backing up BEFORE it 503s (all-zero when wasm is compiled out).
     const w = server.wasmObservability();
     const n = std.fmt.bufPrint(buf, "{{\"status\":\"ok\",\"routes\":{d},\"upstreams\":{d},\"port\":{d},\"workers\":{d}," ++
-        "\"wasm\":{{\"park_active\":{d},\"park_capacity\":{d},\"pool_instances\":{d},\"pool_pinned\":{d},\"control_configured\":{},\"control_ready\":{}}}}}", .{
-        route_count,    upstream_count,   server.cfg.port, server.cfg.workers,
-        w.park_active,  w.park_capacity,  w.pool_instances, w.pool_pinned,
+        "\"wasm\":{{\"park_active\":{d},\"park_capacity\":{d},\"pool_instances\":{d},\"pool_pinned\":{d},\"control_configured\":{},\"control_ready\":{}," ++
+        "\"tenants_active\":{d},\"tenant_hits\":{d},\"tenant_misses\":{d},\"tenant_evictions\":{d}}}}}", .{
+        route_count,          upstream_count,  server.cfg.port,  server.cfg.workers,
+        w.park_active,        w.park_capacity, w.pool_instances, w.pool_pinned,
         w.control_configured, w.control_ready,
+        w.tenants_active,     w.tenant_hits,   w.tenant_misses,  w.tenant_evictions,
     }) catch return .{ .status = 200, .body = "{\"status\":\"ok\"}" };
     return .{ .status = 200, .body = n };
 }
@@ -424,12 +431,22 @@ fn getMetrics(server: *Server, buf: []u8) DispatchResult {
         \\# HELP swerver_wasm_control_ready Tier-2 control transport connected (1/0).
         \\# TYPE swerver_wasm_control_ready gauge
         \\swerver_wasm_control_ready {d}
+        \\# HELP swerver_wasm_tenants_active Warm tenant-to-microVM mappings (this worker).
+        \\# TYPE swerver_wasm_tenants_active gauge
+        \\swerver_wasm_tenants_active {d}
+        \\# HELP swerver_wasm_tenant_hits Warm tenant registry hits (this worker).
+        \\# TYPE swerver_wasm_tenant_hits counter
+        \\swerver_wasm_tenant_hits {d}
+        \\# HELP swerver_wasm_tenant_misses Tenant registry misses / cold starts (this worker).
+        \\# TYPE swerver_wasm_tenant_misses counter
+        \\swerver_wasm_tenant_misses {d}
         \\
     , .{
-        route_count,     upstream_count,
-        w.park_active,   w.park_capacity,
+        route_count,      upstream_count,
+        w.park_active,    w.park_capacity,
         w.pool_instances, w.pool_pinned,
         @as(u8, if (w.control_ready) 1 else 0),
+        w.tenants_active, w.tenant_hits, w.tenant_misses,
     }) catch return .{ .status = 500, .body = "metrics render failed\n", .content_type = "text/plain" };
     return .{ .status = 200, .body = body, .content_type = "text/plain; version=0.0.4" };
 }
@@ -467,7 +484,7 @@ fn writeConfigAndReload(server: *Server, alloc: std.mem.Allocator, tree: std.jso
     server.cfg.timeouts = new.timeouts;
     server.cfg.limits = new.limits;
 
-    if (loaded.upstreams.len > 0 and loaded.routes.len > 0) {
+    if (loaded.routes.len > 0 and (loaded.upstreams.len > 0 or upstream_mod.anyTenantRoute(loaded.routes))) {
         var new_proxy = proxy_mod.Proxy.init(server.allocator, .{
             .upstreams = loaded.upstreams,
             .routes = loaded.routes,
@@ -746,6 +763,30 @@ fn writeUpstreamJson(buf: []u8, u: upstream_mod.Upstream) usize {
     off += copyInto(buf[off..], "\"");
     off += copyInto(buf[off..], "}");
     return off;
+}
+
+/// GET /v1/tenants: the per-worker tenant-to-microVM registry (park-concurrency
+/// Phase 1). Per-worker view: the admin socket lands on one worker, so this
+/// reflects that worker's warm mappings, not a cluster-wide set.
+fn listTenants(server: *Server, buf: []u8) DispatchResult {
+    if (!build_options.enable_wasm) return .{ .status = 200, .body = "{\"tenants\":[]}" };
+    var off: usize = 0;
+    off += copyInto(buf[off..], "{\"tenants\":[");
+    var it = server.tenant_registry.iterator();
+    var first = true;
+    while (it.next()) |e| {
+        if (!first) off += copyInto(buf[off..], ",");
+        first = false;
+        off += copyInto(buf[off..], "{\"key\":\"");
+        off += copyEscaped(buf[off..], e.key);
+        off += copyInto(buf[off..], "\",\"path\":\"");
+        off += copyEscaped(buf[off..], e.path);
+        off += copyInto(buf[off..], "\",\"last_used_ms\":");
+        off += copyInto(buf[off..], std.fmt.bufPrint(buf[off..], "{d}", .{e.last_used_ms}) catch "0");
+        off += copyInto(buf[off..], "}");
+    }
+    off += copyInto(buf[off..], "]}");
+    return .{ .status = 200, .body = buf[0..off] };
 }
 
 fn copyInto(dst: []u8, src: []const u8) usize {

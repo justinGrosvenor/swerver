@@ -1,5 +1,6 @@
 const std = @import("std");
 const upstream = @import("upstream.zig");
+const tenant_mod = @import("tenant.zig");
 const pool_mod = @import("pool.zig");
 const balancer = @import("balancer.zig");
 const forward = @import("forward.zig");
@@ -45,6 +46,14 @@ pub const WasmBinding = struct {
     resume_decision: ?middleware.Decision = null,
     start_fn: ?*const fn (ctx: *anyopaque, token: u32, request: []const u8) void = null,
     start_ctx: ?*anyopaque = null,
+    /// Tenant-as-upstream (park-concurrency plan Phase 1). The per-worker
+    /// `*tenant.TenantRegistry` (opaque so this struct stays build-flag-free);
+    /// null disables tenant routing. On a warm HIT the proxy forwards straight
+    /// to the VM's UNIX socket, skipping the filter.
+    tenant_registry: ?*anyopaque = null,
+    /// Socket path a resumed cold-start filter named via set_upstream: THIS
+    /// request forwards there and the mapping is registered. Null otherwise.
+    upstream_override: ?[]const u8 = null,
 };
 
 /// Map a proxy BodyView onto a RequestView body so a WASM filter can read it via
@@ -56,6 +65,20 @@ pub const WasmBinding = struct {
 fn connectToServer(server: *const upstream.Server, connect_ms: u32, allow_private: bool) net.ConnectError!std.posix.fd_t {
     if (server.unix_path.len > 0) return net.connectUnixBlocking(server.unix_path, connect_ms);
     return net.proxyConnect(server.address, server.port, connect_ms, allow_private);
+}
+
+/// Extract the tenant key from a request per the route's TenantRouting. Returns
+/// null when the header is absent/empty/oversized. For the default "host" key
+/// the :port suffix is stripped so "t.example.com" and "t.example.com:8443"
+/// map to the same VM.
+fn extractTenantKey(req: *const request.RequestView, tc: upstream.TenantRouting) ?[]const u8 {
+    const raw = req.getHeader(tc.header) orelse return null;
+    var key = raw;
+    if (std.ascii.eqlIgnoreCase(tc.header, "host")) {
+        if (std.mem.indexOfScalar(u8, key, ':')) |ci| key = key[0..ci];
+    }
+    if (key.len == 0 or key.len > tenant_mod.TENANT_KEY_MAX) return null;
+    return key;
 }
 
 fn bodyViewToRequestBody(bv: forward.BodyView) request.RequestBody {
@@ -662,6 +685,28 @@ pub const Proxy = struct {
             return .{ .resp = forward.createErrorResponse(502), .proxy = self };
         };
 
+        // Tenant-as-upstream (park-concurrency Phase 1): a warm registry HIT (or
+        // the socket a just-resumed cold-start filter named via set_upstream)
+        // forwards straight to the VM. A miss falls through to the filter, which
+        // parks for a Tier-2 cold start.
+        if (build_options.enable_wasm) {
+            if (route.tenant) |tc| {
+                if (self.tenantRegistryOf(wasm)) |reg| {
+                    const key = extractTenantKey(&req, tc);
+                    if (wasm.upstream_override) |ovr| { // resume: filter named the socket
+                        if (key) |k| reg.register(k, ovr, now_ms);
+                        return self.forwardToTenant(route, req, null, ovr, client_ip, client_tls, now_ms, auth_info, client_cert_dn, reg, key orelse "");
+                    }
+                    if (key) |k| if (reg.lookup(k, now_ms)) |path| {
+                        if (!tc.skip_filter_when_warm) {
+                            if (runWasmFilter(route, &req, wasm)) |sc| return .{ .resp = sc.resp, .proxy = self, .pause_reads_ms = sc.pause_reads_ms };
+                        }
+                        return self.forwardToTenant(route, req, null, path, client_ip, client_tls, now_ms, auth_info, client_cert_dn, reg, k);
+                    };
+                }
+            }
+        }
+
         // Per-route WASM edge filter (design 10.0): authenticate/policy-gate
         // before forwarding. This entry handles bodyless / small-body requests,
         // so req.body already carries any body for body_len/read_body. A parking
@@ -932,6 +977,28 @@ pub const Proxy = struct {
             return .{ .resp = forward.createErrorResponse(502), .proxy = self };
         };
 
+        // Tenant-as-upstream warm HIT / resume forward (see handle()). The body
+        // streams to the VM via forwardToTenant's body_view arm.
+        if (build_options.enable_wasm) {
+            if (route.tenant) |tc| {
+                if (self.tenantRegistryOf(wasm)) |reg| {
+                    const key = extractTenantKey(&req, tc);
+                    if (wasm.upstream_override) |ovr| {
+                        if (key) |k| reg.register(k, ovr, now_ms);
+                        return self.forwardToTenant(route, req, body_view, ovr, client_ip, client_tls, now_ms, auth_info, client_cert_dn, reg, key orelse "");
+                    }
+                    if (key) |k| if (reg.lookup(k, now_ms)) |path| {
+                        if (!tc.skip_filter_when_warm) {
+                            var filter_req = req;
+                            filter_req.body = bodyViewToRequestBody(body_view);
+                            if (runWasmFilter(route, &filter_req, wasm)) |sc| return .{ .resp = sc.resp, .proxy = self, .pause_reads_ms = sc.pause_reads_ms };
+                        }
+                        return self.forwardToTenant(route, req, body_view, path, client_ip, client_tls, now_ms, auth_info, client_cert_dn, reg, k);
+                    };
+                }
+            }
+        }
+
         // Per-route WASM edge filter (design 10.0); see handle() for rationale.
         // The accumulated body lives in body_view, not req.body, so expose it to
         // the filter (body_len/read_body) on a request copy. The mapping is
@@ -1176,6 +1243,129 @@ pub const Proxy = struct {
 
         self.releaseResponseBuffer(resp_buf_idx);
         return .{ .resp = forward.createErrorResponse(502), .proxy = self };
+    }
+
+    /// Forward a request directly to a warm tenant microVM's UNIX data socket
+    /// (park-concurrency plan Phase 1), bypassing the upstream registry, the
+    /// balancer, and the connection pool. v1 opens a FRESH connection per
+    /// request (an on-host unix connect is microseconds; the guest bridge caps
+    /// per-VM conns) with no retry. Reuses the same response tail as handle()
+    /// (normalize + Phase 2b response filter + compression) for parity. On any
+    /// connect/send/read failure the tenant mapping is evicted and a 503 with a
+    /// backpressure window is returned so the client's retry takes the cold
+    /// path, paced. `body_view` is null for the bodyless/small-body entry.
+    fn forwardToTenant(
+        self: *Proxy,
+        route: *const upstream.ProxyRoute,
+        req: request.RequestView,
+        body_view: ?forward.BodyView,
+        socket_path: []const u8,
+        client_ip: ?[]const u8,
+        client_tls: bool,
+        now_ms: u64,
+        auth_info: ?*const auth_mod.AuthInfo,
+        client_cert_dn: ?[]const u8,
+        registry: *tenant_mod.TenantRegistry,
+        tenant_key: []const u8,
+    ) ProxyResult {
+        _ = now_ms; // v1: fresh connect per request, no pool timestamps
+        const server = upstream.Server{ .address = "", .port = 0, .unix_path = socket_path };
+
+        const backpressure = ProxyResult{
+            .resp = forward.createErrorResponse(503),
+            .proxy = self,
+            .pause_reads_ms = wasm_filter.POOL_BACKPRESSURE_MS,
+        };
+
+        const req_buf_idx = self.acquireRequestBuffer() orelse return backpressure;
+        defer self.releaseRequestBuffer(req_buf_idx);
+        const resp_buf_idx = self.acquireResponseBuffer() orelse return backpressure;
+        // Released by the caller via ProxyResult.release() on the success path.
+
+        const fd = net.connectUnixBlocking(socket_path, route.timeouts.connect_ms) catch {
+            registry.evict(tenant_key);
+            self.releaseResponseBuffer(resp_buf_idx);
+            return backpressure;
+        };
+        defer clock.closeFd(fd);
+        net.setSocketTimeouts(fd, route.timeouts.send_ms, route.timeouts.read_ms);
+        net.setNoDelay(fd);
+
+        const ctx = forward.ForwardContext{
+            .client_request = req,
+            .client_ip = client_ip,
+            .client_tls = client_tls,
+            .route = route,
+            .server = &server,
+            .upstream_conn = undefined, // unused: buildUpstreamRequest reads only server/route/req
+            .request_buf = &self.request_bufs[req_buf_idx],
+            .response_buf = &self.response_bufs[resp_buf_idx],
+            .auth_headers = if (auth_info) |ai| ai.headers() else &.{},
+            .client_cert_dn = client_cert_dn,
+        };
+
+        // Send request (headers + body). Small-body requests carry the body in
+        // req and go through buildUpstreamRequest; accumulated bodies stream.
+        if (body_view) |bv| {
+            const header_len = forward.buildUpstreamRequestHeaders(&self.request_bufs[req_buf_idx], &ctx, bv.totalLen()) catch {
+                self.releaseResponseBuffer(resp_buf_idx);
+                return backpressure;
+            };
+            net.sendAll(fd, self.request_bufs[req_buf_idx][0..header_len]) catch {
+                registry.evict(tenant_key);
+                self.releaseResponseBuffer(resp_buf_idx);
+                return backpressure;
+            };
+            var it = bv.iterator();
+            while (it.next()) |chunk| {
+                net.sendAll(fd, chunk) catch {
+                    registry.evict(tenant_key);
+                    self.releaseResponseBuffer(resp_buf_idx);
+                    return backpressure;
+                };
+            }
+        } else {
+            const request_len = forward.buildUpstreamRequest(&self.request_bufs[req_buf_idx], &ctx) catch {
+                self.releaseResponseBuffer(resp_buf_idx);
+                return backpressure;
+            };
+            net.sendAll(fd, self.request_bufs[req_buf_idx][0..request_len]) catch {
+                registry.evict(tenant_key);
+                self.releaseResponseBuffer(resp_buf_idx);
+                return backpressure;
+            };
+        }
+
+        const is_head = req.method == .HEAD;
+        const ur = self.readUpstreamResponse(fd, self.response_bufs[resp_buf_idx][0..], is_head, route.max_response_bytes) catch {
+            registry.evict(tenant_key);
+            self.releaseResponseBuffer(resp_buf_idx);
+            return backpressure;
+        };
+        const parsed = forward.parseUpstreamResponse(ur.data, is_head) catch {
+            if (ur.owned) |ob| self.allocator.free(ob);
+            registry.evict(tenant_key);
+            self.releaseResponseBuffer(resp_buf_idx);
+            return backpressure;
+        };
+        const backing: []u8 = if (ur.owned) |ob| ob else self.response_bufs[resp_buf_idx][0..];
+        var normalized = forward.normalizeUpstreamResponse(&parsed, backing, route, self.response_header_bufs[resp_buf_idx][0..], is_head) catch {
+            if (ur.owned) |ob| self.allocator.free(ob);
+            registry.evict(tenant_key);
+            self.releaseResponseBuffer(resp_buf_idx);
+            return backpressure;
+        };
+
+        runWasmResponseFilter(route, &req, &normalized);
+        maybeCompress(&normalized, req.headers, self.response_header_bufs[resp_buf_idx][0..]);
+        return .{ .resp = normalized, .proxy = self, .resp_buf_idx = resp_buf_idx, .owned_buf = ur.owned };
+    }
+
+    /// Typed accessor for the opaque tenant registry carried in the binding.
+    fn tenantRegistryOf(self: *Proxy, wasm: WasmBinding) ?*tenant_mod.TenantRegistry {
+        _ = self;
+        const p = wasm.tenant_registry orelse return null;
+        return @ptrCast(@alignCast(p));
     }
 
     threadlocal var dns_rr_counter: u32 = 0;
