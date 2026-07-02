@@ -63,6 +63,16 @@ pub const UpstreamResponse = struct {
     raw_response: []const u8,
 };
 
+/// Emit the synthesized upstream Host header. UNIX-socket backends have no
+/// meaningful address:port (it would render "Host: :0"); localhost matches
+/// what an on-host loopback server expects.
+fn writeHostHeader(buf: []u8, server: *const upstream.Server) error{BufferFull}!usize {
+    if (server.unix_path.len > 0) {
+        return (std.fmt.bufPrint(buf, "Host: localhost\r\n", .{}) catch return error.BufferFull).len;
+    }
+    return (std.fmt.bufPrint(buf, "Host: {s}:{d}\r\n", .{ server.address, server.port }) catch return error.BufferFull).len;
+}
+
 /// Build the HTTP/1.1 request to send to upstream
 pub fn buildUpstreamRequest(
     buf: []u8,
@@ -81,10 +91,10 @@ pub fn buildUpstreamRequest(
         if (ctx.client_request.getHeader("Host")) |host| {
             pos += (std.fmt.bufPrint(buf[pos..], "Host: {s}\r\n", .{host}) catch return error.BufferFull).len;
         } else {
-            pos += (std.fmt.bufPrint(buf[pos..], "Host: {s}:{d}\r\n", .{ ctx.server.address, ctx.server.port }) catch return error.BufferFull).len;
+            pos += try writeHostHeader(buf[pos..], ctx.server);
         }
     } else {
-        pos += (std.fmt.bufPrint(buf[pos..], "Host: {s}:{d}\r\n", .{ ctx.server.address, ctx.server.port }) catch return error.BufferFull).len;
+        pos += try writeHostHeader(buf[pos..], ctx.server);
     }
 
     // RFC 9110 §7.6.1: Parse Connection header to find dynamic hop-by-hop headers
@@ -257,10 +267,10 @@ pub fn buildUpstreamRequestHeaders(
         if (ctx.client_request.getHeader("Host")) |host| {
             pos += (std.fmt.bufPrint(buf[pos..], "Host: {s}\r\n", .{host}) catch return error.BufferFull).len;
         } else {
-            pos += (std.fmt.bufPrint(buf[pos..], "Host: {s}:{d}\r\n", .{ ctx.server.address, ctx.server.port }) catch return error.BufferFull).len;
+            pos += try writeHostHeader(buf[pos..], ctx.server);
         }
     } else {
-        pos += (std.fmt.bufPrint(buf[pos..], "Host: {s}:{d}\r\n", .{ ctx.server.address, ctx.server.port }) catch return error.BufferFull).len;
+        pos += try writeHostHeader(buf[pos..], ctx.server);
     }
 
     // RFC 9110 §7.6.1: Parse Connection header to find dynamic hop-by-hop headers

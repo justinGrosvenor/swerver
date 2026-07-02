@@ -20,11 +20,18 @@ const middleware = @import("middleware/middleware.zig");
 const request = @import("protocol/request.zig");
 const metrics_mw = @import("middleware/metrics_mw.zig");
 const proxy_mod = @import("proxy/proxy.zig");
+const upstream_mod = @import("proxy/upstream.zig");
+const tenant_mod = @import("proxy/tenant.zig");
 const forward_mod = @import("proxy/forward.zig");
 const preencoded = @import("server/preencoded.zig");
 const server_tls = @import("server/tls.zig");
 const otel_mod = @import("middleware/otel.zig");
 const config_file_mod = @import("config_file.zig");
+// WASM edge filters (design 10.0). Gated; the Server stores the manager as an
+// opaque pointer so this file compiles without the vendored wasm3 dependency.
+const wasm_manager_mod = if (build_options.enable_wasm) @import("wasm/manager.zig") else struct {};
+const wasm_host_call_mod = if (build_options.enable_wasm) @import("wasm/host_call.zig") else struct {};
+const wasm_control_mod = if (build_options.enable_wasm) @import("wasm/control_client.zig") else struct {};
 const accept_mod = @import("server/accept.zig");
 const http3_mod = @import("server/http3.zig");
 const http2_mod = @import("server/http2.zig");
@@ -100,6 +107,50 @@ pub const Server = struct {
     quic: ?quic_handler.Handler,
     /// Reverse proxy handler (null if proxy not configured)
     proxy: ?*proxy_mod.Proxy = null,
+    /// Declarative WASM edge-filter specs (from config). Set before run();
+    /// pools are built per-worker at run() start and rebuilt on config reload.
+    wasm_filter_specs: []const config_file_mod.WasmFilterConfig = &.{},
+    /// Per-worker WASM filter manager owning the filter pools. Opaque so this
+    /// struct needs no build-flag gating; a *wasm.manager.Manager when enabled.
+    wasm_manager: ?*anyopaque = null,
+    /// Per-worker WASM host-call park table (design 10.0). Inline, lives for the
+    /// worker; void when wasm is compiled out.
+    wasm_host_calls: if (build_options.enable_wasm) wasm_host_call_mod.Table else void =
+        if (build_options.enable_wasm) .{} else {},
+    /// Mock host-call transport (e2e mock lane / C2 validation). When enabled, a
+    /// parked filter is completed on the next housekeeping tick with
+    /// `wasm_mock_reply` instead of a real call. Off in production; the real
+    /// control-socket transport (C3, `wasm_control`) takes precedence when set.
+    /// The pending ring holds park tokens awaiting mock completion.
+    wasm_mock_enabled: bool = false,
+    wasm_mock_reply: []const u8 = "ok",
+    wasm_mock_pending: [64]u32 = undefined,
+    wasm_mock_count: usize = 0,
+    /// Nether control-socket path for the real host-call transport (C3). When
+    /// non-empty and wasm is enabled, a ControlClient is built at run() start and
+    /// drives host calls over the sandbox's control socket (proto_version=1),
+    /// superseding the mock. Build-flag-free slice; borrowed, must outlive run().
+    wasm_control_socket_path: []const u8 = "",
+    /// Park (host_call) deadline in ms: how long a wasm filter may stay parked on
+    /// a host call before the host_call.Table fails it closed. Default 30s (the
+    /// historical hardcoded value). Plumbed into the H1/H2 binding `deadline_ms`
+    /// and into the ControlClient's per-command timeout so the transport does not
+    /// out-live the park. Lowerable (e.g. via the e2e env) so timeout assertions
+    /// do not wait 30s. Per-server today; a per-route field is a future refinement.
+    wasm_host_call_deadline_ms: u64 = 30_000,
+    /// Per-worker control-socket client (the real C3 transport). Opaque so the
+    /// Server struct needs no build-flag gating; a *wasm.control_client.ControlClient
+    /// when enabled and a path is configured, else null.
+    wasm_control: ?*anyopaque = null,
+    /// Per-worker tenant-to-microVM affinity registry (park-concurrency Phase 1).
+    /// Survives config reload (route table churn must not drop warm VM mappings).
+    /// Inline; void when wasm is compiled out (tenant routing is reached only via
+    /// the wasm cold-start park).
+    tenant_registry: if (build_options.enable_wasm) tenant_mod.TenantRegistry else void =
+        if (build_options.enable_wasm) .{} else {},
+    /// Idle TTL for tenant registry entries (housekeeping reaps older mappings).
+    /// Default 10 min; the supervisor owns actual VM reclaim.
+    tenant_idle_ttl_ms: u64 = 600_000,
     /// Native PostgreSQL client (null unless the "postgres" config block
     /// is present).
     pg_client: ?*pg_client_mod.PgClient = null,
@@ -296,6 +347,14 @@ pub const Server = struct {
             self.static_cache = std.StringHashMap(StaticCacheEntry).init(allocator);
         }
 
+        // Bind the WASM host-call park table to the worker allocator: each park
+        // now heap-allocates a request-sized owned snapshot (freed on slot reuse
+        // and at the table's deinit during Server.deinit), replacing the old fixed
+        // per-slot embed.
+        if (build_options.enable_wasm) {
+            self.wasm_host_calls.allocator = allocator;
+        }
+
         // Wire the (now stable-addressed) tls_provider into the QUIC handler
         // so each new connection can bootstrap a TLS session via initTls.
         // This must happen after self.* assignment so we can take a pointer
@@ -397,6 +456,14 @@ pub const Server = struct {
             p.deinit();
             self.allocator.destroy(p);
         }
+        // Free WASM filter pools after the proxy that referenced them.
+        self.freeWasmManager(self.wasm_manager);
+        self.wasm_manager = null;
+        // Tear down the control-socket transport (unregisters its fd, fails any
+        // in-flight parks closed) before the io runtime goes away.
+        self.teardownWasmControl();
+        // Reclaim any owned park snapshots (live parks + deferred-free buffers).
+        if (build_options.enable_wasm) self.wasm_host_calls.deinit();
         if (self.spare_fd) |fd| clock.closeFd(fd);
         // Close every bound listener. listener_fd aliases listeners_buf[0].fd
         // (multi-listener model), so we drive closing off the array only and do
@@ -524,6 +591,265 @@ pub const Server = struct {
         }
     }
 
+    /// Build a per-worker WASM filter manager from `specs`, attaching its pools
+    /// to `routes` (the proxy route table, mutated in place). Returns the opaque
+    /// manager pointer, or null if wasm is disabled / no specs. A spec that
+    /// fails to load is logged and skipped (its route then runs unfiltered).
+    // pub so the admin reload path (admin.zig writeConfigAndReload) can rebuild
+    // the manager too; both reload paths must rebuild it or a route edit leaves
+    // filters detached (fail-open). Keep the two call sites in sync.
+    pub fn buildWasmManager(
+        self: *Server,
+        specs: []const config_file_mod.WasmFilterConfig,
+        routes: []upstream_mod.ProxyRoute,
+    ) ?*anyopaque {
+        if (!build_options.enable_wasm) return null;
+        if (specs.len == 0) return null;
+        const mgr = self.allocator.create(wasm_manager_mod.Manager) catch return null;
+        mgr.* = wasm_manager_mod.Manager.init(self.allocator);
+        for (specs, 0..) |w, wi| {
+            // S4: one filter per route. A duplicate `match` would attach a second
+            // pool over the first (or, if the second fails to load, be silently
+            // skipped while the first still serves -- a fail-open). Warn; only the
+            // first spec for a match takes effect.
+            var dup = false;
+            for (specs[0..wi]) |prev| {
+                if (std.mem.eql(u8, prev.match, w.match)) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) {
+                std.log.warn("wasm filter '{s}': duplicate match (a route binds one filter); ignoring this spec, the first wins", .{w.match});
+                continue;
+            }
+            var one = [_]wasm_manager_mod.Spec{.{
+                .match = w.match,
+                .module_path = w.module_path,
+                .instances = w.instances,
+                .fuel = w.fuel,
+                .response_fail_closed = w.response_fail_closed,
+            }};
+            const n = mgr.loadAndAttachProxy(routes, &one) catch {
+                // S2: do NOT continue with the route unfiltered (fail-open). Mark
+                // every route this spec targets as wasm_required so it fails
+                // CLOSED (503) at request time instead of forwarding past a
+                // security filter that never loaded.
+                std.log.warn("wasm filter '{s}': failed to load module '{s}'; routes matching '{s}' will FAIL CLOSED (503), not run unfiltered", .{ w.match, w.module_path, w.match });
+                for (routes) |*r| {
+                    if (std.mem.eql(u8, r.path_prefix, w.match)) r.wasm_required = true;
+                }
+                continue;
+            };
+            if (n == 0) {
+                // O3: the match resolved to NO proxy route, so the filter is loaded
+                // but never runs. This is almost always a config typo; warn loudly
+                // rather than the silent info line it used to be.
+                std.log.warn("wasm filter '{s}' (module '{s}') matched NO route (no proxy route has path_prefix '{s}'); it will never run", .{ w.match, w.module_path, w.match });
+            } else {
+                std.log.info("wasm filter '{s}' -> {s} ({d} route(s), {d} instances)", .{ w.match, w.module_path, n, w.instances });
+            }
+        }
+        return @ptrCast(mgr);
+    }
+
+    /// WASM edge-function observability snapshot for the admin API / metrics.
+    /// Build-flag-aware: all-zero / false when wasm is compiled out.
+    pub const WasmObservability = struct {
+        park_active: usize = 0,
+        park_capacity: usize = 0,
+        pool_instances: usize = 0,
+        pool_pinned: usize = 0,
+        control_configured: bool = false,
+        control_ready: bool = false,
+        tenants_active: usize = 0,
+        tenant_hits: u64 = 0,
+        tenant_misses: u64 = 0,
+        tenant_evictions: u64 = 0,
+    };
+
+    pub fn wasmObservability(self: *Server) WasmObservability {
+        if (!build_options.enable_wasm) return .{};
+        var o = WasmObservability{
+            .park_capacity = wasm_host_call_mod.Table.CAP,
+            .park_active = self.wasm_host_calls.activeCount(),
+            .control_configured = self.wasm_control_socket_path.len > 0,
+            .tenants_active = self.tenant_registry.count(),
+            .tenant_hits = self.tenant_registry.hits,
+            .tenant_misses = self.tenant_registry.misses,
+            .tenant_evictions = self.tenant_registry.evictions,
+        };
+        if (self.wasm_manager) |p| {
+            const mgr: *wasm_manager_mod.Manager = @ptrCast(@alignCast(p));
+            const t = mgr.instanceTotals();
+            o.pool_instances = t.total;
+            o.pool_pinned = t.pinned;
+        }
+        if (self.wasmControlClient()) |cc| o.control_ready = cc.isReady();
+        return o;
+    }
+
+    pub fn freeWasmManager(self: *Server, ptr: ?*anyopaque) void {
+        if (!build_options.enable_wasm) return;
+        if (ptr) |p| {
+            const mgr: *wasm_manager_mod.Manager = @ptrCast(@alignCast(p));
+            mgr.deinit();
+            self.allocator.destroy(mgr);
+        }
+    }
+
+    /// Fail-closed completions drained from the park table by a config reload.
+    /// Two-step by design: cancel BEFORE the old manager is freed (the pinned
+    /// instances live in its pools), deliver AFTER the new manager is in place
+    /// (delivery re-drives connection I/O, and a pipelined request dispatched
+    /// during that re-drive may park again; it must land in the NEW pools).
+    pub const WasmDrainedParks = if (build_options.enable_wasm) struct {
+        completions: [wasm_host_call_mod.Table.CAP]wasm_host_call_mod.Completion = undefined,
+        count: usize = 0,
+    } else struct {};
+
+    /// Reload step 1: cancel every live wasm park, releasing each pinned
+    /// instance back to its (old) pool while that memory is still valid. The
+    /// returned completions reference only slot-owned snapshots, never the
+    /// instances, so they survive freeing the old manager.
+    pub fn wasmCancelAllParks(self: *Server) WasmDrainedParks {
+        var drained = WasmDrainedParks{};
+        if (build_options.enable_wasm) {
+            drained.count = self.wasm_host_calls.cancelAll(&drained.completions);
+            if (drained.count > 0) {
+                std.log.warn("config reload: cancelling {d} in-flight wasm park(s) fail-closed", .{drained.count});
+            }
+        }
+        return drained;
+    }
+
+    /// Reload step 2: answer the cancelled parks (fail-closed 500s) through
+    /// dispatch's park-resume delivery, which also restarts each connection's
+    /// I/O. The slot-owned snapshots are reclaimed lazily on slot reuse.
+    pub fn wasmDeliverDrainedParks(self: *Server, drained: *const WasmDrainedParks) void {
+        if (build_options.enable_wasm) {
+            for (drained.completions[0..drained.count]) |c| dispatch.wasmResume(self, c);
+        }
+    }
+
+    /// Is a WASM filter parked on this connection (generation-checked)? Used by
+    /// handleParkSentinel to set `.wasm_parked`.
+    pub fn wasmHasParkFor(self: *Server, conn_index: u32, conn_id: u64) bool {
+        if (build_options.enable_wasm) {
+            return self.wasm_host_calls.hasParkFor(conn_index, conn_id);
+        }
+        return false;
+    }
+
+    /// Release any WASM park bound to this connection (client disconnect). The
+    /// pinned instance is returned to its pool; no response is served.
+    pub fn wasmCancelForConn(self: *Server, conn_index: u32, conn_id: u64) void {
+        if (build_options.enable_wasm) {
+            _ = self.wasm_host_calls.cancelForConn(conn_index, conn_id);
+        }
+    }
+
+    /// Is a WASM filter parked on this specific stream (generation-checked)? Used
+    /// by the H2/H3 dispatch (E2) to confirm a park-sentinel response really
+    /// registered a park before suspending the stream.
+    pub fn wasmHasParkForStream(self: *Server, conn_index: u32, conn_id: u64, stream_id: u32) bool {
+        if (build_options.enable_wasm) {
+            return self.wasm_host_calls.hasParkForStream(conn_index, conn_id, stream_id);
+        }
+        return false;
+    }
+
+    /// Release a WASM park bound to a single multiplexed stream (RST_STREAM /
+    /// QUIC stream reset). The pinned instance is returned to its pool; the
+    /// connection's other parked streams are untouched. The per-stream
+    /// counterpart to wasmCancelForConn, used by H2/H3 (E2).
+    pub fn wasmCancelForStream(self: *Server, conn_index: u32, conn_id: u64, stream_id: u32) void {
+        if (build_options.enable_wasm) {
+            _ = self.wasm_host_calls.cancelForStream(conn_index, conn_id, stream_id);
+        }
+    }
+
+    /// Transport start hook (set as WasmBinding.start_fn). Initiates the host
+    /// call for a freshly parked filter. The real control-socket transport (C3)
+    /// takes precedence: it writes the staged command line to the sandbox's
+    /// control socket and completes the park when the framed reply arrives. With
+    /// no control client configured, the mock transport queues the token for
+    /// completion on the next tick. `req_bytes` is the filter's staged outbound
+    /// command (must NOT be __-prefixed: Nether reserves __*__ for host control
+    /// commands and forwards unknown lines to the guest verbatim).
+    /// WasmBinding.start_fn adapter: `ctx` is the Server. The canonical thunk
+    /// for park sites outside dispatch.zig (the protocol files keep local
+    /// copies for now; consolidation is a tracked cleanup).
+    pub fn wasmStartThunk(ctx: *anyopaque, token: u32, req_bytes: []const u8) void {
+        const self: *Server = @ptrCast(@alignCast(ctx));
+        self.wasmStartHostCall(token, req_bytes);
+    }
+
+    pub fn wasmStartHostCall(self: *Server, token: u32, req_bytes: []const u8) void {
+        if (build_options.enable_wasm) {
+            if (self.wasm_control) |p| {
+                const cc: *wasm_control_mod.ControlClient = @ptrCast(@alignCast(p));
+                cc.startCall(&self.io, token, req_bytes);
+                return;
+            }
+            if (self.wasm_mock_enabled and self.wasm_mock_count < self.wasm_mock_pending.len) {
+                self.wasm_mock_pending[self.wasm_mock_count] = token;
+                self.wasm_mock_count += 1;
+            }
+        }
+    }
+
+    /// Typed accessor for the control client (null when wasm is off or no path is
+    /// configured). Keeps the opaque field's casts in one place. The return type
+    /// is comptime-conditional so this signature compiles when wasm is disabled
+    /// (the body's wasm references sit past the pruned early return).
+    pub fn wasmControlClient(self: *Server) ?*(if (build_options.enable_wasm) wasm_control_mod.ControlClient else anyopaque) {
+        if (!build_options.enable_wasm) return null;
+        const p = self.wasm_control orelse return null;
+        return @ptrCast(@alignCast(p));
+    }
+
+    /// Build the control-socket client for this worker if a path is configured.
+    /// Called once at run() start (per worker, after fork), before the loop.
+    /// Idempotent: tears down any existing client first.
+    pub fn setupWasmControl(self: *Server) void {
+        if (!build_options.enable_wasm) return;
+        self.teardownWasmControl();
+        if (self.wasm_control_socket_path.len == 0) return;
+        const cc = self.allocator.create(wasm_control_mod.ControlClient) catch return;
+        cc.* = wasm_control_mod.ControlClient.init(
+            self.wasm_control_socket_path,
+            wasm_control_mod.DEFAULT_SLOT,
+        );
+        // Keep the transport's per-command budget aligned with the park deadline so
+        // the socket does not out-live the park (lets a test set a sub-second one).
+        cc.command_timeout_ms = self.wasm_host_call_deadline_ms;
+        self.wasm_control = @ptrCast(cc);
+        std.log.info("wasm control transport -> {s} (slot {d})", .{ self.wasm_control_socket_path, wasm_control_mod.DEFAULT_SLOT });
+    }
+
+    fn teardownWasmControl(self: *Server) void {
+        if (!build_options.enable_wasm) return;
+        if (self.wasmControlClient()) |cc| {
+            cc.deinit(&self.io);
+            self.allocator.destroy(cc);
+            self.wasm_control = null;
+        }
+    }
+
+    /// Build the WASM filter pools for this worker and attach them to the live
+    /// proxy. Called once at run() start (per worker, after fork). Idempotent:
+    /// tears down any existing manager first.
+    pub fn setupWasmFilters(self: *Server) void {
+        if (!build_options.enable_wasm) return;
+        const proxy = self.proxy orelse return;
+        self.freeWasmManager(self.wasm_manager);
+        self.wasm_manager = self.buildWasmManager(
+            self.wasm_filter_specs,
+            @constCast(proxy.config.routes),
+        );
+    }
+
     /// Apply a pending reload result produced by the background thread.
     /// Called from the event loop; only does the fast pointer swap.
     pub fn applyPendingReload(self: *Server) void {
@@ -537,7 +863,7 @@ pub const Server = struct {
         self.cfg.timeouts = new.timeouts;
         self.cfg.limits = new.limits;
 
-        if (loaded.upstreams.len > 0 and loaded.routes.len > 0) {
+        if (loaded.routes.len > 0 and (loaded.upstreams.len > 0 or upstream_mod.anyTenantRoute(loaded.routes))) {
             var new_proxy = proxy_mod.Proxy.init(self.allocator, .{
                 .upstreams = loaded.upstreams,
                 .routes = loaded.routes,
@@ -554,17 +880,35 @@ pub const Server = struct {
             };
             proxy_ptr.* = new_proxy;
 
+            // Cancel in-flight wasm parks BEFORE any old state is freed: the
+            // pinned instances live in the old manager's pools, and parked
+            // requests hold across event-loop iterations, so "never
+            // mid-request" does not cover them. Their fail-closed responses
+            // are delivered after the swap (below), so any pipelined request
+            // re-driven by that delivery parks against the NEW pools.
+            const drained_parks = self.wasmCancelAllParks();
+
             const old_proxy = self.proxy;
             const old_arena = self.reload_arena;
+            const old_wasm = self.wasm_manager;
             self.proxy = proxy_ptr;
             self.reload_arena = loaded.arena;
+
+            // Rebuild the WASM filter pools for the new route table, then free
+            // the old manager AFTER the old proxy is gone (its routes referenced
+            // the old pools). Parked filters were cancelled above; nothing else
+            // holds an old instance (applyPendingReload runs in the event loop,
+            // never mid-request).
+            self.wasm_manager = self.buildWasmManager(loaded.wasm_filters, @constCast(loaded.routes));
 
             if (old_proxy) |old| {
                 old.deinit();
                 self.allocator.destroy(old);
             }
             if (old_arena) |*oa| oa.deinit();
+            self.freeWasmManager(old_wasm);
             self.needs_peer_ip = true;
+            self.wasmDeliverDrainedParks(&drained_parks);
 
             const source = self.config_source.?;
             const src_label: []const u8 = switch (source) {
@@ -576,14 +920,21 @@ pub const Server = struct {
             });
         } else {
             if (self.proxy != null and loaded.upstreams.len == 0 and loaded.routes.len == 0) {
+                // Same park drain as the rebuild branch: release pinned
+                // instances before their pools are freed, answer after.
+                const drained_parks = self.wasmCancelAllParks();
                 if (self.proxy) |old| {
                     old.deinit();
                     self.allocator.destroy(old);
                     self.proxy = null;
                 }
+                // Proxy removed: tear down its filter pools too.
+                self.freeWasmManager(self.wasm_manager);
+                self.wasm_manager = null;
                 if (self.reload_arena) |*old_arena| old_arena.deinit();
                 self.reload_arena = loaded.arena;
                 self.needs_peer_ip = self.app_router.middleware_chain.post.len > 0;
+                self.wasmDeliverDrainedParks(&drained_parks);
                 std.log.info("Config reloaded (proxy removed)", .{});
             } else {
                 loaded.deinit();
@@ -598,6 +949,9 @@ pub const Server = struct {
     }
 
     pub fn run(self: *Server, run_for_ms: ?u64) !void {
+        // Build this worker's WASM filter pools and attach them to the proxy
+        // before entering the event loop (per-worker, after fork).
+        self.setupWasmFilters();
         return dispatch.runLoop(self, run_for_ms);
     }
 
@@ -709,6 +1063,14 @@ pub const Server = struct {
             .status = 400,
             .headers = &[_]response_mod.Header{},
             .body = .{ .bytes = "Bad Request\n" },
+        };
+    }
+
+    pub fn internalErrorResponse() response_mod.Response {
+        return .{
+            .status = 500,
+            .headers = &[_]response_mod.Header{},
+            .body = .{ .bytes = "Internal Server Error\n" },
         };
     }
 
@@ -1122,6 +1484,9 @@ pub const Server = struct {
         // (generation-checked), so the continuation can never write
         // into this slot's next occupant. O(1) when not parked.
         if (self.pg_client) |pgc| pgc.cancelForConn(conn.index, conn.id);
+        // Same for a parked WASM filter: release the pinned instance so it does
+        // not leak when the client disconnects mid-park. O(1) when not parked.
+        self.wasmCancelForConn(conn.index, conn.id);
         if (conn.is_tunnel) {
             if (conn.tunnel_peer_index) |pi| {
                 conn.tunnel_peer_index = null;
@@ -1214,6 +1579,28 @@ pub const Server = struct {
     }
 };
 
+test "S2: a wasm filter whose module fails to load fails its routes closed" {
+    if (!build_options.enable_wasm) return;
+    // buildWasmManager only reads self.allocator; an otherwise-undefined Server
+    // is sufficient to exercise the load-failure marking in isolation.
+    var srv: Server = undefined;
+    srv.allocator = std.testing.allocator;
+    var routes = [_]upstream_mod.ProxyRoute{
+        .{ .path_prefix = "/guarded", .upstream = "u" },
+        .{ .path_prefix = "/open", .upstream = "u" },
+    };
+    const specs = [_]config_file_mod.WasmFilterConfig{
+        .{ .match = "/guarded", .module_path = "/nonexistent/does-not-exist.wasm" },
+    };
+    const mgr = srv.buildWasmManager(&specs, &routes);
+    defer srv.freeWasmManager(mgr);
+    // The guarded route must fail CLOSED (wasm_required), not run unfiltered.
+    try std.testing.expect(routes[0].wasm_required);
+    try std.testing.expect(routes[0].wasm_pool == null);
+    // An unrelated route is untouched.
+    try std.testing.expect(!routes[1].wasm_required);
+}
+
 test "metrics middleware response queued for http1" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -1234,7 +1621,9 @@ test "metrics middleware response queued for http1" {
     const chain = middleware.Chain.init(&.{metrics_mw.evaluate}, &.{});
     app_router.setMiddleware(chain);
 
-    var server = try Server.initWithRouter(allocator, cfg, app_router);
+    const server = try allocator.create(Server);
+    defer allocator.destroy(server);
+    try server.initInPlace(allocator, cfg, app_router);
     defer server.deinit();
 
     metrics_mw.getStore().* = .{};
@@ -1277,7 +1666,7 @@ test "metrics middleware response queued for http1" {
     const conn = server.io.acquireConnection(server.io.nowMs()) orelse return error.OutOfMemory;
     defer if (conn.state != .closed) server.io.releaseConnection(conn);
 
-    try http1_mod.queueResponse(&server, conn, result.resp);
+    try http1_mod.queueResponse(server, conn, result.resp);
     // Managed body fits alongside headers — combined into single write
     try std.testing.expectEqual(@as(u8, 1), conn.write_count);
 
@@ -1312,7 +1701,9 @@ test "metrics middleware response queued for http2" {
     const chain = middleware.Chain.init(&.{metrics_mw.evaluate}, &.{});
     app_router.setMiddleware(chain);
 
-    var server = try Server.initWithRouter(allocator, cfg, app_router);
+    const server = try allocator.create(Server);
+    defer allocator.destroy(server);
+    try server.initInPlace(allocator, cfg, app_router);
     defer server.deinit();
 
     metrics_mw.getStore().* = .{};
@@ -1361,7 +1752,7 @@ test "metrics middleware response queued for http2" {
     _ = stack.openTestStream(1);
     conn.http2_stack = &stack;
 
-    try http2_mod.queueHttp2Response(&server, conn, 1, result.resp, false);
+    try http2_mod.queueHttp2Response(server, conn, 1, result.resp, false);
     try std.testing.expect(conn.write_count >= 1);
 
     const expected = result.resp.bodyBytes();
@@ -1413,7 +1804,9 @@ test "metrics middleware end-to-end http1" {
     const chain = middleware.Chain.init(&.{metrics_mw.evaluate}, &.{});
     app_router.setMiddleware(chain);
 
-    var server = try Server.initWithRouter(allocator, cfg, app_router);
+    const server = try allocator.create(Server);
+    defer allocator.destroy(server);
+    try server.initInPlace(allocator, cfg, app_router);
     defer server.deinit();
 
     metrics_mw.getStore().* = .{};
@@ -1461,7 +1854,7 @@ test "metrics middleware end-to-end http1" {
     const conn = server.io.acquireConnection(server.io.nowMs()) orelse return error.OutOfMemory;
     defer if (conn.state != .closed) server.io.releaseConnection(conn);
 
-    try http1_mod.queueResponse(&server, conn, result.resp);
+    try http1_mod.queueResponse(server, conn, result.resp);
     // Managed body fits alongside headers — combined into single write
     try std.testing.expectEqual(@as(u8, 1), conn.write_count);
 
@@ -1495,7 +1888,9 @@ test "metrics middleware end-to-end http2" {
     const chain = middleware.Chain.init(&.{metrics_mw.evaluate}, &.{});
     app_router.setMiddleware(chain);
 
-    var server = try Server.initWithRouter(allocator, cfg, app_router);
+    const server = try allocator.create(Server);
+    defer allocator.destroy(server);
+    try server.initInPlace(allocator, cfg, app_router);
     defer server.deinit();
 
     metrics_mw.getStore().* = .{};
@@ -1558,7 +1953,7 @@ test "metrics middleware end-to-end http2" {
     conn.protocol = .http2;
     conn.http2_stack = &stack;
 
-    try http2_mod.queueHttp2Response(&server, conn, 1, result.resp, false);
+    try http2_mod.queueHttp2Response(server, conn, 1, result.resp, false);
     try std.testing.expect(conn.write_count >= 1);
 
     const expected = result.resp.bodyBytes();
@@ -1622,7 +2017,9 @@ test "http1 response bytes from write queue" {
         .require_payment = false,
         .payment_required_b64 = "",
     });
-    var server = try Server.initWithRouter(allocator, cfg, app_router);
+    const server = try allocator.create(Server);
+    defer allocator.destroy(server);
+    try server.initInPlace(allocator, cfg, app_router);
     defer server.deinit();
 
     const conn = server.io.acquireConnection(server.io.nowMs()) orelse return error.OutOfMemory;
@@ -1636,7 +2033,7 @@ test "http1 response bytes from write queue" {
         .body = .{ .bytes = "hi" },
     };
 
-    try http1_mod.queueResponse(&server, conn, resp);
+    try http1_mod.queueResponse(server, conn, resp);
     const bytes = try write_queue.drainWriteQueue(&server.io, conn, allocator);
     defer allocator.free(bytes);
 
@@ -1665,7 +2062,9 @@ test "http1 managed response bytes from write queue" {
         .require_payment = false,
         .payment_required_b64 = "",
     });
-    var server = try Server.initWithRouter(allocator, cfg, app_router);
+    const server = try allocator.create(Server);
+    defer allocator.destroy(server);
+    try server.initInPlace(allocator, cfg, app_router);
     defer server.deinit();
 
     const handle = server.io.acquireBuffer() orelse return error.OutOfMemory;
@@ -1683,7 +2082,7 @@ test "http1 managed response bytes from write queue" {
     const conn = server.io.acquireConnection(server.io.nowMs()) orelse return error.OutOfMemory;
     defer if (conn.state != .closed) server.io.releaseConnection(conn);
 
-    try http1_mod.queueResponse(&server, conn, resp);
+    try http1_mod.queueResponse(server, conn, resp);
     const bytes = try write_queue.drainWriteQueue(&server.io, conn, allocator);
     defer allocator.free(bytes);
 

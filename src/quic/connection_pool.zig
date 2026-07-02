@@ -72,6 +72,10 @@ pub const ConnectionPool = struct {
     max_connections: usize,
     /// Is this a server pool?
     is_server: bool,
+    /// Monotonic source of stable per-connection ids (Connection.id). Never
+    /// reused, so a stale lookup for a freed connection fails cleanly. Used by
+    /// the per-stream WASM park model (E2b) to re-find a connection on resume.
+    next_conn_id: u64 = 1,
 
     const CidKeyContext = struct {
         pub fn hash(_: @This(), key: CidKey) u64 {
@@ -127,6 +131,9 @@ pub const ConnectionPool = struct {
         // Create connection
         const conn = self.allocator.create(connection.Connection) catch return Error.OutOfMemory;
         conn.* = connection.Connection.init(self.allocator, self.is_server, dcid);
+        // Assign a stable, never-reused id for per-stream WASM park lookups (E2b).
+        conn.id = self.next_conn_id;
+        self.next_conn_id += 1;
 
         // Create pool entry
         const entry = self.allocator.create(PoolEntry) catch {
@@ -181,6 +188,17 @@ pub const ConnectionPool = struct {
     pub fn findByCid(self: *ConnectionPool, cid: types.ConnectionId) ?*connection.Connection {
         if (self.by_cid.get(.{ .cid = cid })) |entry| {
             return entry.conn;
+        }
+        return null;
+    }
+
+    /// Find connection by its stable id (Connection.id). Used by the per-stream
+    /// WASM park resume path (E2b) to re-locate a parked H3 connection after the
+    /// host call completes off the datagram path. Returns null if the connection
+    /// was freed in the meantime (the H3 analog of a failed generation check).
+    pub fn findById(self: *ConnectionPool, id: u64) ?*connection.Connection {
+        for (self.entries.items) |entry| {
+            if (entry.conn.id == id) return entry.conn;
         }
         return null;
     }

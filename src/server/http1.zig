@@ -50,6 +50,8 @@ const write_queue = @import("write_queue.zig");
 const cache_mod = @import("../proxy/cache.zig");
 const otel_mod = @import("../middleware/otel.zig");
 const body_schema = @import("../middleware/body_schema.zig");
+const proxy_mod = @import("../proxy/proxy.zig");
+const build_options = @import("build_options");
 
 pub const connection_close_hdr = "Connection: close\r\n";
 pub const date_prefix = "Date: ";
@@ -1117,6 +1119,30 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
             const cert_dn: ?[]const u8 = if (conn.tls_session) |*session| session.getPeerCertSubject(&cert_dn_buf) else null;
             const now_ms = server.now_ms;
             const otel_start = if (server.otel != null) clock.realtimeNanos() orelse 0 else 0;
+            // Park binding, mirroring the main dispatch loop: a host_call filter
+            // on this route parks instead of failing closed. The park snapshot
+            // copies the scattered accum body (bounded by the snapshot cap;
+            // oversized bodies still fail closed at park time), so the accum
+            // buffers can be cleaned up while parked.
+            if (build_options.enable_wasm) {
+                conn.wasm_proxy_resume = .{
+                    .route_idx = route_idx,
+                    .otel_start = otel_start,
+                    .needs_settlement = x402_result == .allow and x402_result.allow.needs_settlement,
+                };
+            }
+            const accum_wasm: proxy_mod.WasmBinding = if (build_options.enable_wasm) .{
+                .table = @ptrCast(&server.wasm_host_calls),
+                .conn_index = conn.index,
+                .conn_id = conn.id,
+                .stream_id = 0, // H1 sentinel
+                .protocol = .http1,
+                .deadline_ms = server.now_ms + server.wasm_host_call_deadline_ms,
+                .resume_ctx = @ptrCast(&conn.wasm_proxy_resume),
+                .start_fn = server_mod.Server.wasmStartThunk,
+                .start_ctx = @ptrCast(server),
+                .tenant_registry = @ptrCast(&server.tenant_registry),
+            } else .{};
             var proxy_result = proxy.handleWithBody(
                 hparse.view,
                 body_view,
@@ -1126,8 +1152,18 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
                 now_ms,
                 auth_info_ptr,
                 cert_dn,
+                accum_wasm,
             );
             defer proxy_result.release();
+
+            // Park sentinel: suspend like the main loop (cache/otel/settlement
+            // run on resume via proxyForwardAndRespond). The accum buffers are
+            // safe to free now; the park owns its snapshot.
+            if (build_options.enable_wasm and proxy_result.resp.isParked()) {
+                cleanupBodyAccumulation(server, conn);
+                _ = handleParkSentinel(server, conn, proxy_result.resp);
+                return;
+            }
 
             // Invalidate cache on mutating methods (body-accumulated requests are typically POST/PUT)
             if (matched_route.cache != null) {
@@ -1195,6 +1231,13 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
     const arena_handle = server.io.acquireBuffer();
     var empty_arena: [0]u8 = undefined;
     const arena_buf = if (arena_handle) |handle| handle.bytes else empty_arena[0..];
+    const otel_start = if (server.otel != null) clock.realtimeNanos() orelse 0 else 0;
+    // Park stash + binding, mirroring the main dispatch loop's router path: a
+    // host_call filter parks instead of failing closed (the park snapshot
+    // copies the scattered accum body, bounded by the snapshot cap).
+    if (build_options.enable_wasm) {
+        conn.wasm_proxy_resume = .{ .route_idx = 0, .otel_start = otel_start, .needs_settlement = false };
+    }
     var scratch = router.HandlerScratch{
         .response_buf = response_buf[0..],
         .response_headers = response_headers[0..],
@@ -1207,8 +1250,18 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
             .conn_index = conn.index,
             .conn_id = conn.id,
         },
+        .wasm = .{
+            .table = if (build_options.enable_wasm) @ptrCast(&server.wasm_host_calls) else null,
+            .conn_index = conn.index,
+            .conn_id = conn.id,
+            .stream_id = 0, // H1 sentinel
+            .protocol = .http1,
+            .deadline_ms = server.now_ms + server.wasm_host_call_deadline_ms,
+            .resume_ctx = if (build_options.enable_wasm) @ptrCast(&conn.wasm_proxy_resume) else null,
+            .start_fn = if (build_options.enable_wasm) server_mod.Server.wasmStartThunk else null,
+            .start_ctx = @ptrCast(server),
+        },
     };
-    const otel_start = if (server.otel != null) clock.realtimeNanos() orelse 0 else 0;
     const result = server.app_router.handle(req_view, &mw_ctx, &scratch);
     if (scratch.arena_handle) |handle| server.io.releaseBuffer(handle);
     if (result.pause_reads_ms) |pause_ms| {
@@ -1325,7 +1378,13 @@ pub fn handleParkSentinel(server: *Server, conn: *connection.Connection, resp: r
                 return true;
             }
         }
-        std.log.err("pg: handler returned the park sentinel without a live parked query; responding 500", .{});
+        // WASM edge-filter park (design 10.0). The filter hook registered the
+        // park in the per-worker host_call table before returning the sentinel.
+        if (server.wasmHasParkFor(conn.index, conn.id)) {
+            conn.x402 = .wasm_parked;
+            return true;
+        }
+        std.log.err("park sentinel without a live parked op; responding 500", .{});
         queueResponse(server, conn, .{
             .status = 500,
             .headers = &.{},
@@ -1341,6 +1400,8 @@ pub fn handleParkSentinel(server: *Server, conn: *connection.Connection, resp: r
             pgc.cancelForConn(conn.index, conn.id);
         }
     }
+    // Cancel an orphaned wasm park (sentinel discarded) to avoid a pinned-instance leak.
+    server.wasmCancelForConn(conn.index, conn.id);
     return false;
 }
 

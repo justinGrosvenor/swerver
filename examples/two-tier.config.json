@@ -1,0 +1,18 @@
+{
+  "server": { "port": 8080, "workers": 4 },
+
+  "upstreams": [
+    { "name": "api", "servers": [{ "address": "127.0.0.1", "port": 9001 }] }
+  ],
+
+  "routes": [
+    { "path_prefix": "/agent/", "upstream": "api" }
+  ],
+
+  "wasm_filters": [
+    { "match": "/agent/", "module": "./agent_filter.wasm", "instances": 8, "fuel": 5000000 }
+  ],
+
+  "wasm_control_socket": "/run/nether/agent.sock",
+  "wasm_host_call_deadline_ms": 5000
+}

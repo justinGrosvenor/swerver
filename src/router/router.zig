@@ -9,15 +9,54 @@ const clock = @import("../runtime/clock.zig");
 const io_runtime = @import("../runtime/io.zig");
 const pg_client_mod = @import("../db/pg/client.zig");
 const pg_handler_api = @import("../db/pg/handler_api.zig");
+const build_options = @import("build_options");
+// WASM edge filters (design 10.0). Gated so router.zig compiles without the
+// vendored wasm3 dependency; the Route stores the pool as an opaque pointer so
+// the struct itself needs no gating.
+const wasm_filter = if (build_options.enable_wasm) @import("../wasm/filter.zig") else struct {};
+const wasm_host_call = if (build_options.enable_wasm) @import("../wasm/host_call.zig") else struct {};
 
 /// Per-thread scratch for merging handler-returned headers with
 /// middleware-accumulated headers (security, CORS, etc.) before the
 /// response gets serialized. Sized to hold the handler's max + the
-/// middleware chain's max in one pass. See `Router.handle`.
-threadlocal var merged_headers_tls: [MAX_RESPONSE_HEADERS + middleware.Chain.MAX_MIDDLEWARE_HEADERS + 2]response.Header = undefined;
+/// middleware chain's max + a WASM filter's request-modify and response-phase
+/// headers in one pass. See `Router.handle`.
+// Holds, in one pass: handler headers + middleware headers + the WASM
+// request-modify bucket + the WASM response-phase bucket + 2 x402 receipt
+// headers. Three MAX_RESPONSE_HEADERS buckets (handler, modify, response) so a
+// full handler plus both wasm buckets never silently truncates a (security) header.
+threadlocal var merged_headers_tls: [3 * MAX_RESPONSE_HEADERS + middleware.Chain.MAX_MIDDLEWARE_HEADERS + 2]response.Header = undefined;
+/// Stable copy of the request-phase WASM modify headers, taken BEFORE the
+/// response phase runs. The modify headers' name/value bytes live in the filter
+/// instance's scratch; the response phase reuses the SAME pooled instance and its
+/// resetStaging + on_response overwrite that scratch, so without this copy the
+/// modify headers would be clobbered (dropped/garbled) by the time of the merge.
+threadlocal var wasm_modify_hdr_tls: [MAX_RESPONSE_HEADERS]response.Header = undefined;
+threadlocal var wasm_modify_bytes_tls: [8192]u8 = undefined;
 threadlocal var x402_receipt_tls: response.Header = undefined;
 threadlocal var x402_receipt_v1_tls: response.Header = undefined;
 threadlocal var x402_has_receipt: bool = false;
+
+/// Copy WASM modify headers (name+value bytes) into a stable threadlocal so they
+/// survive the response phase reusing the same filter instance. Returns the
+/// stabilized slice (a prefix dropped on overflow, bounds-checked).
+fn stabilizeWasmModifyHeaders(src: []const response.Header) []const response.Header {
+    var off: usize = 0;
+    var n: usize = 0;
+    for (src) |h| {
+        if (n >= wasm_modify_hdr_tls.len) break;
+        if (off + h.name.len + h.value.len > wasm_modify_bytes_tls.len) break;
+        @memcpy(wasm_modify_bytes_tls[off..][0..h.name.len], h.name);
+        const name = wasm_modify_bytes_tls[off..][0..h.name.len];
+        off += h.name.len;
+        @memcpy(wasm_modify_bytes_tls[off..][0..h.value.len], h.value);
+        const value = wasm_modify_bytes_tls[off..][0..h.value.len];
+        off += h.value.len;
+        wasm_modify_hdr_tls[n] = .{ .name = name, .value = value };
+        n += 1;
+    }
+    return wasm_modify_hdr_tls[0..n];
+}
 
 /// Errors surfaced by `Router` registration and routing.
 ///
@@ -51,6 +90,11 @@ pub const RouteResult = struct {
     resp: response.Response,
     /// If non-null, pause reads for this many milliseconds (rate limiting)
     pause_reads_ms: ?u64 = null,
+    /// True when a Phase 2b on_response filter replaced the body with a slice
+    /// that borrows the wasm instance's scratch (released to .idle already).
+    /// The caller must copy any write-queue spill (conn.pending_body) into
+    /// stable buffers before the instance serves another request.
+    wasm_body_borrowed: bool = false,
 };
 
 /// Signature of every route handler swerver dispatches. Handlers are
@@ -538,6 +582,39 @@ pub const HandlerScratch = struct {
     /// dispatch layer when a PG client is configured; the zero value
     /// makes `ctx.pg.query()` fail with error.NotConnected.
     pg: PgBinding = .{},
+    /// WASM edge-filter park-and-resume binding (design 10.0). Set by the H1
+    /// dispatch layer when wasm is enabled. The zero value (table == null) makes
+    /// a parking filter fail closed (no park path), preserving direct
+    /// Router.handle callers and the proxy path.
+    wasm: WasmBinding = .{},
+};
+
+/// WASM park binding, threaded from the H1 dispatch layer into the filter hook.
+/// `table` is a `*wasm.host_call.Table` (opaque so this struct needs no
+/// build-flag gating). On a re-dispatch after a completed host call,
+/// `resume_decision` carries the resumed filter decision so the hook skips
+/// re-invoking the filter and applies it (the handler then runs for allow).
+pub const WasmBinding = struct {
+    table: ?*anyopaque = null,
+    conn_index: u32 = 0,
+    conn_id: u64 = 0,
+    /// Stream within the connection. H1 uses the sentinel 0; H2/H3 (E2) pass the
+    /// real stream id so a parked stream resumes independently of its siblings.
+    stream_id: u32 = 0,
+    /// Protocol of the parked stream; stored on the park slot so `wasmResume`
+    /// routes response delivery (H1 queueResponse vs H2/H3 stream sends in E2).
+    protocol: middleware.Context.Protocol = .http1,
+    deadline_ms: u64 = 0,
+    /// Opaque resumed-path context carried into the park slot (E1; null in E0).
+    resume_ctx: ?*anyopaque = null,
+    resume_decision: ?middleware.Decision = null,
+    /// Transport start hook: invoked when a filter parks, with the park token and
+    /// the guest-encoded outbound request (the staged host_call bytes). The
+    /// transport (mock or vsock) performs the call and later delivers the result
+    /// via dispatch.wasmComplete(token, ...). Null when no transport is wired
+    /// (the park then only completes via the deadline tick).
+    start_fn: ?*const fn (ctx: *anyopaque, token: u32, request: []const u8) void = null,
+    start_ctx: ?*anyopaque = null,
 };
 
 /// Connection identity + per-worker PG client, threaded from the
@@ -619,6 +696,11 @@ pub const Route = struct {
     middleware_chain: ?*middleware.Chain = null,
     x402_policy: x402.RoutePaymentConfig = .{},
     body_policy: BodyPolicy = .accumulate,
+    /// Optional per-route WASM edge filter pool (design 10.0). Opaque to avoid
+    /// gating this struct on build_options.enable_wasm; cast to *wasm_filter.Pool
+    /// in handle() inside a comptime-gated block. Set via attachWasmFilter.
+    wasm_pool: ?*anyopaque = null,
+    wasm_fuel: i64 = 0,
     pattern_buf: [MAX_PATTERN_LEN]u8 = undefined,
     pattern_len: usize = 0,
     param_count: u8 = 0,
@@ -783,6 +865,22 @@ pub const Router = struct {
     /// Set middleware chain
     pub fn setMiddleware(self: *Router, chain: middleware.Chain) void {
         self.middleware_chain = chain;
+    }
+
+    /// Attach a WASM edge-filter pool to every route whose pattern equals
+    /// `pattern`. `pool` is a `*wasm.filter.Pool` (opaque here so router.zig
+    /// needs no build-flag gating); `fuel` is the per-invocation budget. The
+    /// pool must outlive the router. Returns the number of routes matched.
+    pub fn attachWasmFilter(self: *Router, pattern: []const u8, pool: *anyopaque, fuel: i64) usize {
+        var matched: usize = 0;
+        for (self.routes[0..self.route_count]) |*r| {
+            if (std.mem.eql(u8, r.pattern, pattern)) {
+                r.wasm_pool = pool;
+                r.wasm_fuel = fuel;
+                matched += 1;
+            }
+        }
+        return matched;
     }
 
     /// Set app state pointer (for HandlerContext.state).
@@ -1045,6 +1143,17 @@ pub const Router = struct {
         var result_resp: response.Response = undefined;
         const result_pause: ?u64 = null;
         var ran_handler = false;
+        // Response headers staged by a WASM filter's modify decision; merged
+        // below alongside middleware headers. Borrows the filter instance
+        // scratch, valid until the response is serialized (single-threaded,
+        // non-reentrant per worker).
+        var wasm_modify_headers: []const response.Header = &.{};
+        // Response headers staged by a WASM filter's Phase 2b on_response hook.
+        // Same lifetime/merge discipline as wasm_modify_headers.
+        var wasm_response_headers: []const response.Header = &.{};
+        // Set when on_response replaced the body with instance-scratch bytes;
+        // surfaced via RouteResult.wasm_body_borrowed.
+        var wasm_body_borrowed = false;
 
         var path_matched = false;
         for (self.routes[0..self.route_count]) |r| {
@@ -1093,6 +1202,96 @@ pub const Router = struct {
                     },
                 }
             }
+            // Per-route WASM edge filter (design 10.0). Runs after native
+            // middleware, before the handler. Terminal decisions: allow, reject,
+            // modify (stage response headers). Phase 3: a filter may PARK on a
+            // host_call; if the dispatch layer wired a park binding, the request
+            // parks (returns the sentinel) and resumes later via wasmResume.
+            // Only compiled when built with -Denable-wasm.
+            if (build_options.enable_wasm) {
+                if (r.wasm_pool) |pool_ptr| {
+                    const pool: *wasm_filter.Pool = @ptrCast(@alignCast(pool_ptr));
+                    if (scratch.wasm.resume_decision) |rd| {
+                        // Re-dispatch: a completed host call injected its decision;
+                        // skip the filter and apply it (handler runs for allow).
+                        switch (rd) {
+                            .allow, .skip => {},
+                            .reject => |resp| {
+                                result_resp = resp;
+                                return .{ .resp = result_resp };
+                            },
+                            .modify => |mod| wasm_modify_headers = mod.response_headers,
+                            .rate_limit_backpressure => |bp| return .{
+                                .resp = bp.resp,
+                                .pause_reads_ms = if (bp.pause_reads) bp.resume_after_ms else null,
+                            },
+                        }
+                    } else if (scratch.wasm.table) |tbl_ptr| {
+                        // Park-capable path (H1 dispatch wired the binding).
+                        const table: *wasm_host_call.Table = @ptrCast(@alignCast(tbl_ptr));
+                        const inst = pool.acquire() orelse {
+                            // Pool exhausted. Fail closed (503) AND apply
+                            // connection backpressure: pause reads briefly so a
+                            // flood self-throttles instead of burning the event
+                            // loop fast-failing excess parks (the G2 cliff). The
+                            // 503 is still served; the connection is just paced.
+                            result_resp = .{ .status = 503, .headers = &.{}, .body = .{ .bytes = "edge function pool exhausted" } };
+                            return .{ .resp = result_resp, .pause_reads_ms = wasm_filter.POOL_BACKPRESSURE_MS };
+                        };
+                        switch (wasm_filter.invokeOutcome(inst, &req, r.wasm_fuel)) {
+                            .decision => |d| switch (d) {
+                                .allow, .skip => {},
+                                .reject => |resp| {
+                                    result_resp = resp;
+                                    return .{ .resp = result_resp };
+                                },
+                                .modify => |mod| wasm_modify_headers = mod.response_headers,
+                                .rate_limit_backpressure => |bp| return .{
+                                    .resp = bp.resp,
+                                    .pause_reads_ms = if (bp.pause_reads) bp.resume_after_ms else null,
+                                },
+                            },
+                            .parked => |call_request| {
+                                // Pin the instance in the park table (keyed to this
+                                // connection), kick the transport with the staged
+                                // request, and return the park sentinel; the
+                                // dispatch layer's handleParkSentinel sets
+                                // .wasm_parked and the transport drives the host
+                                // call to completion -> wasmResume.
+                                if (table.park(inst, req, scratch.wasm.conn_index, scratch.wasm.conn_id, scratch.wasm.stream_id, scratch.wasm.protocol, scratch.wasm.deadline_ms, r.wasm_fuel, scratch.wasm.resume_ctx)) |token| {
+                                    if (scratch.wasm.start_fn) |start| {
+                                        start(scratch.wasm.start_ctx.?, token, call_request);
+                                    }
+                                    return .{ .resp = response.Response.parked };
+                                }
+                                // Park table full: unpin and fail closed (503),
+                                // plus connection backpressure (pause reads
+                                // briefly) so the flood self-throttles rather
+                                // than re-hammering the exhausted table.
+                                _ = wasm_filter.cancelPark(inst);
+                                result_resp = .{ .status = 503, .headers = &.{}, .body = .{ .bytes = "edge function park table full" } };
+                                return .{ .resp = result_resp, .pause_reads_ms = wasm_filter.POOL_BACKPRESSURE_MS };
+                            },
+                        }
+                    } else {
+                        // No park binding (direct Router.handle caller / proxy):
+                        // terminal run, fails closed on a park.
+                        switch (pool.run(&req, r.wasm_fuel)) {
+                            .allow, .skip => {},
+                            .reject => |resp| {
+                                result_resp = resp;
+                                return .{ .resp = result_resp };
+                            },
+                            .modify => |mod| wasm_modify_headers = mod.response_headers,
+                            .rate_limit_backpressure => |bp| return .{
+                                .resp = bp.resp,
+                                .pause_reads_ms = if (bp.pause_reads) bp.resume_after_ms else null,
+                            },
+                        }
+                    }
+                }
+            }
+
             result_resp = r.handler(&ctx);
             ran_handler = true;
             if (result_resp.status >= 200 and result_resp.status < 300) {
@@ -1113,6 +1312,43 @@ pub const Router = struct {
                             std.log.warn("x402 settlement failed: {s}", .{settle.error_reason});
                             result_resp = .{ .status = 502, .headers = &.{}, .body = .{ .bytes = "{\"error\":\"payment settlement failed\"}" } };
                         }
+                    }
+                }
+            }
+
+            // Phase 2b: response-phase WASM filter. Runs AFTER the handler
+            // produced result_resp and BEFORE the header merge, so its staged
+            // headers join the merge. Status/body edits apply directly (the
+            // server recomputes Content-Length from the replaced body). FAIL-OPEN:
+            // a trap leaves result_resp untouched (the request already passed
+            // policy). Only compiled with -Denable-wasm.
+            if (build_options.enable_wasm) {
+                if (r.wasm_pool) |pool_ptr| {
+                    const pool: *wasm_filter.Pool = @ptrCast(@alignCast(pool_ptr));
+                    if (pool.hasResponseHook()) {
+                        // The response phase reuses the SAME pooled instance whose
+                        // scratch the request-phase modify headers point into;
+                        // copy them to stable storage BEFORE runResponse so the
+                        // merge below does not read clobbered bytes.
+                        if (wasm_modify_headers.len > 0) {
+                            wasm_modify_headers = stabilizeWasmModifyHeaders(wasm_modify_headers);
+                        }
+                        const edit = pool.runResponse(&req, &result_resp, r.wasm_fuel);
+                        // S3: a trapping response hook fails OPEN by default; a
+                        // pool marked response_fail_closed serves a fresh 503
+                        // instead so a redaction/scrub trap cannot leak the
+                        // original response body or headers.
+                        if (edit.trapped and pool.response_fail_closed) {
+                            result_resp = .{ .status = 503, .headers = &.{}, .body = .{ .bytes = "edge function response error" } };
+                            wasm_response_headers = &.{};
+                            break;
+                        }
+                        if (edit.new_status) |s| result_resp.status = s;
+                        if (edit.new_body) |b| {
+                            result_resp.body = .{ .bytes = b };
+                            wasm_body_borrowed = true;
+                        }
+                        wasm_response_headers = edit.add_headers;
                     }
                 }
             }
@@ -1143,7 +1379,7 @@ pub const Router = struct {
         // per thread and the protocol layer serializes the response bytes
         // before the next request on the same thread.
         const mw_headers = self.middleware_chain.getResponseHeaders();
-        if (mw_headers.len > 0 or x402_has_receipt) {
+        if (mw_headers.len > 0 or x402_has_receipt or wasm_modify_headers.len > 0 or wasm_response_headers.len > 0) {
             const handler_headers = result_resp.headers;
             const merge_cap = merged_headers_tls.len;
             var i: usize = 0;
@@ -1153,6 +1389,16 @@ pub const Router = struct {
                 i += 1;
             }
             for (mw_headers) |h| {
+                if (i >= merge_cap) break;
+                merged_headers_tls[i] = h;
+                i += 1;
+            }
+            for (wasm_modify_headers) |h| {
+                if (i >= merge_cap) break;
+                merged_headers_tls[i] = h;
+                i += 1;
+            }
+            for (wasm_response_headers) |h| {
                 if (i >= merge_cap) break;
                 merged_headers_tls[i] = h;
                 i += 1;
@@ -1180,7 +1426,7 @@ pub const Router = struct {
             self.middleware_chain.executePost(mw_ctx, req, result_resp, elapsed_ns);
         }
 
-        return .{ .resp = result_resp, .pause_reads_ms = result_pause };
+        return .{ .resp = result_resp, .pause_reads_ms = result_pause, .wasm_body_borrowed = wasm_body_borrowed };
     }
 
     /// Quick O(route_count) check: does ANY registered route's path
@@ -1860,4 +2106,428 @@ test "jsonValue end-to-end produces escaped, std-identical body" {
 
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqualStrings(sw.buffered(), resp.body.bytes);
+}
+
+test "wasm: per-route filter allow / reject / modify via handle" {
+    if (build_options.enable_wasm) {
+        const FILTER = @embedFile("../wasm/testdata/filter_probe.wasm");
+
+        var pool = try wasm_filter.Pool.init(std.testing.allocator, FILTER, .{ .instances = 2 });
+        defer pool.deinit();
+
+        var router = Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+        const handler = struct {
+            fn h(_: *HandlerContext) response.Response {
+                return response.Response.ok();
+            }
+        }.h;
+        try router.get("/api/orders", handler);
+        try router.get("/modify/thing", handler);
+
+        try std.testing.expectEqual(@as(usize, 1), router.attachWasmFilter("/api/orders", &pool, wasm_filter.DEFAULT_FUEL));
+        try std.testing.expectEqual(@as(usize, 1), router.attachWasmFilter("/modify/thing", &pool, wasm_filter.DEFAULT_FUEL));
+
+        var response_buf: [RESPONSE_BUF_SIZE]u8 = undefined;
+        var response_headers: [MAX_RESPONSE_HEADERS]response.Header = undefined;
+        var arena_buf: [ARENA_BUF_SIZE]u8 = undefined;
+
+        // 1. /api/orders without key -> filter rejects 401 (handler never runs).
+        {
+            var mw_ctx = middleware.Context{};
+            var scratch = HandlerScratch{ .response_buf = response_buf[0..], .response_headers = response_headers[0..], .arena_buf = arena_buf[0..] };
+            const req = request.RequestView{ .method = .GET, .path = "/api/orders", .headers = &.{} };
+            const result = router.handle(req, &mw_ctx, &scratch);
+            try std.testing.expectEqual(@as(u16, 401), result.resp.status);
+            try std.testing.expectEqualStrings("missing api key", result.resp.bodyBytes());
+        }
+
+        // 2. /api/orders with key -> filter allows -> handler 200.
+        {
+            var mw_ctx = middleware.Context{};
+            var scratch = HandlerScratch{ .response_buf = response_buf[0..], .response_headers = response_headers[0..], .arena_buf = arena_buf[0..] };
+            const hdrs = [_]response.Header{.{ .name = "x-api-key", .value = "sk_live_1" }};
+            const req = request.RequestView{ .method = .GET, .path = "/api/orders", .headers = &hdrs };
+            const result = router.handle(req, &mw_ctx, &scratch);
+            try std.testing.expectEqual(@as(u16, 200), result.resp.status);
+        }
+
+        // 3. /modify/thing -> filter modify stages x-checked -> handler 200 + header merged.
+        {
+            var mw_ctx = middleware.Context{};
+            var scratch = HandlerScratch{ .response_buf = response_buf[0..], .response_headers = response_headers[0..], .arena_buf = arena_buf[0..] };
+            const req = request.RequestView{ .method = .GET, .path = "/modify/thing", .headers = &.{} };
+            const result = router.handle(req, &mw_ctx, &scratch);
+            try std.testing.expectEqual(@as(u16, 200), result.resp.status);
+            var found = false;
+            for (result.resp.headers) |h| {
+                if (std.mem.eql(u8, h.name, "x-checked")) found = true;
+            }
+            try std.testing.expect(found);
+        }
+    } else return error.SkipZigTest;
+}
+
+test "wasm: Phase 2b response filter edits the handler response via handle" {
+    if (build_options.enable_wasm) {
+        const RESP_FILTER = @embedFile("../wasm/testdata/response_probe.wasm");
+
+        var pool = try wasm_filter.Pool.init(std.testing.allocator, RESP_FILTER, .{ .instances = 1 });
+        defer pool.deinit();
+
+        var router = Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+        // The handler emits a body the response filter reacts to (per request path).
+        const handler = struct {
+            fn h(ctx: *HandlerContext) response.Response {
+                return ctx.text(200, "boom: secret");
+            }
+        }.h;
+        try router.get("/widgets", handler);
+        _ = router.attachWasmFilter("/widgets", &pool, wasm_filter.DEFAULT_FUEL);
+
+        var response_buf: [RESPONSE_BUF_SIZE]u8 = undefined;
+        var response_headers: [MAX_RESPONSE_HEADERS]response.Header = undefined;
+        var arena_buf: [ARENA_BUF_SIZE]u8 = undefined;
+
+        var mw_ctx = middleware.Context{};
+        var scratch = HandlerScratch{ .response_buf = response_buf[0..], .response_headers = response_headers[0..], .arena_buf = arena_buf[0..] };
+        const req = request.RequestView{ .method = .GET, .path = "/widgets", .headers = &.{} };
+        const result = router.handle(req, &mw_ctx, &scratch);
+
+        // on_response saw the "boom" body -> 403 + replacement body.
+        try std.testing.expectEqual(@as(u16, 403), result.resp.status);
+        try std.testing.expectEqualStrings("blocked by edge", result.resp.bodyBytes());
+        // The replacement body borrows the instance scratch; the flag tells the
+        // dispatch tail to materialize any write-queue spill (stable .bytes
+        // responses must NOT set it, or large-response streaming would truncate).
+        try std.testing.expect(result.wasm_body_borrowed);
+    } else return error.SkipZigTest;
+}
+
+test "wasm: on_request modify + on_response on the same instance both survive (no clobber)" {
+    if (build_options.enable_wasm) {
+        // Regression for the audit HIGH: the request-phase modify header's bytes
+        // live in the filter instance scratch; the response phase reuses the SAME
+        // pooled instance (instances=1) and overwrites that scratch. Without the
+        // stabilize-before-runResponse fix, the modify header is clobbered/dropped.
+        const RESP_FILTER = @embedFile("../wasm/testdata/response_probe.wasm");
+        var pool = try wasm_filter.Pool.init(std.testing.allocator, RESP_FILTER, .{ .instances = 1 });
+        defer pool.deinit();
+
+        var router = Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+        const handler = struct {
+            fn h(ctx: *HandlerContext) response.Response {
+                return ctx.text(200, "ok");
+            }
+        }.h;
+        try router.get("/dual", handler);
+        _ = router.attachWasmFilter("/dual", &pool, wasm_filter.DEFAULT_FUEL);
+
+        var response_buf: [RESPONSE_BUF_SIZE]u8 = undefined;
+        var response_headers: [MAX_RESPONSE_HEADERS]response.Header = undefined;
+        var arena_buf: [ARENA_BUF_SIZE]u8 = undefined;
+        var mw_ctx = middleware.Context{};
+        var scratch = HandlerScratch{ .response_buf = response_buf[0..], .response_headers = response_headers[0..], .arena_buf = arena_buf[0..] };
+        const req = request.RequestView{ .method = .GET, .path = "/dual", .headers = &.{} };
+        const result = router.handle(req, &mw_ctx, &scratch);
+
+        // BOTH the request-phase modify header and the response-phase header must
+        // be present and intact (the modify one was the clobber victim).
+        var saw_modify = false;
+        var saw_response = false;
+        for (result.resp.headers) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "x-req-modify")) {
+                saw_modify = true;
+                try std.testing.expectEqualStrings("from-on-request", h.value);
+            }
+            if (std.ascii.eqlIgnoreCase(h.name, "x-wasm-response")) saw_response = true;
+        }
+        try std.testing.expect(saw_modify); // not clobbered by the response phase
+        try std.testing.expect(saw_response);
+    } else return error.SkipZigTest;
+}
+
+test "wasm: re-dispatch injects resume decision (skip filter, run handler)" {
+    if (build_options.enable_wasm) {
+        const FILTER = @embedFile("../wasm/testdata/filter_probe.wasm");
+        var pool = try wasm_filter.Pool.init(std.testing.allocator, FILTER, .{ .instances = 1 });
+        defer pool.deinit();
+
+        var router = Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+        const handler = struct {
+            fn h(_: *HandlerContext) response.Response {
+                return response.Response.ok();
+            }
+        }.h;
+        try router.get("/api/orders", handler);
+        _ = router.attachWasmFilter("/api/orders", &pool, wasm_filter.DEFAULT_FUEL);
+
+        var response_buf: [RESPONSE_BUF_SIZE]u8 = undefined;
+        var response_headers: [MAX_RESPONSE_HEADERS]response.Header = undefined;
+        var arena_buf: [ARENA_BUF_SIZE]u8 = undefined;
+        var mw_ctx = middleware.Context{};
+        // /api/orders with no key: the filter WOULD reject 401. With an injected
+        // resume decision of allow, the filter is skipped and the handler runs.
+        var scratch = HandlerScratch{
+            .response_buf = response_buf[0..],
+            .response_headers = response_headers[0..],
+            .arena_buf = arena_buf[0..],
+            .wasm = .{ .resume_decision = .allow },
+        };
+        const req = request.RequestView{ .method = .GET, .path = "/api/orders", .headers = &.{} };
+        try std.testing.expectEqual(@as(u16, 200), router.handle(req, &mw_ctx, &scratch).resp.status);
+
+        // An injected reject is served without running the handler.
+        var scratch2 = HandlerScratch{
+            .response_buf = response_buf[0..],
+            .response_headers = response_headers[0..],
+            .arena_buf = arena_buf[0..],
+            .wasm = .{ .resume_decision = .{ .reject = .{ .status = 418, .headers = &.{}, .body = .{ .bytes = "teapot" } } } },
+        };
+        try std.testing.expectEqual(@as(u16, 418), router.handle(req, &mw_ctx, &scratch2).resp.status);
+    } else return error.SkipZigTest;
+}
+
+test "wasm: filter park registers in table and fires the transport start hook" {
+    if (build_options.enable_wasm) {
+        const FILTER = @embedFile("../wasm/testdata/filter_probe.wasm");
+        var pool = try wasm_filter.Pool.init(std.testing.allocator, FILTER, .{ .instances = 1 });
+        defer pool.deinit();
+        var table = wasm_host_call.Table.init(std.testing.allocator);
+        defer table.deinit();
+
+        var router = Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+        const handler = struct {
+            fn h(_: *HandlerContext) response.Response {
+                return response.Response.ok();
+            }
+        }.h;
+        try router.get("/enrich", handler);
+        _ = router.attachWasmFilter("/enrich", &pool, wasm_filter.DEFAULT_FUEL);
+
+        const Cap = struct {
+            var called: bool = false;
+            var tok: u32 = 12345;
+            var req_len: usize = 0;
+            fn start(ctx: *anyopaque, token: u32, req_bytes: []const u8) void {
+                _ = ctx;
+                called = true;
+                tok = token;
+                req_len = req_bytes.len;
+            }
+        };
+
+        var response_buf: [RESPONSE_BUF_SIZE]u8 = undefined;
+        var response_headers: [MAX_RESPONSE_HEADERS]response.Header = undefined;
+        var arena_buf: [ARENA_BUF_SIZE]u8 = undefined;
+        var mw_ctx = middleware.Context{};
+        var scratch = HandlerScratch{
+            .response_buf = response_buf[0..],
+            .response_headers = response_headers[0..],
+            .arena_buf = arena_buf[0..],
+            .wasm = .{
+                .table = @ptrCast(&table),
+                .conn_index = 1,
+                .conn_id = 1,
+                .deadline_ms = 9_999_999,
+                .start_fn = Cap.start,
+                .start_ctx = @ptrCast(&table),
+            },
+        };
+        // /enrich stages a host_call and parks: handle returns the sentinel, the
+        // park is registered, and the transport start hook fires with the token
+        // and the staged request bytes.
+        const req = request.RequestView{ .method = .GET, .path = "/enrich", .headers = &.{} };
+        const result = router.handle(req, &mw_ctx, &scratch);
+        try std.testing.expect(result.resp.isParked());
+        try std.testing.expect(Cap.called);
+        try std.testing.expect(Cap.req_len > 0);
+        try std.testing.expect(table.hasParkFor(1, 1));
+
+        // Completing the host call resumes the filter to a decision.
+        const c = table.complete(Cap.tok, "ok") orelse return error.NoCompletion;
+        try std.testing.expect(c.decision == .allow);
+    } else return error.SkipZigTest;
+}
+
+// --- D2 security probing through router.handle -------------------------------
+
+test "D2-4 fail-closed: a trapping request filter never reaches the handler (router.handle)" {
+    if (build_options.enable_wasm) {
+        const FILTER = @embedFile("../wasm/testdata/filter_probe.wasm");
+        var pool = try wasm_filter.Pool.init(std.testing.allocator, FILTER, .{ .instances = 2 });
+        defer pool.deinit();
+
+        var router = Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+        const H = struct {
+            var ran: bool = false;
+            fn h(_: *HandlerContext) response.Response {
+                ran = true;
+                return response.Response.ok();
+            }
+        };
+        H.ran = false;
+        try router.get("/oob", H.h);
+        try router.get("/loop", H.h);
+        // /oob traps on an OOB ABI pointer; /loop traps on fuel exhaustion.
+        try std.testing.expectEqual(@as(usize, 1), router.attachWasmFilter("/oob", &pool, wasm_filter.DEFAULT_FUEL));
+        try std.testing.expectEqual(@as(usize, 1), router.attachWasmFilter("/loop", &pool, 200_000));
+
+        var response_buf: [RESPONSE_BUF_SIZE]u8 = undefined;
+        var response_headers: [MAX_RESPONSE_HEADERS]response.Header = undefined;
+        var arena_buf: [ARENA_BUF_SIZE]u8 = undefined;
+        for ([_][]const u8{ "/oob", "/loop" }) |p| {
+            var mw_ctx = middleware.Context{};
+            var scratch = HandlerScratch{ .response_buf = response_buf[0..], .response_headers = response_headers[0..], .arena_buf = arena_buf[0..] };
+            const req = request.RequestView{ .method = .GET, .path = p, .headers = &.{} };
+            const result = router.handle(req, &mw_ctx, &scratch);
+            // Fail closed: 500, and the handler was NEVER invoked.
+            try std.testing.expectEqual(@as(u16, 500), result.resp.status);
+        }
+        try std.testing.expect(!H.ran);
+    } else return error.SkipZigTest;
+}
+
+test "D2-4 fail-open: a trapping response filter serves the original response (router.handle)" {
+    if (build_options.enable_wasm) {
+        const RESP_FILTER = @embedFile("../wasm/testdata/response_probe.wasm");
+        var pool = try wasm_filter.Pool.init(std.testing.allocator, RESP_FILTER, .{ .instances = 1 });
+        defer pool.deinit();
+
+        var router = Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+        const handler = struct {
+            fn h(ctx: *HandlerContext) response.Response {
+                return ctx.text(202, "keep-me");
+            }
+        }.h;
+        // The fixture's on_response traps for request path "/trap".
+        try router.get("/trap", handler);
+        _ = router.attachWasmFilter("/trap", &pool, wasm_filter.DEFAULT_FUEL);
+
+        var response_buf: [RESPONSE_BUF_SIZE]u8 = undefined;
+        var response_headers: [MAX_RESPONSE_HEADERS]response.Header = undefined;
+        var arena_buf: [ARENA_BUF_SIZE]u8 = undefined;
+        var mw_ctx = middleware.Context{};
+        var scratch = HandlerScratch{ .response_buf = response_buf[0..], .response_headers = response_headers[0..], .arena_buf = arena_buf[0..] };
+        const req = request.RequestView{ .method = .GET, .path = "/trap", .headers = &.{} };
+        const result = router.handle(req, &mw_ctx, &scratch);
+        // The response phase failed OPEN: the handler's original response is served
+        // unchanged (status + body), because the request already passed policy.
+        try std.testing.expectEqual(@as(u16, 202), result.resp.status);
+        try std.testing.expectEqualStrings("keep-me", result.resp.bodyBytes());
+    } else return error.SkipZigTest;
+}
+
+test "D2-5 fail-closed: pool exhaustion -> 503 then recovery (router.handle)" {
+    if (build_options.enable_wasm) {
+        const FILTER = @embedFile("../wasm/testdata/filter_probe.wasm");
+        var pool = try wasm_filter.Pool.init(std.testing.allocator, FILTER, .{ .instances = 1 });
+        defer pool.deinit();
+
+        var router = Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+        const H = struct {
+            var ran: bool = false;
+            fn h(_: *HandlerContext) response.Response {
+                ran = true;
+                return response.Response.ok();
+            }
+        };
+        H.ran = false;
+        try router.get("/public", H.h);
+        _ = router.attachWasmFilter("/public", &pool, wasm_filter.DEFAULT_FUEL);
+
+        var response_buf: [RESPONSE_BUF_SIZE]u8 = undefined;
+        var response_headers: [MAX_RESPONSE_HEADERS]response.Header = undefined;
+        var arena_buf: [ARENA_BUF_SIZE]u8 = undefined;
+
+        // Pin the only instance so the route's pool is exhausted.
+        const pinned = pool.acquire() orelse return error.AcquireFailed;
+        {
+            var mw_ctx = middleware.Context{};
+            var scratch = HandlerScratch{ .response_buf = response_buf[0..], .response_headers = response_headers[0..], .arena_buf = arena_buf[0..] };
+            const req = request.RequestView{ .method = .GET, .path = "/public", .headers = &.{} };
+            const result = router.handle(req, &mw_ctx, &scratch);
+            try std.testing.expectEqual(@as(u16, 503), result.resp.status);
+        }
+        try std.testing.expect(!H.ran); // never reached the handler while exhausted
+
+        // Release -> recovery: the next request runs the handler.
+        pinned.state = .idle;
+        {
+            var mw_ctx = middleware.Context{};
+            var scratch = HandlerScratch{ .response_buf = response_buf[0..], .response_headers = response_headers[0..], .arena_buf = arena_buf[0..] };
+            const req = request.RequestView{ .method = .GET, .path = "/public", .headers = &.{} };
+            const result = router.handle(req, &mw_ctx, &scratch);
+            try std.testing.expectEqual(@as(u16, 200), result.resp.status);
+        }
+        try std.testing.expect(H.ran);
+    } else return error.SkipZigTest;
+}
+
+test "G2 backpressure: park-capable pool exhaustion -> 503 WITH pause_reads (router.handle)" {
+    if (build_options.enable_wasm) {
+        const FILTER = @embedFile("../wasm/testdata/filter_probe.wasm");
+        var pool = try wasm_filter.Pool.init(std.testing.allocator, FILTER, .{ .instances = 1 });
+        defer pool.deinit();
+        var table = wasm_host_call.Table.init(std.testing.allocator);
+        defer table.deinit();
+
+        var router = Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+        const H = struct {
+            var ran: bool = false;
+            fn h(_: *HandlerContext) response.Response {
+                ran = true;
+                return response.Response.ok();
+            }
+        };
+        H.ran = false;
+        try router.get("/enrich", H.h);
+        _ = router.attachWasmFilter("/enrich", &pool, wasm_filter.DEFAULT_FUEL);
+
+        var response_buf: [RESPONSE_BUF_SIZE]u8 = undefined;
+        var response_headers: [MAX_RESPONSE_HEADERS]response.Header = undefined;
+        var arena_buf: [ARENA_BUF_SIZE]u8 = undefined;
+
+        // Pin the only instance so the park-capable hook's acquire() fails. With
+        // the park table wired (start_fn set) the hook reaches the exhaustion
+        // branch under test (not the terminal pool.run path).
+        const pinned = pool.acquire() orelse return error.AcquireFailed;
+        {
+            var mw_ctx = middleware.Context{};
+            var scratch = HandlerScratch{
+                .response_buf = response_buf[0..],
+                .response_headers = response_headers[0..],
+                .arena_buf = arena_buf[0..],
+                .wasm = .{
+                    .table = @ptrCast(&table),
+                    .conn_index = 1,
+                    .conn_id = 1,
+                    .deadline_ms = 9_999_999,
+                    .start_fn = struct {
+                        fn start(_: *anyopaque, _: u32, _: []const u8) void {}
+                    }.start,
+                    .start_ctx = @ptrCast(&table),
+                },
+            };
+            const req = request.RequestView{ .method = .GET, .path = "/enrich", .headers = &.{} };
+            const result = router.handle(req, &mw_ctx, &scratch);
+            // Fail closed is preserved: still a 503, handler never ran.
+            try std.testing.expectEqual(@as(u16, 503), result.resp.status);
+            try std.testing.expect(!H.ran);
+            // NEW (G2): exhaustion now ALSO paces the connection -- a non-null
+            // pause window, not a bare reject. This is the cliff-smoothing signal
+            // the transport turns into conn.setRateLimitPause.
+            try std.testing.expect(result.pause_reads_ms != null);
+            try std.testing.expectEqual(wasm_filter.POOL_BACKPRESSURE_MS, result.pause_reads_ms.?);
+        }
+
+        // Release -> recovery: the next request is no longer paced.
+        pinned.state = .idle;
+        {
+            var mw_ctx = middleware.Context{};
+            var scratch = HandlerScratch{ .response_buf = response_buf[0..], .response_headers = response_headers[0..], .arena_buf = arena_buf[0..] };
+            const req = request.RequestView{ .method = .GET, .path = "/enrich", .headers = &.{} };
+            const result = router.handle(req, &mw_ctx, &scratch);
+            try std.testing.expect(result.pause_reads_ms == null);
+        }
+    } else return error.SkipZigTest;
 }

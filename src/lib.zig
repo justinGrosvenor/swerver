@@ -142,3 +142,16 @@ pub const admin = @import("admin/admin.zig");
 pub const db = struct {
     pub const pg = @import("db/pg/pg.zig");
 };
+
+// WASM edge functions (design 10.0). Gated on the build flag so the @cImport of
+// vendored wasm3 never runs in a build without it. Mirrors the enable_tls gate.
+const build_options = @import("build_options");
+pub const wasm = if (build_options.enable_wasm)
+    struct {
+        pub const runtime = @import("wasm/runtime.zig");
+        pub const filter = @import("wasm/filter.zig");
+        pub const manager = @import("wasm/manager.zig");
+        pub const host_call = @import("wasm/host_call.zig");
+    }
+else
+    struct {};

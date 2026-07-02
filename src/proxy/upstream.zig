@@ -34,10 +34,14 @@ pub const Upstream = struct {
 
 /// Individual backend server definition
 pub const Server = struct {
-    /// Server address (hostname or IP)
+    /// Server address (hostname or IP). Ignored when `unix_path` is set.
     address: []const u8,
-    /// Server port
+    /// Server port. Ignored when `unix_path` is set.
     port: u16,
+    /// UNIX-domain stream socket path (empty = TCP via address:port). Used for
+    /// on-host backends: tenant microVM data sockets, local daemons. Validated
+    /// at config parse (absolute, <= net.UNIX_PATH_MAX); no SSRF check applies.
+    unix_path: []const u8 = "",
     /// Weight for weighted load balancing (higher = more traffic)
     weight: u16 = 1,
     /// Number of failures before marking unavailable
@@ -98,7 +102,35 @@ pub const TrafficTarget = struct {
     weight: u16 = 100,
 };
 
+/// Per-route tenant-to-microVM routing config (park-concurrency plan Phase 1).
+pub const TenantRouting = struct {
+    /// Request header whose value is the tenant key (VM affinity). Default
+    /// "host" (the :port suffix is stripped when keying) so vhost-style
+    /// tenancy needs no client cooperation; set e.g. "x-tenant" for an
+    /// explicit internal key. A tenant key is a ROUTING key, not an auth grant.
+    header: []const u8 = "host",
+    /// Required allowed-path prefix: a socket path registered from a Tier-2
+    /// reply must start with this, so a compromised supervisor cannot point
+    /// swerver at an arbitrary host socket. Empty is rejected at config parse.
+    socket_dir: []const u8,
+    /// When warm (registry hit), skip the wasm filter entirely and proxy
+    /// straight to the VM (the Phase 1 goal: steady state is ordinary
+    /// proxying). Set false to keep running the filter per request for policy
+    /// (the filter must then return allow without parking when warm).
+    skip_filter_when_warm: bool = true,
+};
+
 var split_counter: u32 = 0;
+
+/// True if any route uses tenant-as-upstream routing. Such routes forward to a
+/// per-request microVM, so a config with tenant routes needs a Proxy built even
+/// when no named upstreams are declared.
+pub fn anyTenantRoute(routes: []const ProxyRoute) bool {
+    for (routes) |r| {
+        if (r.tenant != null) return true;
+    }
+    return false;
+}
 
 pub const ProxyRoute = struct {
     /// Path prefix to match (e.g., "/api/")
@@ -136,6 +168,22 @@ pub const ProxyRoute = struct {
     /// Traffic mirroring: name of upstream to shadow-send requests to.
     /// Fire-and-forget — mirror response is discarded.
     mirror: ?[]const u8 = null,
+    /// Per-route WASM edge filter (design 10.0). Opaque `*wasm.filter.Pool`,
+    /// invoked before forwarding: it can allow or reject (auth/policy gate).
+    /// Set by the filter manager at startup; null means no filter. See proxy.zig.
+    wasm_pool: ?*anyopaque = null,
+    wasm_fuel: i64 = 0,
+    /// Set when a configured filter for this route FAILED to load. The route
+    /// then fails CLOSED (503) instead of forwarding unfiltered: a security
+    /// filter that silently no-ops is worse than a hard error. See proxy.zig
+    /// runWasmFilter and server.zig buildWasmManager.
+    wasm_required: bool = false,
+    /// Tenant-as-upstream routing (park-concurrency plan Phase 1). When set, a
+    /// request is keyed to a tenant microVM: a warm mapping (in the Server-owned
+    /// TenantRegistry) forwards directly to the VM's UNIX data socket; a miss
+    /// runs the wasm filter, which parks for a Tier-2 cold start whose reply
+    /// names the socket. Null means ordinary routing. See proxy.zig.
+    tenant: ?TenantRouting = null,
 
     /// Resolve the upstream name, applying traffic split if configured.
     pub fn selectUpstream(self: *const ProxyRoute) []const u8 {

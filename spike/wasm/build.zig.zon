@@ -1,0 +1,14 @@
+.{
+    .name = .wasm_spike,
+    .version = "0.0.0",
+    .fingerprint = 0xa0fb8f933358ca4e,
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "filter",
+        "vendor",
+    },
+    .dependencies = .{},
+}

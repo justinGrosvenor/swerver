@@ -95,6 +95,7 @@ const proxy_handler = @import("proxy/proxy.zig");
 const proxy_cache = @import("proxy/cache.zig");
 const proxy_dns = @import("proxy/dns.zig");
 const proxy_consul = @import("proxy/consul.zig");
+const proxy_tenant = @import("proxy/tenant.zig");
 const proxy_websocket = @import("proxy/websocket.zig");
 
 // Force tests in these modules to be included. Lazy analysis means
@@ -200,6 +201,7 @@ comptime {
     _ = proxy_cache;
     _ = proxy_dns;
     _ = proxy_consul;
+    _ = proxy_tenant;
     _ = proxy_upstream;
     _ = proxy_pool;
     _ = proxy_balancer;
@@ -220,6 +222,15 @@ comptime {
     }
     if (builtin.os.tag.isDarwin()) {
         _ = @import("runtime/backend/kqueue.zig");
+    }
+
+    // WASM edge functions (design 10.0): only when built with -Denable-wasm,
+    // so the @cImport of vendored wasm3 never runs in a build without it.
+    if (@import("build_options").enable_wasm) {
+        _ = @import("wasm/runtime.zig");
+        _ = @import("wasm/filter.zig");
+        _ = @import("wasm/manager.zig");
+        _ = @import("wasm/host_call.zig");
     }
 }
 

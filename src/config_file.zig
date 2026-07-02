@@ -10,6 +10,7 @@ const consul_mod = @import("proxy/consul.zig");
 const body_schema_mod = @import("middleware/body_schema.zig");
 const clock = @import("runtime/clock.zig");
 const pg_client_mod = @import("db/pg/client.zig");
+const net_mod = @import("runtime/net.zig");
 
 /// Config file schema version. Bump the minor component when fields are
 /// added (backward-compatible), the major component when a field is
@@ -34,10 +35,49 @@ pub const SCHEMA_VERSION = "1.0";
 
 /// Loaded configuration from a JSON file.
 /// Owns all parsed string data via an arena allocator.
+/// Declarative WASM edge-filter binding (design 10.0). Plain struct (not gated
+/// on enable_wasm) so config parsing is build-flag-independent; the server
+/// converts these to wasm.manager.Spec and builds pools only when wasm is on.
+pub const WasmFilterConfig = struct {
+    /// Proxy route path prefix to bind to (matched against ProxyRoute.path_prefix).
+    /// Config-driven filters attach to PROXY routes only; embedded-Router app
+    /// routes are wired via the Zig API (router.attachWasmFilter /
+    /// wasm.manager.loadAndAttachRouter), since the embedded router is not built
+    /// from the config file. See server.setupWasmFilters.
+    match: []const u8,
+    /// Path to the .wasm module on disk.
+    module_path: []const u8,
+    /// Pre-instantiated instances per worker. 1 suffices under the synchronous
+    /// Phase-1 model; raise it for parking (Tier-2) filters. SIZING: a parked
+    /// request pins one instance for the whole host-call round-trip, so size
+    /// `instances` to the expected CONCURRENT Tier-2 fan-out for this filter.
+    /// Once all instances are pinned the next park is refused with connection
+    /// backpressure (a 503 plus a brief read-pause) rather than a CPU-burning
+    /// bare 503, so the pool size sets the smooth-degradation ceiling. The park
+    /// table CAP (host_call.Table.CAP, currently 64) is the hard ceiling across
+    /// all filters on a worker; sizing above it buys nothing. Each extra
+    /// instance reserves ~4 MiB of linear memory. See filter.Config.instances.
+    instances: usize = 1,
+    /// Per-invocation fuel budget (loop back-edges).
+    fuel: i64 = 5_000_000,
+    /// S3: serve a 503 when the on_response hook traps, instead of the original
+    /// response (default fail-open). Set this for redaction/scrub filters so a
+    /// response-phase trap cannot leak the un-redacted response.
+    response_fail_closed: bool = false,
+};
+
 pub const LoadedConfig = struct {
     server_config: config_mod.ServerConfig,
     upstreams: []const upstream_mod.Upstream,
     routes: []const upstream_mod.ProxyRoute,
+    wasm_filters: []const WasmFilterConfig,
+    /// Tier-2 control-socket path ("" = none); borrows `arena`. Applied to the
+    /// Server in main.zig so parking filters can drive a real sandbox from config.
+    wasm_control_socket: []const u8,
+    /// Park deadline in ms (0 = use the Server default).
+    wasm_host_call_deadline_ms: u64,
+    /// Tenant registry idle TTL in ms (0 = use the Server default).
+    tenant_idle_ttl_ms: u64,
     arena: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *LoadedConfig) void {
@@ -250,16 +290,35 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
         if (u.servers.len > balancer_mod.Balancer.MAX_SERVERS) return error.ConfigParseError;
         const servers_out = try alloc.alloc(upstream_mod.Server, u.servers.len);
         for (u.servers, 0..) |s, si| {
-            // Validate server address doesn't contain control characters
-            if (!isSafeHttpValue(s.address)) return error.ConfigParseError;
-            servers_out[si] = .{
-                .address = s.address,
-                .port = s.port,
-                .weight = s.weight orelse 1,
-                .max_fails = s.max_fails orelse 3,
-                .fail_timeout_ms = s.fail_timeout_ms orelse 30_000,
-                .backup = s.backup orelse false,
-            };
+            // A server is EITHER a unix-socket path OR an address+port, not both.
+            if (s.unix) |uxp| {
+                if (s.address != null or s.port != null) return error.ConfigParseError;
+                if (uxp.len == 0 or uxp.len > net_mod.UNIX_PATH_MAX) return error.ConfigParseError;
+                if (uxp[0] != '/') return error.ConfigParseError; // absolute path
+                if (!isSafeHttpValue(uxp)) return error.ConfigParseError;
+                servers_out[si] = .{
+                    .address = "",
+                    .port = 0,
+                    .unix_path = uxp,
+                    .weight = s.weight orelse 1,
+                    .max_fails = s.max_fails orelse 3,
+                    .fail_timeout_ms = s.fail_timeout_ms orelse 30_000,
+                    .backup = s.backup orelse false,
+                };
+            } else {
+                const addr = s.address orelse return error.ConfigParseError;
+                const port = s.port orelse return error.ConfigParseError;
+                // Validate server address doesn't contain control characters
+                if (!isSafeHttpValue(addr)) return error.ConfigParseError;
+                servers_out[si] = .{
+                    .address = addr,
+                    .port = port,
+                    .weight = s.weight orelse 1,
+                    .max_fails = s.max_fails orelse 3,
+                    .fail_timeout_ms = s.fail_timeout_ms orelse 30_000,
+                    .backup = s.backup orelse false,
+                };
+            }
         }
 
         var health_check: ?upstream_mod.HealthCheck = null;
@@ -346,11 +405,19 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
                 @memcpy(ext_copy, ext_list.items);
                 extensions_json = ext_copy;
             }
+            // O9: name the route + missing field instead of a bare ConfigParseError
+            // (which left the operator with only a Zig stack trace).
+            const x402_missing: ?[]const u8 =
+                if (x.price == null) "price" else if (x.asset == null) "asset" else if (x.network == null) "network" else if (x.pay_to == null) "pay_to" else null;
+            if (x402_missing) |field| {
+                std.log.err("config: route '{s}' x402 is missing required field '{s}' (x402 requires price + asset + network + pay_to)", .{ r.path_prefix, field });
+                return error.ConfigParseError;
+            }
             route_x402 = .{
-                .price = x.price orelse return error.ConfigParseError,
-                .asset = x.asset orelse return error.ConfigParseError,
-                .network = x.network orelse return error.ConfigParseError,
-                .pay_to = x.pay_to orelse return error.ConfigParseError,
+                .price = x.price.?,
+                .asset = x.asset.?,
+                .network = x.network.?,
+                .pay_to = x.pay_to.?,
                 .scheme = x.scheme orelse "exact",
                 .max_timeout_seconds = x.max_timeout_seconds orelse 60,
                 .settlement_url = x.settlement_url orelse "",
@@ -425,10 +492,30 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
             route_headers.set_request = hdrs;
         }
 
+        var route_tenant: ?upstream_mod.TenantRouting = null;
+        if (r.tenant) |tj| {
+            // socket_dir is the trust boundary for supervisor-named sockets.
+            if (tj.socket_dir.len == 0 or tj.socket_dir[0] != '/') return error.ConfigParseError;
+            if (!isSafeHttpValue(tj.socket_dir)) return error.ConfigParseError;
+            const hdr = tj.header orelse "host";
+            if (!isSafeHttpValue(hdr)) return error.ConfigParseError;
+            // A tenant route forwards per-request to a microVM; a static
+            // upstream, traffic split, cache, or mirror is undefined here.
+            if (traffic_split != null or route_cache != null or r.mirror != null) return error.ConfigParseError;
+            route_tenant = .{
+                .header = hdr,
+                .socket_dir = tj.socket_dir,
+                .skip_filter_when_warm = tj.skip_filter_when_warm orelse true,
+            };
+        }
+
         routes_out[ri] = .{
             .path_prefix = r.path_prefix,
             .host = r.host,
-            .upstream = r.upstream,
+            // Tenant routes carry no static upstream; use a sentinel that the
+            // name-validation loop skips.
+            .upstream = r.upstream orelse "",
+            .tenant = route_tenant,
             .rewrite = rewrite,
             .headers = route_headers,
             .timeouts = .{
@@ -449,8 +536,14 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
         };
     }
 
-    // Validate that every route references a valid upstream name
+    // Validate that every route references a valid upstream name. Tenant routes
+    // forward to a per-request microVM instead of a named upstream, so they are
+    // exempt (and must NOT carry one).
     for (routes_out) |route| {
+        if (route.tenant != null) {
+            if (route.upstream.len != 0) return error.ConfigParseError;
+            continue;
+        }
         var found = false;
         for (upstreams_out) |u| {
             if (std.mem.eql(u8, route.upstream, u.name)) {
@@ -491,10 +584,39 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
         }
     }
 
+    // WASM edge filters (design 10.0). Parsed unconditionally; the server only
+    // builds pools from these when compiled with -Denable-wasm.
+    const wasm_defs = file_cfg.wasm_filters orelse &[_]WasmFilterJson{};
+    const wasm_out = try alloc.alloc(WasmFilterConfig, wasm_defs.len);
+    for (wasm_defs, 0..) |w, wi| {
+        var instances = w.instances orelse 1;
+        if (instances == 0) {
+            std.log.warn("wasm_filters['{s}']: instances=0 is invalid (would 503 every request); using 1", .{w.match});
+            instances = 1;
+        }
+        var fuel = w.fuel orelse 5_000_000;
+        if (fuel <= 0) {
+            std.log.warn("wasm_filters['{s}']: fuel<=0 would fail-close every looping filter; using default", .{w.match});
+            fuel = 5_000_000;
+        }
+        wasm_out[wi] = .{
+            .match = w.match,
+            .module_path = w.module,
+            .instances = instances,
+            .fuel = fuel,
+            .response_fail_closed = w.response_fail_closed orelse false,
+        };
+    }
+
     return .{
         .server_config = cfg,
         .upstreams = upstreams_out,
         .routes = routes_out,
+        .wasm_filters = wasm_out,
+        // Borrows the parsed-JSON arena (same lifetime as wasm_filters' paths).
+        .wasm_control_socket = file_cfg.wasm_control_socket orelse "",
+        .wasm_host_call_deadline_ms = file_cfg.wasm_host_call_deadline_ms orelse 0,
+        .tenant_idle_ttl_ms = file_cfg.tenant_idle_ttl_ms orelse 0,
         .arena = arena,
     };
 }
@@ -593,6 +715,24 @@ const FileConfig = struct {
     postgres: ?PostgresJson = null,
     upstreams: ?[]const UpstreamJson = null,
     routes: ?[]const RouteJson = null,
+    wasm_filters: ?[]const WasmFilterJson = null,
+    /// Nether Tier-2 control-socket path. Set this to enable the real host-call
+    /// transport for parking wasm filters from a config-driven deployment (it was
+    /// previously settable only via the embedded Zig API). One global socket per
+    /// server, matching the single-ControlClient transport.
+    wasm_control_socket: ?[]const u8 = null,
+    /// Park (host_call) deadline in ms before a parked filter fails closed.
+    wasm_host_call_deadline_ms: ?u64 = null,
+    /// Tenant-to-microVM registry idle TTL in ms (park-concurrency Phase 1).
+    tenant_idle_ttl_ms: ?u64 = null,
+};
+
+const WasmFilterJson = struct {
+    match: []const u8,
+    module: []const u8,
+    instances: ?usize = null,
+    fuel: ?i64 = null,
+    response_fail_closed: ?bool = null,
 };
 
 const ServerJson = struct {
@@ -753,8 +893,9 @@ const ConsulDiscoveryJson = struct {
 };
 
 const ServerEntryJson = struct {
-    address: []const u8,
-    port: u16,
+    address: ?[]const u8 = null,
+    port: ?u16 = null,
+    unix: ?[]const u8 = null,
     weight: ?u16 = null,
     max_fails: ?u16 = null,
     fail_timeout_ms: ?u32 = null,
@@ -786,7 +927,10 @@ const HeaderJson = struct {
 const RouteJson = struct {
     path_prefix: []const u8,
     host: ?[]const u8 = null,
-    upstream: []const u8,
+    /// Optional when `tenant` is set (the upstream is a per-request microVM);
+    /// otherwise required.
+    upstream: ?[]const u8 = null,
+    tenant: ?TenantJson = null,
     rewrite_pattern: ?[]const u8 = null,
     rewrite_replacement: ?[]const u8 = null,
     connect_timeout_ms: ?u32 = null,
@@ -803,6 +947,12 @@ const RouteJson = struct {
     mirror: ?[]const u8 = null,
     upstream_headers: ?[]const HeaderJson = null,
     retry: ?RetryJson = null,
+};
+
+const TenantJson = struct {
+    header: ?[]const u8 = null,
+    socket_dir: []const u8,
+    skip_filter_when_warm: ?bool = null,
 };
 
 const RetryJson = struct {
@@ -878,6 +1028,29 @@ test "parse minimal config" {
     try std.testing.expectEqual(@as(usize, 0), loaded.routes.len);
 }
 
+test "parse wasm_filters block (design 10.0)" {
+    const json =
+        \\{
+        \\  "server": { "port": 8080 },
+        \\  "wasm_filters": [
+        \\    { "match": "/api/", "module": "./auth.wasm", "instances": 8, "fuel": 2000000 },
+        \\    { "match": "/admin/", "module": "./admin.wasm" }
+        \\  ]
+        \\}
+    ;
+    var loaded = try parseJsonFromBytes(std.testing.allocator, json);
+    defer loaded.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), loaded.wasm_filters.len);
+    try std.testing.expectEqualStrings("/api/", loaded.wasm_filters[0].match);
+    try std.testing.expectEqualStrings("./auth.wasm", loaded.wasm_filters[0].module_path);
+    try std.testing.expectEqual(@as(usize, 8), loaded.wasm_filters[0].instances);
+    try std.testing.expectEqual(@as(i64, 2000000), loaded.wasm_filters[0].fuel);
+    // Defaults applied when omitted.
+    try std.testing.expectEqual(@as(usize, 1), loaded.wasm_filters[1].instances);
+    try std.testing.expectEqual(@as(i64, 5000000), loaded.wasm_filters[1].fuel);
+}
+
 test "preencoded + cache_static_files map to server config" {
     // Defaults: preencoded off (disable_preencoded true), cache off.
     {
@@ -948,6 +1121,72 @@ test "parse full config with upstreams and routes" {
     try std.testing.expect(loaded.routes[0].rewrite != null);
     try std.testing.expectEqualStrings("/api", loaded.routes[0].rewrite.?.pattern);
     try std.testing.expectEqualStrings("", loaded.routes[0].rewrite.?.replacement);
+}
+
+test "parse unix-socket upstream server" {
+    const json =
+        \\{
+        \\  "upstreams": [{
+        \\    "name": "vm",
+        \\    "servers": [ { "unix": "/tmp/vm-42.sock" } ]
+        \\  }],
+        \\  "routes": [{ "path_prefix": "/", "upstream": "vm" }]
+        \\}
+    ;
+    var loaded = try parseJsonFromBytes(std.testing.allocator, json);
+    defer loaded.deinit();
+    try std.testing.expectEqualStrings("/tmp/vm-42.sock", loaded.upstreams[0].servers[0].unix_path);
+    try std.testing.expectEqualStrings("", loaded.upstreams[0].servers[0].address);
+    try std.testing.expectEqual(@as(u16, 0), loaded.upstreams[0].servers[0].port);
+}
+
+test "reject unix + address on the same server, and non-absolute unix path" {
+    const both =
+        \\{ "upstreams": [{ "name": "x", "servers": [ { "unix": "/s.sock", "address": "1.2.3.4", "port": 80 } ] }],
+        \\  "routes": [{ "path_prefix": "/", "upstream": "x" }] }
+    ;
+    try std.testing.expectError(error.ConfigParseError, parseJsonFromBytes(std.testing.allocator, both));
+    const rel =
+        \\{ "upstreams": [{ "name": "x", "servers": [ { "unix": "relative.sock" } ] }],
+        \\  "routes": [{ "path_prefix": "/", "upstream": "x" }] }
+    ;
+    try std.testing.expectError(error.ConfigParseError, parseJsonFromBytes(std.testing.allocator, rel));
+    const neither =
+        \\{ "upstreams": [{ "name": "x", "servers": [ { "weight": 2 } ] }],
+        \\  "routes": [{ "path_prefix": "/", "upstream": "x" }] }
+    ;
+    try std.testing.expectError(error.ConfigParseError, parseJsonFromBytes(std.testing.allocator, neither));
+}
+
+test "parse tenant route (no upstream required) and reject invalid combos" {
+    const ok =
+        \\{
+        \\  "routes": [{
+        \\    "path_prefix": "/",
+        \\    "tenant": { "header": "x-tenant", "socket_dir": "/run/vms/" }
+        \\  }]
+        \\}
+    ;
+    var loaded = try parseJsonFromBytes(std.testing.allocator, ok);
+    defer loaded.deinit();
+    try std.testing.expect(loaded.routes[0].tenant != null);
+    try std.testing.expectEqualStrings("x-tenant", loaded.routes[0].tenant.?.header);
+    try std.testing.expectEqualStrings("/run/vms/", loaded.routes[0].tenant.?.socket_dir);
+    try std.testing.expect(loaded.routes[0].tenant.?.skip_filter_when_warm);
+    try std.testing.expectEqualStrings("", loaded.routes[0].upstream); // sentinel
+
+    // socket_dir is required and must be absolute.
+    const no_dir =
+        \\{ "routes": [{ "path_prefix": "/", "tenant": { "header": "x-tenant", "socket_dir": "" } }] }
+    ;
+    try std.testing.expectError(error.ConfigParseError, parseJsonFromBytes(std.testing.allocator, no_dir));
+
+    // A tenant route must not also carry a static upstream.
+    const with_up =
+        \\{ "upstreams": [{ "name":"api","servers":[{"address":"1.2.3.4","port":80}] }],
+        \\  "routes": [{ "path_prefix": "/", "upstream": "api", "tenant": { "socket_dir": "/run/vms/" } }] }
+    ;
+    try std.testing.expectError(error.ConfigParseError, parseJsonFromBytes(std.testing.allocator, with_up));
 }
 
 test "parse empty config uses defaults" {
@@ -1156,6 +1395,39 @@ test "parse otel config" {
     try std.testing.expectEqual(@as(u32, 10), loaded.server_config.otel.flush_interval_s);
     try std.testing.expectEqual(@as(u16, 50), loaded.server_config.otel.sample_rate);
     try std.testing.expectEqual(@as(u16, 128), loaded.server_config.otel.max_batch_size);
+}
+
+test "O1: wasm_control_socket + deadline parse from config" {
+    const json =
+        \\{
+        \\  "wasm_control_socket": "/run/nether/agent.sock",
+        \\  "wasm_host_call_deadline_ms": 5000,
+        \\  "wasm_filters": [{ "match": "/agent/", "module": "./f.wasm" }]
+        \\}
+    ;
+    var loaded = try parseJsonFromBytes(std.testing.allocator, json);
+    defer loaded.deinit();
+    try std.testing.expectEqualStrings("/run/nether/agent.sock", loaded.wasm_control_socket);
+    try std.testing.expectEqual(@as(u64, 5000), loaded.wasm_host_call_deadline_ms);
+    try std.testing.expectEqual(@as(usize, 1), loaded.wasm_filters.len);
+    try std.testing.expectEqual(@as(u64, 0), loaded.tenant_idle_ttl_ms); // absent -> server default
+}
+
+test "tenant_idle_ttl_ms parses from config" {
+    const json =
+        \\{ "tenant_idle_ttl_ms": 120000,
+        \\  "routes": [{ "path_prefix": "/", "tenant": { "socket_dir": "/run/vms/" } }] }
+    ;
+    var loaded = try parseJsonFromBytes(std.testing.allocator, json);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(u64, 120000), loaded.tenant_idle_ttl_ms);
+}
+
+test "O1: absent wasm_control_socket defaults to empty (transport off)" {
+    var loaded = try parseJsonFromBytes(std.testing.allocator, "{}");
+    defer loaded.deinit();
+    try std.testing.expectEqualStrings("", loaded.wasm_control_socket);
+    try std.testing.expectEqual(@as(u64, 0), loaded.wasm_host_call_deadline_ms);
 }
 
 test "parse postgres config" {

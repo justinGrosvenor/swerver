@@ -12,7 +12,7 @@ Add an `admin` block to the config:
 {
   "admin": {
     "enabled": true,
-    "port": 9090,
+    "port": 9180,
     "address": "127.0.0.1",
     "api_key": "secret-admin-key"
   }
@@ -34,35 +34,51 @@ Add an `admin` block to the config:
 Send the API key on every request. The key is matched against `admin.api_key`:
 
 ```sh
-curl -H "X-API-Key: secret-admin-key" http://127.0.0.1:9090/routes
+curl -H "X-API-Key: secret-admin-key" http://127.0.0.1:9180/v1/routes
 ```
 
 ## Endpoints
 
+All endpoints are under the `/v1` prefix.
+
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/routes` | List current routes |
-| `POST` | `/routes` | Add a route |
-| `DELETE` | `/routes/{prefix}` | Remove the route with that path prefix |
-| `GET` | `/upstreams` | List upstreams |
-| `POST` | `/upstreams` | Add an upstream |
-| `PUT` | `/upstreams/{name}` | Update an upstream |
-| `DELETE` | `/upstreams/{name}` | Remove an upstream |
+| `GET` | `/v1/routes` | List routes, including their `auth`, `x402`, and `wasm_filter` bindings |
+| `POST` | `/v1/routes` | Add a route |
+| `DELETE` | `/v1/routes/{prefix}` | Remove the route with that path prefix (URL-encode the prefix) |
+| `GET` | `/v1/upstreams` | List upstreams |
+| `POST` | `/v1/upstreams` | Add an upstream |
+| `DELETE` | `/v1/upstreams/{name}` | Remove an upstream |
+| `GET` | `/v1/status` | Server status + WASM park-table / filter-pool gauges (JSON) |
+| `GET` | `/v1/metrics` | Prometheus metrics (`text/plain`), including the Tier-2 gauges |
+| `GET` | `/v1/usage` | Usage counters (append `?reset` to zero them after reading) |
+| `DELETE` | `/v1/usage` | Read and reset usage counters |
+| `POST` | `/v1/config/persist` | Persist the running config back to the file |
+| `POST` | `/v1/reload` | Reload config from the file |
 
-The JSON bodies match the `routes[]` and `upstreams[]` shapes from the config file. See [Reverse proxy & gateway](../guide/reverse-proxy.md) for the field reference.
+There is no `PUT`; update an upstream by `DELETE` + `POST`. The JSON bodies match
+the `routes[]` and `upstreams[]` shapes from the config file. See
+[Reverse proxy & gateway](../guide/reverse-proxy.md) for the field reference.
+
+`/v1/status` and `/v1/metrics` expose the Tier-2 observability gauges:
+`park_active` / `park_capacity` (host-call table occupancy vs the hard ceiling)
+and `pool_instances` / `pool_pinned` (edge-filter pool saturation), plus whether
+the control transport is configured and connected. Watch `pool_pinned` approach
+`pool_instances`, or `park_active` approach `park_capacity`, to see Tier-2 fan-out
+backing up before it 503s.
 
 ## Examples
 
 List routes:
 
 ```sh
-curl -H "X-API-Key: secret-admin-key" http://127.0.0.1:9090/routes
+curl -H "X-API-Key: secret-admin-key" http://127.0.0.1:9180/v1/routes
 ```
 
 Add an upstream:
 
 ```sh
-curl -X POST http://127.0.0.1:9090/upstreams \
+curl -X POST http://127.0.0.1:9180/v1/upstreams \
   -H "X-API-Key: secret-admin-key" \
   -H "Content-Type: application/json" \
   -d '{
@@ -75,7 +91,7 @@ curl -X POST http://127.0.0.1:9090/upstreams \
 Add a route pointing at it:
 
 ```sh
-curl -X POST http://127.0.0.1:9090/routes \
+curl -X POST http://127.0.0.1:9180/v1/routes \
   -H "X-API-Key: secret-admin-key" \
   -H "Content-Type: application/json" \
   -d '{
@@ -89,7 +105,7 @@ curl -X POST http://127.0.0.1:9090/routes \
 Remove a route by its prefix:
 
 ```sh
-curl -X DELETE http://127.0.0.1:9090/routes/%2Fcanary%2F \
+curl -X DELETE http://127.0.0.1:9180/v1/routes/%2Fcanary%2F \
   -H "X-API-Key: secret-admin-key"
 ```
 
