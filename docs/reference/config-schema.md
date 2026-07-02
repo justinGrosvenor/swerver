@@ -313,6 +313,14 @@ The registry is per-worker and survives config reload; idle entries are reaped
 after `tenant_idle_ttl_ms`. `GET /v1/tenants` on the admin API lists the current
 worker's warm mappings.
 
+**Tenant server framing.** The in-guest tenant HTTP server should set
+`Content-Length` or use `Transfer-Encoding: chunked` on its responses. swerver
+detects a truncated Content-Length or chunked body and fails loud (502), but a
+close-delimited response (neither header, body ends at connection close) that is
+cut short is indistinguishable from a complete one and would be served as-is.
+The Nether data-plane bridge is byte-for-byte lossless, so this only bites a
+misbehaving tenant; explicit framing is defense in depth.
+
 ### `routes[].rate_limit`
 
 | Key | Type | Default | Description |
