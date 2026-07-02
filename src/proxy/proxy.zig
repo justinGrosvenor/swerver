@@ -1571,6 +1571,30 @@ test "parseIpToU32" {
     try std.testing.expect(parseIpToU32("192.168.1.1.1") == null);
 }
 
+test "extractTenantKey: host strips port, custom header verbatim, bounds" {
+    const tc_host = upstream.TenantRouting{ .socket_dir = "/tmp/" };
+    // host with :port -> port stripped.
+    const r1 = request.RequestView{ .method = .GET, .path = "/vm/x", .headers = &.{
+        .{ .name = "host", .value = "alpha.example.com:8443" },
+    } };
+    try std.testing.expectEqualStrings("alpha.example.com", extractTenantKey(&r1, tc_host).?);
+    // host without a port -> verbatim.
+    const r2 = request.RequestView{ .method = .GET, .path = "/vm/x", .headers = &.{
+        .{ .name = "host", .value = "beta.example.com" },
+    } };
+    try std.testing.expectEqualStrings("beta.example.com", extractTenantKey(&r2, tc_host).?);
+    // Missing header -> null.
+    const r3 = request.RequestView{ .method = .GET, .path = "/vm/x", .headers = &.{} };
+    try std.testing.expect(extractTenantKey(&r3, tc_host) == null);
+
+    // A custom header is used verbatim (no port stripping).
+    const tc_hdr = upstream.TenantRouting{ .header = "x-tenant", .socket_dir = "/tmp/" };
+    const r4 = request.RequestView{ .method = .GET, .path = "/vm/x", .headers = &.{
+        .{ .name = "x-tenant", .value = "tenant-42:with-colon" },
+    } };
+    try std.testing.expectEqualStrings("tenant-42:with-colon", extractTenantKey(&r4, tc_hdr).?);
+}
+
 test "Proxy route matching" {
     const routes = [_]upstream.ProxyRoute{
         .{
