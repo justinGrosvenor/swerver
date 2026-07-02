@@ -33,6 +33,11 @@ pub const DEFAULT_SLOT: u32 = 4;
 /// Reports and shell commands end with 0x1e<exit-code>\n.
 const RS: u8 = 0x1e;
 
+/// Delimiter-escape lead byte (0x1f, ASCII US) per control-protocol.md "Output
+/// framing" (R2b): the agent emits a BODY 0x1e/0x1f as ESC,(byte^0x40), so a raw
+/// RS on the wire is only ever the real trailer. See unescapeBody.
+const ESC: u8 = 0x1f;
+
 /// Buffers. A reply larger than RECV_CAP is DRAINED to its frame boundary (the
 /// agent always emits the 0x1e<exit>\n trailer; it truncates the body, not the
 /// frame -- control-protocol.md "Output bound"), so the socket stays clean and
@@ -434,19 +439,48 @@ pub const ControlClient = struct {
         }
     }
 
+    /// Un-escape a delimiter-escaped reply BODY in place (R2b, inverse of the
+    /// nether agent's write_escaped): a body 0x1e/0x1f arrives on the wire as
+    /// ESC,(byte^0x40) so a raw RS is only ever the real trailer. Returns the
+    /// decoded length (always <= buf.len; escapes only shrink). A dangling
+    /// trailing ESC (its pair truncated away by a drain/cap edge) is dropped.
+    /// Pre-R2b agents never emit raw ESC in practice, and escape-free bodies
+    /// are byte-identical, so this is backward-safe.
+    fn unescapeBody(buf: []u8) usize {
+        var n: usize = 0;
+        var esc = false;
+        for (buf) |b| {
+            if (esc) {
+                buf[n] = b ^ 0x40;
+                n += 1;
+                esc = false;
+            } else if (b == ESC) {
+                esc = true;
+            } else {
+                buf[n] = b;
+                n += 1;
+            }
+        }
+        return n;
+    }
+
     /// Deliver an in-flight command reply, truncating the BODY (never the trailer)
     /// so the delivered frame fits the filter's result buffer. `body_len` is the
     /// retained output length in recv_buf[0..]; `trailer` is the 0x1e<exit>\n bytes
-    /// (which may alias recv_buf past body_len, so it is copied out first). Mirrors
+    /// (which may alias recv_buf past body_len, so it is copied out first). The
+    /// body is un-escaped here (R2b) so the filter sees literal bytes. Mirrors
     /// the nether-side max_output_bytes contract one level down (R2).
     fn deliverCommandReply(self: *ControlClient, body_len: usize, trailer: []const u8) void {
         const tn: usize = @min(trailer.len, TRAILER_MAX);
-        const max_body: usize = if (DELIVER_CAP > tn) DELIVER_CAP - tn else 0;
-        const keep = @min(body_len, max_body);
-        if (keep < body_len)
-            std.log.warn("wasm control ({s}): agent reply body {d}B over result cap {d}B; body truncated, exit trailer kept", .{ self.path, body_len, DELIVER_CAP });
         var tbuf: [TRAILER_MAX]u8 = undefined;
         @memcpy(tbuf[0..tn], trailer[0..tn]);
+        // Un-escape after the trailer copy (it may alias recv_buf past body_len;
+        // un-escaping only writes within [0..body_len) and only shrinks).
+        const decoded_len = unescapeBody(self.recv_buf[0..body_len]);
+        const max_body: usize = if (DELIVER_CAP > tn) DELIVER_CAP - tn else 0;
+        const keep = @min(decoded_len, max_body);
+        if (keep < decoded_len)
+            std.log.warn("wasm control ({s}): agent reply body {d}B over result cap {d}B; body truncated, exit trailer kept", .{ self.path, decoded_len, DELIVER_CAP });
         @memcpy(self.recv_buf[keep .. keep + tn], tbuf[0..tn]);
         if (self.inflight) |t| {
             self.inflight = null;
@@ -549,7 +583,11 @@ pub const ControlClient = struct {
 
         switch (self.state) {
             .info_wait => {
-                if (!verifyProtoVersion(body)) {
+                // The __info__ report is a command reply too: un-escape (R2b)
+                // before parsing. In-place is safe: bytes at/after `sep` are
+                // untouched and consumeFront only shifts from `end`.
+                const info_len = unescapeBody(body);
+                if (!verifyProtoVersion(body[0..info_len])) {
                     self.fail(io_rt, now_ms, "proto_version mismatch (expected 1)");
                     return true;
                 }
@@ -855,6 +893,97 @@ test "tryConsumeReply: partial trailer is not consumed until newline" {
     try testing.expect(cc.tryConsumeReply(&io_rt, 0));
     try testing.expectEqual(@as(?Token, 7), Captured.token);
     try testing.expectEqualStrings("data\x1e0\n", Captured.body[0..Captured.body_len]);
+}
+
+test "R2b: escaped 0x1e in the body un-escapes and does not break framing" {
+    Captured.reset();
+    var dummy: u8 = 0;
+    var cc = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
+    cc.installResume(@ptrCast(&dummy), Captured.complete, Captured.fail);
+    var io_rt: io_mod.IoRuntime = undefined;
+
+    // Nether's live R2b proof shape: a workload printed "A<0x1e>0\nB" and exited
+    // 7; the agent escapes the body 0x1e as 0x1f,0x5e so the only raw 0x1e on
+    // the wire is the real trailer. swerver must deliver the literal bytes with
+    // the exit-7 trailer intact.
+    cc.state = .ready;
+    cc.inflight = 11;
+    const wire = "A\x1f\x5e0\nB\x1e7\n";
+    @memcpy(cc.recv_buf[0..wire.len], wire);
+    cc.recv_len = wire.len;
+    try testing.expect(cc.tryConsumeReply(&io_rt, 0));
+    try testing.expectEqual(@as(?Token, 11), Captured.token);
+    try testing.expectEqualStrings("A\x1e0\nB\x1e7\n", Captured.body[0..Captured.body_len]);
+    try testing.expectEqual(@as(usize, 0), cc.recv_len);
+}
+
+test "R2b: escaped 0x1f round-trips; escape-free bodies are byte-identical" {
+    Captured.reset();
+    var dummy: u8 = 0;
+    var cc = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
+    cc.installResume(@ptrCast(&dummy), Captured.complete, Captured.fail);
+    var io_rt: io_mod.IoRuntime = undefined;
+
+    cc.state = .ready;
+    cc.inflight = 12;
+    const wire = "x\x1f\x5fy\x1e0\n"; // body "x<0x1f>y"
+    @memcpy(cc.recv_buf[0..wire.len], wire);
+    cc.recv_len = wire.len;
+    try testing.expect(cc.tryConsumeReply(&io_rt, 0));
+    try testing.expectEqualStrings("x\x1fy\x1e0\n", Captured.body[0..Captured.body_len]);
+
+    // No escapes: byte-identical delivery (backward-safe with pre-R2b agents).
+    Captured.reset();
+    cc.inflight = 13;
+    const plain = "plain output\x1e0\n";
+    @memcpy(cc.recv_buf[0..plain.len], plain);
+    cc.recv_len = plain.len;
+    try testing.expect(cc.tryConsumeReply(&io_rt, 0));
+    try testing.expectEqualStrings("plain output\x1e0\n", Captured.body[0..Captured.body_len]);
+}
+
+test "R2b: an escape pair split across two reads decodes once the frame completes" {
+    Captured.reset();
+    var dummy: u8 = 0;
+    var cc = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
+    cc.installResume(@ptrCast(&dummy), Captured.complete, Captured.fail);
+    var io_rt: io_mod.IoRuntime = undefined;
+
+    cc.state = .ready;
+    cc.inflight = 14;
+    // First chunk ends mid-escape (trailing 0x1f, no raw 0x1e yet) -> no frame,
+    // nothing consumed, nothing prematurely un-escaped.
+    const part1 = "data\x1f";
+    @memcpy(cc.recv_buf[0..part1.len], part1);
+    cc.recv_len = part1.len;
+    try testing.expect(!cc.tryConsumeReply(&io_rt, 0));
+    try testing.expect(Captured.token == null);
+
+    // Second chunk completes the pair and the frame: decode happens on the
+    // whole body at delivery time.
+    const part2 = "\x5e!\x1e0\n";
+    @memcpy(cc.recv_buf[cc.recv_len..][0..part2.len], part2);
+    cc.recv_len += part2.len;
+    try testing.expect(cc.tryConsumeReply(&io_rt, 0));
+    try testing.expectEqual(@as(?Token, 14), Captured.token);
+    try testing.expectEqualStrings("data\x1e!\x1e0\n", Captured.body[0..Captured.body_len]);
+}
+
+test "R2b: a dangling trailing escape at a truncation edge is dropped, trailer kept" {
+    Captured.reset();
+    var dummy: u8 = 0;
+    var cc = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
+    cc.installResume(@ptrCast(&dummy), Captured.complete, Captured.fail);
+
+    // Drive deliverCommandReply directly with a body whose final byte is a bare
+    // ESC (its pair lost to a drain/cap edge): must not panic, must drop the
+    // dangling ESC, and must keep the exit trailer.
+    cc.inflight = 15;
+    const body = "abc\x1f";
+    @memcpy(cc.recv_buf[0..body.len], body);
+    cc.deliverCommandReply(body.len, "\x1e3\n");
+    try testing.expectEqual(@as(?Token, 15), Captured.token);
+    try testing.expectEqualStrings("abc\x1e3\n", Captured.body[0..Captured.body_len]);
 }
 
 test "tryConsumeReply: a bare ERR at handshake fails fast (no hang)" {

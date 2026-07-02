@@ -134,9 +134,45 @@ pub fn hostCall(cmd: []const u8) bool {
 }
 
 /// In on_resume: copy the completed host-call result into `buf` (clamped).
+/// The result is the full agent reply frame: `<output>0x1e<exit>\n`. The host
+/// un-escapes the output (R2b), so it may contain LITERAL 0x1e bytes; parse the
+/// trailer from the END (see callResultParts), never the first 0x1e.
 pub fn callResult(buf: []u8) []const u8 {
     const n = raw.read_call_result(buf.ptr, @intCast(buf.len));
     return buf[0..clampLen(n, buf.len)];
+}
+
+pub const CallResultParts = struct {
+    /// Command output, literal bytes (host already un-escaped).
+    output: []const u8,
+    /// Exit code from the trailer; null when the trailer is absent/malformed
+    /// (transport failure delivered a bare frame) -- treat as failure.
+    exit_code: ?u8,
+};
+
+/// Split a callResult frame into output + exit code. The trailer is the frame's
+/// SUFFIX `0x1e<digits>\n`, so it is found from the end: the LAST 0x1e. A
+/// literal 0x1e inside the output (possible post-R2b) cannot forge it because
+/// everything after the real trailer's 0x1e is only digits + newline.
+pub fn callResultParts(frame: []const u8) CallResultParts {
+    if (frame.len < 3 or frame[frame.len - 1] != '\n') return .{ .output = frame, .exit_code = null };
+    var sep: usize = frame.len - 1;
+    while (sep > 0) {
+        sep -= 1;
+        if (frame[sep] == 0x1e) {
+            const digits = frame[sep + 1 .. frame.len - 1];
+            if (digits.len == 0 or digits.len > 3) break;
+            var code: u32 = 0;
+            for (digits) |d| {
+                if (d < '0' or d > '9') return .{ .output = frame, .exit_code = null };
+                code = code * 10 + (d - '0');
+            }
+            if (code > 255) break;
+            return .{ .output = frame[0..sep], .exit_code = @intCast(code) };
+        }
+        if (frame[sep] < '0' or frame[sep] > '9') break;
+    }
+    return .{ .output = frame, .exit_code = null };
 }
 
 // --- Response-phase helpers (valid in on_response) --------------------------
