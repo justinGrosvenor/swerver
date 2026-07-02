@@ -1224,6 +1224,24 @@ test "parseUpstreamResponse waits for complete chunked body" {
     try std.testing.expectError(error.IncompleteResponse, parseUpstreamResponse(resp_data, false));
 }
 
+test "parseUpstreamResponse rejects a Content-Length body truncated by EOF" {
+    // The upstream (or, in the two-tier path, a tenant VM behind the nether
+    // data-plane bridge) declared Content-Length: 10 but only 3 bytes arrived
+    // before the socket closed. This MUST be error.IncompleteResponse, not a
+    // silently-served short body: the proxy caller converts the error to a 502
+    // (embedded/proxy path) or a tenant-mapping eviction + 503 (tenant path).
+    // Regression guard for the nether streaming-truncation P0's blast radius:
+    // a truncated CL response fails LOUD through swerver.
+    const truncated = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc";
+    try std.testing.expectError(error.IncompleteResponse, parseUpstreamResponse(truncated, false));
+
+    // The exact-length body is accepted (the boundary case: not one byte short).
+    const complete = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabcdefghij";
+    const p = try parseUpstreamResponse(complete, false);
+    try std.testing.expectEqual(@as(u16, 200), p.status);
+    try std.testing.expectEqualStrings("abcdefghij", complete[p.body_start..p.body_end]);
+}
+
 test "parseUpstreamResponse disables keep-alive for close-delimited bodies" {
     const resp_data = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nhello";
     const parsed = try parseUpstreamResponse(resp_data, false);
