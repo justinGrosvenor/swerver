@@ -77,6 +77,7 @@ pub const Master = struct {
     /// worker builds its own ControlClient. "" / 0 leave the Server defaults.
     wasm_control_socket_path: []const u8 = "",
     wasm_host_call_deadline_ms: u64 = 0,
+    tenant_idle_ttl_ms: u64 = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -200,6 +201,7 @@ pub const Master = struct {
             // endpoint per worker index). No placeholder = shared path (warned).
             srv.wasm_control_socket_path = expandWorkerPath(self.wasm_control_socket_path, worker_id, &worker_sock_buf) orelse self.wasm_control_socket_path;
             if (self.wasm_host_call_deadline_ms != 0) srv.wasm_host_call_deadline_ms = self.wasm_host_call_deadline_ms;
+            if (self.tenant_idle_ttl_ms != 0) srv.tenant_idle_ttl_ms = self.tenant_idle_ttl_ms;
 
             srv.run(null) catch |err| {
                 std.log.err("[w{d}] server error: {}", .{ worker_id, err });

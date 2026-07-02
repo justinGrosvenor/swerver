@@ -76,6 +76,8 @@ pub const LoadedConfig = struct {
     wasm_control_socket: []const u8,
     /// Park deadline in ms (0 = use the Server default).
     wasm_host_call_deadline_ms: u64,
+    /// Tenant registry idle TTL in ms (0 = use the Server default).
+    tenant_idle_ttl_ms: u64,
     arena: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *LoadedConfig) void {
@@ -614,6 +616,7 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
         // Borrows the parsed-JSON arena (same lifetime as wasm_filters' paths).
         .wasm_control_socket = file_cfg.wasm_control_socket orelse "",
         .wasm_host_call_deadline_ms = file_cfg.wasm_host_call_deadline_ms orelse 0,
+        .tenant_idle_ttl_ms = file_cfg.tenant_idle_ttl_ms orelse 0,
         .arena = arena,
     };
 }
@@ -720,6 +723,8 @@ const FileConfig = struct {
     wasm_control_socket: ?[]const u8 = null,
     /// Park (host_call) deadline in ms before a parked filter fails closed.
     wasm_host_call_deadline_ms: ?u64 = null,
+    /// Tenant-to-microVM registry idle TTL in ms (park-concurrency Phase 1).
+    tenant_idle_ttl_ms: ?u64 = null,
 };
 
 const WasmFilterJson = struct {
@@ -1405,6 +1410,17 @@ test "O1: wasm_control_socket + deadline parse from config" {
     try std.testing.expectEqualStrings("/run/nether/agent.sock", loaded.wasm_control_socket);
     try std.testing.expectEqual(@as(u64, 5000), loaded.wasm_host_call_deadline_ms);
     try std.testing.expectEqual(@as(usize, 1), loaded.wasm_filters.len);
+    try std.testing.expectEqual(@as(u64, 0), loaded.tenant_idle_ttl_ms); // absent -> server default
+}
+
+test "tenant_idle_ttl_ms parses from config" {
+    const json =
+        \\{ "tenant_idle_ttl_ms": 120000,
+        \\  "routes": [{ "path_prefix": "/", "tenant": { "socket_dir": "/run/vms/" } }] }
+    ;
+    var loaded = try parseJsonFromBytes(std.testing.allocator, json);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(u64, 120000), loaded.tenant_idle_ttl_ms);
 }
 
 test "O1: absent wasm_control_socket defaults to empty (transport off)" {
