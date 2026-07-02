@@ -7,6 +7,7 @@ const router = @import("router/router.zig");
 const clock = @import("runtime/clock.zig");
 const proxy_mod = @import("proxy/proxy.zig");
 const x402_client = @import("middleware/x402_client.zig");
+const net_mod = @import("runtime/net.zig");
 
 const MAX_WORKERS = 256;
 
@@ -114,6 +115,18 @@ pub const Master = struct {
 
         std.log.info("[master] starting {d} workers on :{d}", .{ self.worker_count, self.cfg.port });
 
+        // Nether admits ONE primary control client per socket; the rest are
+        // read-only observers. With N>1 workers sharing one socket path, only one
+        // drives host calls -> parking filters and tenant cold starts fail closed
+        // on the others. Warn (do not clamp: non-parking filters still work, and
+        // the operator may want the cores). A "{worker}" placeholder in the path
+        // is expanded per worker (forkWorker) so a supervisor can run N sockets.
+        if (self.worker_count > 1 and self.wasm_control_socket_path.len > 0 and
+            std.mem.indexOf(u8, self.wasm_control_socket_path, "{worker}") == null)
+        {
+            std.log.warn("[master] {d} workers share one wasm control socket '{s}'; only worker 0 becomes the Nether primary -- parking filters / tenant cold starts fail closed on the rest. Use a '{{worker}}' placeholder in the path, or set workers: 1.", .{ self.worker_count, self.wasm_control_socket_path });
+        }
+
         // Fork all workers — each creates its own listener with SO_REUSEPORT
         for (0..self.worker_count) |i| {
             self.forkWorker(@intCast(i));
@@ -163,6 +176,7 @@ pub const Master = struct {
 
         if (pid == 0) {
             // Child process
+            var worker_sock_buf: [net_mod.UNIX_PATH_MAX + 1]u8 = undefined;
             resetChildSignals();
             worker_id_global = worker_id;
             // Tag this worker's settlement spill lines with its id.
@@ -181,7 +195,10 @@ pub const Master = struct {
             };
             srv.config_source = self.config_source;
             srv.wasm_filter_specs = self.wasm_filter_specs;
-            srv.wasm_control_socket_path = self.wasm_control_socket_path;
+            // Expand a "{worker}" placeholder in the control-socket path so each
+            // worker gets its own Nether primary (a supervisor can spawn one
+            // endpoint per worker index). No placeholder = shared path (warned).
+            srv.wasm_control_socket_path = expandWorkerPath(self.wasm_control_socket_path, worker_id, &worker_sock_buf) orelse self.wasm_control_socket_path;
             if (self.wasm_host_call_deadline_ms != 0) srv.wasm_host_call_deadline_ms = self.wasm_host_call_deadline_ms;
 
             srv.run(null) catch |err| {
@@ -300,6 +317,21 @@ pub fn getWorkerId() ?u16 {
 fn detectCpuCount() u16 {
     const count = std.Thread.getCpuCount() catch 1;
     return @intCast(@min(count, MAX_WORKERS));
+}
+
+/// Expand a single "{worker}" placeholder in a control-socket path with the
+/// worker index, into `buf`. Returns the expanded slice, or null if there is no
+/// placeholder (caller uses the original path) or it would not fit `buf`.
+fn expandWorkerPath(path: []const u8, worker_id: u16, buf: []u8) ?[]const u8 {
+    const ph = "{worker}";
+    const at = std.mem.indexOf(u8, path, ph) orelse return null;
+    return std.fmt.bufPrint(buf, "{s}{d}{s}", .{ path[0..at], worker_id, path[at + ph.len ..] }) catch null;
+}
+
+test "expandWorkerPath substitutes the worker index (and no-ops without a placeholder)" {
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("/run/nether-3.sock", expandWorkerPath("/run/nether-{worker}.sock", 3, &buf).?);
+    try std.testing.expect(expandWorkerPath("/run/nether.sock", 3, &buf) == null);
 }
 
 fn pinWorkerCpu(worker_id: u16) void {

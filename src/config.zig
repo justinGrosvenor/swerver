@@ -33,8 +33,11 @@ pub const ServerConfig = struct {
     /// Allowed Host header values. Empty slice means all hosts are accepted.
     /// When non-empty, requests with a Host header not in this list are rejected with 400.
     allowed_hosts: []const []const u8 = &.{},
-    /// Number of worker processes. 1 = single-process (no fork). 0 = auto-detect CPU count.
-    workers: u16 = 1,
+    /// Number of worker processes. 1 = single-process (no fork). 0 = auto-detect
+    /// CPU count (the default). NOTE: with a wasm control socket configured, only
+    /// one worker becomes the Nether primary client; set `workers: 1` if parking
+    /// filters / tenant cold starts must work on every worker (see master.zig).
+    workers: u16 = 0,
     /// Max connections per IP address. 0 = unlimited.
     per_ip_limit: u16 = 0,
     /// Graceful shutdown drain timeout in milliseconds.
@@ -91,7 +94,7 @@ pub const ServerConfig = struct {
             .otel = .{},
             .static_root = "",
             .allowed_hosts = &.{},
-            .workers = 1,
+            .workers = 0,
         };
     }
 
