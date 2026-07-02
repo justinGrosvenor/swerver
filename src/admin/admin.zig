@@ -3,6 +3,7 @@ const build_options = @import("build_options");
 const net = @import("../runtime/net.zig");
 const clock = @import("../runtime/clock.zig");
 const upstream_mod = @import("../proxy/upstream.zig");
+const tenant_mod = @import("../proxy/tenant.zig");
 const proxy_mod = @import("../proxy/proxy.zig");
 const json_write = @import("../runtime/json_write.zig");
 
@@ -770,9 +771,15 @@ fn writeUpstreamJson(buf: []u8, u: upstream_mod.Upstream) usize {
 /// reflects that worker's warm mappings, not a cluster-wide set.
 fn listTenants(server: *Server, buf: []u8) DispatchResult {
     if (!build_options.enable_wasm) return .{ .status = 200, .body = "{\"tenants\":[]}" };
+    return .{ .status = 200, .body = renderTenantsJson(&server.tenant_registry, buf) };
+}
+
+/// Render the tenant registry as `{"tenants":[{key,path,last_used_ms},...]}`.
+/// Split out from listTenants so it is unit-testable without a full Server.
+fn renderTenantsJson(reg: *tenant_mod.TenantRegistry, buf: []u8) []const u8 {
     var off: usize = 0;
     off += copyInto(buf[off..], "{\"tenants\":[");
-    var it = server.tenant_registry.iterator();
+    var it = reg.iterator();
     var first = true;
     while (it.next()) |e| {
         if (!first) off += copyInto(buf[off..], ",");
@@ -782,11 +789,15 @@ fn listTenants(server: *Server, buf: []u8) DispatchResult {
         off += copyInto(buf[off..], "\",\"path\":\"");
         off += copyEscaped(buf[off..], e.path);
         off += copyInto(buf[off..], "\",\"last_used_ms\":");
-        off += copyInto(buf[off..], std.fmt.bufPrint(buf[off..], "{d}", .{e.last_used_ms}) catch "0");
+        // Format into a local buffer first: bufPrint(buf[off..]) then
+        // copyInto(buf[off..], ...) would @memcpy a slice onto itself (aborts
+        // in safe builds). u64 is at most 20 digits.
+        var num_buf: [20]u8 = undefined;
+        off += copyInto(buf[off..], std.fmt.bufPrint(&num_buf, "{d}", .{e.last_used_ms}) catch "0");
         off += copyInto(buf[off..], "}");
     }
     off += copyInto(buf[off..], "]}");
-    return .{ .status = 200, .body = buf[0..off] };
+    return buf[0..off];
 }
 
 fn copyInto(dst: []u8, src: []const u8) usize {
@@ -904,6 +915,20 @@ test "writeRouteJson produces valid JSON" {
     // O8: the binding read-back fields are always present.
     try std.testing.expect(std.mem.indexOf(u8, json, "\"auth\":\"none\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"wasm_filter\":false") != null);
+}
+
+test "renderTenantsJson: empty + a warm entry (no self-alias abort)" {
+    var reg = tenant_mod.TenantRegistry{};
+    var buf: [512]u8 = undefined;
+    // Empty registry.
+    try std.testing.expectEqualStrings("{\"tenants\":[]}", renderTenantsJson(&reg, &buf));
+    // A warm entry: last_used_ms formatting must not @memcpy a slice onto itself
+    // (regression: it did, aborting the worker on the first /v1/tenants call).
+    reg.register("alpha", "/tmp/vm-alpha.sock", 12345);
+    const out = renderTenantsJson(&reg, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"key\":\"alpha\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"path\":\"/tmp/vm-alpha.sock\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"last_used_ms\":12345") != null);
 }
 
 test "O8: writeRouteJson reads back auth + x402 bindings" {
