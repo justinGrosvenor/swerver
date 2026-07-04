@@ -36,6 +36,7 @@ const http2 = @import("../protocol/http2.zig");
 const response_mod = @import("../response/response.zig");
 const router = @import("../router/router.zig");
 const middleware = @import("../middleware/middleware.zig");
+const metrics_mw = @import("../middleware/metrics_mw.zig");
 
 const x402_mod = @import("../middleware/x402.zig");
 const auth_mod = @import("../middleware/auth.zig");
@@ -1911,6 +1912,9 @@ pub fn handleRead(server: *Server, index: u32) !void {
         }
         conn.header_count = parse.view.headers.len;
         conn.is_head_request = (parse.view.method == .HEAD);
+        // Request counting is admin-gated: one predictable branch when the
+        // admin API is off, so benchmark configs pay nothing for it.
+        if (server.cfg.admin.enabled) metrics_mw.getStore().recordRequest(.http1);
         // Reset sent_continue for each new request in pipelined connections
         conn.sent_continue = false;
         if (!parse.keep_alive) conn.close_after_write = true;

@@ -4,6 +4,7 @@ const net = @import("../runtime/net.zig");
 const clock = @import("../runtime/clock.zig");
 const upstream_mod = @import("../proxy/upstream.zig");
 const tenant_mod = @import("../proxy/tenant.zig");
+const metrics_mw = @import("../middleware/metrics_mw.zig");
 const proxy_mod = @import("../proxy/proxy.zig");
 const json_write = @import("../runtime/json_write.zig");
 
@@ -452,7 +453,11 @@ fn getMetrics(server: *Server, buf: []u8) DispatchResult {
         @as(u8, if (w.control_ready) 1 else 0),
         w.tenants_active, w.tenant_hits, w.tenant_misses,
     }) catch return .{ .status = 500, .body = "metrics render failed\n", .content_type = "text/plain" };
-    return .{ .status = 200, .body = body, .content_type = "text/plain; version=0.0.4" };
+    // Traffic series (requests/responses/latency, recorded at the dispatch
+    // layer while the admin API is enabled). Same per-worker caveat as the
+    // wasm gauges: the admin socket lands on one worker.
+    const traffic = metrics_mw.getStore().format(buf[body.len..]) catch "";
+    return .{ .status = 200, .body = buf[0 .. body.len + traffic.len], .content_type = "text/plain; version=0.0.4" };
 }
 
 fn getUsage(buf: []u8, reset: bool) DispatchResult {

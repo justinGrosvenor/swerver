@@ -32,6 +32,7 @@ const request = @import("../protocol/request.zig");
 const response_mod = @import("../response/response.zig");
 const http3 = @import("../protocol/http3.zig");
 const middleware = @import("../middleware/middleware.zig");
+const metrics_mw = @import("../middleware/metrics_mw.zig");
 const quic_handler = @import("../quic/handler.zig");
 const quic_connection = @import("../quic/connection.zig");
 const clock = @import("../runtime/clock.zig");
@@ -321,6 +322,9 @@ fn handleHttp3Request(
 ) void {
     var req_headers: [65]request.Header = undefined;
     const req_view = Server.buildHttp3RequestView(req, req_headers[0..]) orelse return;
+
+    // Admin-gated (see dispatch.zig H1 counterpart): off = one dead branch.
+    if (server.cfg.admin.enabled) metrics_mw.getStore().recordRequest(.http3);
 
     if (!server.isAllowedHost(req_view)) {
         // Host not in allowlist — send the bad-request response

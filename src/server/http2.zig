@@ -35,6 +35,7 @@ const request = @import("../protocol/request.zig");
 const response_mod = @import("../response/response.zig");
 const http2 = @import("../protocol/http2.zig");
 const middleware = @import("../middleware/middleware.zig");
+const metrics_mw = @import("../middleware/metrics_mw.zig");
 const router = @import("../router/router.zig");
 const clock = @import("../runtime/clock.zig");
 const buffer_pool = @import("../runtime/buffer_pool.zig");
@@ -932,6 +933,8 @@ fn dispatchHttp2Request(
     hdr_request: request.RequestView,
     body: []const u8,
 ) !void {
+    // Admin-gated (see dispatch.zig H1 counterpart): off = one dead branch.
+    if (server.cfg.admin.enabled) metrics_mw.getStore().recordRequest(.http2);
     var mw_ctx = middleware.Context{
         .protocol = .http2,
         .is_tls = conn.is_tls,
