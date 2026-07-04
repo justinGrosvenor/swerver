@@ -150,8 +150,11 @@ fn dispatch(server: *Server, method: Method, path: []const u8, body: []const u8,
         };
     }
     if (startsWith(path, "/v1/tenants")) {
-        if (method != .GET) return .{ .status = 405, .body = "{\"error\":\"method not allowed\"}" };
-        return listTenants(server, buf);
+        return switch (method) {
+            .GET => listTenants(server, buf),
+            .DELETE => evictTenant(server, path, buf),
+            else => .{ .status = 405, .body = "{\"error\":\"method not allowed\"}" },
+        };
     }
     if (startsWith(path, "/v1/status")) {
         return getStatus(server, buf);
@@ -800,6 +803,38 @@ fn renderTenantsJson(reg: *tenant_mod.TenantRegistry, buf: []u8) []const u8 {
     return buf[0..off];
 }
 
+/// DELETE /v1/tenants?key=<tenant>: drop one warm mapping so the tenant's next
+/// request cold-starts (park -> fork -> re-register). The on-demand counterpart
+/// to the tenant_idle_ttl_ms reaper; the supervisor still owns the VM itself (a
+/// registry evict never kills a VM). Same per-worker caveat as listTenants.
+fn evictTenant(server: *Server, path: []const u8, buf: []u8) DispatchResult {
+    const key = queryParam(path, "key") orelse
+        return .{ .status = 400, .body = "{\"error\":\"?key= required\"}" };
+    if (key.len == 0) return .{ .status = 400, .body = "{\"error\":\"?key= required\"}" };
+    if (!build_options.enable_wasm) return .{ .status = 404, .body = "{\"error\":\"tenant not found\"}" };
+    if (!evictTenantKey(&server.tenant_registry, key))
+        return .{ .status = 404, .body = "{\"error\":\"tenant not found\"}" };
+    var off: usize = 0;
+    off += copyInto(buf[off..], "{\"ok\":true,\"evicted\":\"");
+    off += copyEscaped(buf[off..], key);
+    off += copyInto(buf[off..], "\"}");
+    return .{ .status = 200, .body = buf[0..off] };
+}
+
+/// Evict `key` if it is warm; reports whether it was found (registry.evict is
+/// void because the proxy's dead-socket callers do not care). Split out from
+/// evictTenant so it is unit-testable without a full Server.
+fn evictTenantKey(reg: *tenant_mod.TenantRegistry, key: []const u8) bool {
+    var it = reg.iterator();
+    while (it.next()) |e| {
+        if (std.mem.eql(u8, e.key, key)) {
+            reg.evict(key);
+            return true;
+        }
+    }
+    return false;
+}
+
 fn copyInto(dst: []u8, src: []const u8) usize {
     const n = @min(dst.len, src.len);
     @memcpy(dst[0..n], src[0..n]);
@@ -929,6 +964,30 @@ test "renderTenantsJson: empty + a warm entry (no self-alias abort)" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"key\":\"alpha\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"path\":\"/tmp/vm-alpha.sock\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"last_used_ms\":12345") != null);
+}
+
+test "evictTenantKey: evicts a warm key once, misses an unknown key" {
+    var reg = tenant_mod.TenantRegistry{};
+    reg.register("alpha", "/tmp/vm-alpha.sock", 100);
+    reg.register("beta", "/tmp/vm-beta.sock", 200);
+
+    try std.testing.expect(!evictTenantKey(&reg, "gamma"));
+    try std.testing.expectEqual(@as(usize, 2), reg.count());
+    try std.testing.expectEqual(@as(u64, 0), reg.evictions);
+
+    try std.testing.expect(evictTenantKey(&reg, "alpha"));
+    try std.testing.expectEqual(@as(usize, 1), reg.count());
+    try std.testing.expectEqual(@as(u64, 1), reg.evictions);
+
+    // A second evict of the same key is a miss, not a double count.
+    try std.testing.expect(!evictTenantKey(&reg, "alpha"));
+    try std.testing.expectEqual(@as(u64, 1), reg.evictions);
+
+    // The survivor still renders.
+    var buf: [512]u8 = undefined;
+    const out = renderTenantsJson(&reg, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"key\":\"beta\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"key\":\"alpha\"") == null);
 }
 
 test "O8: writeRouteJson reads back auth + x402 bindings" {

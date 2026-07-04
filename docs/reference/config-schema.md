@@ -311,7 +311,9 @@ are bounded by the 64 KiB request snapshot cap (larger requests fail closed).
 
 The registry is per-worker and survives config reload; idle entries are reaped
 after `tenant_idle_ttl_ms`. `GET /v1/tenants` on the admin API lists the current
-worker's warm mappings.
+worker's warm mappings; `DELETE /v1/tenants?key=<tenant>` drops one warm mapping
+on demand so the tenant's next request cold-starts (the registry evict never
+kills the VM itself; the supervisor owns reclaim).
 
 **Tenant server framing.** The in-guest tenant HTTP server should set
 `Content-Length` or use `Transfer-Encoding: chunked` on its responses. swerver
