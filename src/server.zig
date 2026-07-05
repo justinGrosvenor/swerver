@@ -1534,7 +1534,7 @@ pub const Server = struct {
             conn.h2_pending_files = null;
         }
         if (conn.h2_pending_responses) |resps| {
-            for (resps) |*r| r.cleanup(&self.io);
+            for (resps) |*r| r.cleanup(&self.io, self.allocator);
             self.allocator.destroy(resps);
             conn.h2_pending_responses = null;
         }

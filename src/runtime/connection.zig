@@ -143,12 +143,25 @@ pub const PendingH2Response = struct {
     active: bool = false,
     stream_id: u32 = 0,
     handle: buffer_pool.BufferHandle = undefined,
+    /// Heap-backed stash for in-memory bodies whose remainder exceeds one pool
+    /// buffer (rare slow path). When set, `handle` is not owned by this slot.
+    heap_bytes: ?[]u8 = null,
     offset: usize = 0,
     len: usize = 0,
 
-    pub fn cleanup(self: *PendingH2Response, io: anytype) void {
+    /// The stashed body bytes, wherever they live.
+    pub fn bytes(self: *const PendingH2Response) []const u8 {
+        return self.heap_bytes orelse self.handle.bytes;
+    }
+
+    pub fn cleanup(self: *PendingH2Response, io: anytype, allocator: std.mem.Allocator) void {
         if (self.active) {
-            io.releaseBuffer(self.handle);
+            if (self.heap_bytes) |hb| {
+                allocator.free(hb);
+                self.heap_bytes = null;
+            } else {
+                io.releaseBuffer(self.handle);
+            }
             self.active = false;
         }
     }

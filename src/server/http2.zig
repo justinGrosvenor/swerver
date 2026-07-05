@@ -653,7 +653,7 @@ fn drainPendingH2Responses(server: *Server, conn: *connection.Connection) void {
             if (allowed == 0) break;
 
             const chunk_len = @min(allowed, payload_max);
-            @memcpy(data_buf.bytes[buf_pos + 9 ..][0..chunk_len], slot.handle.bytes[slot.offset..][0..chunk_len]);
+            @memcpy(data_buf.bytes[buf_pos + 9 ..][0..chunk_len], slot.bytes()[slot.offset..][0..chunk_len]);
             slot.offset += chunk_len;
             total_sent += chunk_len;
 
@@ -672,14 +672,14 @@ fn drainPendingH2Responses(server: *Server, conn: *connection.Connection) void {
 
         if (!conn.enqueueWrite(data_buf, buf_pos)) {
             server.io.releaseBuffer(data_buf);
-            slot.cleanup(&server.io);
+            slot.cleanup(&server.io, server.allocator);
             sendRstStream(server, conn, slot.stream_id, 0x7);
             continue;
         }
         server.io.onWriteBuffered(conn, buf_pos);
 
         if (slot.offset >= slot.len) {
-            slot.cleanup(&server.io);
+            slot.cleanup(&server.io, server.allocator);
             stack.closeStream(slot.stream_id);
         }
     }
@@ -836,6 +836,7 @@ pub fn queueHttp2Response(server: *Server, conn: *connection.Connection, stream_
     // Stash remaining body for the drain pump (fair round-robin with files).
     const remaining_len = body_len - sent;
     var stash_handle: buffer_pool.BufferHandle = undefined;
+    var stash_heap: ?[]u8 = null;
     var stash_offset: usize = undefined;
     var stash_len: usize = undefined;
     if (managed_body) |managed| {
@@ -843,25 +844,38 @@ pub fn queueHttp2Response(server: *Server, conn: *connection.Connection, stream_
         stash_offset = sent;
         stash_len = body_len;
         managed_body = null;
-    } else {
+    } else if (remaining_len <= server.io.cfg.buffer_pool.buffer_size) {
         const h = server.io.acquireBuffer() orelse {
             sendRstStream(server, conn, stream_id, 0x7);
             return;
         };
-        if (h.bytes.len < remaining_len) {
-            server.io.releaseBuffer(h);
-            sendRstStream(server, conn, stream_id, 0x7);
-            return;
-        }
         @memcpy(h.bytes[0..remaining_len], body_bytes[sent..][0..remaining_len]);
         stash_handle = h;
         stash_offset = 0;
         stash_len = remaining_len;
+    } else {
+        // Remainder exceeds one pool buffer: heap-stash it so the body is
+        // delivered whole (truncating here would ship a short body under a
+        // full Content-Length). Rare slow path; the fast path stays pool-only.
+        const hb = server.allocator.alloc(u8, remaining_len) catch {
+            sendRstStream(server, conn, stream_id, 0x7);
+            return;
+        };
+        @memcpy(hb, body_bytes[sent..][0..remaining_len]);
+        stash_heap = hb;
+        stash_offset = 0;
+        stash_len = remaining_len;
     }
+
+    const releaseStash = struct {
+        fn call(srv: *Server, handle: buffer_pool.BufferHandle, heap: ?[]u8) void {
+            if (heap) |hb| srv.allocator.free(hb) else srv.io.releaseBuffer(handle);
+        }
+    }.call;
 
     const resps = conn.h2_pending_responses orelse blk: {
         const alloc = server.allocator.create([connection.MAX_PENDING_H2_RESPONSES]connection.PendingH2Response) catch {
-            server.io.releaseBuffer(stash_handle);
+            releaseStash(server, stash_handle, stash_heap);
             sendRstStream(server, conn, stream_id, 0x7);
             return;
         };
@@ -876,13 +890,14 @@ pub fn queueHttp2Response(server: *Server, conn: *connection.Connection, stream_
                 .active = true,
                 .stream_id = stream_id,
                 .handle = stash_handle,
+                .heap_bytes = stash_heap,
                 .offset = stash_offset,
                 .len = stash_len,
             };
             return;
         }
     }
-    server.io.releaseBuffer(stash_handle);
+    releaseStash(server, stash_handle, stash_heap);
     sendRstStream(server, conn, stream_id, 0x7);
 }
 
@@ -1262,4 +1277,107 @@ test "wasm h2: RST_STREAM during park releases the pinned instance (no leak)" {
         server.io.releaseBuffer(rbuf);
         conn.read_buffer = null;
     } else return error.SkipZigTest;
+}
+
+// ── Regression: large in-memory h2 bodies must not truncate ─────────────────
+
+/// 40 KiB patterned body: bigger than one DATA frame AND bigger than
+/// first-frame + one pool buffer (16 KiB below), which used to hit the
+/// single-buffer stash overflow and RST the stream after ~16 KiB.
+const H2_BIG_BODY = blk: {
+    @setEvalBranchQuota(50_000);
+    var b: [40960]u8 = undefined;
+    for (&b, 0..) |*p, i| p.* = @truncate(i * 31 + 7);
+    break :blk b;
+};
+
+fn h2BigBodyHandler(_: *router.HandlerContext) response_mod.Response {
+    return .{
+        .status = 200,
+        .headers = &[_]response_mod.Header{.{ .name = "Content-Type", .value = "application/octet-stream" }},
+        .body = .{ .bytes = &H2_BIG_BODY },
+    };
+}
+
+/// Append every DATA payload for `want_stream` from the write queue into `out`,
+/// then release the queue. Returns the new fill length.
+fn collectH2Data(server: *Server, conn: *connection.Connection, want_stream: u32, out: []u8, fill: usize) usize {
+    var n = fill;
+    while (conn.peekWrite()) |entry_ptr| {
+        const entry = entry_ptr.*;
+        var off: usize = 0;
+        while (off + 9 <= entry.len) {
+            const flen = (@as(usize, entry.handle.bytes[off]) << 16) |
+                (@as(usize, entry.handle.bytes[off + 1]) << 8) |
+                @as(usize, entry.handle.bytes[off + 2]);
+            const ftype = entry.handle.bytes[off + 3];
+            const sid = ((@as(u32, entry.handle.bytes[off + 5]) & 0x7f) << 24) |
+                (@as(u32, entry.handle.bytes[off + 6]) << 16) |
+                (@as(u32, entry.handle.bytes[off + 7]) << 8) |
+                @as(u32, entry.handle.bytes[off + 8]);
+            const end = @min(off + 9 + flen, entry.len);
+            if (ftype == @intFromEnum(http2.FrameType.data) and sid == want_stream) {
+                const payload = entry.handle.bytes[off + 9 .. end];
+                @memcpy(out[n .. n + payload.len], payload);
+                n += payload.len;
+            }
+            off += 9 + flen;
+        }
+        server.io.releaseBuffer(entry.handle);
+        conn.popWrite();
+    }
+    return n;
+}
+
+test "h2: in-memory body larger than first-frame + one pool buffer is delivered whole" {
+    if (!build_options.enable_http2) return error.SkipZigTest;
+
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var cfg = config.ServerConfig.default();
+    cfg.max_connections = 1;
+    // Small pool so the heap-stash path triggers at 40 KiB: first DATA frame
+    // (~16 KiB) + one 16 KiB buffer < body_len.
+    cfg.buffer_pool = .{ .buffer_size = 16 * 1024, .buffer_count = 16 };
+
+    var app_router = router.Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+    try app_router.get("/big", h2BigBodyHandler);
+
+    var server = try Server.initWithRouter(allocator, cfg, app_router);
+    defer server.deinit();
+
+    const conn = server.io.acquireConnection(server.io.nowMs()) orelse return error.OutOfMemory;
+    defer if (conn.state != .closed) server.io.releaseConnection(conn);
+    // The test drives queueHttp2Response directly and never runs closeConnection,
+    // so mirror its pending-response teardown here (frees the lazily allocated
+    // slot array).
+    defer if (conn.h2_pending_responses) |resps| {
+        for (resps) |*r| r.cleanup(&server.io, server.allocator);
+        allocator.destroy(resps);
+        conn.h2_pending_responses = null;
+    };
+    conn.protocol = .http2;
+    var stack = http2.Stack.init();
+    _ = stack.openTestStream(1);
+    conn.http2_stack = &stack;
+
+    const req = request.RequestView{ .method = .GET, .path = "/big", .headers = &.{} };
+    try dispatchHttp2Request(&server, conn, 1, req, "");
+
+    // Pump: collect DATA payloads, then drain the pending stash until done.
+    var got: [H2_BIG_BODY.len + 4096]u8 = undefined;
+    var n: usize = collectH2Data(&server, conn, 1, &got, 0);
+    var spins: usize = 0;
+    while (conn.hasPendingH2Responses()) : (spins += 1) {
+        if (spins > 64) return error.DrainStuck;
+        drainPendingH2Streams(&server, conn);
+        n = collectH2Data(&server, conn, 1, &got, n);
+    }
+    n = collectH2Data(&server, conn, 1, &got, n);
+
+    // The whole body arrived, byte-identical (was: 16 KiB + RST_STREAM).
+    try testing.expectEqual(H2_BIG_BODY.len, n);
+    try testing.expectEqualSlices(u8, &H2_BIG_BODY, got[0..n]);
 }
