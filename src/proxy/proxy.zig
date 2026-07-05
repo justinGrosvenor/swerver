@@ -1289,7 +1289,9 @@ pub const Proxy = struct {
         };
         defer clock.closeFd(fd);
         net.setSocketTimeouts(fd, route.timeouts.send_ms, route.timeouts.read_ms);
-        net.setNoDelay(fd);
+        // No setNoDelay here: this is an AF_UNIX data socket, and TCP_NODELAY on
+        // a unix fd fails with EPROTONOSUPPORT (errno 102), dumping a stack trace
+        // on every tenant forward. Nagle does not apply to unix sockets anyway.
 
         const ctx = forward.ForwardContext{
             .client_request = req,
