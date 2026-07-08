@@ -85,13 +85,21 @@ pub const ResponseCache = struct {
         self: *ResponseCache,
         method: request_mod.Method,
         path: []const u8,
+        req_body: ?[]const u8,
         req_headers: []const request_mod.Header,
         vary_keys: []const []const u8,
         now_ms: u64,
     ) LookupResult {
-        if (method != .GET) return .miss;
+        if (!method.isCacheable()) return .miss;
+        // RFC 10008 sec 2.7: the cache key MUST incorporate the request
+        // content. A body-bearing cacheable request (QUERY) whose body is not
+        // contiguous in memory cannot be keyed, so it never touches the cache.
+        const body: []const u8 = if (method.allowsRequestBody())
+            (req_body orelse return .miss)
+        else
+            "";
 
-        const key = computeKey(path, vary_keys, req_headers);
+        const key = computeKey(method, path, body, vary_keys, req_headers);
         const idx = self.map.get(key) orelse return .miss;
         const entry = &self.entries[idx];
 
@@ -135,7 +143,9 @@ pub const ResponseCache = struct {
 
     pub fn store(
         self: *ResponseCache,
+        method: request_mod.Method,
         path: []const u8,
+        req_body: ?[]const u8,
         req_headers: []const request_mod.Header,
         vary_keys: []const []const u8,
         resp_status: u16,
@@ -144,6 +154,13 @@ pub const ResponseCache = struct {
         ttl_ms: u64,
         now_ms: u64,
     ) void {
+        if (!method.isCacheable()) return;
+        // Mirror of the lookup guard: a QUERY whose body cannot be keyed is
+        // never stored (it could never be hit).
+        const body: []const u8 = if (method.allowsRequestBody())
+            (req_body orelse return)
+        else
+            "";
         if (resp_status != 200) return;
         if (!isCacheable(resp_headers)) return;
         // RFC 7234 §3.2: a shared cache must not store a response to a request
@@ -152,7 +169,7 @@ pub const ResponseCache = struct {
         // clients. Both are checked in isCacheable/requestPreventsCaching.
         if (requestPreventsCaching(req_headers)) return;
 
-        const key = computeKey(path, vary_keys, req_headers);
+        const key = computeKey(method, path, body, vary_keys, req_headers);
         const effective_ttl = extractMaxAge(resp_headers) orelse ttl_ms;
 
         // If entry already exists for this key, evict and replace
@@ -356,13 +373,33 @@ pub const ResponseCache = struct {
 };
 
 fn computeKey(
+    method: request_mod.Method,
     path: []const u8,
+    req_body: []const u8,
     vary_keys: []const []const u8,
     req_headers: []const request_mod.Header,
 ) u64 {
     var h = std.hash.Wyhash.init(0);
+    // The method separates entries so a QUERY entry can never satisfy a GET
+    // (or HEAD) on the same path, and vice versa.
+    h.update(&[_]u8{@intFromEnum(method)});
     h.update(path);
     h.update("\x00");
+    if (method.allowsRequestBody()) {
+        // RFC 10008 sec 2.7: fold the request content and its media type
+        // (the "related metadata") into the key. Byte-exact, no
+        // normalization: normalizing is a MAY, and mis-normalization serves
+        // wrong responses (sec 4); byte-exact keying is always correct.
+        h.update(req_body);
+        h.update("\x00");
+        for (req_headers) |hdr| {
+            if (std.ascii.eqlIgnoreCase(hdr.name, "Content-Type")) {
+                h.update(hdr.value);
+                break;
+            }
+        }
+        h.update("\x00");
+    }
     for (vary_keys) |vk| {
         for (req_headers) |hdr| {
             if (std.ascii.eqlIgnoreCase(hdr.name, vk)) {
@@ -464,7 +501,7 @@ test "cache miss on empty cache" {
     defer cache.deinit();
 
     const headers = [_]request_mod.Header{};
-    const result = cache.lookup(.GET, "/test", &headers, &.{}, 1000);
+    const result = cache.lookup(.GET, "/test", null, &headers, &.{}, 1000);
     try std.testing.expect(result == .miss);
 }
 
@@ -477,8 +514,8 @@ test "cache store and hit" {
         .{ .name = "Content-Type", .value = "text/plain" },
     };
 
-    cache.store("/test", &req_headers, &.{}, 200, &resp_headers, "hello", 60_000, 1000);
-    const result = cache.lookup(.GET, "/test", &req_headers, &.{}, 2000);
+    cache.store(.GET, "/test", null, &req_headers, &.{}, 200, &resp_headers, "hello", 60_000, 1000);
+    const result = cache.lookup(.GET, "/test", null, &req_headers, &.{}, 2000);
     switch (result) {
         .hit => |info| {
             try std.testing.expectEqual(@as(u16, 200), info.status);
@@ -497,12 +534,12 @@ test "cache expires after TTL" {
     const req_headers = [_]request_mod.Header{};
     const resp_headers = [_]response_mod.Header{};
 
-    cache.store("/ttl", &req_headers, &.{}, 200, &resp_headers, "data", 5_000, 1000);
+    cache.store(.GET, "/ttl", null, &req_headers, &.{}, 200, &resp_headers, "data", 5_000, 1000);
 
-    const hit = cache.lookup(.GET, "/ttl", &req_headers, &.{}, 5000);
+    const hit = cache.lookup(.GET, "/ttl", null, &req_headers, &.{}, 5000);
     try std.testing.expect(hit == .hit);
 
-    const miss = cache.lookup(.GET, "/ttl", &req_headers, &.{}, 7000);
+    const miss = cache.lookup(.GET, "/ttl", null, &req_headers, &.{}, 7000);
     try std.testing.expect(miss == .miss);
 }
 
@@ -515,8 +552,8 @@ test "cache respects no-store" {
         .{ .name = "Cache-Control", .value = "no-store" },
     };
 
-    cache.store("/private", &req_headers, &.{}, 200, &resp_headers, "secret", 60_000, 1000);
-    const result = cache.lookup(.GET, "/private", &req_headers, &.{}, 2000);
+    cache.store(.GET, "/private", null, &req_headers, &.{}, 200, &resp_headers, "secret", 60_000, 1000);
+    const result = cache.lookup(.GET, "/private", null, &req_headers, &.{}, 2000);
     try std.testing.expect(result == .miss);
 }
 
@@ -529,8 +566,8 @@ test "cache does not store Set-Cookie responses" {
         .{ .name = "Content-Type", .value = "text/plain" },
         .{ .name = "Set-Cookie", .value = "session=abc; HttpOnly" },
     };
-    cache.store("/setcookie", &req_headers, &.{}, 200, &resp_headers, "hi", 60_000, 1000);
-    try std.testing.expect(cache.lookup(.GET, "/setcookie", &req_headers, &.{}, 2000) == .miss);
+    cache.store(.GET, "/setcookie", null, &req_headers, &.{}, 200, &resp_headers, "hi", 60_000, 1000);
+    try std.testing.expect(cache.lookup(.GET, "/setcookie", null, &req_headers, &.{}, 2000) == .miss);
 }
 
 test "cache does not store responses to authenticated requests" {
@@ -543,15 +580,15 @@ test "cache does not store responses to authenticated requests" {
     const auth_req = [_]request_mod.Header{
         .{ .name = "Authorization", .value = "Bearer xyz" },
     };
-    cache.store("/authed", &auth_req, &.{}, 200, &resp_headers, "secret", 60_000, 1000);
+    cache.store(.GET, "/authed", null, &auth_req, &.{}, 200, &resp_headers, "secret", 60_000, 1000);
     // Even an anonymous lookup must miss — the authed response was not stored.
-    try std.testing.expect(cache.lookup(.GET, "/authed", &.{}, &.{}, 2000) == .miss);
+    try std.testing.expect(cache.lookup(.GET, "/authed", null, &.{}, &.{}, 2000) == .miss);
 
     const cookie_req = [_]request_mod.Header{
         .{ .name = "Cookie", .value = "session=abc" },
     };
-    cache.store("/cookied", &cookie_req, &.{}, 200, &resp_headers, "secret", 60_000, 1000);
-    try std.testing.expect(cache.lookup(.GET, "/cookied", &.{}, &.{}, 2000) == .miss);
+    cache.store(.GET, "/cookied", null, &cookie_req, &.{}, 200, &resp_headers, "secret", 60_000, 1000);
+    try std.testing.expect(cache.lookup(.GET, "/cookied", null, &.{}, &.{}, 2000) == .miss);
 }
 
 test "cache keys on accept-encoding so compressed entries are not mis-served" {
@@ -566,13 +603,13 @@ test "cache keys on accept-encoding so compressed entries are not mis-served" {
         .{ .name = "Content-Encoding", .value = "gzip" },
     };
     // Store a gzipped entry for a gzip-accepting client.
-    cache.store("/asset", &gzip_req, &vary, 200, &resp_headers, "\x1f\x8b...", 60_000, 1000);
+    cache.store(.GET, "/asset", null, &gzip_req, &vary, 200, &resp_headers, "\x1f\x8b...", 60_000, 1000);
     // A gzip client hits it.
-    try std.testing.expect(cache.lookup(.GET, "/asset", &gzip_req, &vary, 2000) == .hit);
+    try std.testing.expect(cache.lookup(.GET, "/asset", null, &gzip_req, &vary, 2000) == .hit);
     // A client that does not accept gzip must miss (different key), not get
     // served the gzipped body.
     const plain_req = [_]request_mod.Header{};
-    try std.testing.expect(cache.lookup(.GET, "/asset", &plain_req, &vary, 2000) == .miss);
+    try std.testing.expect(cache.lookup(.GET, "/asset", null, &plain_req, &vary, 2000) == .miss);
 }
 
 test "cache does not store Vary:* responses" {
@@ -583,8 +620,8 @@ test "cache does not store Vary:* responses" {
     const resp_headers = [_]response_mod.Header{
         .{ .name = "Vary", .value = "*" },
     };
-    cache.store("/vary", &req_headers, &.{}, 200, &resp_headers, "x", 60_000, 1000);
-    try std.testing.expect(cache.lookup(.GET, "/vary", &req_headers, &.{}, 2000) == .miss);
+    cache.store(.GET, "/vary", null, &req_headers, &.{}, 200, &resp_headers, "x", 60_000, 1000);
+    try std.testing.expect(cache.lookup(.GET, "/vary", null, &req_headers, &.{}, 2000) == .miss);
 }
 
 test "cache conditional 304 with ETag" {
@@ -597,12 +634,12 @@ test "cache conditional 304 with ETag" {
         .{ .name = "Content-Type", .value = "text/plain" },
     };
 
-    cache.store("/etag", &req_store_headers, &.{}, 200, &resp_headers, "body", 60_000, 1000);
+    cache.store(.GET, "/etag", null, &req_store_headers, &.{}, 200, &resp_headers, "body", 60_000, 1000);
 
     const req_headers = [_]request_mod.Header{
         .{ .name = "If-None-Match", .value = "\"abc123\"" },
     };
-    const result = cache.lookup(.GET, "/etag", &req_headers, &.{}, 2000);
+    const result = cache.lookup(.GET, "/etag", null, &req_headers, &.{}, 2000);
     try std.testing.expect(result == .not_modified);
 }
 
@@ -613,14 +650,14 @@ test "cache LRU eviction" {
     const req_headers = [_]request_mod.Header{};
     const resp_headers = [_]response_mod.Header{};
 
-    cache.store("/a", &req_headers, &.{}, 200, &resp_headers, "a", 60_000, 1000);
-    cache.store("/b", &req_headers, &.{}, 200, &resp_headers, "b", 60_000, 1000);
+    cache.store(.GET, "/a", null, &req_headers, &.{}, 200, &resp_headers, "a", 60_000, 1000);
+    cache.store(.GET, "/b", null, &req_headers, &.{}, 200, &resp_headers, "b", 60_000, 1000);
     // This should evict /a (LRU tail)
-    cache.store("/c", &req_headers, &.{}, 200, &resp_headers, "c", 60_000, 1000);
+    cache.store(.GET, "/c", null, &req_headers, &.{}, 200, &resp_headers, "c", 60_000, 1000);
 
-    try std.testing.expect(cache.lookup(.GET, "/a", &req_headers, &.{}, 2000) == .miss);
-    try std.testing.expect(cache.lookup(.GET, "/b", &req_headers, &.{}, 2000) == .hit);
-    try std.testing.expect(cache.lookup(.GET, "/c", &req_headers, &.{}, 2000) == .hit);
+    try std.testing.expect(cache.lookup(.GET, "/a", null, &req_headers, &.{}, 2000) == .miss);
+    try std.testing.expect(cache.lookup(.GET, "/b", null, &req_headers, &.{}, 2000) == .hit);
+    try std.testing.expect(cache.lookup(.GET, "/c", null, &req_headers, &.{}, 2000) == .hit);
 }
 
 test "cache invalidate on POST path" {
@@ -630,11 +667,11 @@ test "cache invalidate on POST path" {
     const req_headers = [_]request_mod.Header{};
     const resp_headers = [_]response_mod.Header{};
 
-    cache.store("/resource", &req_headers, &.{}, 200, &resp_headers, "data", 60_000, 1000);
-    try std.testing.expect(cache.lookup(.GET, "/resource", &req_headers, &.{}, 2000) == .hit);
+    cache.store(.GET, "/resource", null, &req_headers, &.{}, 200, &resp_headers, "data", 60_000, 1000);
+    try std.testing.expect(cache.lookup(.GET, "/resource", null, &req_headers, &.{}, 2000) == .hit);
 
     cache.invalidate("/resource");
-    try std.testing.expect(cache.lookup(.GET, "/resource", &req_headers, &.{}, 2000) == .miss);
+    try std.testing.expect(cache.lookup(.GET, "/resource", null, &req_headers, &.{}, 2000) == .miss);
 }
 
 test "cache vary header differentiation" {
@@ -649,15 +686,15 @@ test "cache vary header differentiation" {
     const req_json = [_]request_mod.Header{
         .{ .name = "Accept", .value = "application/json" },
     };
-    cache.store("/api", &req_json, &vary_keys, 200, &resp_headers, "{}", 60_000, 1000);
+    cache.store(.GET, "/api", null, &req_json, &vary_keys, 200, &resp_headers, "{}", 60_000, 1000);
 
     const req_xml = [_]request_mod.Header{
         .{ .name = "Accept", .value = "application/xml" },
     };
     // Different Accept value should miss
-    try std.testing.expect(cache.lookup(.GET, "/api", &req_xml, &vary_keys, 2000) == .miss);
+    try std.testing.expect(cache.lookup(.GET, "/api", null, &req_xml, &vary_keys, 2000) == .miss);
     // Same Accept value should hit
-    try std.testing.expect(cache.lookup(.GET, "/api", &req_json, &vary_keys, 2000) == .hit);
+    try std.testing.expect(cache.lookup(.GET, "/api", null, &req_json, &vary_keys, 2000) == .hit);
 }
 
 test "cache respects max-age directive" {
@@ -669,19 +706,119 @@ test "cache respects max-age directive" {
         .{ .name = "Cache-Control", .value = "max-age=2" },
     };
 
-    cache.store("/maxage", &req_headers, &.{}, 200, &resp_headers, "data", 60_000, 1000);
+    cache.store(.GET, "/maxage", null, &req_headers, &.{}, 200, &resp_headers, "data", 60_000, 1000);
 
     // Within max-age (2s = 2000ms)
-    try std.testing.expect(cache.lookup(.GET, "/maxage", &req_headers, &.{}, 2500) == .hit);
+    try std.testing.expect(cache.lookup(.GET, "/maxage", null, &req_headers, &.{}, 2500) == .hit);
     // Past max-age
-    try std.testing.expect(cache.lookup(.GET, "/maxage", &req_headers, &.{}, 4000) == .miss);
+    try std.testing.expect(cache.lookup(.GET, "/maxage", null, &req_headers, &.{}, 4000) == .miss);
 }
 
-test "cache skips non-GET methods" {
+test "cache skips non-cacheable methods" {
     var cache = try ResponseCache.init(std.testing.allocator, 16);
     defer cache.deinit();
 
     const req_headers = [_]request_mod.Header{};
-    const result = cache.lookup(.POST, "/test", &req_headers, &.{}, 1000);
-    try std.testing.expect(result == .miss);
+    try std.testing.expect(cache.lookup(.POST, "/test", null, &req_headers, &.{}, 1000) == .miss);
+    try std.testing.expect(cache.lookup(.PUT, "/test", "body", &req_headers, &.{}, 1000) == .miss);
+    // Non-cacheable methods are never stored either.
+    cache.store(.POST, "/test", "body", &req_headers, &.{}, 200, &.{}, "resp", 60_000, 1000);
+    try std.testing.expectEqual(@as(u16, 0), cache.count);
+}
+
+test "QUERY entries are keyed on the request body (RFC 10008 sec 2.7)" {
+    var cache = try ResponseCache.init(std.testing.allocator, 16);
+    defer cache.deinit();
+
+    const ct_json = [_]request_mod.Header{
+        .{ .name = "Content-Type", .value = "application/json" },
+    };
+    const resp_headers = [_]response_mod.Header{
+        .{ .name = "Content-Type", .value = "application/json" },
+    };
+
+    cache.store(.QUERY, "/search", "{\"q\":\"zig\"}", &ct_json, &.{}, 200, &resp_headers, "[\"result-zig\"]", 60_000, 1000);
+
+    // Same path + same body + same media type hits.
+    switch (cache.lookup(.QUERY, "/search", "{\"q\":\"zig\"}", &ct_json, &.{}, 2000)) {
+        .hit => |info| try std.testing.expectEqualStrings("[\"result-zig\"]", info.body),
+        else => return error.ExpectedHit,
+    }
+    // A different body on the same path is a different query: miss.
+    try std.testing.expect(cache.lookup(.QUERY, "/search", "{\"q\":\"rust\"}", &ct_json, &.{}, 2000) == .miss);
+    // Byte-exact keying: semantically equal but byte-different bodies miss.
+    try std.testing.expect(cache.lookup(.QUERY, "/search", "{\"q\": \"zig\"}", &ct_json, &.{}, 2000) == .miss);
+}
+
+test "QUERY cache key includes the request Content-Type" {
+    var cache = try ResponseCache.init(std.testing.allocator, 16);
+    defer cache.deinit();
+
+    const ct_json = [_]request_mod.Header{
+        .{ .name = "Content-Type", .value = "application/json" },
+    };
+    const ct_sql = [_]request_mod.Header{
+        .{ .name = "Content-Type", .value = "application/sql" },
+    };
+    cache.store(.QUERY, "/q", "select 1", &ct_sql, &.{}, 200, &.{}, "one", 60_000, 1000);
+
+    try std.testing.expect(cache.lookup(.QUERY, "/q", "select 1", &ct_sql, &.{}, 2000) == .hit);
+    // Same bytes under a different media type is a different query: miss.
+    try std.testing.expect(cache.lookup(.QUERY, "/q", "select 1", &ct_json, &.{}, 2000) == .miss);
+}
+
+test "QUERY and GET entries on the same path never satisfy each other" {
+    var cache = try ResponseCache.init(std.testing.allocator, 16);
+    defer cache.deinit();
+
+    const no_headers = [_]request_mod.Header{};
+    cache.store(.GET, "/dual", null, &no_headers, &.{}, 200, &.{}, "get-body", 60_000, 1000);
+    cache.store(.QUERY, "/dual", "", &no_headers, &.{}, 200, &.{}, "query-body", 60_000, 1000);
+
+    switch (cache.lookup(.GET, "/dual", null, &no_headers, &.{}, 2000)) {
+        .hit => |info| try std.testing.expectEqualStrings("get-body", info.body),
+        else => return error.ExpectedHit,
+    }
+    switch (cache.lookup(.QUERY, "/dual", "", &no_headers, &.{}, 2000)) {
+        .hit => |info| try std.testing.expectEqualStrings("query-body", info.body),
+        else => return error.ExpectedHit,
+    }
+}
+
+test "QUERY with a non-contiguous (null) body never touches the cache" {
+    var cache = try ResponseCache.init(std.testing.allocator, 16);
+    defer cache.deinit();
+
+    const no_headers = [_]request_mod.Header{};
+    // Store is a no-op without a keyable body.
+    cache.store(.QUERY, "/big", null, &no_headers, &.{}, 200, &.{}, "resp", 60_000, 1000);
+    try std.testing.expectEqual(@as(u16, 0), cache.count);
+    // Lookup with an unkeyable body is a miss even if an entry exists.
+    cache.store(.QUERY, "/big", "q", &no_headers, &.{}, 200, &.{}, "resp", 60_000, 1000);
+    try std.testing.expect(cache.lookup(.QUERY, "/big", null, &no_headers, &.{}, 2000) == .miss);
+}
+
+test "invalidate removes QUERY entries by path" {
+    var cache = try ResponseCache.init(std.testing.allocator, 16);
+    defer cache.deinit();
+
+    const no_headers = [_]request_mod.Header{};
+    cache.store(.QUERY, "/inv", "a", &no_headers, &.{}, 200, &.{}, "ra", 60_000, 1000);
+    cache.store(.QUERY, "/inv", "b", &no_headers, &.{}, 200, &.{}, "rb", 60_000, 1000);
+    try std.testing.expect(cache.lookup(.QUERY, "/inv", "a", &no_headers, &.{}, 2000) == .hit);
+
+    cache.invalidate("/inv");
+    try std.testing.expect(cache.lookup(.QUERY, "/inv", "a", &no_headers, &.{}, 2000) == .miss);
+    try std.testing.expect(cache.lookup(.QUERY, "/inv", "b", &no_headers, &.{}, 2000) == .miss);
+}
+
+test "QUERY responses to authenticated requests are not stored" {
+    var cache = try ResponseCache.init(std.testing.allocator, 16);
+    defer cache.deinit();
+
+    const auth_req = [_]request_mod.Header{
+        .{ .name = "Authorization", .value = "Bearer xyz" },
+    };
+    cache.store(.QUERY, "/authq", "q", &auth_req, &.{}, 200, &.{}, "secret", 60_000, 1000);
+    try std.testing.expect(cache.lookup(.QUERY, "/authq", "q", &.{}, &.{}, 2000) == .miss);
 }

@@ -1019,12 +1019,16 @@ fn proxyForwardAndRespond(
         break :blk vary_buf[0 .. n + 1];
     };
 
-    // Cache store: cache successful GET responses
+    // Cache store: successful responses to cacheable methods (GET, HEAD, and
+    // body-keyed QUERY per RFC 10008; the cache skips a QUERY whose body is
+    // not contiguous).
     if (cache_cfg) |cc| {
-        if (req.method == .GET and proxy_result.resp.status == 200) {
+        if (req.method.isCacheable() and proxy_result.resp.status == 200) {
             if (proxy.route_caches[route_idx]) |*rc| {
                 rc.store(
+                    req.method,
                     req.path,
+                    req.body.sliceOrNull(),
                     req.headers,
                     vary_keys,
                     proxy_result.resp.status,
@@ -2146,7 +2150,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
                 };
                 if (cache_cfg != null) {
                     if (proxy.route_caches[route_idx]) |*rc| {
-                        switch (rc.lookup(parse.view.method, parse.view.path, parse.view.headers, vary_keys, server.now_ms)) {
+                        switch (rc.lookup(parse.view.method, parse.view.path, parse.view.body.sliceOrNull(), parse.view.headers, vary_keys, server.now_ms)) {
                             .hit => |info| {
                                 var resp_headers_buf: [64]response_mod.Header = undefined;
                                 const hdr_count = @min(info.headers.len, resp_headers_buf.len);
