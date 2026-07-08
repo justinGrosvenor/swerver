@@ -892,6 +892,9 @@ pub const Server = struct {
             const old_arena = self.reload_arena;
             const old_wasm = self.wasm_manager;
             self.proxy = proxy_ptr;
+            // Same rule as Server.run: the health thread starts only once the
+            // proxy sits at its final heap address (init must not start it).
+            proxy_ptr.health_manager.startThread();
             self.reload_arena = loaded.arena;
 
             // Rebuild the WASM filter pools for the new route table, then free
@@ -952,6 +955,14 @@ pub const Server = struct {
         // Build this worker's WASM filter pools and attach them to the proxy
         // before entering the event loop (per-worker, after fork).
         self.setupWasmFilters();
+        // Start the upstream health-check thread at the proxy's FINAL address,
+        // in the process that will consume its results. Proxy.init must not
+        // start it (the init-local is returned by value; the thread would pin
+        // a dead stack frame), and pre-fork threads do not survive into
+        // workers - a fork-inherited handle would be joined against a thread
+        // that does not exist, and fork-frozen health states would never
+        // update. Started here, each worker probes and joins its own thread.
+        if (self.proxy) |p| p.health_manager.startThread();
         return dispatch.runLoop(self, run_for_ms);
     }
 
