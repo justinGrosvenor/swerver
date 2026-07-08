@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 // Top-level modules
+const bootstrap = @import("bootstrap.zig");
 const config = @import("config.zig");
 const config_file = @import("config_file.zig");
 const server = @import("server.zig");
@@ -111,6 +112,7 @@ const proxy_websocket = @import("proxy/websocket.zig");
 //   - OS-specific backends are gated at the bottom of this block
 comptime {
     // Top-level
+    _ = bootstrap;
     _ = config;
     _ = config_file;
     _ = server;

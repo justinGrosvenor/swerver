@@ -90,6 +90,14 @@ pub const config = @import("config.zig");
 pub const config_file = @import("config_file.zig");
 pub const config_fetch = @import("config_fetch.zig");
 
+/// Config-driven bootstrap: `bootstrap.run(allocator, .{ .config_path = ...,
+/// .router = app_router })` is the blessed path from config + router to a
+/// running server (proxy construction, Master vs single-process dispatch,
+/// x402 facilitator and WASM filter wiring). The swerver binary is a thin
+/// shell over it; embedders that load a JSON config should prefer it over
+/// hand-rolling the lifecycle.
+pub const bootstrap = @import("bootstrap.zig");
+
 // Core library surface
 const server_mod = @import("server.zig");
 pub const Server = server_mod.Server;
