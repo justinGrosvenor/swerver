@@ -971,10 +971,7 @@ fn isTchar(ch: u8) bool {
 
 /// Check if a request method is idempotent (safe to retry)
 pub fn isIdempotent(method: request.Method) bool {
-    return switch (method) {
-        .GET, .HEAD, .OPTIONS, .TRACE, .PUT, .DELETE => true,
-        else => false,
-    };
+    return method.isIdempotent();
 }
 
 /// Check if a status code indicates the request should be retried

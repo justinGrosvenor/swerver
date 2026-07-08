@@ -1036,7 +1036,7 @@ fn dispatchHttp2Request(
 
     var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
     var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
-    const needs_eager_arena = (hdr_request.method != .GET and hdr_request.method != .HEAD and hdr_request.method != .DELETE);
+    const needs_eager_arena = hdr_request.method.allowsRequestBody();
     const arena_handle = if (needs_eager_arena) server.io.acquireBuffer() else null;
     var empty_arena: [0]u8 = undefined;
     const arena_buf = if (arena_handle) |handle| handle.bytes else empty_arena[0..];

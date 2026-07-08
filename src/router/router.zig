@@ -570,6 +570,10 @@ pub const GroupBuilder = struct {
     pub fn patch(self: *GroupBuilder, pattern: []const u8, handler: HandlerFn) RouterError!void {
         return self.router.routeWithPrefixAndPayment(.PATCH, self.prefix, pattern, handler, self.middleware_chain, self.payment);
     }
+
+    pub fn query(self: *GroupBuilder, pattern: []const u8, handler: HandlerFn) RouterError!void {
+        return self.router.routeWithPrefixAndPayment(.QUERY, self.prefix, pattern, handler, self.middleware_chain, self.payment);
+    }
 };
 
 pub const HandlerScratch = struct {
@@ -936,6 +940,12 @@ pub const Router = struct {
     /// Register a PATCH route
     pub fn patch(self: *Router, pattern: []const u8, handler: HandlerFn) RouterError!void {
         try self.route(.PATCH, pattern, handler);
+    }
+
+    /// Register a QUERY route (RFC 10008). No implicit mapping to or from
+    /// GET routes: the handler contracts differ (QUERY carries a body).
+    pub fn query(self: *Router, pattern: []const u8, handler: HandlerFn) RouterError!void {
+        try self.route(.QUERY, pattern, handler);
     }
 
     /// Register a route with any method
@@ -1990,6 +2000,40 @@ test "405 method-not-allowed when path matches but method does not" {
     const allow = headerValue(result.resp, "Allow");
     try std.testing.expect(allow != null);
     try std.testing.expect(std.mem.indexOf(u8, allow.?, "GET") != null);
+}
+
+test "QUERY routes dispatch first-class with no implicit GET mapping (RFC 10008)" {
+    var router = Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+
+    const handlers = struct {
+        fn viaGet(ctx: *HandlerContext) response.Response {
+            return ctx.text(200, "get");
+        }
+        fn viaQuery(ctx: *HandlerContext) response.Response {
+            return ctx.text(200, "query");
+        }
+    };
+    try router.get("/search", handlers.viaGet);
+    try router.query("/search", handlers.viaQuery);
+    try router.query("/only-query", handlers.viaQuery);
+
+    // Each method hits its own handler on the shared path.
+    var rig = TestRig{};
+    const q = rig.run(&router, .QUERY, "/search");
+    try std.testing.expectEqual(@as(u16, 200), q.resp.status);
+    try std.testing.expectEqualStrings("query", bodyBytes(q.resp));
+    var rig2 = TestRig{};
+    const g = rig2.run(&router, .GET, "/search");
+    try std.testing.expectEqualStrings("get", bodyBytes(g.resp));
+
+    // GET does not implicitly match a QUERY-only route (unlike HEAD->GET):
+    // 405 with an Allow header advertising QUERY.
+    var rig3 = TestRig{};
+    const miss = rig3.run(&router, .GET, "/only-query");
+    try std.testing.expectEqual(@as(u16, 405), miss.resp.status);
+    const allow = headerValue(miss.resp, "Allow");
+    try std.testing.expect(allow != null);
+    try std.testing.expect(std.mem.indexOf(u8, allow.?, "QUERY") != null);
 }
 
 test "custom 404 fallback handler is invoked" {
