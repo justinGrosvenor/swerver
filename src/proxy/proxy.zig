@@ -488,8 +488,13 @@ pub const Proxy = struct {
             try proxy.health_manager.registerUpstream(up);
         }
 
-        proxy.health_manager.startThread();
-
+        // The health thread is NOT started here: `proxy` is a stack local that
+        // the caller copies to its final (heap) address, and the thread captures
+        // `&health_manager`. Starting it here pins a dead stack frame - the
+        // thread then reads garbage checker state (Linux ReleaseFast segfault,
+        // layout-dependent). Server.run() starts it at the final address, once
+        // per process (per worker, after fork - so every worker owns and joins
+        // its own thread and sees live health state).
         return proxy;
     }
 
@@ -1926,4 +1931,28 @@ test "D2-5 fail-closed: proxy filter pool exhaustion -> 503 then recovery" {
         try std.testing.expect(out2 != null and out2.?.resp.isParked());
         try std.testing.expectEqual(@as(usize, 1), table.liveCount());
     } else return error.SkipZigTest;
+}
+
+test "Proxy.init does not start the health thread (Server.run starts it at the final address)" {
+    // Regression guard: init used to call health_manager.startThread() on the
+    // stack-local Proxy it returns BY VALUE. The spawned thread captured
+    // &health_manager of the dead init frame and read garbage checker state,
+    // a layout-dependent segfault on Linux ReleaseFast (found via the
+    // load-balancer benchmark scenario, 2026-07-07).
+    const allocator = std.testing.allocator;
+    const servers = [_]upstream.Server{.{ .address = "127.0.0.1", .port = 1 }};
+    const upstreams = [_]upstream.Upstream{.{
+        .name = "hc",
+        .servers = &servers,
+        .health_check = .{},
+    }};
+    const routes = [_]upstream.ProxyRoute{.{ .path_prefix = "/", .upstream = "hc" }};
+
+    var proxy = try Proxy.init(allocator, .{ .upstreams = &upstreams, .routes = &routes });
+    defer proxy.deinit();
+
+    // The checker is registered, but no thread may run until the struct sits
+    // at its final address (Server.run / the reload swap call startThread).
+    try std.testing.expectEqual(@as(u32, 1), proxy.health_manager.checkers.count());
+    try std.testing.expect(proxy.health_manager.thread_handle == null);
 }
