@@ -570,6 +570,10 @@ pub const GroupBuilder = struct {
     pub fn patch(self: *GroupBuilder, pattern: []const u8, handler: HandlerFn) RouterError!void {
         return self.router.routeWithPrefixAndPayment(.PATCH, self.prefix, pattern, handler, self.middleware_chain, self.payment);
     }
+
+    pub fn query(self: *GroupBuilder, pattern: []const u8, handler: HandlerFn) RouterError!void {
+        return self.router.routeWithPrefixAndPayment(.QUERY, self.prefix, pattern, handler, self.middleware_chain, self.payment);
+    }
 };
 
 pub const HandlerScratch = struct {
@@ -938,6 +942,12 @@ pub const Router = struct {
         try self.route(.PATCH, pattern, handler);
     }
 
+    /// Register a QUERY route (RFC 10008). No implicit mapping to or from
+    /// GET routes: the handler contracts differ (QUERY carries a body).
+    pub fn query(self: *Router, pattern: []const u8, handler: HandlerFn) RouterError!void {
+        try self.route(.QUERY, pattern, handler);
+    }
+
     /// Register a route with any method
     pub fn route(self: *Router, method: request.Method, pattern: []const u8, handler: HandlerFn) RouterError!void {
         return self.routeWithChain(method, pattern, handler, null);
@@ -1164,6 +1174,18 @@ pub const Router = struct {
                     path_matched = true;
                     continue;
                 }
+            }
+            // RFC 10008 sec 2: a QUERY with content MUST carry a Content-Type
+            // consistent with it; a missing media type is a 400. Enforced here
+            // for app routes (the origin's obligation); proxied QUERYs pass
+            // through to their origin unchecked.
+            if (req.method == .QUERY and req.body.len() > 0 and req.getHeader("Content-Type") == null) {
+                result_resp = .{
+                    .status = 400,
+                    .headers = &[_]response.Header{.{ .name = "Content-Type", .value = "text/plain" }},
+                    .body = .{ .bytes = "QUERY requires a Content-Type" },
+                };
+                return .{ .resp = result_resp };
             }
             mw_ctx.route = r.pattern;
             const effective_policy = if (r.x402_policy.require_payment)
@@ -1990,6 +2012,94 @@ test "405 method-not-allowed when path matches but method does not" {
     const allow = headerValue(result.resp, "Allow");
     try std.testing.expect(allow != null);
     try std.testing.expect(std.mem.indexOf(u8, allow.?, "GET") != null);
+}
+
+test "QUERY routes dispatch first-class with no implicit GET mapping (RFC 10008)" {
+    var router = Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+
+    const handlers = struct {
+        fn viaGet(ctx: *HandlerContext) response.Response {
+            return ctx.text(200, "get");
+        }
+        fn viaQuery(ctx: *HandlerContext) response.Response {
+            return ctx.text(200, "query");
+        }
+    };
+    try router.get("/search", handlers.viaGet);
+    try router.query("/search", handlers.viaQuery);
+    try router.query("/only-query", handlers.viaQuery);
+
+    // Each method hits its own handler on the shared path.
+    var rig = TestRig{};
+    const q = rig.run(&router, .QUERY, "/search");
+    try std.testing.expectEqual(@as(u16, 200), q.resp.status);
+    try std.testing.expectEqualStrings("query", bodyBytes(q.resp));
+    var rig2 = TestRig{};
+    const g = rig2.run(&router, .GET, "/search");
+    try std.testing.expectEqualStrings("get", bodyBytes(g.resp));
+
+    // GET does not implicitly match a QUERY-only route (unlike HEAD->GET):
+    // 405 with an Allow header advertising QUERY.
+    var rig3 = TestRig{};
+    const miss = rig3.run(&router, .GET, "/only-query");
+    try std.testing.expectEqual(@as(u16, 405), miss.resp.status);
+    const allow = headerValue(miss.resp, "Allow");
+    try std.testing.expect(allow != null);
+    try std.testing.expect(std.mem.indexOf(u8, allow.?, "QUERY") != null);
+}
+
+test "QUERY with content requires a Content-Type (RFC 10008 sec 2)" {
+    var router = Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+
+    const handler = struct {
+        fn h(ctx: *HandlerContext) response.Response {
+            return ctx.text(200, "queried");
+        }
+    }.h;
+    try router.query("/q", handler);
+
+    var rig = TestRig{};
+
+    // Body without Content-Type: 400 before the handler runs.
+    {
+        var sc = rig.scratch();
+        const req = request.RequestView{
+            .method = .QUERY,
+            .path = "/q",
+            .headers = &.{},
+            .body = .{ .slice = "{\"q\":1}" },
+        };
+        const result = router.handle(req, &rig.mw_ctx, &sc);
+        try std.testing.expectEqual(@as(u16, 400), result.resp.status);
+    }
+
+    // Body with Content-Type: handler runs.
+    {
+        var sc = rig.scratch();
+        const ct = [_]request.Header{.{ .name = "Content-Type", .value = "application/json" }};
+        const req = request.RequestView{
+            .method = .QUERY,
+            .path = "/q",
+            .headers = &ct,
+            .body = .{ .slice = "{\"q\":1}" },
+        };
+        const result = router.handle(req, &rig.mw_ctx, &sc);
+        try std.testing.expectEqual(@as(u16, 200), result.resp.status);
+        try std.testing.expectEqualStrings("queried", bodyBytes(result.resp));
+    }
+
+    // Empty body without Content-Type is degenerate but not malformed.
+    {
+        var sc = rig.scratch();
+        const req = request.RequestView{
+            .method = .QUERY,
+            .path = "/q",
+            .headers = &.{},
+            .body = .{ .slice = "" },
+        };
+        const result = router.handle(req, &rig.mw_ctx, &sc);
+        try std.testing.expectEqual(@as(u16, 200), result.resp.status);
+    }
 }
 
 test "custom 404 fallback handler is invoked" {

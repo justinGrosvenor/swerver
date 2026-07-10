@@ -8,6 +8,12 @@ const buffer_pool = @import("../runtime/buffer_pool.zig");
 /// handler or into the response scratch buffer.
 pub const Header = request.Header;
 
+/// Response header field advertising the media types a resource accepts in
+/// QUERY request bodies (RFC 10008 sec 3). Applies to every URI sharing the
+/// same path. Emission is up to the handler, e.g.:
+///   .{ .name = accept_query_header, .value = "application/json" }
+pub const accept_query_header = "Accept-Query";
+
 /// Response body backed by a pooled buffer that the server will release
 /// back to the pool after the response is serialized. Used when a handler
 /// needs to build a body larger than the per-request `response_buf`

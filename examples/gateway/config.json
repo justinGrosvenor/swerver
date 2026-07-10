@@ -1,6 +1,7 @@
 {
   "server": {
     "port": 8080,
+    "workers": 1,
     "static_root": "examples/gateway/static"
   },
 

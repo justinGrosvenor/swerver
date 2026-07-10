@@ -271,8 +271,10 @@ pub const RetryConfig = struct {
     max_retries: u8 = 1,
     /// HTTP status codes that trigger retry
     retry_statuses: []const u16 = &.{ 502, 503, 504 },
-    /// HTTP methods that are safe to retry
-    retry_methods: []const []const u8 = &.{ "GET", "HEAD", "OPTIONS" },
+    /// HTTP methods that are safe to retry. QUERY is idempotent (RFC 10008
+    /// sec 2.6) and the proxy buffers request bodies, so replaying one on a
+    /// fresh upstream connection is mechanical.
+    retry_methods: []const []const u8 = &.{ "GET", "HEAD", "OPTIONS", "QUERY" },
     /// Whether to retry non-idempotent methods (dangerous)
     retry_non_idempotent: bool = false,
 };

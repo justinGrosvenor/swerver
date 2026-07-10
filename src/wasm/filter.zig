@@ -159,8 +159,25 @@ pub fn methodCode(m: request.Method) i32 {
         .OPTIONS => 6,
         .TRACE => 7,
         .PATCH => 8,
+        .QUERY => 9,
         .OTHER => 255,
     };
+}
+
+test "methodCode ABI values are stable" {
+    // These codes are a guest-visible ABI (mirrored in examples/wasm_filter/
+    // abi.zig). They must never change, only grow.
+    try std.testing.expectEqual(@as(i32, 0), methodCode(.GET));
+    try std.testing.expectEqual(@as(i32, 1), methodCode(.HEAD));
+    try std.testing.expectEqual(@as(i32, 2), methodCode(.POST));
+    try std.testing.expectEqual(@as(i32, 3), methodCode(.PUT));
+    try std.testing.expectEqual(@as(i32, 4), methodCode(.DELETE));
+    try std.testing.expectEqual(@as(i32, 5), methodCode(.CONNECT));
+    try std.testing.expectEqual(@as(i32, 6), methodCode(.OPTIONS));
+    try std.testing.expectEqual(@as(i32, 7), methodCode(.TRACE));
+    try std.testing.expectEqual(@as(i32, 8), methodCode(.PATCH));
+    try std.testing.expectEqual(@as(i32, 9), methodCode(.QUERY));
+    try std.testing.expectEqual(@as(i32, 255), methodCode(.OTHER));
 }
 
 const Decision = i32; // guest on_request() return

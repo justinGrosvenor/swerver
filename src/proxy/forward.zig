@@ -971,10 +971,7 @@ fn isTchar(ch: u8) bool {
 
 /// Check if a request method is idempotent (safe to retry)
 pub fn isIdempotent(method: request.Method) bool {
-    return switch (method) {
-        .GET, .HEAD, .OPTIONS, .TRACE, .PUT, .DELETE => true,
-        else => false,
-    };
+    return method.isIdempotent();
 }
 
 /// Check if a status code indicates the request should be retried
@@ -1325,7 +1322,17 @@ test "isIdempotent" {
     try std.testing.expect(isIdempotent(.OPTIONS));
     try std.testing.expect(isIdempotent(.PUT));
     try std.testing.expect(isIdempotent(.DELETE));
+    try std.testing.expect(isIdempotent(.QUERY));
     try std.testing.expect(!isIdempotent(.POST));
+}
+
+test "isMethodRetryable default config includes QUERY" {
+    const config = upstream.RetryConfig{};
+
+    try std.testing.expect(isMethodRetryable(.GET, &config));
+    try std.testing.expect(isMethodRetryable(.QUERY, &config));
+    try std.testing.expect(!isMethodRetryable(.POST, &config));
+    try std.testing.expect(!isMethodRetryable(.PUT, &config));
 }
 
 test "shouldRetry" {

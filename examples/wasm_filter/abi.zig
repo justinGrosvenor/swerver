@@ -38,6 +38,7 @@ pub const Method = enum(i32) {
     OPTIONS = 6,
     TRACE = 7,
     PATCH = 8,
+    QUERY = 9,
     OTHER = 255,
     _,
 };

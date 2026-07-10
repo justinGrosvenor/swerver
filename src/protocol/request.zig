@@ -30,6 +30,8 @@ pub const Method = enum {
     OPTIONS,
     TRACE,
     PATCH,
+    /// Safe, idempotent, cacheable method with a request body (RFC 10008).
+    QUERY,
     /// Extension method - use method_raw field in RequestView for actual name
     OTHER,
 
@@ -44,8 +46,47 @@ pub const Method = enum {
             .{ "OPTIONS", .OPTIONS },
             .{ "TRACE", .TRACE },
             .{ "PATCH", .PATCH },
+            .{ "QUERY", .QUERY },
         });
         return map.get(s);
+    }
+
+    /// Safe methods (RFC 9110 sec 9.2.1 + RFC 10008 sec 2): no state change
+    /// requested on the target resource. `.OTHER` is conservatively unsafe.
+    pub fn isSafe(self: Method) bool {
+        return switch (self) {
+            .GET, .HEAD, .OPTIONS, .TRACE, .QUERY => true,
+            else => false,
+        };
+    }
+
+    /// Idempotent methods (RFC 9110 sec 9.2.2 + RFC 10008 sec 2.6): safe to
+    /// retry after a connection failure.
+    pub fn isIdempotent(self: Method) bool {
+        return switch (self) {
+            .GET, .HEAD, .OPTIONS, .TRACE, .QUERY, .PUT, .DELETE => true,
+            else => false,
+        };
+    }
+
+    /// Methods whose responses a cache may store and reuse
+    /// (RFC 9111 sec 3 + RFC 10008 sec 2.7).
+    pub fn isCacheable(self: Method) bool {
+        return switch (self) {
+            .GET, .HEAD, .QUERY => true,
+            else => false,
+        };
+    }
+
+    /// Methods that may carry a request body. TRACE MUST NOT have content and
+    /// CONNECT has none (RFC 9110); GET/HEAD/DELETE bodies have no defined
+    /// semantics and are treated as body-less on the fast paths. OPTIONS and
+    /// extension methods may carry content, so they count as body-bearing.
+    pub fn allowsRequestBody(self: Method) bool {
+        return switch (self) {
+            .GET, .HEAD, .DELETE, .TRACE, .CONNECT => false,
+            .POST, .PUT, .PATCH, .OPTIONS, .QUERY, .OTHER => true,
+        };
     }
 
     /// Parse method string, returning OTHER for valid extension methods
@@ -195,6 +236,42 @@ test "Method.fromString parses standard methods and rejects unknown" {
     try std.testing.expect(Method.fromString("PROPFIND") == null);
     try std.testing.expect(Method.fromString("get") == null);
     try std.testing.expect(Method.fromString("") == null);
+}
+
+test "Method.fromString parses QUERY as a first-class method (RFC 10008)" {
+    try std.testing.expectEqual(Method.QUERY, Method.fromString("QUERY").?);
+    // QUERY must resolve to its concrete tag, never fall through to OTHER.
+    try std.testing.expectEqual(Method.QUERY, Method.fromStringExtended("QUERY").?);
+    try std.testing.expectEqualStrings("QUERY", Method.QUERY.toString());
+}
+
+test "Method property classifiers (RFC 9110 sec 9.2, RFC 10008)" {
+    const expectations = [_]struct {
+        m: Method,
+        safe: bool,
+        idempotent: bool,
+        cacheable: bool,
+        body: bool,
+    }{
+        .{ .m = .GET, .safe = true, .idempotent = true, .cacheable = true, .body = false },
+        .{ .m = .HEAD, .safe = true, .idempotent = true, .cacheable = true, .body = false },
+        .{ .m = .POST, .safe = false, .idempotent = false, .cacheable = false, .body = true },
+        .{ .m = .PUT, .safe = false, .idempotent = true, .cacheable = false, .body = true },
+        .{ .m = .DELETE, .safe = false, .idempotent = true, .cacheable = false, .body = false },
+        .{ .m = .CONNECT, .safe = false, .idempotent = false, .cacheable = false, .body = false },
+        .{ .m = .OPTIONS, .safe = true, .idempotent = true, .cacheable = false, .body = true },
+        .{ .m = .TRACE, .safe = true, .idempotent = true, .cacheable = false, .body = false },
+        .{ .m = .PATCH, .safe = false, .idempotent = false, .cacheable = false, .body = true },
+        .{ .m = .QUERY, .safe = true, .idempotent = true, .cacheable = true, .body = true },
+        // Extension methods are conservatively unsafe but body-bearing.
+        .{ .m = .OTHER, .safe = false, .idempotent = false, .cacheable = false, .body = true },
+    };
+    for (expectations) |e| {
+        try std.testing.expectEqual(e.safe, e.m.isSafe());
+        try std.testing.expectEqual(e.idempotent, e.m.isIdempotent());
+        try std.testing.expectEqual(e.cacheable, e.m.isCacheable());
+        try std.testing.expectEqual(e.body, e.m.allowsRequestBody());
+    }
 }
 
 test "Method.fromStringExtended maps extension tokens to OTHER and rejects invalid tokens" {

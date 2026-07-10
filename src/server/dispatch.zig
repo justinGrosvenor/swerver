@@ -1019,12 +1019,16 @@ fn proxyForwardAndRespond(
         break :blk vary_buf[0 .. n + 1];
     };
 
-    // Cache store: cache successful GET responses
+    // Cache store: successful responses to cacheable methods (GET, HEAD, and
+    // body-keyed QUERY per RFC 10008; the cache skips a QUERY whose body is
+    // not contiguous).
     if (cache_cfg) |cc| {
-        if (req.method == .GET and proxy_result.resp.status == 200) {
+        if (req.method.isCacheable() and proxy_result.resp.status == 200) {
             if (proxy.route_caches[route_idx]) |*rc| {
                 rc.store(
+                    req.method,
                     req.path,
+                    req.body.sliceOrNull(),
                     req.headers,
                     vary_keys,
                     proxy_result.resp.status,
@@ -1036,8 +1040,9 @@ fn proxyForwardAndRespond(
             }
         }
     }
-    // Invalidate cache on mutating methods
-    if (cache_cfg != null and req.method != .GET and req.method != .HEAD) {
+    // Invalidate cache on mutating methods. Safe methods (including QUERY,
+    // RFC 10008) never invalidate.
+    if (cache_cfg != null and !req.method.isSafe()) {
         if (proxy.route_caches[route_idx]) |*rc| {
             rc.invalidate(req.path);
         }
@@ -1238,7 +1243,7 @@ fn wasmResumeHttp2(server: *Server, completion: wasm_host_call_mod.Completion) v
                 // resume), not a borrow of a reused frame buffer.
                 var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
                 var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
-                const needs_eager_arena = (completion.req.method != .GET and completion.req.method != .HEAD and completion.req.method != .DELETE);
+                const needs_eager_arena = completion.req.method.allowsRequestBody();
                 const arena_handle = if (needs_eager_arena) server.io.acquireBuffer() else null;
                 var empty_arena: [0]u8 = undefined;
                 const arena_buf = if (arena_handle) |h| h.bytes else empty_arena[0..];
@@ -1376,7 +1381,7 @@ fn wasmResumeHttp3(server: *Server, completion: wasm_host_call_mod.Completion) v
             // of a reused frame buffer.
             var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
             var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
-            const needs_eager_arena = (completion.req.method != .GET and completion.req.method != .HEAD and completion.req.method != .DELETE);
+            const needs_eager_arena = completion.req.method.allowsRequestBody();
             const arena_handle = if (needs_eager_arena) server.io.acquireBuffer() else null;
             var empty_arena: [0]u8 = undefined;
             const arena_buf = if (arena_handle) |h| h.bytes else empty_arena[0..];
@@ -1987,7 +1992,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
                 } else if (conn.x402 == .resolved_reject) {
                     conn.x402 = .none;
                     const reject_info = x402_mod.rejectWith(.facilitator_rejected, x402_policy);
-                    if (parse.view.method == .POST or parse.view.method == .PUT or parse.view.method == .PATCH) conn.close_after_write = true;
+                    if (parse.view.method.allowsRequestBody()) conn.close_after_write = true;
                     try http1_mod.queueResponse(server, conn, reject_info.resp);
                     if (conn.read_buffered_bytes == 0) break;
                     continue;
@@ -1995,7 +2000,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
                     x402_result = x402_mod.evaluateWithFacilitator(parse.view, x402_policy, null);
                     switch (x402_result) {
                         .reject => |info| {
-                            if (parse.view.method == .POST or parse.view.method == .PUT or parse.view.method == .PATCH) conn.close_after_write = true;
+                            if (parse.view.method.allowsRequestBody()) conn.close_after_write = true;
                             try http1_mod.queueResponse(server, conn, info.resp);
                             if (conn.read_buffered_bytes == 0) break;
                             continue;
@@ -2037,7 +2042,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
                                 // No facilitator will be consulted and the
                                 // payment was not verified locally — fail
                                 // closed instead of granting free access.
-                                if (parse.view.method == .POST or parse.view.method == .PUT or parse.view.method == .PATCH) conn.close_after_write = true;
+                                if (parse.view.method.allowsRequestBody()) conn.close_after_write = true;
                                 try http1_mod.queueResponse(server, conn, reject_info.resp);
                                 if (conn.read_buffered_bytes == 0) break;
                                 continue;
@@ -2049,7 +2054,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
                 switch (auth_result) {
                     .allow => {},
                     .reject => |resp| {
-                        if (parse.view.method == .POST or parse.view.method == .PUT or parse.view.method == .PATCH) conn.close_after_write = true;
+                        if (parse.view.method.allowsRequestBody()) conn.close_after_write = true;
                         try http1_mod.queueResponse(server, conn, resp);
                         if (conn.read_buffered_bytes == 0) break;
                         continue;
@@ -2073,7 +2078,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
                         null;
                     if (ratelimit_mod.evaluateRoute(consumer, client_key, rl_cfg)) |rl_resp| {
                         conn.setRateLimitPause(server.now_ms, rl_resp.pause_ms);
-                        if (parse.view.method == .POST or parse.view.method == .PUT or parse.view.method == .PATCH) conn.close_after_write = true;
+                        if (parse.view.method.allowsRequestBody()) conn.close_after_write = true;
                         try http1_mod.queueResponse(server, conn, rl_resp.resp);
                         if (conn.read_buffered_bytes == 0) break;
                         continue;
@@ -2087,6 +2092,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
                             var err_buf: [1024]u8 = undefined;
                             const err_json = body_schema_mod.formatErrorResponse(&vr, &err_buf);
                             const json_ct = [_]response_mod.Header{.{ .name = "Content-Type", .value = "application/json" }};
+                            if (parse.view.method.allowsRequestBody()) conn.close_after_write = true;
                             try http1_mod.queueResponse(server, conn, .{
                                 .status = 400,
                                 .headers = &json_ct,
@@ -2144,7 +2150,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
                 };
                 if (cache_cfg != null) {
                     if (proxy.route_caches[route_idx]) |*rc| {
-                        switch (rc.lookup(parse.view.method, parse.view.path, parse.view.headers, vary_keys, server.now_ms)) {
+                        switch (rc.lookup(parse.view.method, parse.view.path, parse.view.body.sliceOrNull(), parse.view.headers, vary_keys, server.now_ms)) {
                             .hit => |info| {
                                 var resp_headers_buf: [64]response_mod.Header = undefined;
                                 const hdr_count = @min(info.headers.len, resp_headers_buf.len);
@@ -2292,7 +2298,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
         // This saves ~200ns/req from the pool acquire+release on
         // the error-handling benchmark where 45% of requests are
         // 404/405 GETs that never touch the arena.
-        const needs_eager_arena = (parse.view.method != .GET and parse.view.method != .HEAD and parse.view.method != .DELETE);
+        const needs_eager_arena = parse.view.method.allowsRequestBody();
         const arena_handle = if (needs_eager_arena) server.io.acquireBuffer() else null;
         var empty_arena: [0]u8 = undefined;
         const arena_buf = if (arena_handle) |handle| handle.bytes else empty_arena[0..];

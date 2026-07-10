@@ -109,6 +109,9 @@ pub fn main() !void {
     try api.get("/build", build);
     try api.get("/db-sum", dbSum);
     try api.post("/echo", echo);
+    // QUERY (RFC 10008): a safe, idempotent method whose query lives in the
+    // request body. Same handler contract as POST; the body carries the query.
+    try api.query("/search", echo);
 
     // /api/db-sum needs a PostgreSQL server; enable the client when
     // PG_DEMO_HOST is set (password read from PG_DEMO_PASSWORD):

@@ -52,18 +52,6 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const config_path = "examples/gateway/config.json";
-
-    // Load upstreams and proxy routes from config.json.
-    var loaded_config = swerver.config_file.loadConfigFile(allocator, config_path) catch |err| {
-        std.log.err("failed to load {s}: {}", .{ config_path, err });
-        return err;
-    };
-    defer loaded_config.deinit();
-
-    var cfg = loaded_config.server_config;
-    try cfg.validate();
-
     // Build the router with custom handler routes.
     var app_router = router.Router.init(.{
         .require_payment = false,
@@ -78,7 +66,6 @@ pub fn main() !void {
     try app_router.get("/health", health);
 
     // Middleware: metrics endpoint (/metrics), security headers, access logging.
-    middleware.security.buildCache();
     const pre_hooks = [_]middleware.MiddlewareFn{
         middleware.metrics.evaluate,
         middleware.security.evaluate,
@@ -92,28 +79,11 @@ pub fn main() !void {
     chain.post = &post_hooks;
     app_router.setMiddleware(chain);
 
-    // Initialize the reverse proxy from config-defined upstreams and routes.
-    var proxy_instance: ?swerver.proxy.handler.Proxy = null;
-    if (loaded_config.upstreams.len > 0 and loaded_config.routes.len > 0) {
-        proxy_instance = try swerver.proxy.handler.Proxy.init(allocator, .{
-            .upstreams = loaded_config.upstreams,
-            .routes = loaded_config.routes,
-        });
-    }
-
-    // Assemble and start the server.
-    var builder = swerver.ServerBuilder
-        .config(cfg)
-        .router(app_router);
-    if (proxy_instance) |*p| {
-        builder = builder.withProxy(p);
-    }
-    const srv = try builder.build(allocator);
-    defer {
-        srv.deinit();
-        allocator.destroy(srv);
-    }
-
-    std.log.info("gateway listening on :{d}", .{cfg.port});
-    try srv.run(null);
+    // The bootstrap owns the rest: it loads config.json, builds the reverse
+    // proxy from its upstreams/routes (heap-allocated, so the server can
+    // reload/destroy it safely), and serves until shutdown.
+    try swerver.bootstrap.run(allocator, .{
+        .config_path = "examples/gateway/config.json",
+        .router = app_router,
+    });
 }
