@@ -36,6 +36,7 @@ const http2 = @import("../protocol/http2.zig");
 const response_mod = @import("../response/response.zig");
 const router = @import("../router/router.zig");
 const middleware = @import("../middleware/middleware.zig");
+const metrics_mw = @import("../middleware/metrics_mw.zig");
 
 const x402_mod = @import("../middleware/x402.zig");
 const auth_mod = @import("../middleware/auth.zig");
@@ -46,6 +47,12 @@ const accept_mod = @import("accept.zig");
 const http1_mod = @import("http1.zig");
 const pg_client_mod = @import("../db/pg/client.zig");
 const pg_handler_api = @import("../db/pg/handler_api.zig");
+const wasm_host_call_mod = if (build_options.enable_wasm) @import("../wasm/host_call.zig") else struct {};
+const wasm_control_mod = if (build_options.enable_wasm) @import("../wasm/control_client.zig") else struct {};
+// The WASM filter host-call (park) deadline is configurable per-server via
+// `Server.wasm_host_call_deadline_ms` (default 30s). Binding sites below set the
+// park `deadline_ms` from it; the reactor tick fails the call closed past it
+// (fuel bounds compute, this backstops a stalled/dead guest).
 const http2_mod = @import("http2.zig");
 const http3_mod = @import("http3.zig");
 const preencoded = @import("preencoded.zig");
@@ -115,6 +122,14 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
     // its stable address once the loop owns it.
     if (server.pg_client) |pgc| pgc.installResume(@ptrCast(server), pgResume);
 
+    // Build the WASM control-socket transport (C3) for this worker and install
+    // its resume hooks. No-op when wasm is off or no control socket is set (the
+    // mock transport, if enabled, then drives completions instead).
+    server.setupWasmControl();
+    if (build_options.enable_wasm) {
+        if (server.wasmControlClient()) |cc| cc.installResume(@ptrCast(server), wasmCompleteThunk, wasmFailThunk);
+    }
+
     try server.io.start();
     // Eagerly start PG pool connects at worker boot. Otherwise the pool
     // relies on the first housekeeping tick, which is wall-clock gated and
@@ -122,6 +137,11 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
     // oversubscription — its slots stay .closed and the first request
     // routed to it (via SO_REUSEPORT) 503s with NotConnected.
     if (server.pg_client) |pgc| pgc.tick(&server.io, server.io.nowMs());
+    // Eagerly start the control-socket connect at worker boot (same rationale as
+    // the PG pool: don't wait for the first wall-clock-gated housekeeping tick).
+    if (build_options.enable_wasm) {
+        if (server.wasmControlClient()) |cc| cc.tick(&server.io, server.io.nowMs());
+    }
     server.refreshCachedDate();
     // Bind + register every effective listener. The effective set is the
     // explicit `listeners` array when present, else a single synthesized
@@ -329,8 +349,14 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
                     // case that ever changes.
                     if (io_mod.isExternalId(event.conn_id)) {
                         if (event.kernel_buffer) |kb| kb.release();
-                        if (server.pg_client) |pgc| {
-                            pgc.onEvent(&server.io, @intCast(event.conn_id & 0xFFFF_FFFF), event.kind);
+                        const slot: u32 = @intCast(event.conn_id & 0xFFFF_FFFF);
+                        // External-fd slots are partitioned by owner: the PG pool
+                        // owns 0..MAX_SLOTS-1; the WASM control socket takes the
+                        // next slot(s). Route by slot range.
+                        if (slot < pg_client_mod.MAX_SLOTS) {
+                            if (server.pg_client) |pgc| pgc.onEvent(&server.io, slot, event.kind);
+                        } else if (build_options.enable_wasm) {
+                            if (server.wasmControlClient()) |cc| cc.onEvent(&server.io, event.kind);
                         }
                         continue;
                     }
@@ -473,6 +499,41 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
                 }
                 if (timeout_result.count < timeout_result.to_close.len) break;
             }
+            // Lift expired time-based read pauses (rate-limit 429 pacing,
+            // filter/pool backpressure windows). canRead() blocks while
+            // resume_read_at_ms is pending, and on edge-triggered epoll or
+            // native io_uring no further read event fires for request bytes
+            // that arrived during the pause (the edge/CQE was already
+            // consumed); without this sweep the connection would hang until
+            // the idle timeout. handleRead drains socket or seeded buffer
+            // bytes; the recv re-arm is double-arm-guarded in the backend.
+            {
+                var expired: [64]struct { idx: u32, id: u64 } = undefined;
+                sweep: while (true) {
+                    var n: usize = 0;
+                    for (server.io.connections.activeConnections()) |idx| {
+                        const c = server.io.getConnection(idx) orelse continue;
+                        if (c.resume_read_at_ms > 0 and now_ms >= c.resume_read_at_ms) {
+                            c.resume_read_at_ms = 0;
+                            c.read_paused = false;
+                            expired[n] = .{ .idx = idx, .id = c.id };
+                            n += 1;
+                            if (n == expired.len) break;
+                        }
+                    }
+                    for (expired[0..n]) |e| {
+                        const c = server.io.getConnection(e.idx) orelse continue;
+                        if (c.id != e.id or c.state == .closed) continue;
+                        handleRead(server, e.idx) catch {};
+                        const rc = server.io.getConnection(e.idx) orelse continue;
+                        if (rc.id != e.id or rc.state == .closed) continue;
+                        if (!rc.close_after_write and rc.x402 == .none) {
+                            if (rc.fd) |pfd| server.io.rearmRecv(e.idx, pfd);
+                        }
+                    }
+                    if (n < expired.len) break :sweep;
+                }
+            }
             if (server.quic) |*q| {
                 q.cleanup();
             }
@@ -482,6 +543,11 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
             if (server.pg_client) |pgc| {
                 pgc.tick(&server.io, now_ms);
             }
+            if (build_options.enable_wasm) {
+                if (server.wasmControlClient()) |cc| cc.tick(&server.io, now_ms);
+                _ = server.tenant_registry.evictIdle(now_ms, server.tenant_idle_ttl_ms);
+            }
+            wasmTick(server, now_ms);
             if (server.otel) |otel_exp| {
                 otel_exp.tick(now_ms);
             }
@@ -741,6 +807,708 @@ fn pgResume(ctx: *anyopaque, outcome: *const pg_client_mod.Outcome) void {
     if (rconn.id != outcome.conn_id or rconn.state == .closed) return;
     if (!rconn.close_after_write and rconn.x402 == .none) {
         if (rconn.fd) |pfd| server.io.rearmRecv(outcome.conn_index, pfd);
+    }
+}
+
+/// Drive a completed WASM host call: deliver the resumed filter Decision to the
+/// parked HTTP connection and restart its I/O. Mirrors pgResume, but a wasm
+/// FILTER parked before the handler, so allow/modify RE-DISPATCH the request
+/// (re-enter router.handle with the filter skipped so the handler runs); reject
+/// and backpressure are served directly. The transport (C1) and the deadline
+/// tick call this. Routes delivery by completion.protocol: .http1 is implemented;
+/// .http2/.http3 are E2 stubs. Compiled only when wasm is enabled.
+pub fn wasmResume(server: *Server, completion: wasm_host_call_mod.Completion) void {
+    switch (completion.protocol) {
+        .http1 => {},
+        .http2 => {
+            // E2a: deliver a resumed parked H2 stream's response on its own
+            // stream via queueHttp2Response, keyed by completion.stream_id. The
+            // connection kept multiplexing while this stream was parked.
+            wasmResumeHttp2(server, completion);
+            return;
+        },
+        .http3 => {
+            // E2b: deliver a resumed parked H3 stream's response on its own QUIC
+            // stream via the h3 send path, keyed by the QUIC connection id +
+            // stream id. The connection kept multiplexing its other streams while
+            // this one was parked.
+            wasmResumeHttp3(server, completion);
+            return;
+        },
+    }
+    const conn = server.io.getConnection(completion.conn_index) orelse return;
+    if (conn.id != completion.conn_id) return; // slot recycled while parked
+    if (conn.x402 != .wasm_parked) return;
+    conn.x402 = .none;
+
+    switch (completion.decision) {
+        .reject => |resp| {
+            http1_mod.queueResponse(server, conn, resp) catch {
+                conn.close_after_write = true;
+            };
+            // The reject body borrows the resumed instance's staged scratch
+            // (released to .idle by resumeCall/cancel); copy any spilled tail to
+            // stable pool buffers before the next request reuses the instance.
+            if (conn.pending_body.len > 0) http1_mod.materializePendingBody(server, conn);
+            recordResumeSpan(server, completion, resp.status);
+        },
+        .rate_limit_backpressure => |bp| {
+            http1_mod.queueResponse(server, conn, bp.resp) catch {
+                conn.close_after_write = true;
+            };
+            if (bp.pause_reads) conn.setRateLimitPause(server.now_ms, bp.resume_after_ms);
+        },
+        .allow, .skip, .modify => {
+            // Proxy route? Re-forward through the proxy with the filter skipped
+            // (the upstream was never contacted at park time). Falls through to
+            // the embedded-Router re-dispatch when it is not a proxy route.
+            if (proxyResume(server, conn, completion)) {
+                restartConnIo(server, completion.conn_index, completion.conn_id);
+                return;
+            }
+            // Re-run the pipeline with the resumed decision injected so the
+            // filter is skipped and the handler runs. completion.req is the
+            // park slot's OWNED snapshot (valid through this synchronous resume),
+            // not a borrow of the connection read buffer.
+            var response_buf: [PG_RESUME_BUF_SIZE]u8 = undefined;
+            var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
+            const arena_handle = server.io.acquireBuffer();
+            defer if (arena_handle) |h| server.io.releaseBuffer(h);
+            var empty_arena: [0]u8 = undefined;
+            const arena_buf = if (arena_handle) |h| h.bytes else empty_arena[0..];
+            var mw_ctx = middleware.Context{
+                .client_ip = conn.cached_peer_ip,
+                .protocol = .http1,
+            };
+            var scratch = router.HandlerScratch{
+                .response_buf = response_buf[0..],
+                .response_headers = response_headers[0..],
+                .arena_buf = arena_buf,
+                .pg = .{
+                    .client = server.pg_client,
+                    .io_rt = &server.io,
+                    .conn_index = completion.conn_index,
+                    .conn_id = completion.conn_id,
+                },
+                .wasm = .{
+                    .table = if (build_options.enable_wasm) @ptrCast(&server.wasm_host_calls) else null,
+                    .conn_index = completion.conn_index,
+                    .conn_id = completion.conn_id,
+                    .stream_id = completion.stream_id, // 0 for H1
+                    .protocol = .http1,
+                    .deadline_ms = server.now_ms + server.wasm_host_call_deadline_ms,
+                    .resume_decision = completion.decision,
+                },
+            };
+            const result = server.app_router.handle(completion.req, &mw_ctx, &scratch);
+            // The handler may itself park (PG); handleParkSentinel catches that.
+            if (http1_mod.handleParkSentinel(server, conn, result.resp)) {
+                if (conn.x402 != .none) return; // re-parked; resume again later
+            } else {
+                http1_mod.queueResponse(server, conn, result.resp) catch {
+                    conn.close_after_write = true;
+                };
+                // Same Phase 2b hazard as the main loop: a replaced response body
+                // borrows the (now-idle, soon-reused) instance scratch; copy any
+                // spilled tail into stable pool buffers before returning. Stable
+                // .bytes sources keep the lazy drain (same gate as the main loop).
+                if (result.wasm_body_borrowed and conn.pending_body.len > 0) http1_mod.materializePendingBody(server, conn);
+                recordResumeSpan(server, completion, result.resp.status);
+            }
+        },
+    }
+
+    // Restart connection I/O (same tail as pgResume): flush, drain pipelined
+    // requests buffered behind the park, re-arm recv.
+    restartConnIo(server, completion.conn_index, completion.conn_id);
+}
+
+/// Record the OTel span for a parked-and-resumed H1 ROUTER request. The span
+/// start was stashed on the connection at park time (WasmProxyResumeCtx, which
+/// the router binding also points its resume_ctx at); without this, exactly the
+/// slow (parked) requests would be invisible to tracing. The proxy resume path
+/// records its span in proxyForwardAndRespond instead.
+fn recordResumeSpan(server: *Server, completion: wasm_host_call_mod.Completion, status: u16) void {
+    if (!build_options.enable_wasm) return;
+    const otel_exp = server.otel orelse return;
+    const rctx_ptr = completion.resume_ctx orelse return;
+    const rctx: *const connection.Connection.WasmProxyResumeCtx = @ptrCast(@alignCast(rctx_ptr));
+    otel_exp.recordSpan(completion.req.method, completion.req.path, status, rctx.otel_start, clock.realtimeNanos() orelse 0);
+}
+
+/// Restart a connection's I/O after an out-of-event-loop completion (park
+/// resume, expired read pause): flush queued writes, drain any pipelined
+/// request bytes buffered behind the suspension, and re-arm recv (the native
+/// io_uring backend uses single-shot recv, so the normal re-arm was skipped
+/// when the pipeline loop broke). Generation-checked; safe to call on a
+/// connection that closed in the meantime.
+fn restartConnIo(server: *Server, conn_index: u32, conn_id: u64) void {
+    const conn = server.io.getConnection(conn_index) orelse return;
+    if (conn.id != conn_id or conn.state == .closed) return;
+    if (conn.write_count > 0) handleWrite(server, conn_index) catch {};
+    const postconn = server.io.getConnection(conn_index) orelse return;
+    if (postconn.id != conn_id or postconn.state == .closed) return;
+    if (postconn.x402 == .none and postconn.read_buffered_bytes > 0) {
+        handleRead(server, conn_index) catch {};
+    }
+    const rconn = server.io.getConnection(conn_index) orelse return;
+    if (rconn.id != conn_id or rconn.state == .closed) return;
+    if (!rconn.close_after_write and rconn.x402 == .none) {
+        if (rconn.fd) |pfd| server.io.rearmRecv(conn_index, pfd);
+    }
+}
+
+/// Park-time context the proxy post-forward processing needs on resume. Holds
+/// only what cannot be recomputed from (server, conn, proxy, req, route_idx):
+/// the route index, the otel span start, and the live x402 evaluation result.
+/// The main loop builds this on the stack from its locals; proxyResume rebuilds
+/// it from the stashed connection.WasmProxyResumeCtx plus the owned snapshot.
+const ProxyPostCtx = struct {
+    route_idx: usize,
+    otel_start: i128,
+    x402_result: x402_mod.EvaluateResult,
+};
+
+/// Outcome of proxyForwardAndRespond: whether the response was served, or the
+/// connection parked for inline-receipt settlement (response held, delivered
+/// when settlement completes). The main loop ignores it (its loop tail is the
+/// same either way); proxyResume relies on conn.x402 (set to .settle_pending on
+/// a settle-park) to drive the I/O restart, so the enum is informational.
+const ProxyRespondOutcome = enum { responded, settle_parked };
+
+/// Run the post-`proxy.handle` processing the main dispatch loop performs after a
+/// proxy forward, factored out so the resumed (wasm-parked) proxy path runs it
+/// too: response-cache store/invalidate, the otel span, x402 settlement (incl.
+/// the inline-receipt settle-park via packHeldResponse), then queueResponse plus
+/// the owned-buffer tail. Behavior is identical to the inline tail it replaces.
+///
+/// On a settle-park it sets conn.x402 = .settle_pending, holds the response, and
+/// returns .settle_parked WITHOUT calling queueResponse (the held response is
+/// delivered when settlement completes); otherwise it queues the response and
+/// returns .responded. The vary keys and per-route config are recomputed from
+/// route_idx so both call sites pass a minimal context. Compiled in all builds
+/// (no wasm dependency).
+fn proxyForwardAndRespond(
+    server: *Server,
+    conn: *connection.Connection,
+    proxy: *proxy_mod.Proxy,
+    req: request_mod.RequestView,
+    proxy_result: *proxy_mod.ProxyResult,
+    pctx: ProxyPostCtx,
+) !ProxyRespondOutcome {
+    const route_idx = pctx.route_idx;
+    // The resume path replays a route_idx captured at park time. Reload drains
+    // parks before swapping the proxy, so a stale index should be unreachable;
+    // guard anyway: indexing a shorter route table with it is OOB, and a
+    // reordered one applies another route's cache/x402 policy.
+    if (route_idx >= proxy.config.routes.len) {
+        try http1_mod.queueResponse(server, conn, Server.internalErrorResponse());
+        return .responded;
+    }
+    const cache_cfg = proxy.config.routes[route_idx].cache;
+
+    // Recompute the vary keys exactly as the pre-forward cache lookup did: base
+    // vary from config + the implicit accept-encoding key (the proxy may compress
+    // per the client's Accept-Encoding before the store below).
+    var vary_buf: [16][]const u8 = undefined;
+    const vary_keys: []const []const u8 = blk: {
+        const base_vary: []const []const u8 = if (cache_cfg) |cc| cc.vary else &.{};
+        const n = @min(base_vary.len, vary_buf.len - 1);
+        for (base_vary[0..n], 0..) |v, vi| vary_buf[vi] = v;
+        vary_buf[n] = "accept-encoding";
+        break :blk vary_buf[0 .. n + 1];
+    };
+
+    // Cache store: cache successful GET responses
+    if (cache_cfg) |cc| {
+        if (req.method == .GET and proxy_result.resp.status == 200) {
+            if (proxy.route_caches[route_idx]) |*rc| {
+                rc.store(
+                    req.path,
+                    req.headers,
+                    vary_keys,
+                    proxy_result.resp.status,
+                    proxy_result.resp.headers,
+                    proxy_result.resp.bodyBytes(),
+                    @as(u64, cc.ttl_s) * 1000,
+                    server.now_ms,
+                );
+            }
+        }
+    }
+    // Invalidate cache on mutating methods
+    if (cache_cfg != null and req.method != .GET and req.method != .HEAD) {
+        if (proxy.route_caches[route_idx]) |*rc| {
+            rc.invalidate(req.path);
+        }
+    }
+
+    if (server.otel) |otel_exp| {
+        otel_exp.recordSpan(req.method, req.path, proxy_result.resp.status, pctx.otel_start, clock.realtimeNanos() orelse 0);
+    }
+
+    // Settlement: submit async, optionally park for inline receipt
+    const x402_result = pctx.x402_result;
+    const x402_policy = proxy.route_x402_policies[route_idx];
+    const route_fac = proxy.route_facilitators[route_idx] orelse server.app_router.facilitator;
+    settle_blk: {
+        if (proxy_result.resp.status < 200 or proxy_result.resp.status >= 300) break :settle_blk;
+        if (!(x402_result == .allow and x402_result.allow.needs_settlement)) break :settle_blk;
+        const fac = route_fac orelse break :settle_blk;
+        const charge = for (proxy_result.resp.headers) |hdr| {
+            if (std.ascii.eqlIgnoreCase(hdr.name, "x-charge-amount")) break hdr.value;
+        } else "";
+        var settle_entry = x402_client.RequestEntry{ .kind = .settle, .conn_index = conn.index, .conn_id = conn.id };
+        fillSettleEntry(&settle_entry, fac, x402_result.allow.payment_header, &x402_policy, charge, req.path);
+        if (settle_entry.http_len == 0) break :settle_blk;
+
+        // Settle-park: hold response until settlement completes, then inject receipt header.
+        // Enabled by config (inline_receipt) or per-request header (X-Inline-Receipt: true).
+        const want_receipt = x402_policy.inline_receipt or for (req.headers) |hdr| {
+            if (std.ascii.eqlIgnoreCase(hdr.name, "x-inline-receipt")) break std.mem.eql(u8, hdr.value, "true");
+        } else false;
+        if (want_receipt and packHeldResponse(server, conn, proxy_result.resp)) {
+            if (x402_client.submit(settle_entry)) {
+                conn.x402 = .settle_pending;
+                server.io.setTimeoutPhase(conn, .write);
+                conn.phase_enter_ms = server.now_ms;
+                conn.markActive(server.now_ms);
+                return .settle_parked;
+            }
+            releaseHeldBuffer(server, conn);
+        }
+
+        // Fire-and-forget: submit settle without parking
+        if (!x402_client.submit(settle_entry)) {
+            x402_client.spillSettle(
+                x402_policy.gateway_id,
+                x402_policy.network,
+                x402_policy.asset,
+                if (charge.len > 0) charge else x402_policy.price,
+                "settle queue full",
+            );
+        }
+    }
+
+    try http1_mod.queueResponse(server, conn, proxy_result.resp);
+    if (conn.pending_body.len > 0) {
+        // The unsent tail must outlive proxy_result.release(). It lives in the
+        // upstream heap buffer ONLY when the body was forwarded as-is; a Phase 2b
+        // on_response that REPLACED the body (or maybeCompress) repoints resp.body
+        // into the wasm instance scratch / compress scratch, which does NOT alias
+        // owned_buf and is released/reused after this call. So take the owned
+        // buffer ONLY when the tail actually lies within it; otherwise copy the
+        // tail into stable pool buffers now (while the scratch is still valid).
+        const tail = conn.pending_body;
+        const within_owned = if (proxy_result.owned_buf) |owned|
+            @intFromPtr(tail.ptr) >= @intFromPtr(owned.ptr) and
+                @intFromPtr(tail.ptr) + tail.len <= @intFromPtr(owned.ptr) + owned.len
+        else
+            false;
+        if (within_owned) {
+            std.debug.assert(conn.pending_body_owned == null);
+            conn.pending_body_owned = proxy_result.takeOwnedBuf();
+        } else {
+            http1_mod.materializePendingBody(server, conn);
+        }
+    }
+    return .responded;
+}
+
+/// Re-forward a parked PROXY request after its host call completed (resume to
+/// allow). Returns true if the parked request was a proxy route (handled here);
+/// false if not (the caller falls back to the embedded-Router re-dispatch).
+///
+/// Re-enters proxy.handle with the filter skipped (resume_decision injected) then
+/// runs the SAME post-forward processing the main loop runs via
+/// proxyForwardAndRespond -- response-cache store/invalidate, the otel span, and
+/// x402 settlement (incl. the inline-receipt settle-park) -- so a parked-then-
+/// allowed proxy request is cached/metered/settled like a non-parked one (E1).
+/// The upstream was not contacted at park time, so this is where the forward
+/// actually happens. The post-forward context is read from the connection's
+/// WasmProxyResumeCtx (stashed by the main loop, reached via completion.resume_ctx)
+/// plus the owned request snapshot. v1 limitation that REMAINS: auth_info/cert_dn
+/// are not re-derived, so upstream auth-header injection is absent for parked
+/// reqs. Compiled only when wasm is enabled.
+fn proxyResume(server: *Server, conn: *connection.Connection, completion: wasm_host_call_mod.Completion) bool {
+    if (!build_options.enable_wasm) return false;
+    const proxy = server.proxy orelse return false;
+    const route = proxy.matchRoute(&completion.req) orelse return false;
+    if (route.wasm_pool == null) return false; // not a wasm-filtered proxy route
+
+    var ip_buf: [64]u8 = undefined;
+    var client_ip_str: ?[]const u8 = null;
+    if (conn.cached_peer_ip) |ip4| {
+        const n = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ ip4[0], ip4[1], ip4[2], ip4[3] }) catch "";
+        if (n.len > 0) client_ip_str = ip_buf[0..n.len];
+    }
+    var mw_ctx = middleware.Context{ .client_ip = conn.cached_peer_ip, .protocol = .http1 };
+    // resume_decision skips the filter; auth_info/cert_dn are not re-derived on
+    // the resumed path (v1) -- upstream auth injection is absent for parked reqs.
+    // For a tenant route the resumed filter may have named the VM socket via
+    // set_upstream (completion.upstream_override): carry it + the registry so
+    // proxy.handle forwards this request there and records the warm mapping.
+    // The path is validated against socket_dir before it is trusted.
+    const tenant_override: ?[]const u8 = blk: {
+        const ovr = completion.upstream_override orelse break :blk null;
+        const tc = route.tenant orelse break :blk null;
+        if (tc.socket_dir.len == 0 or !std.mem.startsWith(u8, ovr, tc.socket_dir)) {
+            std.log.warn("wasm tenant: filter named socket '{s}' outside socket_dir '{s}'; ignoring", .{ ovr, tc.socket_dir });
+            break :blk null;
+        }
+        break :blk ovr;
+    };
+    const binding = proxy_mod.WasmBinding{
+        .resume_decision = completion.decision,
+        .tenant_registry = @ptrCast(&server.tenant_registry),
+        .upstream_override = tenant_override,
+    };
+    var pr = proxy.handle(
+        completion.req,
+        &mw_ctx,
+        client_ip_str,
+        conn.tls_session != null,
+        server.now_ms,
+        null,
+        null,
+        binding,
+    );
+    defer pr.release();
+
+    // Rebuild the post-forward context stashed by the main loop at park time. The
+    // resume_ctx pointer aliases this connection's WasmProxyResumeCtx; fall back
+    // to the field directly if a transport ever delivers a null ctx.
+    const rctx: *const connection.Connection.WasmProxyResumeCtx = if (completion.resume_ctx) |p|
+        @ptrCast(@alignCast(p))
+    else
+        &conn.wasm_proxy_resume;
+    // Reconstruct the x402 evaluation result from the carried needs_settlement
+    // flag (the result at park time is always .allow -- rejects fast-return before
+    // the forward). Re-point payment_header at the OWNED request snapshot; the
+    // original slice borrowed the now-reused read buffer.
+    const x402_result: x402_mod.EvaluateResult = .{ .allow = .{
+        .payment_header = x402_mod.findValidPaymentHeader(completion.req) orelse "",
+        .needs_settlement = rctx.needs_settlement,
+    } };
+    _ = proxyForwardAndRespond(server, conn, proxy, completion.req, &pr, .{
+        .route_idx = rctx.route_idx,
+        .otel_start = rctx.otel_start,
+        .x402_result = x402_result,
+    }) catch {
+        conn.close_after_write = true;
+    };
+    return true;
+}
+
+/// Deliver a resumed parked HTTP/2 stream's filter Decision on its own stream
+/// (E2a). Mirrors the H1 wasmResume body but routes delivery through
+/// queueHttp2Response on completion.stream_id, leaving the rest of the
+/// connection's streams untouched (the connection kept multiplexing while this
+/// stream was parked, so there is no pipeline gate to lift). allow/modify
+/// RE-DISPATCH the request (proxy re-forward or router re-run with the filter
+/// skipped); reject/backpressure are served directly on the stream. Compiled
+/// only when wasm is enabled.
+fn wasmResumeHttp2(server: *Server, completion: wasm_host_call_mod.Completion) void {
+    if (!build_options.enable_wasm) return;
+    const conn = server.io.getConnection(completion.conn_index) orelse return;
+    if (conn.id != completion.conn_id) return; // slot recycled while parked
+    if (conn.protocol != .http2 or conn.http2_stack == null) return;
+    const stream_id = completion.stream_id;
+    const is_head = completion.req.method == .HEAD;
+
+    switch (completion.decision) {
+        .reject => |resp| {
+            http2_mod.queueHttp2Response(server, conn, stream_id, resp, is_head) catch {};
+        },
+        .rate_limit_backpressure => |bp| {
+            // Serve the backpressure response on this stream only. A
+            // connection-level read pause would stall sibling streams, so H2
+            // does not pause reads here; per-stream backpressure (a STREAM-level
+            // flow-control stall) is a deferred refinement.
+            http2_mod.queueHttp2Response(server, conn, stream_id, bp.resp, is_head) catch {};
+        },
+        .allow, .skip, .modify => {
+            // Proxy route? Re-forward with the filter skipped (the upstream was
+            // never contacted at park time). Falls through to the embedded-Router
+            // re-dispatch when it is not a proxy route.
+            if (!proxyResumeHttp2(server, conn, completion)) {
+                // Re-run the router with the resumed decision injected so the
+                // filter is skipped and the handler runs. completion.req is the
+                // park slot's OWNED snapshot (valid through this synchronous
+                // resume), not a borrow of a reused frame buffer.
+                var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
+                var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
+                const needs_eager_arena = (completion.req.method != .GET and completion.req.method != .HEAD and completion.req.method != .DELETE);
+                const arena_handle = if (needs_eager_arena) server.io.acquireBuffer() else null;
+                var empty_arena: [0]u8 = undefined;
+                const arena_buf = if (arena_handle) |h| h.bytes else empty_arena[0..];
+                var mw_ctx = middleware.Context{
+                    .protocol = .http2,
+                    .is_tls = conn.is_tls,
+                    .stream_id = stream_id,
+                    .buffer_ops = .{
+                        .ctx = &server.io,
+                        .acquire = write_queue.acquireBufferOpaque,
+                        .release = write_queue.releaseBufferOpaque,
+                    },
+                };
+                if (conn.cached_peer_ip) |ip4| {
+                    mw_ctx.client_ip = ip4;
+                } else if (conn.cached_peer_ip6) |ip6| {
+                    mw_ctx.client_ip6 = ip6;
+                }
+                var scratch = router.HandlerScratch{
+                    .response_buf = response_buf[0..],
+                    .response_headers = response_headers[0..],
+                    .arena_buf = arena_buf,
+                    .arena_handle = arena_handle,
+                    .buffer_ops = mw_ctx.buffer_ops,
+                    .wasm = .{
+                        .table = @ptrCast(&server.wasm_host_calls),
+                        .conn_index = completion.conn_index,
+                        .conn_id = completion.conn_id,
+                        .stream_id = stream_id,
+                        .protocol = .http2,
+                        .deadline_ms = server.now_ms + server.wasm_host_call_deadline_ms,
+                        .resume_decision = completion.decision,
+                    },
+                };
+                const result = server.app_router.handle(completion.req, &mw_ctx, &scratch);
+                if (scratch.arena_handle) |h| server.io.releaseBuffer(h);
+                if (result.pause_reads_ms) |pause_ms| conn.setRateLimitPause(server.now_ms, pause_ms);
+                // The handler may itself park again: leave the stream suspended
+                // rather than serializing the park sentinel (H3-resume parity).
+                // A sentinel with no live park is failed closed.
+                if (result.resp.isParked()) {
+                    if (server.wasmHasParkForStream(completion.conn_index, completion.conn_id, stream_id)) return;
+                    server.wasmCancelForStream(completion.conn_index, completion.conn_id, stream_id);
+                    http2_mod.queueHttp2Response(server, conn, stream_id, Server.internalErrorResponse(), is_head) catch {};
+                } else {
+                    http2_mod.queueHttp2Response(server, conn, stream_id, result.resp, is_head) catch {};
+                }
+            }
+        },
+    }
+
+    // Flush the freshly queued frames and re-arm recv. handleWrite is a no-op
+    // when the connection has no fd (unit tests inspect the queue directly) and
+    // flushes to the socket in production. No x402/.wasm_parked gate exists for
+    // H2: the connection was never suspended, only this one stream.
+    if (conn.write_count > 0) handleWrite(server, completion.conn_index) catch {};
+    const rc = server.io.getConnection(completion.conn_index) orelse return;
+    if (rc.id != completion.conn_id or rc.state == .closed) return;
+    if (!rc.close_after_write) {
+        if (rc.fd) |pfd| server.io.rearmRecv(completion.conn_index, pfd);
+    }
+}
+
+/// Re-forward a parked PROXY request on an HTTP/2 stream after its host call
+/// completed (resume to allow). Returns true if the parked request was a proxy
+/// route (handled here); false if not (the caller falls back to the
+/// embedded-Router re-dispatch). Mirrors proxyResume but delivers via
+/// queueHttp2Response on completion.stream_id. Compiled only when wasm is enabled.
+fn proxyResumeHttp2(server: *Server, conn: *connection.Connection, completion: wasm_host_call_mod.Completion) bool {
+    if (!build_options.enable_wasm) return false;
+    const proxy = server.proxy orelse return false;
+    const route = proxy.matchRoute(&completion.req) orelse return false;
+    if (route.wasm_pool == null) return false; // not a wasm-filtered proxy route
+
+    var ip_buf: [64]u8 = undefined;
+    var client_ip_str: ?[]const u8 = null;
+    if (conn.cached_peer_ip) |ip4| {
+        const n = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ ip4[0], ip4[1], ip4[2], ip4[3] }) catch "";
+        if (n.len > 0) client_ip_str = ip_buf[0..n.len];
+    }
+    var mw_ctx = middleware.Context{ .client_ip = conn.cached_peer_ip, .protocol = .http2, .is_tls = conn.is_tls, .stream_id = completion.stream_id };
+    // resume_decision skips the filter; the upstream was not contacted at park
+    // time, so this is where the forward actually happens. Cache/otel/x402 are
+    // not re-run on the resumed proxy path (H1 parity, v1 limitation).
+    const binding = proxy_mod.WasmBinding{ .resume_decision = completion.decision };
+    var pr = proxy.handle(
+        completion.req,
+        &mw_ctx,
+        client_ip_str,
+        conn.tls_session != null,
+        server.now_ms,
+        null,
+        null,
+        binding,
+    );
+    defer pr.release();
+    http2_mod.queueHttp2Response(server, conn, completion.stream_id, pr.resp, completion.req.method == .HEAD) catch {};
+    return true;
+}
+
+/// Deliver a resumed parked HTTP/3 stream's filter Decision on its own QUIC
+/// stream (E2b). The H3 analog of wasmResumeHttp2: it routes delivery through
+/// the h3 send path (http3_mod.deliverResume), keyed by the QUIC connection id
+/// (completion.conn_id) + stream id, leaving the connection's other streams
+/// untouched (the connection kept multiplexing while this stream was parked).
+/// allow/modify RE-DISPATCH the request (proxy re-forward or router re-run with
+/// the filter skipped); reject/backpressure are served directly on the stream.
+/// The QUIC connection is re-found by id inside deliverResume; if it was freed
+/// while parked the delivery is a no-op. Compiled only when wasm is enabled.
+fn wasmResumeHttp3(server: *Server, completion: wasm_host_call_mod.Completion) void {
+    if (!build_options.enable_wasm) return;
+    const stream_id = completion.stream_id;
+    const conn_id = completion.conn_id;
+
+    switch (completion.decision) {
+        .reject => |resp| {
+            http3_mod.deliverResume(server, conn_id, stream_id, resp);
+        },
+        .rate_limit_backpressure => |bp| {
+            // Serve the backpressure response on this stream only. A
+            // connection-level read pause would stall sibling streams, so H3
+            // (like H2) does not pause the connection here; per-stream
+            // backpressure is a deferred refinement.
+            http3_mod.deliverResume(server, conn_id, stream_id, bp.resp);
+        },
+        .allow, .skip, .modify => {
+            // Proxy route? Re-forward with the filter skipped (the upstream was
+            // never contacted at park time). Falls through to the embedded-Router
+            // re-dispatch when it is not a proxy route.
+            if (proxyResumeHttp3(server, completion)) return;
+
+            // Re-run the router with the resumed decision injected so the filter
+            // is skipped and the handler runs. completion.req is the park slot's
+            // OWNED snapshot (valid through this synchronous resume), not a borrow
+            // of a reused frame buffer.
+            var response_buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
+            var response_headers: [router.MAX_RESPONSE_HEADERS]response_mod.Header = undefined;
+            const needs_eager_arena = (completion.req.method != .GET and completion.req.method != .HEAD and completion.req.method != .DELETE);
+            const arena_handle = if (needs_eager_arena) server.io.acquireBuffer() else null;
+            var empty_arena: [0]u8 = undefined;
+            const arena_buf = if (arena_handle) |h| h.bytes else empty_arena[0..];
+            var mw_ctx = middleware.Context{
+                .protocol = .http3,
+                .is_tls = true, // QUIC is always TLS
+                .stream_id = stream_id,
+                .buffer_ops = .{
+                    .ctx = &server.io,
+                    .acquire = write_queue.acquireBufferOpaque,
+                    .release = write_queue.releaseBufferOpaque,
+                },
+            };
+            var scratch = router.HandlerScratch{
+                .response_buf = response_buf[0..],
+                .response_headers = response_headers[0..],
+                .arena_buf = arena_buf,
+                .arena_handle = arena_handle,
+                .buffer_ops = mw_ctx.buffer_ops,
+                .wasm = .{
+                    .table = @ptrCast(&server.wasm_host_calls),
+                    .conn_index = completion.conn_index,
+                    .conn_id = conn_id,
+                    .stream_id = stream_id,
+                    .protocol = .http3,
+                    .deadline_ms = server.now_ms + server.wasm_host_call_deadline_ms,
+                    .resume_decision = completion.decision,
+                },
+            };
+            const result = server.app_router.handle(completion.req, &mw_ctx, &scratch);
+            if (scratch.arena_handle) |h| server.io.releaseBuffer(h);
+            // The handler may itself park again (PG, or another host call): leave
+            // the stream suspended rather than sending the park sentinel.
+            if (result.resp.isParked()) {
+                if (server.wasmHasParkForStream(completion.conn_index, conn_id, stream_id)) return;
+                server.wasmCancelForStream(completion.conn_index, conn_id, stream_id);
+                http3_mod.deliverResume(server, conn_id, stream_id, response_mod.Response{
+                    .status = 500,
+                    .headers = &.{},
+                    .body = .{ .bytes = "Internal Server Error" },
+                });
+                return;
+            }
+            http3_mod.deliverResume(server, conn_id, stream_id, result.resp);
+        },
+    }
+}
+
+/// Re-forward a parked PROXY request on an HTTP/3 stream after its host call
+/// completed (resume to allow). Returns true if the parked request was a proxy
+/// route (handled here); false if not (the caller falls back to the
+/// embedded-Router re-dispatch). Mirrors proxyResumeHttp2 but delivers via the
+/// h3 send path on completion.stream_id. Compiled only when wasm is enabled.
+fn proxyResumeHttp3(server: *Server, completion: wasm_host_call_mod.Completion) bool {
+    if (!build_options.enable_wasm) return false;
+    const proxy = server.proxy orelse return false;
+    const route = proxy.matchRoute(&completion.req) orelse return false;
+    if (route.wasm_pool == null) return false; // not a wasm-filtered proxy route
+
+    var mw_ctx = middleware.Context{ .protocol = .http3, .is_tls = true, .stream_id = completion.stream_id };
+    // resume_decision skips the filter; the upstream was not contacted at park
+    // time, so this is where the forward actually happens. Cache/otel/x402 are
+    // not re-run on the resumed proxy path (H1/H2 parity, v1 limitation).
+    const binding = proxy_mod.WasmBinding{ .resume_decision = completion.decision };
+    var pr = proxy.handle(
+        completion.req,
+        &mw_ctx,
+        null,
+        true, // QUIC is always TLS
+        server.now_ms,
+        null,
+        null,
+        binding,
+    );
+    defer pr.release();
+    http3_mod.deliverResume(server, completion.conn_id, completion.stream_id, pr.resp);
+    return true;
+}
+
+/// Fire WASM host-call wall-clock deadlines from the housekeeping tick: each
+/// timed-out park is failed closed and delivered via wasmResume. No-op when wasm
+/// is disabled or nothing is parked.
+fn wasmTick(server: *Server, now_ms: u64) void {
+    if (build_options.enable_wasm) {
+        // Mock transport (e2e mock lane): complete parks queued since the last
+        // tick with the canned reply. Drained here, off any handler stack frame.
+        if (server.wasm_mock_enabled and server.wasm_mock_count > 0) {
+            const reply = server.wasm_mock_reply;
+            const n = server.wasm_mock_count;
+            server.wasm_mock_count = 0;
+            for (server.wasm_mock_pending[0..n]) |token| wasmComplete(server, token, reply);
+        }
+        // Wall-clock deadlines.
+        var completions: [16]wasm_host_call_mod.Completion = undefined;
+        const n = server.wasm_host_calls.tick(now_ms, &completions);
+        for (completions[0..n]) |c| wasmResume(server, c);
+    }
+}
+
+/// Transport start hook (router.WasmBinding.start_fn). Routes a freshly parked
+/// filter's host call to the Server's transport (control socket or mock).
+fn wasmStartThunk(ctx: *anyopaque, token: u32, request: []const u8) void {
+    const server: *Server = @ptrCast(@alignCast(ctx));
+    server.wasmStartHostCall(token, request);
+}
+
+/// ControlClient.CompleteFn adapter: the *anyopaque ctx is the Server.
+fn wasmCompleteThunk(ctx: *anyopaque, token: u32, result: []const u8) void {
+    wasmComplete(@ptrCast(@alignCast(ctx)), token, result);
+}
+
+/// ControlClient.FailFn adapter: fail the park closed (transport error).
+fn wasmFailThunk(ctx: *anyopaque, token: u32) void {
+    wasmFail(@ptrCast(@alignCast(ctx)), token);
+}
+
+/// Deliver a completed host call (success path). The transport calls this when
+/// the guest reply is in; it resumes the filter and re-dispatches. `token` is a
+/// wasm.host_call.Token (u32).
+pub fn wasmComplete(server: *Server, token: u32, result: []const u8) void {
+    if (build_options.enable_wasm) {
+        if (server.wasm_host_calls.complete(token, result)) |c| wasmResume(server, c);
+    }
+}
+
+/// Fail a parked host call closed (transport failure: connect error, EOF,
+/// command timeout). Mirrors wasmComplete but cancels the park to a fail-closed
+/// Decision. A no-op if the token already resolved (e.g. the table deadline fired
+/// first), so a late/duplicate failure from the transport is harmless.
+pub fn wasmFail(server: *Server, token: u32) void {
+    if (build_options.enable_wasm) {
+        if (server.wasm_host_calls.cancel(token, .host_call_failed)) |c| wasmResume(server, c);
     }
 }
 
@@ -1033,7 +1801,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
     var memo_path: []const u8 = "";
 
     while (conn.state != .closed and conn.read_buffered_bytes > 0 and conn.canEnqueueWrite() and !conn.hasPendingFile()) {
-        if (conn.x402 == .pending or conn.x402 == .settle_pending or conn.x402 == .db_parked) break;
+        if (conn.x402 == .pending or conn.x402 == .settle_pending or conn.x402 == .db_parked or conn.x402 == .wasm_parked) break;
         // Opportunistic inline write drain: push enqueued responses
         // to the kernel while still processing pipelined requests.
         // At low connection counts (e.g. 512 conns / 64 workers =
@@ -1144,6 +1912,9 @@ pub fn handleRead(server: *Server, index: u32) !void {
         }
         conn.header_count = parse.view.headers.len;
         conn.is_head_request = (parse.view.method == .HEAD);
+        // Request counting is admin-gated: one predictable branch when the
+        // admin API is off, so benchmark configs pay nothing for it.
+        if (server.cfg.admin.enabled) metrics_mw.getStore().recordRequest(.http1);
         // Reset sent_continue for each new request in pipelined connections
         conn.sent_continue = false;
         if (!parse.keep_alive) conn.close_after_write = true;
@@ -1399,6 +2170,36 @@ pub fn handleRead(server: *Server, index: u32) !void {
                 }
 
                 const otel_start = if (server.otel != null) clock.realtimeNanos() orelse 0 else 0;
+                // E1: stash the post-forward processing context BEFORE the
+                // forward so a wasm filter park on this proxy route can run
+                // cache-store/otel/settlement on resume (proxyResume reads this
+                // via the binding's resume_ctx). x402_result is always .allow
+                // here (rejects fast-returned above); carry only needs_settlement
+                // (the payment header is re-derived from the owned snapshot on
+                // resume). Harmless dead data when the filter does not park.
+                if (build_options.enable_wasm) {
+                    conn.wasm_proxy_resume = .{
+                        .route_idx = route_idx,
+                        .otel_start = otel_start,
+                        .needs_settlement = x402_result == .allow and x402_result.allow.needs_settlement,
+                    };
+                }
+                // Park binding: a host_call filter on this proxy route parks
+                // (H1 only). On park, runWasmFilter registers in the table, kicks
+                // the transport (start_fn), and returns the park sentinel; we
+                // suspend the connection and let wasmResume re-forward on allow.
+                const proxy_wasm: proxy_mod.WasmBinding = if (build_options.enable_wasm) .{
+                    .table = @ptrCast(&server.wasm_host_calls),
+                    .conn_index = conn.index,
+                    .conn_id = conn.id,
+                    .stream_id = 0, // H1 sentinel
+                    .protocol = .http1,
+                    .deadline_ms = server.now_ms + server.wasm_host_call_deadline_ms,
+                    .resume_ctx = @ptrCast(&conn.wasm_proxy_resume),
+                    .start_fn = wasmStartThunk,
+                    .start_ctx = @ptrCast(server),
+                    .tenant_registry = @ptrCast(&server.tenant_registry),
+                } else .{};
                 var proxy_result = proxy.handle(
                     parse.view,
                     &mw_ctx,
@@ -1407,93 +2208,37 @@ pub fn handleRead(server: *Server, index: u32) !void {
                     server.now_ms,
                     auth_info_ptr,
                     cert_dn,
+                    proxy_wasm,
                 );
                 defer proxy_result.release();
 
-                // Cache store: cache successful GET responses
-                if (cache_cfg) |cc| {
-                    if (parse.view.method == .GET and proxy_result.resp.status == 200) {
-                        if (proxy.route_caches[route_idx]) |*rc| {
-                            rc.store(
-                                parse.view.path,
-                                parse.view.headers,
-                                vary_keys,
-                                proxy_result.resp.status,
-                                proxy_result.resp.headers,
-                                proxy_result.resp.bodyBytes(),
-                                @as(u64, cc.ttl_s) * 1000,
-                                server.now_ms,
-                            );
-                        }
-                    }
-                }
-                // Invalidate cache on mutating methods
-                if (cache_cfg != null and parse.view.method != .GET and parse.view.method != .HEAD) {
-                    if (proxy.route_caches[route_idx]) |*rc| {
-                        rc.invalidate(parse.view.path);
-                    }
+                // Park sentinel from a proxy filter: suspend (set .wasm_parked)
+                // and stop the pipeline. Skip cache/otel/settlement/queueResponse;
+                // wasmResume re-forwards on allow. Same break semantics as the
+                // router park path below.
+                if (build_options.enable_wasm and proxy_result.resp.isParked()) {
+                    _ = http1_mod.handleParkSentinel(server, conn, proxy_result.resp);
+                    break;
                 }
 
-                if (server.otel) |otel_exp| {
-                    otel_exp.recordSpan(parse.view.method, parse.view.path, proxy_result.resp.status, otel_start, clock.realtimeNanos() orelse 0);
+                // Pool/park-table exhaustion: the proxy filter served a 503 and
+                // asked for connection backpressure. Pause reads so the flood
+                // self-throttles (G2). Mirrors the router HandleResult path below.
+                if (proxy_result.pause_reads_ms) |pause_ms| {
+                    conn.setRateLimitPause(server.now_ms, pause_ms);
                 }
 
-                // Settlement: submit async, optionally park for inline receipt
-                settle_blk: {
-                    if (proxy_result.resp.status < 200 or proxy_result.resp.status >= 300) break :settle_blk;
-                    if (!(x402_result == .allow and x402_result.allow.needs_settlement)) break :settle_blk;
-                    const fac = route_fac orelse break :settle_blk;
-                    const charge = for (proxy_result.resp.headers) |hdr| {
-                        if (std.ascii.eqlIgnoreCase(hdr.name, "x-charge-amount")) break hdr.value;
-                    } else "";
-                    var settle_entry = x402_client.RequestEntry{ .kind = .settle, .conn_index = conn.index, .conn_id = conn.id };
-                    fillSettleEntry(&settle_entry, fac, x402_result.allow.payment_header, &x402_policy, charge, parse.view.path);
-                    if (settle_entry.http_len == 0) break :settle_blk;
-
-                    // Settle-park: hold response until settlement completes, then inject receipt header.
-                    // Enabled by config (inline_receipt) or per-request header (X-Inline-Receipt: true).
-                    const want_receipt = x402_policy.inline_receipt or for (parse.view.headers) |hdr| {
-                        if (std.ascii.eqlIgnoreCase(hdr.name, "x-inline-receipt")) break std.mem.eql(u8, hdr.value, "true");
-                    } else false;
-                    if (want_receipt and packHeldResponse(server, conn, proxy_result.resp)) {
-                        if (x402_client.submit(settle_entry)) {
-                            conn.x402 = .settle_pending;
-                            server.io.setTimeoutPhase(conn, .write);
-                            conn.phase_enter_ms = server.now_ms;
-                            conn.markActive(server.now_ms);
-                            if (conn.read_buffered_bytes == 0) break;
-                            continue;
-                        }
-                        releaseHeldBuffer(server, conn);
-                    }
-
-                    // Fire-and-forget: submit settle without parking
-                    if (!x402_client.submit(settle_entry)) {
-                        x402_client.spillSettle(
-                            x402_policy.gateway_id,
-                            x402_policy.network,
-                            x402_policy.asset,
-                            if (charge.len > 0) charge else x402_policy.price,
-                            "settle queue full",
-                        );
-                    }
-                }
-
-                try http1_mod.queueResponse(server, conn, proxy_result.resp);
-                if (conn.pending_body.len > 0) {
-                    if (proxy_result.takeOwnedBuf()) |owned| {
-                        // Large proxied response: the unsent tail points into
-                        // the proxy's heap buffer. Take ownership so it
-                        // outlives proxy_result.release(); freed when the
-                        // tail drains (handleWrite) or the connection closes.
-                        std.debug.assert(conn.pending_body_owned == null);
-                        conn.pending_body_owned = owned;
-                    } else {
-                        // Pool-buffer response: copy the tail out before
-                        // proxy_result.release() frees the upstream buffer.
-                        http1_mod.materializePendingBody(server, conn);
-                    }
-                }
+                // Post-forward processing (cache store/invalidate, otel span,
+                // x402 settlement incl. the inline-receipt settle-park, then
+                // queueResponse + the owned-buffer tail), shared with the resumed
+                // (wasm-parked) proxy path so parity holds (E1). On a settle-park
+                // this sets conn.x402 = .settle_pending and holds the response;
+                // either outcome takes the same loop tail below.
+                _ = try proxyForwardAndRespond(server, conn, proxy, parse.view, &proxy_result, .{
+                    .route_idx = route_idx,
+                    .otel_start = otel_start,
+                    .x402_result = x402_result,
+                });
                 if (conn.read_buffered_bytes == 0) break;
                 continue;
             }
@@ -1551,6 +2296,13 @@ pub fn handleRead(server: *Server, index: u32) !void {
         const arena_handle = if (needs_eager_arena) server.io.acquireBuffer() else null;
         var empty_arena: [0]u8 = undefined;
         const arena_buf = if (arena_handle) |handle| handle.bytes else empty_arena[0..];
+        const otel_start = if (server.otel != null) clock.realtimeNanos() orelse 0 else 0;
+        // Stash the span start across a possible park so the router resume path
+        // can record the span too (the proxy path stashes route_idx/settlement
+        // the same way). Harmless dead data when the filter does not park.
+        if (build_options.enable_wasm) {
+            conn.wasm_proxy_resume = .{ .route_idx = 0, .otel_start = otel_start, .needs_settlement = false };
+        }
         var scratch = router.HandlerScratch{
             .response_buf = response_buf[0..],
             .response_headers = response_headers[0..],
@@ -1563,8 +2315,20 @@ pub fn handleRead(server: *Server, index: u32) !void {
                 .conn_index = conn.index,
                 .conn_id = conn.id,
             },
+            .wasm = .{
+                // *wasm.host_call.Table (opaque); null when wasm is compiled out,
+                // which makes a parking filter fail closed.
+                .table = if (build_options.enable_wasm) @ptrCast(&server.wasm_host_calls) else null,
+                .conn_index = conn.index,
+                .conn_id = conn.id,
+                .stream_id = 0, // H1 sentinel
+                .protocol = .http1,
+                .deadline_ms = server.now_ms + server.wasm_host_call_deadline_ms,
+                .resume_ctx = if (build_options.enable_wasm) @ptrCast(&conn.wasm_proxy_resume) else null,
+                .start_fn = if (build_options.enable_wasm) wasmStartThunk else null,
+                .start_ctx = if (build_options.enable_wasm) @ptrCast(server) else null,
+            },
         };
-        const otel_start = if (server.otel != null) clock.realtimeNanos() orelse 0 else 0;
         const result = server.app_router.handle(parse.view, &mw_ctx, &scratch);
         if (scratch.arena_handle) |handle| server.io.releaseBuffer(handle);
         if (result.pause_reads_ms) |pause_ms| {
@@ -1577,6 +2341,18 @@ pub fn handleRead(server: *Server, index: u32) !void {
         // drain and write-readiness events.
         if (http1_mod.handleParkSentinel(server, conn, result.resp)) break;
         try http1_mod.queueResponse(server, conn, result.resp);
+        // A Phase 2b on_response filter can REPLACE the body with a slice that
+        // borrows the wasm instance's scratch, which invokeResponse releases to
+        // .idle immediately (reused by the next request). If the body did not fit
+        // the write queue, the spilled tail in conn.pending_body still borrows
+        // that scratch -> the next request would overwrite it (cross-request body
+        // corruption). Materialize the tail into stable pool buffers now, while
+        // the scratch is still valid. Gated on wasm_body_borrowed: stable .bytes
+        // sources must keep the lazy pending_body drain (materializing them
+        // truncates any tail past the write-queue capacity and force-closes).
+        if (build_options.enable_wasm and result.wasm_body_borrowed and conn.pending_body.len > 0) {
+            http1_mod.materializePendingBody(server, conn);
+        }
         if (server.otel) |otel_exp| {
             otel_exp.recordSpan(parse.view.method, parse.view.path, result.resp.status, otel_start, clock.realtimeNanos() orelse 0);
         }
@@ -1594,6 +2370,9 @@ pub fn handleRead(server: *Server, index: u32) !void {
     if (!server.io.capabilities().delivers_read_data and
         conn.read_buffered_bytes == 0 and
         conn.canEnqueueWrite() and
+        !conn.read_paused and
+        conn.resume_read_at_ms == 0 and
+        conn.x402 == .none and
         !conn.close_after_write)
     {
         conn.read_offset = 0;

@@ -1,7 +1,10 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const net = @import("../runtime/net.zig");
 const clock = @import("../runtime/clock.zig");
 const upstream_mod = @import("../proxy/upstream.zig");
+const tenant_mod = @import("../proxy/tenant.zig");
+const metrics_mw = @import("../middleware/metrics_mw.zig");
 const proxy_mod = @import("../proxy/proxy.zig");
 const json_write = @import("../runtime/json_write.zig");
 
@@ -68,20 +71,20 @@ pub fn pollAdmin(server: *Server) void {
     const total_read = n;
 
     const req = parseHttpRequest(req_buf[0..total_read]) orelse {
-        _ = writeHttpResponse(client, 400, "{\"error\":\"bad request\"}");
+        _ = writeHttpResponse(client, 400, "{\"error\":\"bad request\"}", "application/json");
         return;
     };
 
     if (server.cfg.admin.api_key.len > 0) {
         if (!checkApiKey(req.headers_start, req.headers_end, req_buf[0..total_read], server.cfg.admin.api_key)) {
-            _ = writeHttpResponse(client, 401, "{\"error\":\"unauthorized\"}");
+            _ = writeHttpResponse(client, 401, "{\"error\":\"unauthorized\"}", "application/json");
             return;
         }
     }
 
     var resp_buf: [MAX_RESPONSE]u8 = undefined;
     const result = dispatch(server, req.method, req.path, req.body(req_buf[0..total_read]), &resp_buf);
-    _ = writeHttpResponse(client, result.status, result.body);
+    _ = writeHttpResponse(client, result.status, result.body, result.content_type);
 }
 
 fn setTimeouts(fd: std.posix.fd_t) void {
@@ -90,7 +93,7 @@ fn setTimeouts(fd: std.posix.fd_t) void {
     _ = std.posix.system.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv), @sizeOf(std.posix.timeval));
 }
 
-fn writeHttpResponse(fd: std.posix.fd_t, status: u16, json_body: []const u8) bool {
+fn writeHttpResponse(fd: std.posix.fd_t, status: u16, json_body: []const u8, content_type: []const u8) bool {
     var hdr_buf: [256]u8 = undefined;
     const status_text = switch (status) {
         200 => "OK",
@@ -103,7 +106,7 @@ fn writeHttpResponse(fd: std.posix.fd_t, status: u16, json_body: []const u8) boo
         500 => "Internal Server Error",
         else => "OK",
     };
-    const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ status, status_text, json_body.len }) catch return false;
+    const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ status, status_text, content_type, json_body.len }) catch return false;
     _ = writeAll(fd, hdr) catch return false;
     _ = writeAll(fd, json_body) catch return false;
     return true;
@@ -127,6 +130,7 @@ fn writeAll(fd: std.posix.fd_t, data: []const u8) !void {
 const DispatchResult = struct {
     status: u16,
     body: []const u8,
+    content_type: []const u8 = "application/json",
 };
 
 fn dispatch(server: *Server, method: Method, path: []const u8, body: []const u8, buf: []u8) DispatchResult {
@@ -146,8 +150,18 @@ fn dispatch(server: *Server, method: Method, path: []const u8, body: []const u8,
             else => .{ .status = 405, .body = "{\"error\":\"method not allowed\"}" },
         };
     }
+    if (startsWith(path, "/v1/tenants")) {
+        return switch (method) {
+            .GET => listTenants(server, buf),
+            .DELETE => evictTenant(server, path, buf),
+            else => .{ .status = 405, .body = "{\"error\":\"method not allowed\"}" },
+        };
+    }
     if (startsWith(path, "/v1/status")) {
         return getStatus(server, buf);
+    }
+    if (startsWith(path, "/v1/metrics")) {
+        return getMetrics(server, buf);
     }
     if (startsWith(path, "/v1/usage")) {
         return switch (method) {
@@ -379,10 +393,71 @@ fn deleteUpstream(server: *Server, path: []const u8, buf: []u8) DispatchResult {
 fn getStatus(server: *Server, buf: []u8) DispatchResult {
     const route_count: usize = if (server.proxy) |p| p.config.routes.len else 0;
     const upstream_count: usize = if (server.proxy) |p| p.config.upstreams.len else 0;
-    const n = std.fmt.bufPrint(buf, "{{\"status\":\"ok\",\"routes\":{d},\"upstreams\":{d},\"port\":{d},\"workers\":{d}}}", .{
-        route_count, upstream_count, server.cfg.port, server.cfg.workers,
+    // O7: surface Tier-2 park-table + filter-pool saturation so an operator can
+    // see fan-out backing up BEFORE it 503s (all-zero when wasm is compiled out).
+    const w = server.wasmObservability();
+    const n = std.fmt.bufPrint(buf, "{{\"status\":\"ok\",\"routes\":{d},\"upstreams\":{d},\"port\":{d},\"workers\":{d}," ++
+        "\"wasm\":{{\"park_active\":{d},\"park_capacity\":{d},\"pool_instances\":{d},\"pool_pinned\":{d},\"control_configured\":{},\"control_ready\":{}," ++
+        "\"tenants_active\":{d},\"tenant_hits\":{d},\"tenant_misses\":{d},\"tenant_evictions\":{d}}}}}", .{
+        route_count,          upstream_count,  server.cfg.port,  server.cfg.workers,
+        w.park_active,        w.park_capacity, w.pool_instances, w.pool_pinned,
+        w.control_configured, w.control_ready,
+        w.tenants_active,     w.tenant_hits,   w.tenant_misses,  w.tenant_evictions,
     }) catch return .{ .status = 200, .body = "{\"status\":\"ok\"}" };
     return .{ .status = 200, .body = n };
+}
+
+// O6: Prometheus metrics on the admin listener -- a config/proxy-mode deployment
+// has no embedded-router /metrics, so this is the only scrape surface. Includes
+// the O7 Tier-2 gauges.
+fn getMetrics(server: *Server, buf: []u8) DispatchResult {
+    const route_count: usize = if (server.proxy) |p| p.config.routes.len else 0;
+    const upstream_count: usize = if (server.proxy) |p| p.config.upstreams.len else 0;
+    const w = server.wasmObservability();
+    const body = std.fmt.bufPrint(buf,
+        \\# HELP swerver_routes Configured proxy routes.
+        \\# TYPE swerver_routes gauge
+        \\swerver_routes {d}
+        \\# HELP swerver_upstreams Configured upstreams.
+        \\# TYPE swerver_upstreams gauge
+        \\swerver_upstreams {d}
+        \\# HELP swerver_wasm_park_active Live Tier-2 parks (host-call table occupancy).
+        \\# TYPE swerver_wasm_park_active gauge
+        \\swerver_wasm_park_active {d}
+        \\# HELP swerver_wasm_park_capacity Park-table hard ceiling across all filters.
+        \\# TYPE swerver_wasm_park_capacity gauge
+        \\swerver_wasm_park_capacity {d}
+        \\# HELP swerver_wasm_pool_instances Total edge-filter instances.
+        \\# TYPE swerver_wasm_pool_instances gauge
+        \\swerver_wasm_pool_instances {d}
+        \\# HELP swerver_wasm_pool_pinned Edge-filter instances pinned (busy or parked).
+        \\# TYPE swerver_wasm_pool_pinned gauge
+        \\swerver_wasm_pool_pinned {d}
+        \\# HELP swerver_wasm_control_ready Tier-2 control transport connected (1/0).
+        \\# TYPE swerver_wasm_control_ready gauge
+        \\swerver_wasm_control_ready {d}
+        \\# HELP swerver_wasm_tenants_active Warm tenant-to-microVM mappings (this worker).
+        \\# TYPE swerver_wasm_tenants_active gauge
+        \\swerver_wasm_tenants_active {d}
+        \\# HELP swerver_wasm_tenant_hits Warm tenant registry hits (this worker).
+        \\# TYPE swerver_wasm_tenant_hits counter
+        \\swerver_wasm_tenant_hits {d}
+        \\# HELP swerver_wasm_tenant_misses Tenant registry misses / cold starts (this worker).
+        \\# TYPE swerver_wasm_tenant_misses counter
+        \\swerver_wasm_tenant_misses {d}
+        \\
+    , .{
+        route_count,      upstream_count,
+        w.park_active,    w.park_capacity,
+        w.pool_instances, w.pool_pinned,
+        @as(u8, if (w.control_ready) 1 else 0),
+        w.tenants_active, w.tenant_hits, w.tenant_misses,
+    }) catch return .{ .status = 500, .body = "metrics render failed\n", .content_type = "text/plain" };
+    // Traffic series (requests/responses/latency, recorded at the dispatch
+    // layer while the admin API is enabled). Same per-worker caveat as the
+    // wasm gauges: the admin socket lands on one worker.
+    const traffic = metrics_mw.getStore().format(buf[body.len..]) catch "";
+    return .{ .status = 200, .body = buf[0 .. body.len + traffic.len], .content_type = "text/plain; version=0.0.4" };
 }
 
 fn getUsage(buf: []u8, reset: bool) DispatchResult {
@@ -418,7 +493,7 @@ fn writeConfigAndReload(server: *Server, alloc: std.mem.Allocator, tree: std.jso
     server.cfg.timeouts = new.timeouts;
     server.cfg.limits = new.limits;
 
-    if (loaded.upstreams.len > 0 and loaded.routes.len > 0) {
+    if (loaded.routes.len > 0 and (loaded.upstreams.len > 0 or upstream_mod.anyTenantRoute(loaded.routes))) {
         var new_proxy = proxy_mod.Proxy.init(server.allocator, .{
             .upstreams = loaded.upstreams,
             .routes = loaded.routes,
@@ -434,24 +509,44 @@ fn writeConfigAndReload(server: *Server, alloc: std.mem.Allocator, tree: std.jso
         };
         proxy_ptr.* = new_proxy;
 
+        // Cancel in-flight wasm parks BEFORE freeing old state (their pinned
+        // instances live in the old manager's pools) and answer them after
+        // the swap, mirroring Server.applyPendingReload.
+        const drained_parks = server.wasmCancelAllParks();
+
         const old_proxy = server.proxy;
         const old_arena = server.reload_arena;
+        const old_wasm = server.wasm_manager;
         server.proxy = proxy_ptr;
         server.reload_arena = loaded.arena;
+
+        // Rebuild the WASM filter pools for the new route table, then free the
+        // old manager AFTER the old proxy (whose routes referenced the old
+        // pools). This MUST mirror Server.applyPendingReload: without it an
+        // admin route/upstream edit leaves every route with wasm_pool == null,
+        // silently disabling all Tier-1 filters (fail-open).
+        server.wasm_manager = server.buildWasmManager(loaded.wasm_filters, @constCast(loaded.routes));
 
         if (old_proxy) |old| {
             old.deinit();
             server.allocator.destroy(old);
         }
         if (old_arena) |*oa| oa.deinit();
+        server.freeWasmManager(old_wasm);
+        server.wasmDeliverDrainedParks(&drained_parks);
     } else if (loaded.upstreams.len == 0 and loaded.routes.len == 0) {
+        const drained_parks = server.wasmCancelAllParks();
         if (server.proxy) |old| {
             old.deinit();
             server.allocator.destroy(old);
             server.proxy = null;
         }
+        // Proxy removed: tear down its filter pools too (mirror applyPendingReload).
+        server.freeWasmManager(server.wasm_manager);
+        server.wasm_manager = null;
         if (server.reload_arena) |*old_arena| old_arena.deinit();
         server.reload_arena = loaded.arena;
+        server.wasmDeliverDrainedParks(&drained_parks);
     } else {
         loaded.deinit();
     }
@@ -633,6 +728,21 @@ fn writeRouteJson(buf: []u8, route: upstream_mod.ProxyRoute) usize {
         }
         off += copyInto(buf[off..], "}");
     }
+    // O8: read back the chain an operator configured -- auth method, x402 pricing,
+    // and the wasm-filter binding. These were invisible in the route view before,
+    // so a config could not be verified through the admin API.
+    off += copyInto(buf[off..], ",\"auth\":\"");
+    off += copyInto(buf[off..], @tagName(route.auth));
+    off += copyInto(buf[off..], "\"");
+    if (route.x402) |x| {
+        off += copyInto(buf[off..], ",\"x402\":{\"price\":\"");
+        off += copyEscaped(buf[off..], x.price);
+        off += copyInto(buf[off..], "\",\"network\":\"");
+        off += copyEscaped(buf[off..], x.network);
+        off += copyInto(buf[off..], "\"}");
+    }
+    off += copyInto(buf[off..], if (route.wasm_pool != null) ",\"wasm_filter\":true" else ",\"wasm_filter\":false");
+    if (route.wasm_required) off += copyInto(buf[off..], ",\"wasm_required\":true");
     off += copyInto(buf[off..], "}");
     return off;
 }
@@ -662,6 +772,72 @@ fn writeUpstreamJson(buf: []u8, u: upstream_mod.Upstream) usize {
     off += copyInto(buf[off..], "\"");
     off += copyInto(buf[off..], "}");
     return off;
+}
+
+/// GET /v1/tenants: the per-worker tenant-to-microVM registry (park-concurrency
+/// Phase 1). Per-worker view: the admin socket lands on one worker, so this
+/// reflects that worker's warm mappings, not a cluster-wide set.
+fn listTenants(server: *Server, buf: []u8) DispatchResult {
+    if (!build_options.enable_wasm) return .{ .status = 200, .body = "{\"tenants\":[]}" };
+    return .{ .status = 200, .body = renderTenantsJson(&server.tenant_registry, buf) };
+}
+
+/// Render the tenant registry as `{"tenants":[{key,path,last_used_ms},...]}`.
+/// Split out from listTenants so it is unit-testable without a full Server.
+fn renderTenantsJson(reg: *tenant_mod.TenantRegistry, buf: []u8) []const u8 {
+    var off: usize = 0;
+    off += copyInto(buf[off..], "{\"tenants\":[");
+    var it = reg.iterator();
+    var first = true;
+    while (it.next()) |e| {
+        if (!first) off += copyInto(buf[off..], ",");
+        first = false;
+        off += copyInto(buf[off..], "{\"key\":\"");
+        off += copyEscaped(buf[off..], e.key);
+        off += copyInto(buf[off..], "\",\"path\":\"");
+        off += copyEscaped(buf[off..], e.path);
+        off += copyInto(buf[off..], "\",\"last_used_ms\":");
+        // Format into a local buffer first: bufPrint(buf[off..]) then
+        // copyInto(buf[off..], ...) would @memcpy a slice onto itself (aborts
+        // in safe builds). u64 is at most 20 digits.
+        var num_buf: [20]u8 = undefined;
+        off += copyInto(buf[off..], std.fmt.bufPrint(&num_buf, "{d}", .{e.last_used_ms}) catch "0");
+        off += copyInto(buf[off..], "}");
+    }
+    off += copyInto(buf[off..], "]}");
+    return buf[0..off];
+}
+
+/// DELETE /v1/tenants?key=<tenant>: drop one warm mapping so the tenant's next
+/// request cold-starts (park -> fork -> re-register). The on-demand counterpart
+/// to the tenant_idle_ttl_ms reaper; the supervisor still owns the VM itself (a
+/// registry evict never kills a VM). Same per-worker caveat as listTenants.
+fn evictTenant(server: *Server, path: []const u8, buf: []u8) DispatchResult {
+    const key = queryParam(path, "key") orelse
+        return .{ .status = 400, .body = "{\"error\":\"?key= required\"}" };
+    if (key.len == 0) return .{ .status = 400, .body = "{\"error\":\"?key= required\"}" };
+    if (!build_options.enable_wasm) return .{ .status = 404, .body = "{\"error\":\"tenant not found\"}" };
+    if (!evictTenantKey(&server.tenant_registry, key))
+        return .{ .status = 404, .body = "{\"error\":\"tenant not found\"}" };
+    var off: usize = 0;
+    off += copyInto(buf[off..], "{\"ok\":true,\"evicted\":\"");
+    off += copyEscaped(buf[off..], key);
+    off += copyInto(buf[off..], "\"}");
+    return .{ .status = 200, .body = buf[0..off] };
+}
+
+/// Evict `key` if it is warm; reports whether it was found (registry.evict is
+/// void because the proxy's dead-socket callers do not care). Split out from
+/// evictTenant so it is unit-testable without a full Server.
+fn evictTenantKey(reg: *tenant_mod.TenantRegistry, key: []const u8) bool {
+    var it = reg.iterator();
+    while (it.next()) |e| {
+        if (std.mem.eql(u8, e.key, key)) {
+            reg.evict(key);
+            return true;
+        }
+    }
+    return false;
 }
 
 fn copyInto(dst: []u8, src: []const u8) usize {
@@ -776,6 +952,61 @@ test "writeRouteJson produces valid JSON" {
     const json = buf[0..n];
     try std.testing.expect(std.mem.indexOf(u8, json, "\"path_prefix\":\"/api/\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"upstream\":\"backend\"") != null);
+    // O8: the binding read-back fields are always present.
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"auth\":\"none\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"wasm_filter\":false") != null);
+}
+
+test "renderTenantsJson: empty + a warm entry (no self-alias abort)" {
+    var reg = tenant_mod.TenantRegistry{};
+    var buf: [512]u8 = undefined;
+    // Empty registry.
+    try std.testing.expectEqualStrings("{\"tenants\":[]}", renderTenantsJson(&reg, &buf));
+    // A warm entry: last_used_ms formatting must not @memcpy a slice onto itself
+    // (regression: it did, aborting the worker on the first /v1/tenants call).
+    reg.register("alpha", "/tmp/vm-alpha.sock", 12345);
+    const out = renderTenantsJson(&reg, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"key\":\"alpha\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"path\":\"/tmp/vm-alpha.sock\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"last_used_ms\":12345") != null);
+}
+
+test "evictTenantKey: evicts a warm key once, misses an unknown key" {
+    var reg = tenant_mod.TenantRegistry{};
+    reg.register("alpha", "/tmp/vm-alpha.sock", 100);
+    reg.register("beta", "/tmp/vm-beta.sock", 200);
+
+    try std.testing.expect(!evictTenantKey(&reg, "gamma"));
+    try std.testing.expectEqual(@as(usize, 2), reg.count());
+    try std.testing.expectEqual(@as(u64, 0), reg.evictions);
+
+    try std.testing.expect(evictTenantKey(&reg, "alpha"));
+    try std.testing.expectEqual(@as(usize, 1), reg.count());
+    try std.testing.expectEqual(@as(u64, 1), reg.evictions);
+
+    // A second evict of the same key is a miss, not a double count.
+    try std.testing.expect(!evictTenantKey(&reg, "alpha"));
+    try std.testing.expectEqual(@as(u64, 1), reg.evictions);
+
+    // The survivor still renders.
+    var buf: [512]u8 = undefined;
+    const out = renderTenantsJson(&reg, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"key\":\"beta\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"key\":\"alpha\"") == null);
+}
+
+test "O8: writeRouteJson reads back auth + x402 bindings" {
+    var buf: [512]u8 = undefined;
+    const route = upstream_mod.ProxyRoute{
+        .path_prefix = "/paid/",
+        .upstream = "backend",
+        .auth = .{ .api_key = .{ .keys = &.{}, .header_name = "X-API-Key" } },
+        .x402 = .{ .price = "$0.001", .asset = "USDC", .network = "base-sepolia", .pay_to = "0xabc" },
+    };
+    const n = writeRouteJson(&buf, route);
+    const json = buf[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"auth\":\"api_key\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"x402\":{\"price\":\"$0.001\",\"network\":\"base-sepolia\"}") != null);
 }
 
 test "writeUpstreamJson produces valid JSON" {

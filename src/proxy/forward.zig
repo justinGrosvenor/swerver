@@ -63,6 +63,16 @@ pub const UpstreamResponse = struct {
     raw_response: []const u8,
 };
 
+/// Emit the synthesized upstream Host header. UNIX-socket backends have no
+/// meaningful address:port (it would render "Host: :0"); localhost matches
+/// what an on-host loopback server expects.
+fn writeHostHeader(buf: []u8, server: *const upstream.Server) error{BufferFull}!usize {
+    if (server.unix_path.len > 0) {
+        return (std.fmt.bufPrint(buf, "Host: localhost\r\n", .{}) catch return error.BufferFull).len;
+    }
+    return (std.fmt.bufPrint(buf, "Host: {s}:{d}\r\n", .{ server.address, server.port }) catch return error.BufferFull).len;
+}
+
 /// Build the HTTP/1.1 request to send to upstream
 pub fn buildUpstreamRequest(
     buf: []u8,
@@ -81,10 +91,10 @@ pub fn buildUpstreamRequest(
         if (ctx.client_request.getHeader("Host")) |host| {
             pos += (std.fmt.bufPrint(buf[pos..], "Host: {s}\r\n", .{host}) catch return error.BufferFull).len;
         } else {
-            pos += (std.fmt.bufPrint(buf[pos..], "Host: {s}:{d}\r\n", .{ ctx.server.address, ctx.server.port }) catch return error.BufferFull).len;
+            pos += try writeHostHeader(buf[pos..], ctx.server);
         }
     } else {
-        pos += (std.fmt.bufPrint(buf[pos..], "Host: {s}:{d}\r\n", .{ ctx.server.address, ctx.server.port }) catch return error.BufferFull).len;
+        pos += try writeHostHeader(buf[pos..], ctx.server);
     }
 
     // RFC 9110 §7.6.1: Parse Connection header to find dynamic hop-by-hop headers
@@ -257,10 +267,10 @@ pub fn buildUpstreamRequestHeaders(
         if (ctx.client_request.getHeader("Host")) |host| {
             pos += (std.fmt.bufPrint(buf[pos..], "Host: {s}\r\n", .{host}) catch return error.BufferFull).len;
         } else {
-            pos += (std.fmt.bufPrint(buf[pos..], "Host: {s}:{d}\r\n", .{ ctx.server.address, ctx.server.port }) catch return error.BufferFull).len;
+            pos += try writeHostHeader(buf[pos..], ctx.server);
         }
     } else {
-        pos += (std.fmt.bufPrint(buf[pos..], "Host: {s}:{d}\r\n", .{ ctx.server.address, ctx.server.port }) catch return error.BufferFull).len;
+        pos += try writeHostHeader(buf[pos..], ctx.server);
     }
 
     // RFC 9110 §7.6.1: Parse Connection header to find dynamic hop-by-hop headers
@@ -1212,6 +1222,24 @@ test "parseUpstreamResponse skips interim 1xx responses" {
 test "parseUpstreamResponse waits for complete chunked body" {
     const resp_data = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n";
     try std.testing.expectError(error.IncompleteResponse, parseUpstreamResponse(resp_data, false));
+}
+
+test "parseUpstreamResponse rejects a Content-Length body truncated by EOF" {
+    // The upstream (or, in the two-tier path, a tenant VM behind the nether
+    // data-plane bridge) declared Content-Length: 10 but only 3 bytes arrived
+    // before the socket closed. This MUST be error.IncompleteResponse, not a
+    // silently-served short body: the proxy caller converts the error to a 502
+    // (embedded/proxy path) or a tenant-mapping eviction + 503 (tenant path).
+    // Regression guard for the nether streaming-truncation P0's blast radius:
+    // a truncated CL response fails LOUD through swerver.
+    const truncated = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc";
+    try std.testing.expectError(error.IncompleteResponse, parseUpstreamResponse(truncated, false));
+
+    // The exact-length body is accepted (the boundary case: not one byte short).
+    const complete = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabcdefghij";
+    const p = try parseUpstreamResponse(complete, false);
+    try std.testing.expectEqual(@as(u16, 200), p.status);
+    try std.testing.expectEqualStrings("abcdefghij", complete[p.body_start..p.body_end]);
 }
 
 test "parseUpstreamResponse disables keep-alive for close-delimited bodies" {

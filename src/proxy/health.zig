@@ -178,8 +178,11 @@ pub const HealthChecker = struct {
             return false;
         };
 
-        // Connect to the server
-        const fd = net.connectBlocking(server.address, server.port, self.config.timeout_ms) catch {
+        // Connect to the server (UNIX-socket backends probe over their path)
+        const fd = (if (server.unix_path.len > 0)
+            net.connectUnixBlocking(server.unix_path, self.config.timeout_ms)
+        else
+            net.connectBlocking(server.address, server.port, self.config.timeout_ms)) catch {
             health_state.recordFailure(now_ms, &self.config);
             return false;
         };
@@ -235,8 +238,12 @@ pub const HealthChecker = struct {
         // GET /health HTTP/1.1\r\n
         pos += (std.fmt.bufPrint(self.request_buf[pos..], "GET {s} HTTP/1.1\r\n", .{self.config.path}) catch return error.BufferFull).len;
 
-        // Host header
-        pos += (std.fmt.bufPrint(self.request_buf[pos..], "Host: {s}:{d}\r\n", .{ server.address, server.port }) catch return error.BufferFull).len;
+        // Host header (unix-socket backends have no address:port)
+        if (server.unix_path.len > 0) {
+            pos += (std.fmt.bufPrint(self.request_buf[pos..], "Host: localhost\r\n", .{}) catch return error.BufferFull).len;
+        } else {
+            pos += (std.fmt.bufPrint(self.request_buf[pos..], "Host: {s}:{d}\r\n", .{ server.address, server.port }) catch return error.BufferFull).len;
+        }
 
         // User-Agent
         pos += (std.fmt.bufPrint(self.request_buf[pos..], "User-Agent: swerver-health-check/1.0\r\n", .{}) catch return error.BufferFull).len;

@@ -23,7 +23,7 @@ A minimal config:
 | --- | --- | --- | --- |
 | `address` | string | `"0.0.0.0"` | Bind address for the legacy single listener. |
 | `port` | integer | `8080` | Bind port for the legacy single listener. |
-| `workers` | integer | `1` | Worker processes. `1` = single-process (no fork); `0` = auto-detect CPU count. Overridden by `--workers`. |
+| `workers` | integer | `0` | Worker processes. `0` = auto-detect CPU count (default); `1` = single-process (no fork). Overridden by `--workers`. With a `wasm_control_socket` set, only one worker becomes the Nether primary; use a `{worker}` placeholder in the socket path (a per-worker endpoint) or set `1` if parking filters / tenant routing must work on every worker. Auto-detect reads host CPUs and is NOT cgroup-quota-clamped, so pin `workers` explicitly in a constrained container. |
 | `max_connections` | integer | `2048` | Max concurrent connections. Capped at 1,000,000; must be ≤ `buffer_pool.buffer_count / 2`. |
 | `static_root` | string | `""` (off) | Directory for static file serving. Empty disables it. Overridden by `--static-root`. |
 | `disable_middleware` | bool | `false` | Disable security headers, metrics, and access logging, for pure-benchmark mode. |
@@ -209,10 +209,14 @@ Backend pools for the reverse proxy (requires an `-Denable-proxy=true` build). E
 
 ### `upstreams[].servers[]`
 
+A server is EITHER a TCP `address`+`port` OR a UNIX-domain socket `unix` path,
+not both.
+
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `address` | string | *required* | Backend host/IP. |
-| `port` | integer | *required* | Backend port. |
+| `address` | string | *required (TCP)* | Backend host/IP. Omit when `unix` is set. |
+| `port` | integer | *required (TCP)* | Backend port. Omit when `unix` is set. |
+| `unix` | string | (none) | UNIX-domain stream socket path (absolute, <= 103 bytes). For on-host backends: local daemons, tenant microVM data sockets. Mutually exclusive with `address`/`port`; no SSRF check applies. |
 | `weight` | integer | `1` | Load-balancing weight. |
 | `max_fails` | integer | `3` | Failures before marking down. |
 | `fail_timeout_ms` | integer | `30000` | Down-period before retrying. |
@@ -261,13 +265,16 @@ Backend pools for the reverse proxy (requires an `-Denable-proxy=true` build). E
 
 ## `routes[]`
 
-Proxy routes, matched by path prefix (and optional host). Every route must reference a defined upstream.
+Proxy routes, matched by path prefix (and optional host). Every route must
+reference a defined `upstream`, UNLESS it sets `tenant` (then the upstream is a
+per-request microVM and `upstream` must be omitted).
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `path_prefix` | string | *required* | Path prefix to match. |
 | `host` | string | (none) | Optional host match. |
-| `upstream` | string | *required* | Target upstream `name`. |
+| `upstream` | string | *required (non-tenant)* | Target upstream `name`. Omit for a `tenant` route. |
+| `tenant` | object | (none) | Tenant-as-upstream routing (see below). Mutually exclusive with `upstream`, `cache`, `traffic_split`, `mirror`. |
 | `rewrite_pattern` | string | (none) | Prefix to strip/replace in the upstream path. |
 | `rewrite_replacement` | string | `""` | Replacement for `rewrite_pattern`. |
 | `connect_timeout_ms` | integer | `5000` | Upstream connect timeout. |
@@ -284,6 +291,37 @@ Proxy routes, matched by path prefix (and optional host). Every route must refer
 | `upstream_headers` | object[] | (none) | `{ name, value }` headers added to the upstream request. |
 | `retry` | object | (none) | `{ max_retries }` (default `1`) on connection failure / retryable 5xx. |
 | `x402` | object | (none) | Per-route x402 pricing (see below). |
+
+### `routes[].tenant`
+
+Routes a request to a warm tenant microVM (park-concurrency Phase 1). A request
+is keyed to a VM by a header value; a warm mapping (learned on cold start) is
+proxied straight to the VM's UNIX data socket, skipping the wasm filter. A miss
+runs the route's wasm filter, which parks for a Tier-2 cold start whose reply
+names the socket (staged via the `set_upstream` ABI). Requires a `wasm_filter`
+bound to the same route and (typically) a `wasm_control_socket`. HTTP/1 cold
+start only; warm hits also work for accumulated-body requests. Cold-start parks
+are bounded by the 64 KiB request snapshot cap (larger requests fail closed).
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `socket_dir` | string | *required* | Allowed absolute path prefix for VM sockets. A supervisor-named socket outside it is refused (the trust boundary). |
+| `header` | string | `"host"` | Request header carrying the tenant key. For `host` the `:port` suffix is stripped. A tenant key is a routing key, not an auth grant. |
+| `skip_filter_when_warm` | bool | `true` | On a warm hit, bypass the filter and proxy directly (the Phase 1 goal). Set `false` to run the filter every request (it must then allow without parking when warm). |
+
+The registry is per-worker and survives config reload; idle entries are reaped
+after `tenant_idle_ttl_ms`. `GET /v1/tenants` on the admin API lists the current
+worker's warm mappings; `DELETE /v1/tenants?key=<tenant>` drops one warm mapping
+on demand so the tenant's next request cold-starts (the registry evict never
+kills the VM itself; the supervisor owns reclaim).
+
+**Tenant server framing.** The in-guest tenant HTTP server should set
+`Content-Length` or use `Transfer-Encoding: chunked` on its responses. swerver
+detects a truncated Content-Length or chunked body and fails loud (502), but a
+close-delimited response (neither header, body ends at connection close) that is
+cut short is indistinguishable from a complete one and would be served as-is.
+The Nether data-plane bridge is byte-for-byte lossless, so this only bites a
+misbehaving tenant; explicit framing is defense in depth.
 
 ### `routes[].rate_limit`
 
@@ -331,6 +369,60 @@ Proxy routes, matched by path prefix (and optional host). Every route must refer
 | `extensions` | object | (none) | Free-form extension object, serialized into the payment payload. |
 | `resource_url` | string | `""` | Resource URL advertised in the 402. |
 | `inline_receipt` | bool | `false` | Inline the settlement receipt in the response. |
+
+---
+
+## `wasm_filters[]`
+
+WASM edge filters (design 10.0) run at the edge before forwarding, to allow /
+reject / modify a request, and optionally park on a Tier-2 sandbox host call.
+Config-attached filters bind to **proxy routes** (matched by `path_prefix`); a
+`match` that resolves to no route is logged and the filter never runs. Author
+filters with the `examples/wasm_filter/abi.zig` binding (build with `-mcpu=mvp`).
+Requires a build with WASM enabled.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `match` | string | *required* | Proxy route `path_prefix` to attach to. |
+| `module` | string | *required* | Path to the `.wasm` module on disk. |
+| `instances` | integer | `1` | Pre-instantiated instances per worker. Size to the expected CONCURRENT parked (Tier-2) requests; the next park past the pool gets backpressure. |
+| `fuel` | integer | `5000000` | Per-invocation loop-back-edge budget; exhaustion fails closed. |
+| `response_fail_closed` | bool | `false` | Serve a 503 if the `on_response` hook traps (default fails open, serving the original response). Set for redaction/scrub filters. |
+
+## `wasm_control_socket`
+
+Top-level string (default `""`). The Nether Tier-2 control-socket path. Set it to
+enable the real host-call transport so parking filters drive a sandbox; empty
+leaves the transport off (a parking filter then fails closed). One global socket
+per server.
+
+## `wasm_host_call_deadline_ms`
+
+Top-level integer (default `30000`). How long a filter may stay parked on a host
+call before it fails closed. Also bounds the control-socket per-command timeout.
+
+## `tenant_idle_ttl_ms`
+
+Top-level integer (default `600000`, 10 min). How long a warm tenant-to-microVM
+mapping (see `routes[].tenant`) survives without use before housekeeping reaps
+it. Only garbage-collects swerver's view; the Nether supervisor owns actual VM
+reclaim (a later miss just re-parks the cold start).
+
+### Two-tier example
+
+```json
+{
+  "upstreams": [{ "name": "api", "servers": [{ "address": "127.0.0.1", "port": 9001 }] }],
+  "routes": [{ "path_prefix": "/agent/", "upstream": "api" }],
+  "wasm_filters": [{ "match": "/agent/", "module": "./agent_filter.wasm", "instances": 8 }],
+  "wasm_control_socket": "/run/nether/agent.sock",
+  "wasm_host_call_deadline_ms": 5000
+}
+```
+
+A request to `/agent/*` runs `agent_filter.wasm`, which may park on a host call
+over `/run/nether/agent.sock`; on allow it forwards to the `api` upstream. See
+`examples/two-tier.config.json`.
 
 ---
 

@@ -53,6 +53,11 @@ pub const ProcessResult = struct {
     close_connection: bool = false,
     /// HTTP/3 events generated (headers received, data received, etc.)
     http3_events: []http3.Event = &.{},
+    /// Stream ids the peer reset (RESET_STREAM / STOP_SENDING) in this packet.
+    /// Surfaced so the server can release a per-stream WASM filter park (E2b)
+    /// on a reset stream, the H3 analog of H2 RST_STREAM -> cancelForStream.
+    /// Points into Connection-owned storage; valid until the next packet.
+    reset_streams: []const u64 = &.{},
 };
 
 /// Server-wide QUIC metrics
@@ -145,6 +150,10 @@ pub const Handler = struct {
         // by the previous packet's now-dispatched events.
         const clearEvents = struct {
             fn call(c: *connection.Connection) void {
+                // Drop any peer stream resets recorded for the previous packet
+                // (surfaced to the server for per-stream WASM park release, E2b)
+                // so this packet only ever reports resets from its own frames.
+                c.clearResetStreams();
                 if (c.http3_stack) |*stack| {
                     stack.events.clearRetainingCapacity();
                     stack.resetPerPacketScratch();
@@ -249,6 +258,9 @@ pub const Handler = struct {
 
         result.conn = conn;
         result.close_connection = !conn.isAlive();
+        // Surface any peer stream resets recorded while processing this packet's
+        // frames so the server can release a per-stream WASM filter park (E2b).
+        result.reset_streams = conn.resetStreams();
 
         // Record packet received
         metrics_mw.getStore().recordQuicPackets(0, 1, 0);
@@ -560,6 +572,10 @@ pub const Handler = struct {
                     }
                 },
                 .reset_stream => |reset| {
+                    // Surface the reset so a WASM filter parked on this stream
+                    // (E2b) is released; the host_call table no-ops when nothing
+                    // is parked on it.
+                    conn.recordResetStream(reset.stream_id);
                     if (conn.getStream(reset.stream_id)) |s| {
                         s.onReset(reset.final_size) catch |err| {
                             std.log.debug("QUIC stream reset failed: {}", .{err});
@@ -567,6 +583,9 @@ pub const Handler = struct {
                     }
                 },
                 .stop_sending => |stop| {
+                    // Peer asked us to stop sending: treat like a reset for park
+                    // release (the response we'd resume into is unwanted).
+                    conn.recordResetStream(stop.stream_id);
                     if (conn.getStream(stop.stream_id)) |s| {
                         s.reset(stop.application_error_code);
                     }

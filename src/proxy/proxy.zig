@@ -1,5 +1,6 @@
 const std = @import("std");
 const upstream = @import("upstream.zig");
+const tenant_mod = @import("tenant.zig");
 const pool_mod = @import("pool.zig");
 const balancer = @import("balancer.zig");
 const forward = @import("forward.zig");
@@ -15,6 +16,228 @@ const consul_mod = @import("consul.zig");
 const compress_mod = @import("../middleware/compress.zig");
 const net = @import("../runtime/net.zig");
 const clock = @import("../runtime/clock.zig");
+const buffer_pool = @import("../runtime/buffer_pool.zig");
+const build_options = @import("build_options");
+// WASM edge filters (design 10.0). Gated; ProxyRoute stores the pool as an
+// opaque pointer so this module compiles without the vendored wasm3 dependency.
+const wasm_filter = if (build_options.enable_wasm) @import("../wasm/filter.zig") else struct {};
+const wasm_host_call = if (build_options.enable_wasm) @import("../wasm/host_call.zig") else struct {};
+
+/// WASM park binding, threaded from the H1 dispatch layer into the proxy filter
+/// hook (mirror of router.WasmBinding). Empty (`.{}`) means no park support: the
+/// filter runs terminally and fails closed on a park (the path H2/H3 and the
+/// body-accumulation path use). When `table` + `start_fn` are wired (H1 dispatch),
+/// a parking filter registers in the table and returns the park sentinel;
+/// `resume_decision` carries the resumed decision on the re-dispatch after the
+/// host call completes (the filter is then skipped and the request forwarded).
+pub const WasmBinding = struct {
+    table: ?*anyopaque = null,
+    conn_index: u32 = 0,
+    conn_id: u64 = 0,
+    /// Stream within the connection. H1 uses the sentinel 0; H2/H3 (E2) pass the
+    /// real stream id so a parked stream resumes independently of its siblings.
+    stream_id: u32 = 0,
+    /// Protocol of the parked stream; stored on the park slot so `wasmResume`
+    /// routes response delivery (H1 queueResponse vs H2/H3 stream sends in E2).
+    protocol: middleware.Context.Protocol = .http1,
+    deadline_ms: u64 = 0,
+    /// Opaque resumed-path context carried into the park slot (E1; null in E0).
+    resume_ctx: ?*anyopaque = null,
+    resume_decision: ?middleware.Decision = null,
+    start_fn: ?*const fn (ctx: *anyopaque, token: u32, request: []const u8) void = null,
+    start_ctx: ?*anyopaque = null,
+    /// Tenant-as-upstream (park-concurrency plan Phase 1). The per-worker
+    /// `*tenant.TenantRegistry` (opaque so this struct stays build-flag-free);
+    /// null disables tenant routing. On a warm HIT the proxy forwards straight
+    /// to the VM's UNIX socket, skipping the filter.
+    tenant_registry: ?*anyopaque = null,
+    /// Socket path a resumed cold-start filter named via set_upstream: THIS
+    /// request forwards there and the mapping is registered. Null otherwise.
+    upstream_override: ?[]const u8 = null,
+};
+
+/// Map a proxy BodyView onto a RequestView body so a WASM filter can read it via
+/// body_len/read_body. Zero-copy: the two share the scattered-buffer layout.
+/// Connect to a backend server: UNIX-domain when the server carries a socket
+/// path, else TCP. The single choke point for the request path, handleWithBody,
+/// and the mirror; unix paths skip SSRF validation (they are vetted at config
+/// parse / tenant registration, and isPrivateAddress is meaningless for them).
+fn connectToServer(server: *const upstream.Server, connect_ms: u32, allow_private: bool) net.ConnectError!std.posix.fd_t {
+    if (server.unix_path.len > 0) return net.connectUnixBlocking(server.unix_path, connect_ms);
+    return net.proxyConnect(server.address, server.port, connect_ms, allow_private);
+}
+
+/// Extract the tenant key from a request per the route's TenantRouting. Returns
+/// null when the header is absent/empty/oversized. For the default "host" key
+/// the :port suffix is stripped so "t.example.com" and "t.example.com:8443"
+/// map to the same VM.
+fn extractTenantKey(req: *const request.RequestView, tc: upstream.TenantRouting) ?[]const u8 {
+    const raw = req.getHeader(tc.header) orelse return null;
+    var key = raw;
+    if (std.ascii.eqlIgnoreCase(tc.header, "host")) {
+        if (std.mem.indexOfScalar(u8, key, ':')) |ci| key = key[0..ci];
+    }
+    if (key.len == 0 or key.len > tenant_mod.TENANT_KEY_MAX) return null;
+    return key;
+}
+
+fn bodyViewToRequestBody(bv: forward.BodyView) request.RequestBody {
+    return switch (bv) {
+        .slice => |s| .{ .slice = s },
+        .buffers => |b| .{ .scattered = .{
+            .handles = b.handles,
+            .last_buf_len = b.last_buf_len,
+            .total_len = b.total_len,
+            .buffer_size = b.buffer_size,
+        } },
+    };
+}
+
+var proxy_modify_warned = false;
+
+/// Run a route's WASM edge filter (if any) against `req_view`. Returns a
+/// short-circuit Response when the filter rejects (or fails closed); null to
+/// proceed with forwarding. A request-phase `.modify` (response-header injection
+/// from on_request) is not honored on the proxy path: the proper mechanism for
+/// rewriting a proxied response is the Phase 2b response hook (on_response), which
+/// runs on the upstream response via runWasmResponseFilter and supersedes it. We
+/// log once and forward rather than silently dropping. See design 10.0.
+/// Run the request-phase WASM filter for a proxy route. Returns:
+///   - null              -> proceed to forward,
+///   - Response.parked   -> the filter parked (the caller returns it; H1 dispatch
+///                          suspends the connection and resumes later),
+///   - any other Response -> a terminal reject/error to serve.
+/// With an empty binding (no table) the filter runs terminally and fails closed
+/// on a park (H2/H3 + the body path). With a table wired (H1 dispatch) a parking
+/// filter registers and returns the park sentinel; a `resume_decision` skips the
+/// filter on the post-host-call re-dispatch.
+/// A short-circuit outcome from the request-phase WASM filter: a Response to
+/// serve instead of forwarding, plus an optional connection-backpressure window
+/// (set on pool/park-table exhaustion so the caller pauses reads, smoothing the
+/// G2 concurrency cliff). `pause_reads_ms == null` means serve `resp` with no
+/// pacing (the prior behavior for reject/error). Returning `null` from
+/// runWasmFilter still means "proceed to forward".
+const WasmShortCircuit = struct {
+    resp: response.Response,
+    pause_reads_ms: ?u64 = null,
+};
+
+fn runWasmFilter(route: *const upstream.ProxyRoute, req_view: *const request.RequestView, wb: WasmBinding) ?WasmShortCircuit {
+    if (!build_options.enable_wasm) return null;
+    const pool_ptr = route.wasm_pool orelse {
+        // S2: the configured filter for this route failed to load. Fail CLOSED
+        // (503) rather than forwarding unfiltered. buildWasmManager sets
+        // wasm_required on routes whose module failed to load.
+        if (route.wasm_required) return .{ .resp = forward.createErrorResponse(503) };
+        return null;
+    };
+    const fpool: *wasm_filter.Pool = @ptrCast(@alignCast(pool_ptr));
+
+    // Re-dispatch after a completed host call: apply the resumed decision,
+    // skipping the filter. A proxy ignores request-phase modify headers (the
+    // response phase is the mechanism); allow/skip/modify all forward.
+    if (wb.resume_decision) |rd| {
+        return switch (rd) {
+            .allow, .skip, .modify => null,
+            .reject => |resp| .{ .resp = resp },
+            .rate_limit_backpressure => |bp| .{ .resp = bp.resp },
+        };
+    }
+
+    // Park-capable path (H1 dispatch wired the binding).
+    if (wb.table) |tbl_ptr| {
+        const table: *wasm_host_call.Table = @ptrCast(@alignCast(tbl_ptr));
+        // Pool exhausted: fail closed (503) AND apply connection backpressure
+        // (pause reads briefly) so a flood self-throttles instead of burning the
+        // event loop fast-failing excess parks (the G2 cliff). The 503 is still
+        // served; the connection is just paced.
+        const inst = fpool.acquire() orelse return .{
+            .resp = forward.createErrorResponse(503),
+            .pause_reads_ms = wasm_filter.POOL_BACKPRESSURE_MS,
+        };
+        switch (wasm_filter.invokeOutcome(inst, req_view, route.wasm_fuel)) {
+            .decision => |d| return switch (d) {
+                .allow, .skip => null,
+                .reject => |resp| .{ .resp = resp },
+                .modify => null, // proxy ignores request-phase modify (see above)
+                .rate_limit_backpressure => |bp| .{ .resp = bp.resp },
+            },
+            .parked => |call_request| {
+                if (table.park(inst, req_view.*, wb.conn_index, wb.conn_id, wb.stream_id, wb.protocol, wb.deadline_ms, route.wasm_fuel, wb.resume_ctx)) |token| {
+                    if (wb.start_fn) |start| start(wb.start_ctx.?, token, call_request);
+                    return .{ .resp = response.Response.parked };
+                }
+                // Park table full: unpin, fail closed (503) + backpressure.
+                _ = wasm_filter.cancelPark(inst);
+                return .{
+                    .resp = forward.createErrorResponse(503),
+                    .pause_reads_ms = wasm_filter.POOL_BACKPRESSURE_MS,
+                };
+            },
+        }
+    }
+
+    // No binding (terminal caller: H2/H3, body path): fail closed on a park.
+    switch (fpool.run(req_view, route.wasm_fuel)) {
+        .reject => |resp| return .{ .resp = resp },
+        .modify => {
+            if (!proxy_modify_warned) {
+                proxy_modify_warned = true;
+                std.log.warn("wasm filter returned modify on a proxy route; request-phase response-header injection is not honored on proxy routes (use the on_response Phase 2b hook instead); forwarding", .{});
+            }
+        },
+        else => {},
+    }
+    return null;
+}
+
+/// Merge buffer for response-phase WASM headers on the proxy path. Holds the
+/// upstream response headers plus the filter's staged headers; the repointed
+/// slice is valid until the response is serialized (single-threaded worker).
+threadlocal var wasm_resp_headers_tls: [128]response.Header = undefined;
+
+/// Phase 2b: run the response-phase WASM filter (on_response) on a proxied
+/// upstream response, BEFORE compression. Applies the filter's edits in place:
+/// status override, body replacement (the encoder recomputes Content-Length from
+/// the body -- normalize already stripped the upstream's), and added response
+/// headers (merged into the tls buffer). FAIL-OPEN: a trap leaves `resp`
+/// untouched (the request already passed policy). No-op without a response hook.
+fn runWasmResponseFilter(
+    route: *const upstream.ProxyRoute,
+    req_view: *const request.RequestView,
+    resp: *response.Response,
+) void {
+    if (!build_options.enable_wasm) return;
+    const pool_ptr = route.wasm_pool orelse return;
+    const fpool: *wasm_filter.Pool = @ptrCast(@alignCast(pool_ptr));
+    if (!fpool.hasResponseHook()) return;
+    const edit = fpool.runResponse(req_view, resp, route.wasm_fuel);
+    // S3: a trapping response hook fails OPEN by default (serve original); for a
+    // redaction/scrub filter that would leak the un-redacted response, so a pool
+    // marked response_fail_closed serves a fresh 503 instead (drops the original
+    // body AND headers -- no partial leak).
+    if (edit.trapped and fpool.response_fail_closed) {
+        resp.* = forward.createErrorResponse(503);
+        return;
+    }
+    if (edit.new_status) |s| resp.status = s;
+    if (edit.new_body) |b| resp.body = .{ .bytes = b };
+    if (edit.add_headers.len > 0) {
+        const cap = wasm_resp_headers_tls.len;
+        var i: usize = 0;
+        for (resp.headers) |h| {
+            if (i >= cap) break;
+            wasm_resp_headers_tls[i] = h;
+            i += 1;
+        }
+        for (edit.add_headers) |h| {
+            if (i >= cap) break;
+            wasm_resp_headers_tls[i] = h;
+            i += 1;
+        }
+        resp.headers = wasm_resp_headers_tls[0..i];
+    }
+}
 
 /// Reverse Proxy Handler
 ///
@@ -265,8 +488,13 @@ pub const Proxy = struct {
             try proxy.health_manager.registerUpstream(up);
         }
 
-        proxy.health_manager.startThread();
-
+        // The health thread is NOT started here: `proxy` is a stack local that
+        // the caller copies to its final (heap) address, and the thread captures
+        // `&health_manager`. Starting it here pins a dead stack frame - the
+        // thread then reads garbage checker state (Linux ReleaseFast segfault,
+        // layout-dependent). Server.run() starts it at the final address, once
+        // per process (per worker, after fork - so every worker owns and joins
+        // its own thread and sees live health state).
         return proxy;
     }
 
@@ -453,6 +681,7 @@ pub const Proxy = struct {
         now_ms: u64,
         auth_info: ?*const auth_mod.AuthInfo,
         client_cert_dn: ?[]const u8,
+        wasm: WasmBinding,
     ) ProxyResult {
         _ = mw_ctx;
 
@@ -460,6 +689,34 @@ pub const Proxy = struct {
         const route = self.matchRoute(&req) orelse {
             return .{ .resp = forward.createErrorResponse(502), .proxy = self };
         };
+
+        // Tenant-as-upstream (park-concurrency Phase 1): a warm registry HIT (or
+        // the socket a just-resumed cold-start filter named via set_upstream)
+        // forwards straight to the VM. A miss falls through to the filter, which
+        // parks for a Tier-2 cold start.
+        if (build_options.enable_wasm) {
+            if (route.tenant) |tc| {
+                if (self.tenantRegistryOf(wasm)) |reg| {
+                    const key = extractTenantKey(&req, tc);
+                    if (wasm.upstream_override) |ovr| { // resume: filter named the socket
+                        if (key) |k| reg.register(k, ovr, now_ms);
+                        return self.forwardToTenant(route, req, null, ovr, client_ip, client_tls, now_ms, auth_info, client_cert_dn, reg, key orelse "");
+                    }
+                    if (key) |k| if (reg.lookup(k, now_ms)) |path| {
+                        if (!tc.skip_filter_when_warm) {
+                            if (runWasmFilter(route, &req, wasm)) |sc| return .{ .resp = sc.resp, .proxy = self, .pause_reads_ms = sc.pause_reads_ms };
+                        }
+                        return self.forwardToTenant(route, req, null, path, client_ip, client_tls, now_ms, auth_info, client_cert_dn, reg, k);
+                    };
+                }
+            }
+        }
+
+        // Per-route WASM edge filter (design 10.0): authenticate/policy-gate
+        // before forwarding. This entry handles bodyless / small-body requests,
+        // so req.body already carries any body for body_len/read_body. A parking
+        // filter returns the park sentinel (H1 dispatch suspends + resumes).
+        if (runWasmFilter(route, &req, wasm)) |sc| return .{ .resp = sc.resp, .proxy = self, .pause_reads_ms = sc.pause_reads_ms };
 
         const effective_upstream = route.selectUpstream();
 
@@ -534,9 +791,8 @@ pub const Proxy = struct {
                     return .{ .resp = forward.createErrorResponse(503), .proxy = self };
                 };
 
-                const fd = net.proxyConnect(
-                    connect_server.address,
-                    connect_server.port,
+                const fd = connectToServer(
+                    connect_server,
                     route.timeouts.connect_ms,
                     upstream_def.allow_private,
                 ) catch {
@@ -683,6 +939,9 @@ pub const Proxy = struct {
                 pool.markServerSuccess(server_idx);
                 pool.release(c, now_ms, parsed.keep_alive);
 
+                // Phase 2b response filter runs before compression (sees the
+                // uncompressed body); maybeCompress copies its headers forward.
+                runWasmResponseFilter(route, &req, &normalized);
                 maybeCompress(&normalized, req.headers, self.response_header_bufs[resp_buf_idx][0..]);
                 if (route.mirror) |mirror_name| {
                     self.fireMirror(mirror_name, req, null, now_ms);
@@ -714,6 +973,7 @@ pub const Proxy = struct {
         now_ms: u64,
         auth_info: ?*const auth_mod.AuthInfo,
         client_cert_dn: ?[]const u8,
+        wasm: WasmBinding,
     ) ProxyResult {
         _ = mw_ctx;
 
@@ -721,6 +981,38 @@ pub const Proxy = struct {
         const route = self.matchRoute(&req) orelse {
             return .{ .resp = forward.createErrorResponse(502), .proxy = self };
         };
+
+        // Tenant-as-upstream warm HIT / resume forward (see handle()). The body
+        // streams to the VM via forwardToTenant's body_view arm.
+        if (build_options.enable_wasm) {
+            if (route.tenant) |tc| {
+                if (self.tenantRegistryOf(wasm)) |reg| {
+                    const key = extractTenantKey(&req, tc);
+                    if (wasm.upstream_override) |ovr| {
+                        if (key) |k| reg.register(k, ovr, now_ms);
+                        return self.forwardToTenant(route, req, body_view, ovr, client_ip, client_tls, now_ms, auth_info, client_cert_dn, reg, key orelse "");
+                    }
+                    if (key) |k| if (reg.lookup(k, now_ms)) |path| {
+                        if (!tc.skip_filter_when_warm) {
+                            var filter_req = req;
+                            filter_req.body = bodyViewToRequestBody(body_view);
+                            if (runWasmFilter(route, &filter_req, wasm)) |sc| return .{ .resp = sc.resp, .proxy = self, .pause_reads_ms = sc.pause_reads_ms };
+                        }
+                        return self.forwardToTenant(route, req, body_view, path, client_ip, client_tls, now_ms, auth_info, client_cert_dn, reg, k);
+                    };
+                }
+            }
+        }
+
+        // Per-route WASM edge filter (design 10.0); see handle() for rationale.
+        // The accumulated body lives in body_view, not req.body, so expose it to
+        // the filter (body_len/read_body) on a request copy. The mapping is
+        // zero-copy: BodyView and RequestBody share the scattered-buffer shape.
+        {
+            var filter_req = req;
+            filter_req.body = bodyViewToRequestBody(body_view);
+            if (runWasmFilter(route, &filter_req, wasm)) |sc| return .{ .resp = sc.resp, .proxy = self, .pause_reads_ms = sc.pause_reads_ms };
+        }
 
         const effective_upstream_b = route.selectUpstream();
 
@@ -789,9 +1081,8 @@ pub const Proxy = struct {
                     return .{ .resp = forward.createErrorResponse(503), .proxy = self };
                 };
 
-                const fd = net.proxyConnect(
-                    connect_server_b.address,
-                    connect_server_b.port,
+                const fd = connectToServer(
+                    connect_server_b,
                     route.timeouts.connect_ms,
                     upstream_def_b.allow_private,
                 ) catch {
@@ -941,6 +1232,7 @@ pub const Proxy = struct {
                 pool.markServerSuccess(server_idx_b);
                 pool.release(c, now_ms, parsed.keep_alive);
 
+                runWasmResponseFilter(route, &req, &normalized_b);
                 maybeCompress(&normalized_b, req.headers, self.response_header_bufs[resp_buf_idx][0..]);
                 if (route.mirror) |mirror_name| {
                     self.fireMirror(mirror_name, req, body_view, now_ms);
@@ -956,6 +1248,131 @@ pub const Proxy = struct {
 
         self.releaseResponseBuffer(resp_buf_idx);
         return .{ .resp = forward.createErrorResponse(502), .proxy = self };
+    }
+
+    /// Forward a request directly to a warm tenant microVM's UNIX data socket
+    /// (park-concurrency plan Phase 1), bypassing the upstream registry, the
+    /// balancer, and the connection pool. v1 opens a FRESH connection per
+    /// request (an on-host unix connect is microseconds; the guest bridge caps
+    /// per-VM conns) with no retry. Reuses the same response tail as handle()
+    /// (normalize + Phase 2b response filter + compression) for parity. On any
+    /// connect/send/read failure the tenant mapping is evicted and a 503 with a
+    /// backpressure window is returned so the client's retry takes the cold
+    /// path, paced. `body_view` is null for the bodyless/small-body entry.
+    fn forwardToTenant(
+        self: *Proxy,
+        route: *const upstream.ProxyRoute,
+        req: request.RequestView,
+        body_view: ?forward.BodyView,
+        socket_path: []const u8,
+        client_ip: ?[]const u8,
+        client_tls: bool,
+        now_ms: u64,
+        auth_info: ?*const auth_mod.AuthInfo,
+        client_cert_dn: ?[]const u8,
+        registry: *tenant_mod.TenantRegistry,
+        tenant_key: []const u8,
+    ) ProxyResult {
+        _ = now_ms; // v1: fresh connect per request, no pool timestamps
+        const server = upstream.Server{ .address = "", .port = 0, .unix_path = socket_path };
+
+        const backpressure = ProxyResult{
+            .resp = forward.createErrorResponse(503),
+            .proxy = self,
+            .pause_reads_ms = wasm_filter.POOL_BACKPRESSURE_MS,
+        };
+
+        const req_buf_idx = self.acquireRequestBuffer() orelse return backpressure;
+        defer self.releaseRequestBuffer(req_buf_idx);
+        const resp_buf_idx = self.acquireResponseBuffer() orelse return backpressure;
+        // Released by the caller via ProxyResult.release() on the success path.
+
+        const fd = net.connectUnixBlocking(socket_path, route.timeouts.connect_ms) catch {
+            registry.evict(tenant_key);
+            self.releaseResponseBuffer(resp_buf_idx);
+            return backpressure;
+        };
+        defer clock.closeFd(fd);
+        net.setSocketTimeouts(fd, route.timeouts.send_ms, route.timeouts.read_ms);
+        // No setNoDelay here: this is an AF_UNIX data socket, and TCP_NODELAY on
+        // a unix fd fails with EPROTONOSUPPORT (errno 102), dumping a stack trace
+        // on every tenant forward. Nagle does not apply to unix sockets anyway.
+
+        const ctx = forward.ForwardContext{
+            .client_request = req,
+            .client_ip = client_ip,
+            .client_tls = client_tls,
+            .route = route,
+            .server = &server,
+            .upstream_conn = undefined, // unused: buildUpstreamRequest reads only server/route/req
+            .request_buf = &self.request_bufs[req_buf_idx],
+            .response_buf = &self.response_bufs[resp_buf_idx],
+            .auth_headers = if (auth_info) |ai| ai.headers() else &.{},
+            .client_cert_dn = client_cert_dn,
+        };
+
+        // Send request (headers + body). Small-body requests carry the body in
+        // req and go through buildUpstreamRequest; accumulated bodies stream.
+        if (body_view) |bv| {
+            const header_len = forward.buildUpstreamRequestHeaders(&self.request_bufs[req_buf_idx], &ctx, bv.totalLen()) catch {
+                self.releaseResponseBuffer(resp_buf_idx);
+                return backpressure;
+            };
+            net.sendAll(fd, self.request_bufs[req_buf_idx][0..header_len]) catch {
+                registry.evict(tenant_key);
+                self.releaseResponseBuffer(resp_buf_idx);
+                return backpressure;
+            };
+            var it = bv.iterator();
+            while (it.next()) |chunk| {
+                net.sendAll(fd, chunk) catch {
+                    registry.evict(tenant_key);
+                    self.releaseResponseBuffer(resp_buf_idx);
+                    return backpressure;
+                };
+            }
+        } else {
+            const request_len = forward.buildUpstreamRequest(&self.request_bufs[req_buf_idx], &ctx) catch {
+                self.releaseResponseBuffer(resp_buf_idx);
+                return backpressure;
+            };
+            net.sendAll(fd, self.request_bufs[req_buf_idx][0..request_len]) catch {
+                registry.evict(tenant_key);
+                self.releaseResponseBuffer(resp_buf_idx);
+                return backpressure;
+            };
+        }
+
+        const is_head = req.method == .HEAD;
+        const ur = self.readUpstreamResponse(fd, self.response_bufs[resp_buf_idx][0..], is_head, route.max_response_bytes) catch {
+            registry.evict(tenant_key);
+            self.releaseResponseBuffer(resp_buf_idx);
+            return backpressure;
+        };
+        const parsed = forward.parseUpstreamResponse(ur.data, is_head) catch {
+            if (ur.owned) |ob| self.allocator.free(ob);
+            registry.evict(tenant_key);
+            self.releaseResponseBuffer(resp_buf_idx);
+            return backpressure;
+        };
+        const backing: []u8 = if (ur.owned) |ob| ob else self.response_bufs[resp_buf_idx][0..];
+        var normalized = forward.normalizeUpstreamResponse(&parsed, backing, route, self.response_header_bufs[resp_buf_idx][0..], is_head) catch {
+            if (ur.owned) |ob| self.allocator.free(ob);
+            registry.evict(tenant_key);
+            self.releaseResponseBuffer(resp_buf_idx);
+            return backpressure;
+        };
+
+        runWasmResponseFilter(route, &req, &normalized);
+        maybeCompress(&normalized, req.headers, self.response_header_bufs[resp_buf_idx][0..]);
+        return .{ .resp = normalized, .proxy = self, .resp_buf_idx = resp_buf_idx, .owned_buf = ur.owned };
+    }
+
+    /// Typed accessor for the opaque tenant registry carried in the binding.
+    fn tenantRegistryOf(self: *Proxy, wasm: WasmBinding) ?*tenant_mod.TenantRegistry {
+        _ = self;
+        const p = wasm.tenant_registry orelse return null;
+        return @ptrCast(@alignCast(p));
     }
 
     threadlocal var dns_rr_counter: u32 = 0;
@@ -991,7 +1408,7 @@ pub const Proxy = struct {
         const selection = bal_m.select(null, now_ms) orelse return;
         const server_m = selection.server;
 
-        const fd = net.proxyConnect(server_m.address, server_m.port, 500, upstream_m.allow_private) catch return;
+        const fd = connectToServer(server_m, 500, upstream_m.allow_private) catch return;
         defer clock.closeFd(fd);
 
         const dummy_route = upstream.ProxyRoute{
@@ -1080,6 +1497,12 @@ pub const Proxy = struct {
 pub const ProxyResult = struct {
     resp: response.Response,
     proxy: *Proxy,
+    /// Connection-backpressure window (ms) requested by the request-phase WASM
+    /// filter on pool/park-table exhaustion: serve `resp` (a fail-closed 503)
+    /// AND pause reads on the connection for this long so a flood self-throttles
+    /// (the G2 cliff). null = no pacing (the common path). The transport applies
+    /// it via conn.setRateLimitPause, mirroring router HandleResult.pause_reads_ms.
+    pause_reads_ms: ?u64 = null,
     /// Response buffer index to release, or null if none held.
     resp_buf_idx: ?usize = null,
     /// Heap allocation backing `resp` when the upstream response outgrew
@@ -1153,6 +1576,30 @@ test "parseIpToU32" {
     try std.testing.expect(parseIpToU32("invalid") == null);
     try std.testing.expect(parseIpToU32("192.168.1") == null);
     try std.testing.expect(parseIpToU32("192.168.1.1.1") == null);
+}
+
+test "extractTenantKey: host strips port, custom header verbatim, bounds" {
+    const tc_host = upstream.TenantRouting{ .socket_dir = "/tmp/" };
+    // host with :port -> port stripped.
+    const r1 = request.RequestView{ .method = .GET, .path = "/vm/x", .headers = &.{
+        .{ .name = "host", .value = "alpha.example.com:8443" },
+    } };
+    try std.testing.expectEqualStrings("alpha.example.com", extractTenantKey(&r1, tc_host).?);
+    // host without a port -> verbatim.
+    const r2 = request.RequestView{ .method = .GET, .path = "/vm/x", .headers = &.{
+        .{ .name = "host", .value = "beta.example.com" },
+    } };
+    try std.testing.expectEqualStrings("beta.example.com", extractTenantKey(&r2, tc_host).?);
+    // Missing header -> null.
+    const r3 = request.RequestView{ .method = .GET, .path = "/vm/x", .headers = &.{} };
+    try std.testing.expect(extractTenantKey(&r3, tc_host) == null);
+
+    // A custom header is used verbatim (no port stripping).
+    const tc_hdr = upstream.TenantRouting{ .header = "x-tenant", .socket_dir = "/tmp/" };
+    const r4 = request.RequestView{ .method = .GET, .path = "/vm/x", .headers = &.{
+        .{ .name = "x-tenant", .value = "tenant-42:with-colon" },
+    } };
+    try std.testing.expectEqualStrings("tenant-42:with-colon", extractTenantKey(&r4, tc_hdr).?);
 }
 
 test "Proxy route matching" {
@@ -1281,4 +1728,231 @@ test "percentDecodePath" {
 
     // Invalid hex digits rejected
     try std.testing.expect(Proxy.percentDecodePath("/bad%GG") == null);
+}
+
+test "wasm: proxy BodyView (scattered) is filter-readable via body ABI" {
+    if (build_options.enable_wasm) {
+        const FILTER = @embedFile("../wasm/testdata/filter_probe.wasm");
+        var pool = try wasm_filter.Pool.init(std.testing.allocator, FILTER, .{ .instances = 1 });
+        defer pool.deinit();
+
+        // A scattered body "deny me now" split across two pool buffers. Maps to
+        // RequestBody.scattered, which the filter materializes and inspects.
+        var b0 = "deny ".*; // non-last chunk: buffer_size bytes
+        var b1 = "me now".*; // last chunk: last_buf_len bytes
+        var handles = [_]buffer_pool.BufferHandle{
+            .{ .index = 0, .bytes = b0[0..] },
+            .{ .index = 1, .bytes = b1[0..] },
+        };
+        const bv = forward.BodyView{ .buffers = .{
+            .handles = handles[0..],
+            .last_buf_len = b1.len,
+            .total_len = b0.len + b1.len,
+            .buffer_size = b0.len,
+        } };
+
+        var r = request.RequestView{
+            .method = .POST,
+            .path = "/submit",
+            .headers = &.{},
+            .body = bodyViewToRequestBody(bv),
+        };
+        const d = pool.run(&r, wasm_filter.DEFAULT_FUEL);
+        try std.testing.expect(d == .reject);
+        try std.testing.expectEqual(@as(u16, 403), d.reject.status);
+
+        // A clean scattered body is allowed.
+        var c0 = "hello ".*;
+        var c1 = "world".*;
+        var handles2 = [_]buffer_pool.BufferHandle{
+            .{ .index = 0, .bytes = c0[0..] },
+            .{ .index = 1, .bytes = c1[0..] },
+        };
+        const bv2 = forward.BodyView{ .buffers = .{
+            .handles = handles2[0..],
+            .last_buf_len = c1.len,
+            .total_len = c0.len + c1.len,
+            .buffer_size = c0.len,
+        } };
+        var r2 = request.RequestView{
+            .method = .POST,
+            .path = "/submit",
+            .headers = &.{},
+            .body = bodyViewToRequestBody(bv2),
+        };
+        try std.testing.expect(pool.run(&r2, wasm_filter.DEFAULT_FUEL) == .allow);
+    } else return error.SkipZigTest;
+}
+
+test "wasm: proxy request filter parks, registers in the table, fires start_fn" {
+    if (build_options.enable_wasm) {
+        const FILTER = @embedFile("../wasm/testdata/filter_probe.wasm");
+        var pool = try wasm_filter.Pool.init(std.testing.allocator, FILTER, .{ .instances = 2 });
+        defer pool.deinit();
+        var route = upstream.ProxyRoute{
+            .path_prefix = "/enrich",
+            .upstream = "backend",
+            .wasm_pool = @ptrCast(&pool),
+            .wasm_fuel = wasm_filter.DEFAULT_FUEL,
+        };
+        var table = wasm_host_call.Table.init(std.testing.allocator);
+        defer table.deinit();
+
+        const Rec = struct {
+            var token: ?u32 = null;
+            var req_bytes_len: usize = 0;
+            fn start(_: *anyopaque, t: u32, req_bytes: []const u8) void {
+                token = t;
+                req_bytes_len = req_bytes.len;
+            }
+        };
+        Rec.token = null;
+        var dummy: u8 = 0;
+        const binding = WasmBinding{
+            .table = @ptrCast(&table),
+            .conn_index = 5,
+            .conn_id = 99,
+            .deadline_ms = 1_000,
+            .start_fn = Rec.start,
+            .start_ctx = @ptrCast(&dummy),
+        };
+
+        // /enrich stages a host_call and parks.
+        const req = request.RequestView{ .method = .GET, .path = "/enrich", .headers = &.{} };
+        const out = runWasmFilter(&route, &req, binding);
+        try std.testing.expect(out != null and out.?.resp.isParked());
+        try std.testing.expectEqual(@as(usize, 1), table.liveCount());
+        try std.testing.expect(Rec.token != null); // start_fn fired with the park token
+        try std.testing.expect(Rec.req_bytes_len > 0); // staged command forwarded
+
+        // Resume decisions skip the filter: allow -> proceed (null), reject -> serve.
+        try std.testing.expect(runWasmFilter(&route, &req, .{ .resume_decision = .allow }) == null);
+        const rej = runWasmFilter(&route, &req, .{ .resume_decision = .{ .reject = .{
+            .status = 403,
+            .headers = &.{},
+            .body = .{ .bytes = "no" },
+        } } });
+        try std.testing.expect(rej != null);
+        try std.testing.expectEqual(@as(u16, 403), rej.?.resp.status);
+    } else return error.SkipZigTest;
+}
+
+test "wasm: proxy Phase 2b response filter injects a header and rewrites a body" {
+    if (build_options.enable_wasm) {
+        const RESP_FILTER = @embedFile("../wasm/testdata/response_probe.wasm");
+        var pool = try wasm_filter.Pool.init(std.testing.allocator, RESP_FILTER, .{ .instances = 1 });
+        defer pool.deinit();
+        var route = upstream.ProxyRoute{
+            .path_prefix = "/api/",
+            .upstream = "backend",
+            .wasm_pool = @ptrCast(&pool),
+            .wasm_fuel = wasm_filter.DEFAULT_FUEL,
+        };
+        const req = request.RequestView{ .method = .GET, .path = "/api/widgets", .headers = &.{} };
+
+        // Default path: the response filter adds the x-wasm-response header.
+        var resp = response.Response{ .status = 200, .headers = &.{}, .body = .{ .bytes = "upstream body" } };
+        runWasmResponseFilter(&route, &req, &resp);
+        var found = false;
+        for (resp.headers) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "x-wasm-response")) found = true;
+        }
+        try std.testing.expect(found);
+
+        // "boom" body: the filter blocks it (403 + replacement body).
+        var resp2 = response.Response{ .status = 200, .headers = &.{}, .body = .{ .bytes = "boom leak" } };
+        runWasmResponseFilter(&route, &req, &resp2);
+        try std.testing.expectEqual(@as(u16, 403), resp2.status);
+        try std.testing.expectEqualStrings("blocked by edge", resp2.bodyBytes());
+    } else return error.SkipZigTest;
+}
+
+// --- D2 security probing through the proxy filter hook -----------------------
+
+test "D2-4 fail-closed: a trapping proxy request filter never forwards upstream" {
+    if (build_options.enable_wasm) {
+        const FILTER = @embedFile("../wasm/testdata/filter_probe.wasm");
+        var pool = try wasm_filter.Pool.init(std.testing.allocator, FILTER, .{ .instances = 2 });
+        defer pool.deinit();
+        var route = upstream.ProxyRoute{
+            .path_prefix = "/",
+            .upstream = "backend",
+            .wasm_pool = @ptrCast(&pool),
+            .wasm_fuel = 200_000,
+        };
+        // runWasmFilter returns null to mean "forward to upstream". A trapping
+        // filter must NEVER return null -- it must return a fail-closed reject
+        // (500) so the upstream is never reached.
+        for ([_][]const u8{ "/oob", "/loop" }) |p| {
+            const req = request.RequestView{ .method = .GET, .path = p, .headers = &.{} };
+            const out = runWasmFilter(&route, &req, .{});
+            try std.testing.expect(out != null);
+            try std.testing.expectEqual(@as(u16, 500), out.?.resp.status);
+        }
+    } else return error.SkipZigTest;
+}
+
+test "D2-5 fail-closed: proxy filter pool exhaustion -> 503 then recovery" {
+    if (build_options.enable_wasm) {
+        const FILTER = @embedFile("../wasm/testdata/filter_probe.wasm");
+        var pool = try wasm_filter.Pool.init(std.testing.allocator, FILTER, .{ .instances = 1 });
+        defer pool.deinit();
+        var route = upstream.ProxyRoute{
+            .path_prefix = "/enrich",
+            .upstream = "backend",
+            .wasm_pool = @ptrCast(&pool),
+            .wasm_fuel = wasm_filter.DEFAULT_FUEL,
+        };
+        var table = wasm_host_call.Table.init(std.testing.allocator);
+        defer table.deinit();
+        const binding = WasmBinding{
+            .table = @ptrCast(&table),
+            .conn_index = 1,
+            .conn_id = 1,
+            .deadline_ms = 9_999_999,
+        };
+        const req = request.RequestView{ .method = .GET, .path = "/enrich", .headers = &.{} };
+
+        // Pin the only instance: the park path's acquire() fails -> fail closed 503.
+        const pinned = pool.acquire() orelse return error.AcquireFailed;
+        const out = runWasmFilter(&route, &req, binding);
+        try std.testing.expect(out != null);
+        try std.testing.expectEqual(@as(u16, 503), out.?.resp.status);
+        try std.testing.expectEqual(@as(usize, 0), table.liveCount()); // nothing parked
+        // G2: the 503 now also carries a connection-backpressure window so the
+        // proxy path paces the flood (conn.setRateLimitPause) instead of
+        // CPU-burning bare 503s. Fail-closed (the 503) is unchanged.
+        try std.testing.expect(out.?.pause_reads_ms != null);
+        try std.testing.expectEqual(wasm_filter.POOL_BACKPRESSURE_MS, out.?.pause_reads_ms.?);
+
+        // Release -> recovery: the filter now parks (registers in the table).
+        pinned.state = .idle;
+        const out2 = runWasmFilter(&route, &req, binding);
+        try std.testing.expect(out2 != null and out2.?.resp.isParked());
+        try std.testing.expectEqual(@as(usize, 1), table.liveCount());
+    } else return error.SkipZigTest;
+}
+
+test "Proxy.init does not start the health thread (Server.run starts it at the final address)" {
+    // Regression guard: init used to call health_manager.startThread() on the
+    // stack-local Proxy it returns BY VALUE. The spawned thread captured
+    // &health_manager of the dead init frame and read garbage checker state,
+    // a layout-dependent segfault on Linux ReleaseFast (found via the
+    // load-balancer benchmark scenario, 2026-07-07).
+    const allocator = std.testing.allocator;
+    const servers = [_]upstream.Server{.{ .address = "127.0.0.1", .port = 1 }};
+    const upstreams = [_]upstream.Upstream{.{
+        .name = "hc",
+        .servers = &servers,
+        .health_check = .{},
+    }};
+    const routes = [_]upstream.ProxyRoute{.{ .path_prefix = "/", .upstream = "hc" }};
+
+    var proxy = try Proxy.init(allocator, .{ .upstreams = &upstreams, .routes = &routes });
+    defer proxy.deinit();
+
+    // The checker is registered, but no thread may run until the struct sits
+    // at its final address (Server.run / the reload swap call startThread).
+    try std.testing.expectEqual(@as(u32, 1), proxy.health_manager.checkers.count());
+    try std.testing.expect(proxy.health_manager.thread_handle == null);
 }
