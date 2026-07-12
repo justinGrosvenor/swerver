@@ -1863,11 +1863,22 @@ pub fn handleRead(server: *Server, index: u32) !void {
             }
         }
 
+        // Resuming an x402 verify park re-parses the parked request. If its
+        // chunked body was decoded in place by the first parse, the wire
+        // framing is gone - hand the parser the saved decoded geometry.
+        const pre_decoded: ?http1.PreDecodedChunked = if ((conn.x402 == .resolved_allow or conn.x402 == .resolved_reject) and
+            conn.x402_predecoded_consumed > 0)
+            .{ .body_len = conn.x402_predecoded_body_len, .consumed_bytes = conn.x402_predecoded_consumed }
+        else
+            null;
+        conn.x402_predecoded_body_len = 0;
+        conn.x402_predecoded_consumed = 0;
         const parse = http1.parse(buf_slice, .{
             .max_header_bytes = server.cfg.limits.max_header_bytes,
             .max_body_bytes = server.cfg.limits.max_body_bytes,
             .max_header_count = server.cfg.limits.max_header_count,
             .headers_storage = conn.headers[0..],
+            .pre_decoded_chunked = pre_decoded,
         });
         if (parse.state == .partial) {
             if (parse.expect_continue and !conn.sent_continue) {
@@ -2024,6 +2035,13 @@ pub fn handleRead(server: *Server, index: u32) !void {
                                     conn.x402 = .pending;
                                     conn.markActive(server.now_ms);
                                     server.io.unReadConsumed(conn, saved_read_offset, saved_read_buffered);
+                                    if (parse.chunked_decoded) {
+                                        // The rewound bytes no longer hold chunked
+                                        // framing (decoded in place); save the
+                                        // geometry for the resume re-parse.
+                                        conn.x402_predecoded_body_len = @intCast(parse.view.body.len());
+                                        conn.x402_predecoded_consumed = @intCast(parse.consumed_bytes);
+                                    }
                                     break;
                                 }
                                 // Queue full or build failed — fast-reject
