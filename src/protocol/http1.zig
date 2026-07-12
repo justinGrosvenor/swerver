@@ -14,6 +14,19 @@ pub const ParseResult = struct {
     consumed_bytes: usize,
     keep_alive: bool,
     expect_continue: bool,
+    /// True when this complete parse decoded a chunked body IN PLACE,
+    /// destroying the wire framing in the buffer. A caller that rewinds the
+    /// buffer to re-parse later (the x402 verify park) must save the decoded
+    /// geometry and pass it back via Limits.pre_decoded_chunked - a plain
+    /// re-parse of the mutated bytes fails with invalid_chunked_body.
+    chunked_decoded: bool = false,
+};
+
+/// Decoded-chunked-body geometry recorded by a caller that parks a completed
+/// request and later re-parses the same (already mutated) buffer region.
+pub const PreDecodedChunked = struct {
+    body_len: usize,
+    consumed_bytes: usize,
 };
 
 pub const ErrorCode = enum {
@@ -718,6 +731,30 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
     if (!wants_body) expect_continue = false;
     const body_start = header_end + 4;
     if (is_chunked) {
+        if (_limits.pre_decoded_chunked) |pd| {
+            // Re-parse after a park: the body region no longer holds chunked
+            // wire framing (the first parse compacted the decoded payload in
+            // place), so scanning would misread payload bytes as chunk-size
+            // lines. Trust the recorded geometry instead.
+            if (body_start + pd.body_len > _bytes.len or pd.consumed_bytes > _bytes.len) {
+                return parseErr(.invalid_chunked_body, keep_alive);
+            }
+            return .{
+                .state = .complete,
+                .view = .{
+                    .method = method,
+                    .method_raw = method_str,
+                    .path = path,
+                    .headers = _limits.headers_storage[0..header_count],
+                    .body = .{ .slice = _bytes[body_start .. body_start + pd.body_len] },
+                },
+                .error_code = .none,
+                .consumed_bytes = pd.consumed_bytes,
+                .keep_alive = keep_alive,
+                .expect_continue = false,
+                .chunked_decoded = true,
+            };
+        }
         const scan = scanChunked(_bytes, body_start, _limits.max_body_bytes) catch |err| {
             return parseErr(switch (err) {
                 error.BodyTooLarge => .body_too_large,
@@ -752,6 +789,7 @@ pub fn parse(_bytes: []u8, _limits: Limits) ParseResult {
             .consumed_bytes = chunked.consumed_bytes,
             .keep_alive = keep_alive,
             .expect_continue = false,
+            .chunked_decoded = true,
         };
     }
     const total_needed = body_start + content_length;
@@ -788,6 +826,9 @@ pub const Limits = struct {
     max_body_bytes: usize,
     max_header_count: usize,
     headers_storage: []request.Header,
+    /// Set on the re-parse of a parked request whose chunked body a previous
+    /// complete parse already decoded in place (see ParseResult.chunked_decoded).
+    pre_decoded_chunked: ?PreDecodedChunked = null,
 };
 
 /// The method token is bounded (longest standard method is ~11 chars; we
@@ -1122,6 +1163,62 @@ test "scanChunked: zero-length body no trailers" {
     try std.testing.expect(result.complete);
     try std.testing.expectEqual(@as(usize, 0), result.body_len);
     try std.testing.expectEqual(@as(usize, buf.len), result.consumed_bytes);
+}
+
+test "parse: chunked re-parse after in-place decode (x402 park regression)" {
+    // The x402 verify park rewinds the read buffer and re-parses the request
+    // on resume. Parse #1 decodes a chunked body IN PLACE (destroying the
+    // wire framing), so parse #2 of the same bytes used to fail with
+    // invalid_chunked_body -> a generic 400 on every paid chunked request.
+    // The park now records the decoded geometry and passes it back via
+    // Limits.pre_decoded_chunked.
+    var headers_storage: [32]request.Header = undefined;
+    const limits = Limits{
+        .max_header_bytes = 8192,
+        .max_body_bytes = 65536,
+        .max_header_count = 32,
+        .headers_storage = headers_storage[0..],
+    };
+    var buf: [256]u8 = undefined;
+    const wire = "POST /paid HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+    @memcpy(buf[0..wire.len], wire);
+
+    const p1 = parse(buf[0..wire.len], limits);
+    try std.testing.expectEqual(ParseState.complete, p1.state);
+    try std.testing.expect(p1.chunked_decoded);
+    try std.testing.expectEqualStrings("hello world", p1.view.body.sliceOrNull().?);
+    try std.testing.expectEqual(wire.len, p1.consumed_bytes);
+
+    // A plain re-parse of the mutated buffer fails: this is the bug the
+    // snapshot exists to avoid.
+    const p2 = parse(buf[0..wire.len], limits);
+    try std.testing.expectEqual(ParseState.err, p2.state);
+    try std.testing.expectEqual(ErrorCode.invalid_chunked_body, p2.error_code);
+
+    // The re-parse with the recorded geometry reproduces parse #1.
+    var limits_pd = limits;
+    limits_pd.pre_decoded_chunked = .{
+        .body_len = p1.view.body.len(),
+        .consumed_bytes = p1.consumed_bytes,
+    };
+    const p3 = parse(buf[0..wire.len], limits_pd);
+    try std.testing.expectEqual(ParseState.complete, p3.state);
+    try std.testing.expect(p3.chunked_decoded);
+    try std.testing.expectEqualStrings("hello world", p3.view.body.sliceOrNull().?);
+    try std.testing.expectEqual(p1.consumed_bytes, p3.consumed_bytes);
+    try std.testing.expectEqualStrings("/paid", p3.view.path);
+
+    // Content-Length framing is non-destructive: a double parse is
+    // idempotent without any snapshot (why only chunked paid requests broke).
+    var buf_cl: [128]u8 = undefined;
+    const wire_cl = "POST /paid HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n\r\nhello";
+    @memcpy(buf_cl[0..wire_cl.len], wire_cl);
+    const c1 = parse(buf_cl[0..wire_cl.len], limits);
+    try std.testing.expectEqual(ParseState.complete, c1.state);
+    try std.testing.expect(!c1.chunked_decoded);
+    const c2 = parse(buf_cl[0..wire_cl.len], limits);
+    try std.testing.expectEqual(ParseState.complete, c2.state);
+    try std.testing.expectEqualStrings("hello", c2.view.body.sliceOrNull().?);
 }
 
 test "ChunkDecoder: completes without trailers (whole feed)" {

@@ -848,13 +848,27 @@ pub const Proxy = struct {
                     .client_cert_dn = client_cert_dn,
                 };
 
-                const request_len = forward.buildUpstreamRequest(&self.request_bufs[req_buf_idx], &ctx) catch {
-                    pool.markConnectionFailed(c, now_ms, connect_server.max_fails);
-                    continue;
+                // Build the upstream request. Requests whose headers + body fit
+                // the pooled request buffer go out in one send. Larger inline
+                // bodies (between REQUEST_BUF_SIZE and the read-buffer
+                // accumulation threshold, which routes through handleWithBody)
+                // fall back to sending headers and the body slice separately.
+                const inline_body: []const u8 = req.body.sliceOrNull() orelse "";
+                var split_body = false;
+                const request_len = forward.buildUpstreamRequest(&self.request_bufs[req_buf_idx], &ctx) catch blk: {
+                    split_body = true;
+                    break :blk forward.buildUpstreamRequestHeaders(&self.request_bufs[req_buf_idx], &ctx, inline_body.len) catch {
+                        // Even the headers overflow the buffer: a request-shaping
+                        // problem, not an upstream failure - hand the untouched
+                        // connection back and fail without retrying other servers.
+                        pool.release(c, now_ms, true);
+                        self.releaseResponseBuffer(resp_buf_idx);
+                        return .{ .resp = forward.createErrorResponse(502), .proxy = self };
+                    };
                 };
 
                 // Send request to upstream
-                const body_sent = req.body.len() > 0;
+                const body_sent = !split_body and req.body.len() > 0;
                 net.sendAll(c.fd, self.request_bufs[req_buf_idx][0..request_len]) catch {
                     pool.markConnectionFailed(c, now_ms, connect_server.max_fails);
                     // RFC 9110 §9.2.2: Only retry if method is idempotent or body not sent
@@ -864,6 +878,17 @@ pub const Proxy = struct {
                     }
                     continue;
                 };
+                if (split_body and inline_body.len > 0) {
+                    net.sendAll(c.fd, inline_body) catch {
+                        pool.markConnectionFailed(c, now_ms, connect_server.max_fails);
+                        // Body (partially) on the wire: only idempotent methods retry.
+                        if (!forward.isIdempotent(req.method)) {
+                            self.releaseResponseBuffer(resp_buf_idx);
+                            return .{ .resp = forward.createErrorResponse(502), .proxy = self };
+                        }
+                        continue;
+                    };
+                }
 
                 // Read response from upstream. Fits-in-pool-buffer responses
                 // stay zero-allocation; larger ones grow into a heap buffer
@@ -1138,8 +1163,12 @@ pub const Proxy = struct {
                 };
 
                 const header_len = forward.buildUpstreamRequestHeaders(&self.request_bufs[req_buf_idx], &ctx, body_len) catch {
-                    pool.markConnectionFailed(c, now_ms, connect_server_b.max_fails);
-                    continue;
+                    // Headers overflow the request buffer: a request-shaping
+                    // problem, not an upstream failure - hand the untouched
+                    // connection back and fail without retrying other servers.
+                    pool.release(c, now_ms, true);
+                    self.releaseResponseBuffer(resp_buf_idx);
+                    return .{ .resp = forward.createErrorResponse(502), .proxy = self };
                 };
 
                 // Send headers to upstream
@@ -1332,15 +1361,29 @@ pub const Proxy = struct {
                 };
             }
         } else {
-            const request_len = forward.buildUpstreamRequest(&self.request_bufs[req_buf_idx], &ctx) catch {
-                self.releaseResponseBuffer(resp_buf_idx);
-                return backpressure;
+            // Same split fallback as handle(): inline bodies that overflow the
+            // pooled request buffer send headers and body separately.
+            const inline_body: []const u8 = req.body.sliceOrNull() orelse "";
+            var split_body = false;
+            const request_len = forward.buildUpstreamRequest(&self.request_bufs[req_buf_idx], &ctx) catch blk: {
+                split_body = true;
+                break :blk forward.buildUpstreamRequestHeaders(&self.request_bufs[req_buf_idx], &ctx, inline_body.len) catch {
+                    self.releaseResponseBuffer(resp_buf_idx);
+                    return backpressure;
+                };
             };
             net.sendAll(fd, self.request_bufs[req_buf_idx][0..request_len]) catch {
                 registry.evict(tenant_key);
                 self.releaseResponseBuffer(resp_buf_idx);
                 return backpressure;
             };
+            if (split_body and inline_body.len > 0) {
+                net.sendAll(fd, inline_body) catch {
+                    registry.evict(tenant_key);
+                    self.releaseResponseBuffer(resp_buf_idx);
+                    return backpressure;
+                };
+            }
         }
 
         const is_head = req.method == .HEAD;
@@ -1434,8 +1477,18 @@ pub const Proxy = struct {
                 net.sendAll(fd, chunk) catch return;
             }
         } else {
-            const req_len = forward.buildUpstreamRequest(&mirror_req_buf, &ctx) catch return;
+            // Same split fallback as handle(): mirror the full body even when
+            // headers + body overflow the request buffer.
+            const inline_body: []const u8 = req.body.sliceOrNull() orelse "";
+            var split_body = false;
+            const req_len = forward.buildUpstreamRequest(&mirror_req_buf, &ctx) catch blk: {
+                split_body = true;
+                break :blk forward.buildUpstreamRequestHeaders(&mirror_req_buf, &ctx, inline_body.len) catch return;
+            };
             net.sendAll(fd, mirror_req_buf[0..req_len]) catch return;
+            if (split_body and inline_body.len > 0) {
+                net.sendAll(fd, inline_body) catch return;
+            }
         }
     }
 
@@ -1955,4 +2008,102 @@ test "Proxy.init does not start the health thread (Server.run starts it at the f
     // at its final address (Server.run / the reload swap call startThread).
     try std.testing.expectEqual(@as(u32, 1), proxy.health_manager.checkers.count());
     try std.testing.expect(proxy.health_manager.thread_handle == null);
+}
+
+test "handle() forwards inline bodies larger than the request buffer (8KB-64KB 502 regression)" {
+    // Regression: buildUpstreamRequest copies headers + body into the pooled
+    // REQUEST_BUF_SIZE (8KB) request buffer. Requests whose headers + body land
+    // between that and the connection read buffer (below which dispatch still
+    // takes the small-body handle() path) got a 502 - and each attempt counted
+    // a failure against a healthy upstream connection. handle() now falls back
+    // to sending headers and the body slice separately.
+    const allocator = std.testing.allocator;
+
+    const lfd = net.listen("127.0.0.1", 0, 4) catch return error.SkipZigTest;
+    defer clock.closeFd(lfd);
+    const port = net.getLocalPort(lfd) orelse return error.SkipZigTest;
+
+    const Upstream = struct {
+        fn setBlocking(fd: std.posix.fd_t) void {
+            const flags = std.c.fcntl(fd, std.posix.F.GETFL);
+            if (flags < 0) return;
+            const nonblock: c_int = @bitCast(@as(c_uint, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK"));
+            _ = std.c.fcntl(fd, std.posix.F.SETFL, flags & ~nonblock);
+        }
+
+        fn serve(listen_fd: std.posix.fd_t, got_body_len: *usize) void {
+            // net.listen/net.accept are nonblocking (built for the event
+            // loop); spin until the proxy connects, then flip the accepted
+            // fd back to blocking for the simple request/response exchange.
+            const cfd = while (true) {
+                const fd = net.accept(listen_fd) catch |err| switch (err) {
+                    error.WouldBlock => {
+                        std.Thread.yield() catch {};
+                        continue;
+                    },
+                    else => return,
+                };
+                break fd;
+            };
+            defer clock.closeFd(cfd);
+            setBlocking(cfd);
+            var buf: [64 * 1024]u8 = undefined;
+            var total: usize = 0;
+            var header_end: ?usize = null;
+            var content_length: usize = 0;
+            while (total < buf.len) {
+                const n = net.recvBlocking(cfd, buf[total..]) catch return;
+                if (n == 0) break;
+                total += n;
+                if (header_end == null) {
+                    if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n")) |he| {
+                        header_end = he + 4;
+                        var it = std.mem.splitSequence(u8, buf[0..he], "\r\n");
+                        while (it.next()) |line| {
+                            const prefix = "content-length:";
+                            if (line.len > prefix.len and std.ascii.startsWithIgnoreCase(line, prefix)) {
+                                const v = std.mem.trim(u8, line[prefix.len..], " \t");
+                                content_length = std.fmt.parseInt(usize, v, 10) catch 0;
+                            }
+                        }
+                    }
+                }
+                if (header_end) |he| {
+                    if (total >= he + content_length) break;
+                }
+            }
+            if (header_end) |he| got_body_len.* = total - he;
+            net.sendAll(cfd, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok") catch {};
+        }
+    };
+
+    var got_body_len: usize = 0;
+    const upstream_thread = try std.Thread.spawn(.{}, Upstream.serve, .{ lfd, &got_body_len });
+
+    const servers = [_]upstream.Server{.{ .address = "127.0.0.1", .port = port }};
+    const upstreams = [_]upstream.Upstream{.{ .name = "u", .servers = &servers }};
+    const routes = [_]upstream.ProxyRoute{.{ .path_prefix = "/", .upstream = "u" }};
+    var proxy = try Proxy.init(allocator, .{ .upstreams = &upstreams, .routes = &routes });
+    defer proxy.deinit();
+
+    // 16KB body: well under the 64KB read buffer (so real dispatch would take
+    // the small-body handle() path) but overflows the 8KB request buffer
+    // together with the headers.
+    const body = try allocator.alloc(u8, 16 * 1024);
+    defer allocator.free(body);
+    @memset(body, 'b');
+
+    const req = request.RequestView{
+        .method = .POST,
+        .path = "/big",
+        .headers = &.{.{ .name = "host", .value = "test.local" }},
+        .body = .{ .slice = body },
+    };
+    var mw_ctx: middleware.Context = undefined;
+    var pr = proxy.handle(req, &mw_ctx, null, false, 12345, null, null, .{});
+    defer pr.release();
+    upstream_thread.join();
+
+    try std.testing.expectEqual(@as(u16, 200), pr.resp.status);
+    try std.testing.expectEqual(body.len, got_body_len);
 }

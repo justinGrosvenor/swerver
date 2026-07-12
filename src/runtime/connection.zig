@@ -291,6 +291,14 @@ pub const Connection = struct {
     x402_held_hdr_count: u8 = 0,
     x402_held_body_offset: u16 = 0,
     x402_held_body_len: u32 = 0,
+    /// Verify-park snapshot of a chunked request's decoded geometry. The park
+    /// rewinds the read buffer so the resume re-parses the request, but the
+    /// first parse decoded the chunked body in place (the wire framing is
+    /// gone); the resume passes these to http1.parse as pre_decoded_chunked.
+    /// consumed == 0 means no snapshot (a chunked request always consumes
+    /// at least the "0\r\n\r\n" terminator).
+    x402_predecoded_body_len: u32 = 0,
+    x402_predecoded_consumed: u32 = 0,
     /// WASM proxy resumed-path context (E1). When a wasm filter on a PROXY route
     /// parks, the main dispatch loop stashes here the post-`proxy.handle`
     /// processing context (cache/otel/x402-settlement) so `proxyResume` can run
@@ -444,6 +452,8 @@ pub const Connection = struct {
         self.x402_held_hdr_count = 0;
         self.x402_held_body_offset = 0;
         self.x402_held_body_len = 0;
+        self.x402_predecoded_body_len = 0;
+        self.x402_predecoded_consumed = 0;
         self.wasm_proxy_resume = .{};
         // active_list_pos is set by ConnectionPool.acquire
     }
