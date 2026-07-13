@@ -379,6 +379,13 @@ pub const Op = enum(u4) {
     /// they never touch the recv/send/buffer-group machinery (design
     /// 9.0 open question 4, decided poll-driven for v1).
     external_poll = 6,
+    /// One-shot IORING_OP_TIMEOUT bounding a blocking poll() wait. Without
+    /// it, submit_and_wait(1) on an idle ring sleeps until the next I/O
+    /// CQE - which can be never - starving the reactor's deadline and
+    /// housekeeping checks (idle-connection timeouts, health-check apply,
+    /// run_for_ms). At most one is armed at a time; its CQE just clears
+    /// the armed flag so the reactor loop runs a bookkeeping pass.
+    tick = 7,
 };
 
 /// Hard cap on concurrently registered external fds. PgClient needs at
@@ -528,6 +535,12 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
     /// created + armed + started on the first poll() call, when all listeners
     /// have been registered and only the reactor thread touches any ring.
     acceptor_pending: bool = false,
+    /// True while a .tick timeout SQE is in flight (see Op.tick).
+    tick_armed: bool = false,
+    /// Backing timespec for the in-flight .tick SQE. A struct field (not a
+    /// stack local) so the pointer the SQE carries stays valid until the
+    /// kernel consumes it at submit.
+    tick_ts: linux.kernel_timespec = .{ .sec = 0, .nsec = 0 },
     /// Registered UDP socket fd (for multishot recvmsg re-arming,
     /// used by QUIC). Null when QUIC isn't enabled on this process.
     udp_fd: ?i32 = null,
@@ -1016,7 +1029,23 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
         // SPSC drain above. If we do, return immediately so the
         // server can register all of them right away — the next
         // poll() will catch up on any CQEs.
-        const wait_nr: u32 = if (count > 0 or timeout_ms == 0) 0 else 1;
+        var wait_nr: u32 = if (count > 0 or timeout_ms == 0) 0 else 1;
+        if (wait_nr == 1 and !self.tick_armed) {
+            // Bound the blocking wait (see Op.tick). Armed lazily and only
+            // when this poll would actually sleep, so a loaded ring - whose
+            // waits are satisfied by real CQEs immediately - re-arms at most
+            // once per timeout_ms, not once per poll.
+            self.tick_ts = .{
+                .sec = @intCast(timeout_ms / 1000),
+                .nsec = @intCast((timeout_ms % 1000) * std.time.ns_per_ms),
+            };
+            if (self.ring.timeout(packUserData(.tick, 0, 0), &self.tick_ts, 0, 0)) |_| {
+                self.tick_armed = true;
+            } else |_| {
+                // SQ full: skip blocking this round rather than sleep unbounded.
+                wait_nr = 0;
+            }
+        }
         _ = self.ring.submit_and_wait(wait_nr) catch |err| switch (err) {
             error.SignalInterrupt => return self.events[0..count],
             else => return err,
@@ -1060,6 +1089,13 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
             }
 
             switch (op) {
+                .tick => {
+                    // Bounded-wait timeout fired (or completed); the next
+                    // blocking poll re-arms it. No event to emit - returning
+                    // with zero events is exactly the deadline/housekeeping
+                    // wakeup the reactor loop wants.
+                    self.tick_armed = false;
+                },
                 .accept => {
                     if (self.acceptor) |acc| {
                         // Threaded-acceptor path: the eventfd
@@ -1323,4 +1359,21 @@ pub fn probe() bool {
     ) catch return false;
     ring.deinit();
     return true;
+}
+
+test "poll(timeout_ms) returns on an idle ring (bounded wait)" {
+    // Regression: poll() ignored timeout_ms and blocked in
+    // submit_and_wait(1) until the next I/O CQE - forever on an idle ring.
+    // That hung every Linux test that drives Server.run (the CI test-matrix
+    // 20-minute timeout) and starved idle-server housekeeping in production.
+    // The .tick timeout op bounds the wait; an idle poll must return.
+    if (!is_linux) return error.SkipZigTest;
+    if (!probe()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var backend = IoUringNativeBackend.init(allocator, 64) catch return error.SkipZigTest;
+    defer backend.deinit(allocator);
+    // No listeners, no connections: nothing will ever complete except the
+    // tick. Without the fix this call never returns.
+    const ev = try backend.poll(50);
+    try std.testing.expectEqual(@as(usize, 0), ev.len);
 }

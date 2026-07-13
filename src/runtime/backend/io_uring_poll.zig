@@ -22,6 +22,13 @@ const IORING_SETUP_DEFER_TASKRUN = 1 << 13; // kernel 6.1+: batch CQE delivery
 const IORING_OP_POLL_ADD: u8 = 6;
 const IORING_OP_POLL_REMOVE: u8 = 7;
 const IORING_OP_NOP: u8 = 0;
+const IORING_OP_TIMEOUT: u8 = 11;
+
+/// struct __kernel_timespec (backing an IORING_OP_TIMEOUT SQE).
+const KernelTimespec = extern struct {
+    sec: i64,
+    nsec: i64,
+};
 
 // Poll event masks matching EPOLL constants
 const POLLIN: u32 = 0x001;
@@ -58,6 +65,14 @@ pub const MAX_EXTERNAL_FDS = 16;
 /// LISTENER_ID_COUNT (no import — would create a cycle, like EXTERNAL_ID_BIT).
 pub const MAX_LISTENERS = 8;
 const LISTENER_ID_BASE: u64 = std.math.maxInt(u64) - 16;
+
+/// user_data of the one-shot IORING_OP_TIMEOUT bounding a blocking poll()
+/// wait (below the listener token range, never a conn id). Without it,
+/// io_uring_enter(min_complete=1) on an idle ring sleeps until the next
+/// I/O CQE - which can be never - starving the reactor's deadline and
+/// housekeeping checks. Its CQE is swallowed in the reap loop (never
+/// surfaced as an event, never re-armed as a poll).
+const TICK_TOKEN: u64 = LISTENER_ID_BASE - 1;
 
 /// True only for well-formed external tokens: bit 62 set, every other
 /// high bit clear, slot in the low 32 bits (mirror of io.zig's
@@ -117,6 +132,12 @@ pub const IoUringPollBackend = struct {
     cq_tail: *volatile u32,
     /// Output events buffer
     events: []IoUringEvent,
+    /// True while a TICK_TOKEN timeout SQE is in flight.
+    tick_armed: bool = false,
+    /// Backing timespec for the in-flight tick SQE. A struct field (not a
+    /// stack local) so the address the SQE carries stays valid until the
+    /// kernel consumes it at submit.
+    tick_ts: KernelTimespec = .{ .sec = 0, .nsec = 0 },
     /// Track registered FDs for re-arming (POLL_ADD is one-shot)
     /// Layout: [0..MAX_LISTENERS)=listeners, [MAX_LISTENERS]=UDP,
     /// [MAX_LISTENERS+1..]=connections (indexed by conn_id + MAX_LISTENERS + 1).
@@ -247,15 +268,42 @@ pub const IoUringPollBackend = struct {
         // Single io_uring_enter: submit pending re-arm SQEs from the
         // previous cycle AND wait for new events. This merges what was
         // previously two syscalls (submit + wait) into one.
-        const min_complete: u32 = if (timeout_ms > 0) 1 else 0;
+        var min_complete: u32 = if (timeout_ms > 0) 1 else 0;
+        var to_submit = self.pending_submits;
+        self.pending_submits = 0;
+        if (min_complete == 1 and !self.tick_armed) {
+            // Bound the blocking wait (see TICK_TOKEN). Armed lazily and only
+            // when this poll would actually sleep, so a loaded ring re-arms at
+            // most once per timeout_ms, not once per poll.
+            if (self.sqRingHasSpace()) {
+                self.tick_ts = .{
+                    .sec = @intCast(timeout_ms / 1000),
+                    .nsec = @intCast((timeout_ms % 1000) * std.time.ns_per_ms),
+                };
+                const tail = @atomicLoad(u32, self.sq_tail, .acquire);
+                const idx = tail & self.sq_mask;
+                var sqe = &self.sqes[idx];
+                sqe.* = std.mem.zeroes(IoUringSqe);
+                sqe.opcode = IORING_OP_TIMEOUT;
+                sqe.fd = -1;
+                sqe.addr_or_splice = @intFromPtr(&self.tick_ts);
+                sqe.len = 1;
+                sqe.user_data = TICK_TOKEN;
+                self.sq_array[idx] = idx;
+                @atomicStore(u32, self.sq_tail, tail +% 1, .release);
+                to_submit += 1;
+                self.tick_armed = true;
+            } else {
+                // SQ full: skip blocking this round rather than sleep unbounded.
+                min_complete = 0;
+            }
+        }
         // GETEVENTS is required with DEFER_TASKRUN to process deferred
         // completions. Without DEFER_TASKRUN, only set it when waiting.
         const flags: u32 = if (self.defer_taskrun or min_complete > 0)
             IORING_ENTER_GETEVENTS
         else
             0;
-        const to_submit = self.pending_submits;
-        self.pending_submits = 0;
 
         const rc = io_uring_enter(self.ring_fd, to_submit, min_complete, flags, null);
         if (rc < 0) {
@@ -272,6 +320,15 @@ pub const IoUringPollBackend = struct {
             const cqe = &self.cqes[head & self.cq_mask];
             const conn_id = cqe.user_data;
             const res = cqe.res;
+
+            // Bounded-wait tick fired; the next blocking poll re-arms it.
+            // Swallow the CQE - waking with zero events is exactly the
+            // deadline/housekeeping pass the reactor loop wants.
+            if (conn_id == TICK_TOKEN) {
+                self.tick_armed = false;
+                head +%= 1;
+                continue;
+            }
 
             // External-fd CQEs: drop after unregister so a cancelled or
             // still-in-flight poll (POLL_REMOVE completions reuse the

@@ -450,18 +450,43 @@ const SmokeClient = struct {
     }
 };
 
+/// Distinct smoke-test port per test-matrix variant. The variants run as
+/// concurrent test binaries and the server binds with SO_REUSEPORT, so a
+/// shared port silently "works" - until the kernel load-balances one
+/// variant's smoke client onto another variant's server as its bounded run
+/// window expires (a connection reset instead of a pong; flaky on Linux).
+fn smokeTestPort() u16 {
+    const build_options = @import("build_options");
+    var port: u16 = 39440;
+    if (build_options.enable_tls) port += 1;
+    if (build_options.enable_http2) port += 2;
+    if (build_options.enable_http3) port += 4;
+    if (build_options.enable_proxy) port += 8;
+    if (build_options.enable_io_uring) port += 16;
+    if (build_options.enable_x402_crypto) port += 32;
+    return port;
+}
+
 test "bootstrap.run serves a config-driven single-process server end to end" {
     const allocator = std.testing.allocator;
 
     var app_router = router_mod.Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
     try app_router.get("/bootstrap-ping", bootstrapPingHandler);
 
-    var client = SmokeClient{ .port = 39471 };
+    const port = smokeTestPort();
+    var client = SmokeClient{ .port = port };
     const t = try std.Thread.spawn(.{}, SmokeClient.drive, .{&client});
+
+    var cfg_buf: [128]u8 = undefined;
+    const cfg_json = try std.fmt.bufPrint(
+        &cfg_buf,
+        "{{ \"server\": {{ \"address\": \"127.0.0.1\", \"port\": {d}, \"workers\": 1 }} }}",
+        .{port},
+    );
 
     // Blocks for the bounded run window, then tears the server down.
     try run(allocator, .{
-        .config_json = "{ \"server\": { \"address\": \"127.0.0.1\", \"port\": 39471, \"workers\": 1 } }",
+        .config_json = cfg_json,
         .router = app_router,
         .run_for_ms = 1500,
     });
