@@ -206,6 +206,27 @@ Backend pools for the reverse proxy (requires an `-Denable-proxy=true` build). E
 | `dns_discovery` | object | (none) | DNS-based server discovery. |
 | `consul_discovery` | object | (none) | Consul-based server discovery. |
 | `allow_private` | bool | `true` | Allow private/loopback backend addresses. |
+| `tls` | bool | `false` | Connect to this upstream's servers over TLS (HTTPS backends such as AWS Bedrock or api.openai.com). Requires an `-Denable-tls=true` build; rejected at config parse otherwise. Not supported on `unix` servers or WebSocket upgrade routes. |
+| `tls_verify` | bool | `true` | Verify the upstream certificate against the system trust store and check the hostname. Set `false` for self-signed backends (the connection is still encrypted but unauthenticated). |
+| `tls_sni` | string | `""` | SNI / hostname-verification name. Empty uses each server's `address`, which is right when the address is a hostname; set explicitly when servers are IPs. |
+
+Example: routing to an HTTPS API backend.
+
+```json
+{
+  "upstreams": [{
+    "name": "bedrock-v1",
+    "tls": true,
+    "servers": [{ "address": "bedrock-runtime.us-east-1.amazonaws.com", "port": 443 }]
+  }],
+  "routes": [{
+    "path_prefix": "/api/v1/bedrock",
+    "upstream": "bedrock-v1",
+    "rewrite_pattern": "/api/v1/bedrock",
+    "rewrite_replacement": "/model/us.anthropic.claude-sonnet-4-6/converse"
+  }]
+}
+```
 
 ### `upstreams[].servers[]`
 

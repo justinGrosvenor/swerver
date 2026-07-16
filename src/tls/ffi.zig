@@ -126,6 +126,16 @@ extern fn X509_get_subject_name(x: *const X509) ?*X509_NAME;
 extern fn X509_NAME_oneline(name: *const X509_NAME, buf: ?[*]u8, size: c_int) ?[*:0]const u8;
 pub extern fn X509_free(x: *X509) void;
 
+/// Client-side verify mode: SSL_VERIFY_PEER fails the handshake on an
+/// unverifiable chain; SSL_VERIFY_NONE accepts anything (self-signed
+/// backends behind `tls_verify: false`). Distinct from setVerifyPeer, whose
+/// `require=false` still requests verification - that is the SERVER-side
+/// mTLS semantic (request a client cert but allow its absence).
+pub fn setClientVerify(ctx: *SSL_CTX, verify: bool) void {
+    if (!tls_enabled) return;
+    SSL_CTX_set_verify(ctx, if (verify) SSL_VERIFY_PEER else SSL_VERIFY_NONE, null);
+}
+
 pub fn setVerifyPeer(ctx: *SSL_CTX, require: bool) void {
     if (!tls_enabled) return;
     const mode = if (require) SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT else SSL_VERIFY_PEER;
@@ -206,7 +216,7 @@ pub extern fn SSL_free(ssl: *SSL) void;
 extern fn SSL_set_accept_state(ssl: *SSL) void;
 extern fn SSL_set_connect_state(ssl: *SSL) void;
 extern fn SSL_do_handshake(ssl: *SSL) c_int;
-extern fn SSL_get_error(ssl: *const SSL, ret: c_int) c_int;
+pub extern fn SSL_get_error(ssl: *const SSL, ret: c_int) c_int;
 extern fn SSL_is_init_finished(ssl: *const SSL) c_int;
 pub extern fn SSL_read(ssl: *SSL, buf: [*]u8, num: c_int) c_int;
 pub extern fn SSL_write(ssl: *SSL, buf: [*]const u8, num: c_int) c_int;

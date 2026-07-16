@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const config_mod = @import("config.zig");
 const upstream_mod = @import("proxy/upstream.zig");
 const balancer_mod = @import("proxy/balancer.zig");
@@ -365,6 +366,25 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
             };
         }
 
+        const upstream_tls_on = u.tls orelse false;
+        if (upstream_tls_on) {
+            if (!build_options.enable_tls) {
+                std.log.warn("upstream '{s}': tls=true requires a -Denable-tls build", .{u.name});
+                return error.ConfigParseError;
+            }
+            // TLS is TCP-only: a unix-socket backend has no hostname to
+            // verify and the data path never handshakes on unix fds.
+            for (servers_out) |sv| {
+                if (sv.unix_path.len > 0) {
+                    std.log.warn("upstream '{s}': tls=true is not supported on unix_path servers", .{u.name});
+                    return error.ConfigParseError;
+                }
+            }
+            if (u.tls_sni) |sni| {
+                if (!isSafeHttpValue(sni)) return error.ConfigParseError;
+            }
+        }
+
         upstreams_out[ui] = .{
             .name = u.name,
             .servers = servers_out,
@@ -374,6 +394,9 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
             .dns_discovery = dns_discovery,
             .consul_discovery = consul_discovery,
             .allow_private = u.allow_private orelse true,
+            .tls = upstream_tls_on,
+            .tls_verify = u.tls_verify orelse true,
+            .tls_sni = u.tls_sni orelse "",
         };
     }
 
@@ -876,6 +899,9 @@ const UpstreamJson = struct {
     dns_discovery: ?DnsDiscoveryJson = null,
     consul_discovery: ?ConsulDiscoveryJson = null,
     allow_private: ?bool = null,
+    tls: ?bool = null,
+    tls_verify: ?bool = null,
+    tls_sni: ?[]const u8 = null,
 };
 
 const DnsDiscoveryJson = struct {
@@ -1138,6 +1164,52 @@ test "parse unix-socket upstream server" {
     try std.testing.expectEqualStrings("/tmp/vm-42.sock", loaded.upstreams[0].servers[0].unix_path);
     try std.testing.expectEqualStrings("", loaded.upstreams[0].servers[0].address);
     try std.testing.expectEqual(@as(u16, 0), loaded.upstreams[0].servers[0].port);
+}
+
+test "parse tls upstream fields (issue #36)" {
+    const json =
+        \\{
+        \\  "upstreams": [{
+        \\    "name": "bedrock-v1",
+        \\    "tls": true,
+        \\    "tls_sni": "bedrock-runtime.us-east-1.amazonaws.com",
+        \\    "servers": [ { "address": "bedrock-runtime.us-east-1.amazonaws.com", "port": 443 } ]
+        \\  }],
+        \\  "routes": [{ "path_prefix": "/api/v1/bedrock", "upstream": "bedrock-v1" }]
+        \\}
+    ;
+    if (build_options.enable_tls) {
+        var loaded = try parseJsonFromBytes(std.testing.allocator, json);
+        defer loaded.deinit();
+        try std.testing.expect(loaded.upstreams[0].tls);
+        try std.testing.expect(loaded.upstreams[0].tls_verify); // default on
+        try std.testing.expectEqualStrings("bedrock-runtime.us-east-1.amazonaws.com", loaded.upstreams[0].tls_sni);
+    } else {
+        // Fail fast at parse: a tls upstream on a TLS-less build would
+        // otherwise ship cleartext to an HTTPS port at runtime.
+        try std.testing.expectError(error.ConfigParseError, parseJsonFromBytes(std.testing.allocator, json));
+    }
+
+    const verify_off =
+        \\{ "upstreams": [{ "name": "dev", "tls": true, "tls_verify": false,
+        \\    "servers": [ { "address": "127.0.0.1", "port": 8443 } ] }],
+        \\  "routes": [{ "path_prefix": "/", "upstream": "dev" }] }
+    ;
+    if (build_options.enable_tls) {
+        var loaded2 = try parseJsonFromBytes(std.testing.allocator, verify_off);
+        defer loaded2.deinit();
+        try std.testing.expect(loaded2.upstreams[0].tls);
+        try std.testing.expect(!loaded2.upstreams[0].tls_verify);
+        try std.testing.expectEqualStrings("", loaded2.upstreams[0].tls_sni);
+    }
+}
+
+test "reject tls on unix-socket upstream servers" {
+    const json =
+        \\{ "upstreams": [{ "name": "vm", "tls": true, "servers": [ { "unix": "/tmp/vm.sock" } ] }],
+        \\  "routes": [{ "path_prefix": "/", "upstream": "vm" }] }
+    ;
+    try std.testing.expectError(error.ConfigParseError, parseJsonFromBytes(std.testing.allocator, json));
 }
 
 test "reject unix + address on the same server, and non-absolute unix path" {

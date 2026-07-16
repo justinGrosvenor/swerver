@@ -30,6 +30,16 @@ pub const Upstream = struct {
     /// Allow connections to private/loopback addresses (default true for backwards compat).
     /// Set false to enable SSRF protection on this upstream.
     allow_private: bool = true,
+    /// Connect to this upstream's servers over TLS (HTTPS backends, e.g.
+    /// AWS Bedrock or api.openai.com). Requires -Denable-tls; rejected at
+    /// config validation otherwise.
+    tls: bool = false,
+    /// Verify the upstream's certificate against the system trust store and
+    /// check the hostname (default on). Set false for self-signed backends.
+    tls_verify: bool = true,
+    /// SNI/hostname-verification name. Empty = each server's `address`
+    /// (right for hostname addresses; set explicitly when servers are IPs).
+    tls_sni: []const u8 = "",
 };
 
 /// Individual backend server definition
