@@ -17,6 +17,7 @@ const compress_mod = @import("../middleware/compress.zig");
 const net = @import("../runtime/net.zig");
 const clock = @import("../runtime/clock.zig");
 const buffer_pool = @import("../runtime/buffer_pool.zig");
+const upstream_tls = @import("upstream_tls.zig");
 const build_options = @import("build_options");
 // WASM edge filters (design 10.0). Gated; ProxyRoute stores the pool as an
 // opaque pointer so this module compiles without the vendored wasm3 dependency.
@@ -295,6 +296,9 @@ pub const Proxy = struct {
     dns_discovery: dns_mod.DnsDiscovery,
     /// Consul service discovery (polls Consul HTTP API periodically)
     consul_discovery: consul_mod.ConsulDiscovery,
+    /// Client SSL_CTX per TLS-enabled upstream (upstream name -> ctx),
+    /// created at init, freed at deinit. Empty when no upstream sets `tls`.
+    tls_ctxs: std.StringHashMap(*anyopaque),
 
     const REQUEST_BUF_SIZE = 8192;
     const RESPONSE_BUF_SIZE = 65536;
@@ -454,6 +458,7 @@ pub const Proxy = struct {
             .route_caches = route_caches,
             .dns_discovery = dns_discovery,
             .consul_discovery = consul_discovery,
+            .tls_ctxs = std.StringHashMap(*anyopaque).init(allocator),
         };
 
         // Phase 3: Register upstreams - use errdefer to cleanup proxy internals only
@@ -469,10 +474,21 @@ pub const Proxy = struct {
             proxy.upstreams_by_name.deinit();
             proxy.pool_manager.deinit();
             proxy.health_manager.deinit();
+            var ctx_it = proxy.tls_ctxs.valueIterator();
+            while (ctx_it.next()) |ctx| upstream_tls.destroyContext(ctx.*);
+            proxy.tls_ctxs.deinit();
         }
 
         for (config.upstreams) |*up| {
             try proxy.upstreams_by_name.put(up.name, up);
+
+            if (up.tls) {
+                const ctx = upstream_tls.createContext(up.tls_verify) catch |err| {
+                    std.log.err("upstream '{s}': TLS client init failed: {} (HTTPS upstreams need a -Denable-tls build)", .{ up.name, err });
+                    return err;
+                };
+                try proxy.tls_ctxs.put(up.name, ctx);
+            }
 
             // Create connection pool
             const pool = try proxy.pool_manager.getOrCreatePool(up);
@@ -509,6 +525,10 @@ pub const Proxy = struct {
         self.upstreams_by_name.deinit();
         self.pool_manager.deinit();
         self.health_manager.deinit();
+
+        var ctx_it = self.tls_ctxs.valueIterator();
+        while (ctx_it.next()) |ctx| upstream_tls.destroyContext(ctx.*);
+        self.tls_ctxs.deinit();
 
         self.dns_discovery.deinit();
         self.consul_discovery.deinit();
@@ -612,16 +632,47 @@ pub const Proxy = struct {
     /// to `cap` bytes (route.max_response_bytes). Completion is decided
     /// the same way at every step: a successful parse that is not
     /// close-delimited, or EOF.
+    /// Send to an upstream over its negotiated transport (TLS or plain).
+    fn sendUpstream(c: *const pool_mod.UpstreamConnection, data: []const u8) error{SendFailed}!void {
+        if (c.ssl) |ssl| return upstream_tls.send(ssl, data);
+        return net.sendAll(c.fd, data);
+    }
+
+    fn recvUpstream(ssl: ?*anyopaque, fd: std.posix.fd_t, buf: []u8) error{RecvFailed}!usize {
+        if (ssl) |s| return upstream_tls.recv(s, buf);
+        return net.recvBlocking(fd, buf);
+    }
+
+    /// Establish the TLS session on a freshly connected upstream connection.
+    /// No-op for plain upstreams and already-handshaked pooled connections.
+    /// The fd's socket timeouts (set right after connect) bound the handshake.
+    fn ensureUpstreamTls(
+        self: *Proxy,
+        c: *pool_mod.UpstreamConnection,
+        up: *const upstream.Upstream,
+        server_address: []const u8,
+    ) bool {
+        if (!up.tls or c.ssl != null) return true;
+        const ctx = self.tls_ctxs.get(up.name) orelse return false;
+        const sni = if (up.tls_sni.len > 0) up.tls_sni else server_address;
+        c.ssl = upstream_tls.connect(ctx, c.fd, sni, up.tls_verify) catch |err| {
+            std.log.warn("upstream '{s}': TLS handshake with {s} failed: {}", .{ up.name, sni, err });
+            return false;
+        };
+        return true;
+    }
+
     fn readUpstreamResponse(
         self: *Proxy,
         fd: std.posix.fd_t,
+        ssl: ?*anyopaque,
         fixed: []u8,
         is_head: bool,
         cap: usize,
     ) UpstreamReadError!UpstreamRead {
         var total: usize = 0;
         while (total < fixed.len) {
-            const n = net.recvBlocking(fd, fixed[total..]) catch return error.ReadFailed;
+            const n = recvUpstream(ssl, fd, fixed[total..]) catch return error.ReadFailed;
             if (n == 0) break; // EOF
             total += n;
             if (forward.parseUpstreamResponse(fixed[0..total], is_head)) |parsed| {
@@ -653,7 +704,7 @@ pub const Proxy = struct {
                 };
                 capacity = new_capacity;
             }
-            const n = net.recvBlocking(fd, owned[total..capacity]) catch {
+            const n = recvUpstream(ssl, fd, owned[total..capacity]) catch {
                 self.allocator.free(owned);
                 return error.ReadFailed;
             };
@@ -834,6 +885,13 @@ pub const Proxy = struct {
                     }
                 }
 
+                // HTTPS upstream: handshake once per fresh connection
+                // (pooled keep-alive connections reuse their session).
+                if (!self.ensureUpstreamTls(c, upstream_def, connect_server.address)) {
+                    pool.markConnectionFailed(c, now_ms, connect_server.max_fails);
+                    continue;
+                }
+
                 // Build upstream request
                 const ctx = forward.ForwardContext{
                     .client_request = req,
@@ -869,7 +927,7 @@ pub const Proxy = struct {
 
                 // Send request to upstream
                 const body_sent = !split_body and req.body.len() > 0;
-                net.sendAll(c.fd, self.request_bufs[req_buf_idx][0..request_len]) catch {
+                sendUpstream(c, self.request_bufs[req_buf_idx][0..request_len]) catch {
                     pool.markConnectionFailed(c, now_ms, connect_server.max_fails);
                     // RFC 9110 §9.2.2: Only retry if method is idempotent or body not sent
                     if (body_sent and !forward.isIdempotent(req.method)) {
@@ -879,7 +937,7 @@ pub const Proxy = struct {
                     continue;
                 };
                 if (split_body and inline_body.len > 0) {
-                    net.sendAll(c.fd, inline_body) catch {
+                    sendUpstream(c, inline_body) catch {
                         pool.markConnectionFailed(c, now_ms, connect_server.max_fails);
                         // Body (partially) on the wire: only idempotent methods retry.
                         if (!forward.isIdempotent(req.method)) {
@@ -896,6 +954,7 @@ pub const Proxy = struct {
                 const is_head = req.method == .HEAD;
                 const ur = self.readUpstreamResponse(
                     c.fd,
+                    c.ssl,
                     self.response_bufs[resp_buf_idx][0..],
                     is_head,
                     route.max_response_bytes,
@@ -1148,6 +1207,12 @@ pub const Proxy = struct {
                     }
                 }
 
+                // HTTPS upstream: handshake once per fresh connection.
+                if (!self.ensureUpstreamTls(c, upstream_def_b, connect_server_b.address)) {
+                    pool.markConnectionFailed(c, now_ms, connect_server_b.max_fails);
+                    continue;
+                }
+
                 // Build upstream request headers only (no body in buffer)
                 const ctx = forward.ForwardContext{
                     .client_request = req,
@@ -1172,7 +1237,7 @@ pub const Proxy = struct {
                 };
 
                 // Send headers to upstream
-                net.sendAll(c.fd, self.request_bufs[req_buf_idx][0..header_len]) catch {
+                sendUpstream(c, self.request_bufs[req_buf_idx][0..header_len]) catch {
                     pool.markConnectionFailed(c, now_ms, connect_server_b.max_fails);
                     if (!forward.isIdempotent(req.method)) {
                         self.releaseResponseBuffer(resp_buf_idx);
@@ -1185,7 +1250,7 @@ pub const Proxy = struct {
                 var body_send_failed = false;
                 var body_iter = body_view.iterator();
                 while (body_iter.next()) |chunk| {
-                    net.sendAll(c.fd, chunk) catch {
+                    sendUpstream(c, chunk) catch {
                         pool.markConnectionFailed(c, now_ms, connect_server_b.max_fails);
                         body_send_failed = true;
                         break;
@@ -1205,6 +1270,7 @@ pub const Proxy = struct {
                 const is_head_b = req.method == .HEAD;
                 const ur = self.readUpstreamResponse(
                     c.fd,
+                    c.ssl,
                     self.response_bufs[resp_buf_idx][0..],
                     is_head_b,
                     route.max_response_bytes,
@@ -1387,7 +1453,7 @@ pub const Proxy = struct {
         }
 
         const is_head = req.method == .HEAD;
-        const ur = self.readUpstreamResponse(fd, self.response_bufs[resp_buf_idx][0..], is_head, route.max_response_bytes) catch {
+        const ur = self.readUpstreamResponse(fd, null, self.response_bufs[resp_buf_idx][0..], is_head, route.max_response_bytes) catch {
             registry.evict(tenant_key);
             self.releaseResponseBuffer(resp_buf_idx);
             return backpressure;
@@ -1454,6 +1520,23 @@ pub const Proxy = struct {
         const fd = connectToServer(server_m, 500, upstream_m.allow_private) catch return;
         defer clock.closeFd(fd);
 
+        // Mirrors are fire-and-forget and unpooled: handshake a throwaway
+        // session for HTTPS mirror upstreams.
+        var mirror_ssl: ?*anyopaque = null;
+        if (upstream_m.tls) {
+            const tctx = self.tls_ctxs.get(mirror_name) orelse return;
+            const sni = if (upstream_m.tls_sni.len > 0) upstream_m.tls_sni else server_m.address;
+            mirror_ssl = upstream_tls.connect(tctx, fd, sni, upstream_m.tls_verify) catch return;
+        }
+        defer if (mirror_ssl) |ssl| upstream_tls.freeSession(ssl);
+
+        const mirrorSend = struct {
+            fn send(ssl: ?*anyopaque, mfd: std.posix.fd_t, data: []const u8) error{SendFailed}!void {
+                if (ssl) |session| return upstream_tls.send(session, data);
+                return net.sendAll(mfd, data);
+            }
+        }.send;
+
         const dummy_route = upstream.ProxyRoute{
             .path_prefix = "",
             .upstream = mirror_name,
@@ -1471,10 +1554,10 @@ pub const Proxy = struct {
 
         if (body_view) |bv| {
             const header_len = forward.buildUpstreamRequestHeaders(&mirror_req_buf, &ctx, bv.totalLen()) catch return;
-            net.sendAll(fd, mirror_req_buf[0..header_len]) catch return;
+            mirrorSend(mirror_ssl, fd, mirror_req_buf[0..header_len]) catch return;
             var it = bv.iterator();
             while (it.next()) |chunk| {
-                net.sendAll(fd, chunk) catch return;
+                mirrorSend(mirror_ssl, fd, chunk) catch return;
             }
         } else {
             // Same split fallback as handle(): mirror the full body even when
@@ -1485,9 +1568,9 @@ pub const Proxy = struct {
                 split_body = true;
                 break :blk forward.buildUpstreamRequestHeaders(&mirror_req_buf, &ctx, inline_body.len) catch return;
             };
-            net.sendAll(fd, mirror_req_buf[0..req_len]) catch return;
+            mirrorSend(mirror_ssl, fd, mirror_req_buf[0..req_len]) catch return;
             if (split_body and inline_body.len > 0) {
-                net.sendAll(fd, inline_body) catch return;
+                mirrorSend(mirror_ssl, fd, inline_body) catch return;
             }
         }
     }
@@ -1698,12 +1781,14 @@ test "Proxy route matching" {
         .route_caches = &.{},
         .dns_discovery = .{ .allocator = allocator, .entries = &.{}, .entry_count = 0 },
         .consul_discovery = .{ .allocator = allocator, .entries = &.{}, .entry_count = 0 },
+        .tls_ctxs = std.StringHashMap(*anyopaque).init(allocator),
     };
     defer {
         proxy.pool_manager.deinit();
         proxy.balancers.deinit();
         proxy.health_manager.deinit();
         proxy.upstreams_by_name.deinit();
+        proxy.tls_ctxs.deinit();
     }
 
     // Test /api/v1/ matching

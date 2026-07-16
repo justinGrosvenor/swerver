@@ -2511,6 +2511,16 @@ fn setupWebSocketTunnel(
         };
         return;
     };
+    // WebSocket tunnels splice raw bytes between two fds in the event loop;
+    // a TLS upstream would need a non-blocking SSL pump there. Not supported
+    // yet: fail the upgrade rather than tunnel cleartext to an HTTPS port.
+    if (upstream_def.tls) {
+        std.log.warn("websocket upgrade to TLS upstream '{s}' is not supported", .{effective_upstream});
+        http1_mod.queueResponse(server, conn, ws_mod.errorResp(502)) catch {
+            conn.close_after_write = true;
+        };
+        return;
+    }
     const bal = proxy.balancers.get(effective_upstream) orelse {
         http1_mod.queueResponse(server, conn, ws_mod.errorResp(502)) catch {
             conn.close_after_write = true;

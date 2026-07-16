@@ -1,6 +1,7 @@
 const std = @import("std");
 const upstream = @import("upstream.zig");
 const clock = @import("../runtime/clock.zig");
+const upstream_tls = @import("upstream_tls.zig");
 
 /// Upstream Connection Pool
 ///
@@ -50,6 +51,10 @@ pub const UpstreamConnection = struct {
     active_streams: u16,
     /// For HTTP/2: max concurrent streams from SETTINGS
     max_streams: u16,
+    /// TLS session (upstream_tls) when this upstream speaks HTTPS; null for
+    /// plain TCP. Owned by the connection: freed wherever the pool closes
+    /// the fd, and kept alive across keep-alive reuse.
+    ssl: ?*anyopaque = null,
 
     pub fn init(fd: std.posix.fd_t, server_index: u16, now_ms: u64, pool_index: u32) UpstreamConnection {
         return .{
@@ -167,6 +172,7 @@ pub const Pool = struct {
         // Close any remaining connections
         for (self.connections) |maybe_conn| {
             if (maybe_conn) |conn| {
+                if (conn.ssl) |ssl| upstream_tls.freeSession(ssl);
                 // Only close valid file descriptors
                 if (conn.fd >= 0) {
                     clock.closeFd(conn.fd);
@@ -250,6 +256,10 @@ pub const Pool = struct {
         const index = conn.pool_index;
         if (conn.state == .idle) {
             self.idle_count -= 1;
+        }
+        if (conn.ssl) |ssl| {
+            upstream_tls.freeSession(ssl);
+            conn.ssl = null;
         }
         // Only close valid file descriptors
         if (conn.fd >= 0) {

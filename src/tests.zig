@@ -93,6 +93,7 @@ const proxy_balancer = @import("proxy/balancer.zig");
 const proxy_forward = @import("proxy/forward.zig");
 const proxy_health = @import("proxy/health.zig");
 const proxy_handler = @import("proxy/proxy.zig");
+const proxy_upstream_tls = @import("proxy/upstream_tls.zig");
 const proxy_cache = @import("proxy/cache.zig");
 const proxy_dns = @import("proxy/dns.zig");
 const proxy_consul = @import("proxy/consul.zig");
@@ -210,6 +211,7 @@ comptime {
     _ = proxy_forward;
     _ = proxy_health;
     _ = proxy_handler;
+    _ = proxy_upstream_tls;
     _ = proxy_websocket;
 
     // I/O backend — `io_uring_poll` is the portable one

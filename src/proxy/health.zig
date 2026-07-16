@@ -4,6 +4,7 @@ const pool_mod = @import("pool.zig");
 const forward = @import("forward.zig");
 const net = @import("../runtime/net.zig");
 const clock = @import("../runtime/clock.zig");
+const upstream_tls = @import("upstream_tls.zig");
 
 /// Health Check System
 ///
@@ -100,6 +101,9 @@ pub const HealthChecker = struct {
     request_buf: []u8,
     /// Buffer for health check responses
     response_buf: []u8,
+    /// Client TLS context when the upstream speaks HTTPS (probes handshake
+    /// with the same verify policy the proxy uses). Null for plain upstreams.
+    tls_ctx: ?*anyopaque = null,
 
     const REQUEST_BUF_SIZE = 512;
     const RESPONSE_BUF_SIZE = 4096;
@@ -120,6 +124,12 @@ pub const HealthChecker = struct {
         errdefer allocator.free(request_buf);
 
         const response_buf = try allocator.alloc(u8, RESPONSE_BUF_SIZE);
+        errdefer allocator.free(response_buf);
+
+        const tls_ctx: ?*anyopaque = if (upstream_def.tls)
+            try upstream_tls.createContext(upstream_def.tls_verify)
+        else
+            null;
 
         return .{
             .allocator = allocator,
@@ -129,10 +139,12 @@ pub const HealthChecker = struct {
             .published_states = published_states,
             .request_buf = request_buf,
             .response_buf = response_buf,
+            .tls_ctx = tls_ctx,
         };
     }
 
     pub fn deinit(self: *HealthChecker) void {
+        if (self.tls_ctx) |ctx| upstream_tls.destroyContext(ctx);
         self.allocator.free(self.server_health);
         self.allocator.free(self.published_states);
         self.allocator.free(self.request_buf);
@@ -191,8 +203,24 @@ pub const HealthChecker = struct {
         // Set socket timeouts
         net.setSocketTimeouts(fd, self.config.timeout_ms, self.config.timeout_ms);
 
+        // HTTPS upstream: probe over TLS (TCP-connect alone would just
+        // collect a "plain HTTP request to HTTPS port" error page).
+        var ssl: ?*anyopaque = null;
+        if (self.tls_ctx) |ctx| {
+            const up = self.upstream_def;
+            const sni = if (up.tls_sni.len > 0) up.tls_sni else server.address;
+            ssl = upstream_tls.connect(ctx, fd, sni, up.tls_verify) catch {
+                health_state.recordFailure(now_ms, &self.config);
+                return false;
+            };
+        }
+        defer if (ssl) |session| upstream_tls.freeSession(session);
+
         // Send health check request
-        net.sendAll(fd, self.request_buf[0..request_len]) catch {
+        (if (ssl) |session|
+            upstream_tls.send(session, self.request_buf[0..request_len])
+        else
+            net.sendAll(fd, self.request_buf[0..request_len])) catch {
             health_state.recordFailure(now_ms, &self.config);
             return false;
         };
@@ -200,7 +228,10 @@ pub const HealthChecker = struct {
         // Read response
         var total_read: usize = 0;
         while (total_read < self.response_buf.len) {
-            const n = net.recvBlocking(fd, self.response_buf[total_read..]) catch break;
+            const n = (if (ssl) |session|
+                upstream_tls.recv(session, self.response_buf[total_read..])
+            else
+                net.recvBlocking(fd, self.response_buf[total_read..])) catch break;
             if (n == 0) break;
             total_read += n;
 
