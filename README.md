@@ -4,7 +4,7 @@
 
 <h1 align="center">swerver</h1>
 
-<p align="center">A bare metal HTTP server written in pure Zig.</p>
+<p align="center">A fast, complete HTTP/1/2/3 gateway in pure Zig, with WASM edge compute and hardware-isolated microVMs.</p>
 
 <p align="center">
   <a href="https://swerver.net">swerver.net</a> ·
@@ -25,9 +25,11 @@ HTTP/3   ──┘      │
 
 ## What
 
-Swerver is a bare-metal HTTP/1.1 + HTTP/2 + HTTP/3 server. It runs among the fastest entries on HttpArena's 64-core benchmark, including the json-tls workload (TLS termination plus JSON serialization) at 1.95M req/s, and ranks high across baseline, pipelined, HTTP/2, and HTTP/3, while carrying a full middleware chain, TLS termination, and routing.
+swerver is a fast, complete HTTP/1/2/3 gateway written in pure Zig: three protocols (HTTP/1.1, HTTP/2, and HTTP/3 over QUIC), TLS termination, routing, a full middleware chain, a reverse proxy, and an async PostgreSQL client. It runs among the fastest entries on HttpArena's 64-core benchmark, including the json-tls workload (TLS termination plus JSON serialization) at 1.95M req/s, and ranks high across baseline, pipelined, HTTP/2, and HTTP/3.
 
 Fixed-size buffer pools. Stack-allocated parsing. No garbage collection. No hidden allocations. No surprises.
+
+It also runs compute at two altitudes on the request path. WASM edge filters run inline for logic at the edge (microseconds, fuel-bounded, fail-closed, ~0.001ms p50 added). And when a request needs real isolation, a filter can park and fork a hardware-isolated microVM via [nether](https://github.com/justinGrosvenor/nether) for untrusted or agent code, warm in tens of milliseconds, then resume. One binary, self-hostable, no k8s.
 
 ## Quick Start
 

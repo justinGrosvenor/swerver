@@ -1,13 +1,13 @@
 # Personas
 
-## platform-operator
+## the-ml-platform-lead-who-refuses-k8s
 
-Runs production deployments, manages rollout safety, and monitors performance and availability.
+Runs self-hosted models on a rack. Wants a runtime in a box next door that dynamically allocates real services: a tenant key forks a real HTTP server in a hardware-isolated microVM, warm in tens of milliseconds, reaped when idle. No k8s, no other infra stack.
 
-## backend-developer
+## cloud-native-agent-team-needing-egress-governance
 
-Builds application logic on top of the server runtime and requires predictable performance and APIs.
+The model endpoint is just an upstream (a local rack or api.openai.com, same config shape). Agents reach only what is allowlisted; a prompt-injected exfiltration attempt dies at the egress wall with a journal line; every provider call is metered per consumer.
 
 ## reverse-proxy-operator
 
-Deploys Swerver as a reverse proxy in front of backend services, managing traffic distribution, failover, and observability across upstream servers.
+Still first-class: swerver is a fast, correct HTTP/1/2/3 reverse proxy with TLS termination, routing, and a full middleware chain, usable with none of the agent-compute machinery.
