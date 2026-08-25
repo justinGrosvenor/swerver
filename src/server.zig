@@ -209,6 +209,10 @@ pub const Server = struct {
     static_cache: ?std.StringHashMap(StaticCacheEntry) = null,
     /// Total bytes of cached static bodies, bounded by STATIC_CACHE_MAX_BYTES.
     static_cache_bytes: usize = 0,
+    /// Old cache bodies retained after a size-changing refresh. HTTP/1 may hold
+    /// a slice while a slow response drains, so those allocations cannot be
+    /// freed until server teardown. Same-size refreshes reuse the allocation.
+    static_cache_retired: std.ArrayList([]u8) = .empty,
     /// Pre-encoded HTTP/1.1 response cache for opt-in hot static
     /// endpoints. The bytes are raw HTTP/1.1 (status line + headers +
     /// body). Refresh is lazy / per-second to track the Date header.
@@ -487,6 +491,8 @@ pub const Server = struct {
             }
             cache.deinit();
         }
+        for (self.static_cache_retired.items) |body| self.allocator.free(body);
+        self.static_cache_retired.deinit(self.allocator);
         if (self.admin_listener_fd) |fd| clock.closeFd(fd);
         if (self.otel) |otel_ptr| self.allocator.destroy(otel_ptr);
         if (self.pending_reload.swap(null, .acq_rel)) |pr| {
@@ -1378,12 +1384,19 @@ pub const Server = struct {
         body: []u8,
         content_type: []const u8,
         encoding: StaticEncoding,
+        /// A cache entry is periodically reread so mounted static directories
+        /// and atomically replaced precompressed variants remain live.
+        refresh_after_ms: u64,
+        valid: bool = true,
     };
 
     /// Total cached static body bytes never exceed this (per worker).
     /// Once the cap is hit, further files are served uncached rather
     /// than evicting existing entries.
     const STATIC_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+    /// Revalidation is per worker and per entry. One reread per second is
+    /// negligible beside static traffic while bounding stale mounted files.
+    const STATIC_CACHE_REVALIDATE_MS: u64 = 1000;
 
     /// The Accept-Encoding facts that change which file gets served. Cached
     /// entries are keyed by this so every distinct negotiation outcome is
@@ -1398,6 +1411,88 @@ pub const Server = struct {
         if (br) return .br;
         if (gz) return .gzip;
         return .none;
+    }
+
+    const LoadedStaticBody = struct {
+        body: []u8,
+        encoding: StaticEncoding,
+    };
+
+    fn loadStaticBody(self: *Server, file_path: []const u8, accept_encoding: []const u8) ?LoadedStaticBody {
+        const root_fd = self.static_root_fd orelse return null;
+        const variant = resolveStaticVariant(root_fd, file_path, accept_encoding) orelse return null;
+        defer clock.closeFd(variant.fd);
+
+        const end_pos = std.c.lseek(variant.fd, 0, std.posix.SEEK.END);
+        if (end_pos < 0) return null;
+        _ = std.c.lseek(variant.fd, 0, std.posix.SEEK.SET);
+        const size: usize = @intCast(end_pos);
+
+        const body = self.allocator.alloc(u8, size) catch return null;
+        var off: usize = 0;
+        while (off < size) {
+            const n = std.c.pread(variant.fd, body.ptr + off, size - off, @intCast(off));
+            if (n < 0) {
+                switch (std.posix.errno(n)) {
+                    .INTR => continue,
+                    else => {
+                        self.allocator.free(body);
+                        return null;
+                    },
+                }
+            }
+            if (n == 0) break;
+            off += @intCast(n);
+        }
+        if (off != size) {
+            self.allocator.free(body);
+            return null;
+        }
+        return .{ .body = body, .encoding = variant.encoding };
+    }
+
+    fn refreshStaticCacheEntry(
+        self: *Server,
+        entry: *StaticCacheEntry,
+        file_path: []const u8,
+        content_type: []const u8,
+        accept_encoding: []const u8,
+        now_ms: u64,
+    ) bool {
+        const loaded = self.loadStaticBody(file_path, accept_encoding) orelse {
+            // Do not serve a deleted/unreadable file from memory forever. Keep
+            // the allocation for a later same-size recovery, but fall through
+            // to the uncached path until the next refresh window.
+            entry.valid = false;
+            entry.refresh_after_ms = now_ms +% STATIC_CACHE_REVALIDATE_MS;
+            return false;
+        };
+
+        if (loaded.body.len == entry.body.len) {
+            @memcpy(entry.body, loaded.body);
+            self.allocator.free(loaded.body);
+        } else {
+            const next_bytes = self.static_cache_bytes - entry.body.len + loaded.body.len;
+            if (next_bytes > STATIC_CACHE_MAX_BYTES) {
+                self.allocator.free(loaded.body);
+                entry.valid = false;
+                entry.refresh_after_ms = now_ms +% STATIC_CACHE_REVALIDATE_MS;
+                return false;
+            }
+            self.static_cache_retired.append(self.allocator, entry.body) catch {
+                self.allocator.free(loaded.body);
+                entry.valid = false;
+                entry.refresh_after_ms = now_ms +% STATIC_CACHE_REVALIDATE_MS;
+                return false;
+            };
+            self.static_cache_bytes = next_bytes;
+            entry.body = loaded.body;
+        }
+        entry.content_type = content_type;
+        entry.encoding = loaded.encoding;
+        entry.refresh_after_ms = now_ms +% STATIC_CACHE_REVALIDATE_MS;
+        entry.valid = true;
+        return true;
     }
 
     /// Cache-aware static lookup. Returns a cached entry to serve, reading
@@ -1423,49 +1518,35 @@ pub const Server = struct {
         key_buf[file_path.len + 1] = @intFromEnum(classifyAccept(accept_encoding));
         const key = key_buf[0 .. file_path.len + 2];
 
-        if (cache.getPtr(key)) |entry| return entry;
+        const now_ms = self.now_ms;
+        if (cache.getPtr(key)) |entry| {
+            if (now_ms >= entry.refresh_after_ms and
+                !self.refreshStaticCacheEntry(entry, file_path, content_type, accept_encoding, now_ms)) return null;
+            return if (entry.valid) entry else null;
+        }
 
         // Miss: resolve the variant, read it fully into an owned buffer.
-        const root_fd = self.static_root_fd orelse return null;
-        const variant = resolveStaticVariant(root_fd, file_path, accept_encoding) orelse return null;
-        defer clock.closeFd(variant.fd);
-
-        const end_pos = std.c.lseek(variant.fd, 0, std.posix.SEEK.END);
-        if (end_pos < 0) return null;
-        _ = std.c.lseek(variant.fd, 0, std.posix.SEEK.SET);
-        const size: usize = @intCast(end_pos);
+        const loaded = self.loadStaticBody(file_path, accept_encoding) orelse return null;
+        const size = loaded.body.len;
 
         // Too large to cache → tell the caller to serve it uncached.
-        if (self.static_cache_bytes + size > STATIC_CACHE_MAX_BYTES) return null;
-
-        const body = self.allocator.alloc(u8, size) catch return null;
-        var off: usize = 0;
-        while (off < size) {
-            const n = std.c.pread(variant.fd, body.ptr + off, size - off, @intCast(off));
-            if (n < 0) {
-                switch (std.posix.errno(n)) {
-                    .INTR => continue,
-                    else => {
-                        self.allocator.free(body);
-                        return null;
-                    },
-                }
-            }
-            if (n == 0) break;
-            off += @intCast(n);
-        }
-        if (off != size) {
-            self.allocator.free(body);
+        if (self.static_cache_bytes + size > STATIC_CACHE_MAX_BYTES) {
+            self.allocator.free(loaded.body);
             return null;
         }
 
         const owned_key = self.allocator.dupe(u8, key) catch {
-            self.allocator.free(body);
+            self.allocator.free(loaded.body);
             return null;
         };
-        cache.put(owned_key, .{ .body = body, .content_type = content_type, .encoding = variant.encoding }) catch {
+        cache.put(owned_key, .{
+            .body = loaded.body,
+            .content_type = content_type,
+            .encoding = loaded.encoding,
+            .refresh_after_ms = now_ms +% STATIC_CACHE_REVALIDATE_MS,
+        }) catch {
             self.allocator.free(owned_key);
-            self.allocator.free(body);
+            self.allocator.free(loaded.body);
             return null;
         };
         self.static_cache_bytes += size;
@@ -1610,6 +1691,50 @@ test "S2: a wasm filter whose module fails to load fails its routes closed" {
     try std.testing.expect(routes[0].wasm_pool == null);
     // An unrelated route is untouched.
     try std.testing.expect(!routes[1].wasm_required);
+}
+
+test "static cache revalidates a precompressed sibling from disk" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "app.js", .data = "identity" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "app.js.br", .data = "old-br" });
+
+    var srv: Server = undefined;
+    srv.allocator = testing.allocator;
+    srv.static_root_fd = tmp.dir.handle;
+    srv.static_cache = std.StringHashMap(Server.StaticCacheEntry).init(testing.allocator);
+    srv.static_cache_bytes = 0;
+    srv.static_cache_retired = .empty;
+    srv.now_ms = 1;
+    defer {
+        if (srv.static_cache) |*cache| {
+            var it = cache.iterator();
+            while (it.next()) |kv| {
+                testing.allocator.free(kv.key_ptr.*);
+                testing.allocator.free(kv.value_ptr.body);
+            }
+            cache.deinit();
+        }
+        for (srv.static_cache_retired.items) |body| testing.allocator.free(body);
+        srv.static_cache_retired.deinit(testing.allocator);
+    }
+
+    const first = srv.staticCacheGetOrLoad("app.js", "application/javascript", "br") orelse
+        return error.CacheLoadFailed;
+    try testing.expectEqual(Server.StaticEncoding.br, first.encoding);
+    try testing.expectEqualStrings("old-br", first.body);
+
+    // The validator atomically replaces app.js plus its .br/.gz twins with
+    // same-length bytes. Once the refresh window expires, the worker must not
+    // keep serving the pre-replacement variant forever.
+    try tmp.dir.writeFile(io, .{ .sub_path = "app.js.br", .data = "new-br" });
+    srv.now_ms = 1 + Server.STATIC_CACHE_REVALIDATE_MS;
+    const refreshed = srv.staticCacheGetOrLoad("app.js", "application/javascript", "br") orelse
+        return error.CacheRefreshFailed;
+    try testing.expectEqual(Server.StaticEncoding.br, refreshed.encoding);
+    try testing.expectEqualStrings("new-br", refreshed.body);
 }
 
 test "metrics middleware response queued for http1" {

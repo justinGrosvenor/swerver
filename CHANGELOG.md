@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Static files
+
+- **fix: cached static and precompressed files now follow mounted disk changes.**
+  Per-worker static cache entries are revalidated once per second, including
+  `.br` and `.gz` siblings. Atomic replacements and deletions therefore become
+  visible without disabling the cache. This also prevents a temporary invalid
+  compressed variant observed by one worker from poisoning later TLS requests.
+
 ### Observability
 
 - **feat: OTLP trace exporter now supports TLS and custom headers.** The
