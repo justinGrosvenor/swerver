@@ -75,6 +75,9 @@ pub const LoadedConfig = struct {
     /// Tier-2 control-socket path ("" = none); borrows `arena`. Applied to the
     /// Server in main.zig so parking filters can drive a real sandbox from config.
     wasm_control_socket: []const u8,
+    /// Independent control connections. One is compatible with a direct Nether
+    /// socket; a broker such as nether-supervisor may opt into up to 16.
+    wasm_control_connections: u8,
     /// Park deadline in ms (0 = use the Server default).
     wasm_host_call_deadline_ms: u64,
     /// Tenant registry idle TTL in ms (0 = use the Server default).
@@ -631,6 +634,15 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
         };
     }
 
+    var wasm_control_connections = file_cfg.wasm_control_connections orelse 1;
+    if (wasm_control_connections == 0) {
+        std.log.warn("wasm_control_connections=0 is invalid; using 1", .{});
+        wasm_control_connections = 1;
+    } else if (wasm_control_connections > 16) {
+        std.log.warn("wasm_control_connections={d} exceeds the 16-lane ceiling; using 16", .{wasm_control_connections});
+        wasm_control_connections = 16;
+    }
+
     return .{
         .server_config = cfg,
         .upstreams = upstreams_out,
@@ -638,6 +650,7 @@ pub fn parseJsonFromBytes(parent_alloc: std.mem.Allocator, bytes: []const u8) !L
         .wasm_filters = wasm_out,
         // Borrows the parsed-JSON arena (same lifetime as wasm_filters' paths).
         .wasm_control_socket = file_cfg.wasm_control_socket orelse "",
+        .wasm_control_connections = @intCast(wasm_control_connections),
         .wasm_host_call_deadline_ms = file_cfg.wasm_host_call_deadline_ms orelse 0,
         .tenant_idle_ttl_ms = file_cfg.tenant_idle_ttl_ms orelse 0,
         .arena = arena,
@@ -742,8 +755,11 @@ const FileConfig = struct {
     /// Nether Tier-2 control-socket path. Set this to enable the real host-call
     /// transport for parking wasm filters from a config-driven deployment (it was
     /// previously settable only via the embedded Zig API). One global socket per
-    /// server, matching the single-ControlClient transport.
+    /// server, with an opt-in pool of parallel control connections.
     wasm_control_socket: ?[]const u8 = null,
+    /// Parallel connections to a broker-style control socket. Keep at one for a
+    /// direct Nether VM socket, whose additional clients are observers.
+    wasm_control_connections: ?u16 = null,
     /// Park (host_call) deadline in ms before a parked filter fails closed.
     wasm_host_call_deadline_ms: ?u64 = null,
     /// Tenant-to-microVM registry idle TTL in ms (park-concurrency Phase 1).
@@ -1469,10 +1485,11 @@ test "parse otel config" {
     try std.testing.expectEqual(@as(u16, 128), loaded.server_config.otel.max_batch_size);
 }
 
-test "O1: wasm_control_socket + deadline parse from config" {
+test "O1: wasm control socket, connections, and deadline parse from config" {
     const json =
         \\{
         \\  "wasm_control_socket": "/run/nether/agent.sock",
+        \\  "wasm_control_connections": 16,
         \\  "wasm_host_call_deadline_ms": 5000,
         \\  "wasm_filters": [{ "match": "/agent/", "module": "./f.wasm" }]
         \\}
@@ -1480,6 +1497,7 @@ test "O1: wasm_control_socket + deadline parse from config" {
     var loaded = try parseJsonFromBytes(std.testing.allocator, json);
     defer loaded.deinit();
     try std.testing.expectEqualStrings("/run/nether/agent.sock", loaded.wasm_control_socket);
+    try std.testing.expectEqual(@as(u8, 16), loaded.wasm_control_connections);
     try std.testing.expectEqual(@as(u64, 5000), loaded.wasm_host_call_deadline_ms);
     try std.testing.expectEqual(@as(usize, 1), loaded.wasm_filters.len);
     try std.testing.expectEqual(@as(u64, 0), loaded.tenant_idle_ttl_ms); // absent -> server default
@@ -1499,6 +1517,7 @@ test "O1: absent wasm_control_socket defaults to empty (transport off)" {
     var loaded = try parseJsonFromBytes(std.testing.allocator, "{}");
     defer loaded.deinit();
     try std.testing.expectEqualStrings("", loaded.wasm_control_socket);
+    try std.testing.expectEqual(@as(u8, 1), loaded.wasm_control_connections);
     try std.testing.expectEqual(@as(u64, 0), loaded.wasm_host_call_deadline_ms);
 }
 

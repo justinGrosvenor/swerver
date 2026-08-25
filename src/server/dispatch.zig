@@ -356,7 +356,7 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
                         if (slot < pg_client_mod.MAX_SLOTS) {
                             if (server.pg_client) |pgc| pgc.onEvent(&server.io, slot, event.kind);
                         } else if (build_options.enable_wasm) {
-                            if (server.wasmControlClient()) |cc| cc.onEvent(&server.io, event.kind);
+                            if (server.wasmControlClient()) |cc| cc.onEvent(&server.io, slot, event.kind);
                         }
                         continue;
                     }

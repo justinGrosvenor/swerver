@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### WASM / Tier-2
+
+- **perf: broker control calls can use parallel socket lanes.** The new
+  `wasm_control_connections` setting opens up to 16 independent connections for
+  supervisor-style brokers, removing the single-socket FIFO from concurrent
+  tenant cold starts. The default remains one for direct Nether compatibility.
+
 ### Static files
 
 - **fix: cached static and precompressed files now follow mounted disk changes.**

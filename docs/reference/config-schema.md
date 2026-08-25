@@ -417,6 +417,15 @@ enable the real host-call transport so parking filters drive a sandbox; empty
 leaves the transport off (a parking filter then fails closed). One global socket
 per server.
 
+## `wasm_control_connections`
+
+Top-level integer (default `1`, maximum `16`). Number of independent connections
+to `wasm_control_socket`. Keep this at one when connecting directly to a Nether
+VM, because only one client is its primary. A broker that accepts equivalent
+driving connections, such as `nether-supervisor`, can set this to the expected
+concurrent cold-start fan-out so parked requests do not queue behind one control
+round trip.
+
 ## `wasm_host_call_deadline_ms`
 
 Top-level integer (default `30000`). How long a filter may stay parked on a host

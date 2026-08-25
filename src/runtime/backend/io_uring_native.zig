@@ -391,7 +391,7 @@ pub const Op = enum(u4) {
 /// Hard cap on concurrently registered external fds. PgClient needs at
 /// most 4 per worker; 16 leaves room for the proxy-streaming consumer
 /// (design 5.0) without growing the table.
-pub const MAX_EXTERNAL_FDS = 16;
+pub const MAX_EXTERNAL_FDS = 32;
 
 pub fn packUserData(op: Op, gen: u28, conn_id: u32) u64 {
     return (@as(u64, @intFromEnum(op)) << 60) |
@@ -795,7 +795,6 @@ pub const IoUringNativeBackend = if (!is_linux) StubBackend else struct {
         // conn_id field is unused for the singleton UDP socket.
         sqe.user_data = packUserData(.recvmsg, 0, 0);
     }
-
 
     /// Arm a multishot recv on a freshly-accepted connection. Data
     /// arrives via the provided buffer ring and is delivered inline

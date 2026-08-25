@@ -51,7 +51,7 @@ pub const EXTERNAL_ID_BIT: u64 = 1 << 62;
 /// Hard cap on concurrently registered external fds. PgClient needs at
 /// most 4 per worker; 16 leaves room for the proxy-streaming consumer
 /// (design 5.0) without growing the table.
-pub const MAX_EXTERNAL_FDS = 16;
+pub const MAX_EXTERNAL_FDS = 32;
 
 /// Max TCP listeners a single ring tracks (multi-listener model). Slots
 /// [0..MAX_LISTENERS) are reserved for listeners, slot MAX_LISTENERS for the

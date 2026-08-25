@@ -74,8 +74,9 @@ pub const Master = struct {
     wasm_filter_specs: []const config_file_mod.WasmFilterConfig = &.{},
     /// Tier-2 control-socket path + park deadline, propagated to each worker so a
     /// config-driven multi-process deployment can drive a real sandbox. Each
-    /// worker builds its own ControlClient. "" / 0 leave the Server defaults.
+    /// worker builds its own ControlPool. "" / 0 leave the Server defaults.
     wasm_control_socket_path: []const u8 = "",
+    wasm_control_connections: u8 = 1,
     wasm_host_call_deadline_ms: u64 = 0,
     tenant_idle_ttl_ms: u64 = 0,
 
@@ -200,6 +201,7 @@ pub const Master = struct {
             // worker gets its own Nether primary (a supervisor can spawn one
             // endpoint per worker index). No placeholder = shared path (warned).
             srv.wasm_control_socket_path = expandWorkerPath(self.wasm_control_socket_path, worker_id, &worker_sock_buf) orelse self.wasm_control_socket_path;
+            srv.wasm_control_connections = self.wasm_control_connections;
             if (self.wasm_host_call_deadline_ms != 0) srv.wasm_host_call_deadline_ms = self.wasm_host_call_deadline_ms;
             if (self.tenant_idle_ttl_ms != 0) srv.tenant_idle_ttl_ms = self.tenant_idle_ttl_ms;
 

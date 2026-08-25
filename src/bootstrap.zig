@@ -219,6 +219,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !void {
     const wasm_specs: []const config_file_mod.WasmFilterConfig =
         if (loaded_config) |lc| lc.wasm_filters else &.{};
     const wasm_ctl_socket: []const u8 = if (loaded_config) |lc| lc.wasm_control_socket else "";
+    const wasm_ctl_connections: u8 = if (loaded_config) |lc| lc.wasm_control_connections else 1;
     const wasm_deadline_ms: u64 = if (loaded_config) |lc| lc.wasm_host_call_deadline_ms else 0;
     const tenant_ttl_ms: u64 = if (loaded_config) |lc| lc.tenant_idle_ttl_ms else 0;
 
@@ -228,6 +229,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !void {
         master.config_source = config_source;
         master.wasm_filter_specs = wasm_specs;
         master.wasm_control_socket_path = wasm_ctl_socket;
+        master.wasm_control_connections = wasm_ctl_connections;
         master.wasm_host_call_deadline_ms = wasm_deadline_ms;
         master.tenant_idle_ttl_ms = tenant_ttl_ms;
         defer master.deinit();
@@ -248,6 +250,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !void {
         srv.config_source = config_source;
         srv.wasm_filter_specs = wasm_specs;
         srv.wasm_control_socket_path = wasm_ctl_socket;
+        srv.wasm_control_connections = wasm_ctl_connections;
         if (wasm_deadline_ms != 0) srv.wasm_host_call_deadline_ms = wasm_deadline_ms;
         if (tenant_ttl_ms != 0) srv.tenant_idle_ttl_ms = tenant_ttl_ms;
         try srv.run(opts.run_for_ms);

@@ -131,6 +131,9 @@ pub const Server = struct {
     /// drives host calls over the sandbox's control socket (proto_version=1),
     /// superseding the mock. Build-flag-free slice; borrowed, must outlive run().
     wasm_control_socket_path: []const u8 = "",
+    /// Independent connections to wasm_control_socket_path. One preserves the
+    /// direct-Nether single-primary contract; brokers may opt into more lanes.
+    wasm_control_connections: u8 = 1,
     /// Park (host_call) deadline in ms: how long a wasm filter may stay parked on
     /// a host call before the host_call.Table fails it closed. Default 30s (the
     /// historical hardcoded value). Plumbed into the H1/H2 binding `deadline_ms`
@@ -138,8 +141,8 @@ pub const Server = struct {
     /// out-live the park. Lowerable (e.g. via the e2e env) so timeout assertions
     /// do not wait 30s. Per-server today; a per-route field is a future refinement.
     wasm_host_call_deadline_ms: u64 = 30_000,
-    /// Per-worker control-socket client (the real C3 transport). Opaque so the
-    /// Server struct needs no build-flag gating; a *wasm.control_client.ControlClient
+    /// Per-worker control-socket pool (the real C3 transport). Opaque so the
+    /// Server struct needs no build-flag gating; a *wasm.control_client.ControlPool
     /// when enabled and a path is configured, else null.
     wasm_control: ?*anyopaque = null,
     /// Per-worker tenant-to-microVM affinity registry (park-concurrency Phase 1).
@@ -794,7 +797,7 @@ pub const Server = struct {
     pub fn wasmStartHostCall(self: *Server, token: u32, req_bytes: []const u8) void {
         if (build_options.enable_wasm) {
             if (self.wasm_control) |p| {
-                const cc: *wasm_control_mod.ControlClient = @ptrCast(@alignCast(p));
+                const cc: *wasm_control_mod.ControlPool = @ptrCast(@alignCast(p));
                 cc.startCall(&self.io, token, req_bytes);
                 return;
             }
@@ -809,7 +812,7 @@ pub const Server = struct {
     /// configured). Keeps the opaque field's casts in one place. The return type
     /// is comptime-conditional so this signature compiles when wasm is disabled
     /// (the body's wasm references sit past the pruned early return).
-    pub fn wasmControlClient(self: *Server) ?*(if (build_options.enable_wasm) wasm_control_mod.ControlClient else anyopaque) {
+    pub fn wasmControlClient(self: *Server) ?*(if (build_options.enable_wasm) wasm_control_mod.ControlPool else anyopaque) {
         if (!build_options.enable_wasm) return null;
         const p = self.wasm_control orelse return null;
         return @ptrCast(@alignCast(p));
@@ -822,16 +825,18 @@ pub const Server = struct {
         if (!build_options.enable_wasm) return;
         self.teardownWasmControl();
         if (self.wasm_control_socket_path.len == 0) return;
-        const cc = self.allocator.create(wasm_control_mod.ControlClient) catch return;
-        cc.* = wasm_control_mod.ControlClient.init(
-            self.wasm_control_socket_path,
-            wasm_control_mod.DEFAULT_SLOT,
-        );
+        const cc = self.allocator.create(wasm_control_mod.ControlPool) catch return;
+        cc.init(self.wasm_control_socket_path, self.wasm_control_connections);
         // Keep the transport's per-command budget aligned with the park deadline so
         // the socket does not out-live the park (lets a test set a sub-second one).
-        cc.command_timeout_ms = self.wasm_host_call_deadline_ms;
+        for (cc.clients[0..cc.lane_count]) |*client| client.command_timeout_ms = self.wasm_host_call_deadline_ms;
         self.wasm_control = @ptrCast(cc);
-        std.log.info("wasm control transport -> {s} (slot {d})", .{ self.wasm_control_socket_path, wasm_control_mod.DEFAULT_SLOT });
+        std.log.info("wasm control transport -> {s} ({d} lane(s), slots {d}..{d})", .{
+            self.wasm_control_socket_path,
+            cc.lane_count,
+            wasm_control_mod.DEFAULT_SLOT,
+            wasm_control_mod.DEFAULT_SLOT + cc.lane_count - 1,
+        });
     }
 
     fn teardownWasmControl(self: *Server) void {

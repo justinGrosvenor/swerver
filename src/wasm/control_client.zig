@@ -10,9 +10,11 @@
 //! writable from onEvent(); failures and timeouts are staged and never resume a
 //! continuation beneath a live handler stack frame.
 //!
-//! Serialized: one sandbox, one in-flight call. Extra parks queue (FIFO) and
-//! issue as the socket frees. Concurrency scales by holding more sandbox sockets,
-//! not by multiplexing one. Compiled only when build_options.enable_wasm is set.
+//! Each ControlClient is serialized: one socket, one in-flight call. ControlPool
+//! optionally holds multiple independent clients for brokers that accept several
+//! driving connections (for example nether-supervisor). The default stays one
+//! lane because a Nether VM control socket admits only one primary client.
+//! Compiled only when build_options.enable_wasm is set.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -28,6 +30,10 @@ pub const Token = host_call.Token;
 /// (4); the control socket takes the next slot. Kept distinct so dispatch.zig
 /// can route external-fd events to the right owner by slot range.
 pub const DEFAULT_SLOT: u32 = 4;
+/// Opt-in lane ceiling. Slots 4..19 are reserved for control clients; the I/O
+/// backends provide 32 external slots, leaving room for the four PG slots and
+/// future transports.
+pub const MAX_LANES: u8 = 16;
 
 /// The agent reply trailer separator (0x1e, ASCII RS), per control-protocol.md.
 /// Reports and shell commands end with 0x1e<exit-code>\n.
@@ -763,6 +769,79 @@ pub const ControlClient = struct {
     }
 };
 
+/// A set of independent serialized control connections. Commands are assigned
+/// to the least-loaded ready lane, round-robin among ties. This is deliberately
+/// opt-in: direct Nether sockets have one primary, while a supervisor/broker can
+/// accept many equivalent driving clients and execute cold starts concurrently.
+pub const ControlPool = struct {
+    clients: [MAX_LANES]ControlClient = undefined,
+    lane_count: u8 = 1,
+    next_lane: u8 = 0,
+
+    pub fn init(self: *ControlPool, path: []const u8, requested: u8) void {
+        self.lane_count = @max(@as(u8, 1), @min(requested, MAX_LANES));
+        self.next_lane = 0;
+        for (self.clients[0..self.lane_count], 0..) |*client, index| {
+            client.* = ControlClient.init(path, DEFAULT_SLOT + @as(u32, @intCast(index)));
+        }
+    }
+
+    pub fn installResume(self: *ControlPool, ctx: *anyopaque, complete_fn: CompleteFn, fail_fn: FailFn) void {
+        for (self.clients[0..self.lane_count]) |*client| client.installResume(ctx, complete_fn, fail_fn);
+    }
+
+    pub fn deinit(self: *ControlPool, io_rt: *io_mod.IoRuntime) void {
+        for (self.clients[0..self.lane_count]) |*client| client.deinit(io_rt);
+    }
+
+    pub fn startCall(self: *ControlPool, io_rt: *io_mod.IoRuntime, token: Token, cmd: []const u8) void {
+        const index = self.selectLaneIndex();
+        self.next_lane = @intCast((index + 1) % self.lane_count);
+        self.clients[index].startCall(io_rt, token, cmd);
+    }
+
+    pub fn onEvent(self: *ControlPool, io_rt: *io_mod.IoRuntime, slot: u32, kind: io_mod.EventKind) void {
+        if (slot < DEFAULT_SLOT) return;
+        const index = slot - DEFAULT_SLOT;
+        if (index >= self.lane_count) return;
+        self.clients[index].onEvent(io_rt, kind);
+    }
+
+    pub fn tick(self: *ControlPool, io_rt: *io_mod.IoRuntime, now_ms: u64) void {
+        for (self.clients[0..self.lane_count]) |*client| client.tick(io_rt, now_ms);
+    }
+
+    pub fn isReady(self: *const ControlPool) bool {
+        for (self.clients[0..self.lane_count]) |*client| {
+            if (client.isReady()) return true;
+        }
+        return false;
+    }
+
+    fn selectLaneIndex(self: *const ControlPool) usize {
+        var best: usize = self.next_lane;
+        var best_load: usize = std.math.maxInt(usize);
+        var found_ready = false;
+        for (0..self.lane_count) |offset| {
+            const index = (self.next_lane + offset) % self.lane_count;
+            const client = &self.clients[index];
+            const ready = client.state == .ready;
+            if (found_ready and !ready) continue;
+            if (ready and !found_ready) {
+                found_ready = true;
+                best_load = std.math.maxInt(usize);
+            }
+            const load = client.q_count + @intFromBool(client.inflight != null or client.send_len != 0);
+            if (load < best_load) {
+                best = index;
+                best_load = load;
+                if (ready and load == 0) break;
+            }
+        }
+        return best;
+    }
+};
+
 /// Is `buf` an unframed control-plane status line (a bare `ERR ...` / `OK ...`
 /// with no 0x1e trailer)? Used to distinguish a control-plane reply (e.g. "ERR
 /// agent not connected" before the guest is ready) from a framed command reply.
@@ -792,6 +871,30 @@ fn verifyProtoVersion(report: []const u8) bool {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "control pool distributes calls across ready lanes and preserves single-lane default" {
+    var pool: ControlPool = undefined;
+    pool.init("/tmp/unused.sock", 0);
+    try testing.expectEqual(@as(u8, 1), pool.lane_count);
+
+    pool.init("/tmp/unused.sock", 3);
+    for (pool.clients[0..3]) |*client| client.state = .ready;
+    try testing.expectEqual(@as(usize, 0), pool.selectLaneIndex());
+    pool.clients[0].inflight = 10;
+    pool.next_lane = 1;
+    try testing.expectEqual(@as(usize, 1), pool.selectLaneIndex());
+    pool.clients[1].inflight = 11;
+    pool.next_lane = 2;
+    try testing.expectEqual(@as(usize, 2), pool.selectLaneIndex());
+
+    // A reconnecting lane does not steal work from a ready lane, even if its
+    // queue is empty.
+    pool.clients[2].state = .closed;
+    pool.clients[0].inflight = null;
+    pool.clients[1].inflight = null;
+    pool.next_lane = 2;
+    try testing.expectEqual(@as(usize, 0), pool.selectLaneIndex());
+}
 
 test "verifyProtoVersion accepts v1, rejects others" {
     try testing.expect(verifyProtoVersion("nether sandbox info\nproto_version=1\nbackend=hvf\n"));
