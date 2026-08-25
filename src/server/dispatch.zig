@@ -1730,6 +1730,24 @@ pub fn handleRead(server: *Server, index: u32) !void {
                 if (conn.write_count > 0) {
                     drainTlsWriteQueue(server, conn);
                     if (conn.state == .closed) return;
+                    // A partial carry means the socket is still
+                    // backpressured. Do not decrypt more input until the
+                    // writable event finishes draining it.
+                    if (conn.write_count > 0 or conn.tls_cipher_carry_handle != null) break;
+                }
+
+                // handleHttp2Read deliberately stops with plaintext still in
+                // read_buffer when the write queue reaches its safety reserve.
+                // The drain above reopened queue capacity, so resume that
+                // buffered work BEFORE asking OpenSSL for another record. If
+                // SSL_read were tried first and returned WANT_READ, an
+                // edge-triggered backend would strand the plaintext forever:
+                // the kernel socket is already empty and cannot deliver a new
+                // read edge. Body-bearing multiplexed traffic (notably gRPC)
+                // hits this path much sooner than GET-only H2 workloads.
+                if (try resumeBufferedTlsH2(server, conn)) {
+                    if (conn.state == .closed) return;
+                    continue;
                 }
                 const drain_buf = conn.read_buffer orelse break;
                 var drain_offset = conn.read_offset + conn.read_buffered_bytes;
@@ -2411,6 +2429,16 @@ pub fn handleRead(server: *Server, index: u32) !void {
         }
         // No more data available, continue normally
     }
+}
+
+/// Re-enter the H2 parser after TLS write backpressure has cleared.
+/// Returns true only when buffered plaintext was consumed; a partial frame
+/// returns false so the caller can fetch another TLS record without spinning.
+fn resumeBufferedTlsH2(server: *Server, conn: *connection.Connection) !bool {
+    const before = conn.read_buffered_bytes;
+    if (before == 0) return false;
+    try http2_mod.handleHttp2Read(server, conn);
+    return conn.read_buffered_bytes < before;
 }
 
 // ── WebSocket tunnel relay ────────────────────────────────────
@@ -3264,8 +3292,89 @@ fn resumeSettlePark(server: *Server, conn: *connection.Connection, result: *cons
 }
 
 // ============================================================
-// Tests — settle-park pack/unpack roundtrip
+// Tests — TLS/H2 buffered re-entry and settle-park packing
 // ============================================================
+
+fn bufferedH2Handler(_: *router.HandlerContext) response_mod.Response {
+    return .{ .status = 200, .headers = &.{}, .body = .{ .bytes = "ok" } };
+}
+
+test "tls h2 resumes buffered plaintext after write backpressure clears" {
+    if (!build_options.enable_http2) return error.SkipZigTest;
+
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var cfg = config.ServerConfig.default();
+    cfg.max_connections = 1;
+    // 57 queued entries leave the H2 parser's seven-slot safety reserve,
+    // plus room for the read buffer and the eventual response.
+    cfg.buffer_pool = .{ .buffer_size = 16 * 1024, .buffer_count = 80 };
+
+    var app_router = router.Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+    try app_router.get("/", bufferedH2Handler);
+
+    var server = try Server.initWithRouter(allocator, cfg, app_router);
+    defer server.deinit();
+
+    const conn = server.io.acquireConnection(server.io.nowMs()) orelse return error.OutOfMemory;
+    var stack = http2.Stack.init();
+    conn.protocol = .http2;
+    conn.http2_stack = &stack;
+    conn.h2_pending = try allocator.create([connection.MAX_PENDING_H2_BODIES]connection.PendingH2Body);
+    conn.h2_pending.?.* = [_]connection.PendingH2Body{.{}} ** connection.MAX_PENDING_H2_BODIES;
+
+    const read_buf = server.io.acquireBuffer() orelse return error.OutOfMemory;
+    conn.read_buffer = read_buf;
+    var off: usize = 0;
+    @memcpy(read_buf.bytes[off..][0..http2.Preface.len], http2.Preface);
+    off += http2.Preface.len;
+    // Static HPACK indices: :method GET, :path /, :scheme http.
+    const header_block = [_]u8{ 0x82, 0x84, 0x86 };
+    try http2.writeFrameHeader(read_buf.bytes[off..], .headers, 0x5, 1, header_block.len);
+    off += 9;
+    @memcpy(read_buf.bytes[off..][0..header_block.len], &header_block);
+    off += header_block.len;
+    conn.read_buffered_bytes = off;
+
+    defer {
+        while (conn.peekWrite()) |entry| {
+            server.io.releaseBuffer(entry.handle);
+            conn.popWrite();
+        }
+        server.io.releaseBuffer(read_buf);
+        conn.read_buffer = null;
+        allocator.destroy(conn.h2_pending.?);
+        conn.h2_pending = null;
+        conn.http2_stack = null;
+        if (conn.state != .closed) server.io.releaseConnection(conn);
+    }
+
+    // Recreate the exact precondition from the production failure: H2 leaves
+    // valid plaintext buffered because fewer than eight write slots remain.
+    while (conn.writeQueueAvailable() > 7) {
+        const dummy = server.io.acquireBuffer() orelse return error.OutOfMemory;
+        if (!conn.enqueueWrite(dummy, 1)) {
+            server.io.releaseBuffer(dummy);
+            return error.TestUnexpectedResult;
+        }
+    }
+    const buffered_before = conn.read_buffered_bytes;
+    try http2_mod.handleHttp2Read(&server, conn);
+    try std.testing.expectEqual(buffered_before, conn.read_buffered_bytes);
+
+    // Model the TLS drain reopening capacity, then exercise the helper called
+    // before SSL_read. The old ordering would ask OpenSSL first, get WANT_READ,
+    // and leave these bytes stranded indefinitely.
+    while (conn.peekWrite()) |entry| {
+        server.io.releaseBuffer(entry.handle);
+        conn.popWrite();
+    }
+    try std.testing.expect(try resumeBufferedTlsH2(&server, conn));
+    try std.testing.expectEqual(@as(usize, 0), conn.read_buffered_bytes);
+    try std.testing.expect(conn.write_count > 0);
+}
 
 test "packHeaders roundtrip with body" {
     var buf: [4096]u8 = undefined;

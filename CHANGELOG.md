@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### HTTP/2 / gRPC
+
+- **fix: TLS H2 resumes plaintext buffered behind write backpressure.** When
+  the H2 parser paused with its write queue near capacity, the TLS drain loop
+  flushed the responses but asked OpenSSL for another record before returning
+  to plaintext already in the connection buffer. A `WANT_READ` then stranded
+  body-bearing multiplexed requests on edge-triggered backends. Buffered H2
+  work is now resumed first, with partial-frame and socket-backpressure guards.
+
 ### WASM / Tier-2
 
 - **perf: broker control calls can use parallel socket lanes.** The new
