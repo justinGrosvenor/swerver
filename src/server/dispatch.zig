@@ -579,9 +579,13 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
         // Drain host (FFI) completions: a host thread answered a parked
         // request, wrote the response into the slot, and woke us. Resume runs
         // here on the reactor thread (it mutates non-atomic connection state).
-        while (ffi_bridge.instance.popCompletion()) |c| {
-            ffiResumeCompletion(server, c);
-            ffi_bridge.instance.freeSlot(c.slot);
+        // Gated on `embedded`: a normal server has no FFI bridge, so this must
+        // not touch the (cross-module, global) ring atomics every iteration.
+        if (server.embedded) {
+            while (ffi_bridge.instance.popCompletion()) |c| {
+                ffiResumeCompletion(server, c);
+                ffi_bridge.instance.freeSlot(c.slot);
+            }
         }
 
         // Drain async x402 facilitator results.
@@ -790,7 +794,11 @@ fn ffiResumeCompletion(server: *Server, c: ffi_bridge.Bridge.Completion) void {
     };
 
     if (conn.write_count > 0) handleWrite(server, c.conn_index) catch {};
-    handleRead(server, c.conn_index) catch {};
+    // Only drain pipelined bytes if any are actually buffered — mirrors
+    // pgResume's gate. An unconditional handleRead on the common non-pipelined
+    // path issues a wasted recv (EAGAIN) per request; rearmRecv below re-arms
+    // keep-alive regardless.
+    if (conn.read_buffered_bytes > 0) handleRead(server, c.conn_index) catch {};
     const postconn = server.io.getConnection(c.conn_index) orelse return;
     if (postconn.id == c.conn_id and postconn.state != .closed and !postconn.close_after_write and postconn.x402 == .none) {
         if (postconn.fd) |pfd| server.io.rearmRecv(c.conn_index, pfd);
@@ -2368,8 +2376,9 @@ pub fn handleRead(server: *Server, index: u32) !void {
         // FFI (host) route: park the request and hand it to the host callback.
         // The connection enters .ffi_parked; the reactor resumes it when the
         // host calls swerver_respond. Break the pipeline loop — remaining
-        // buffered bytes are processed after resume.
-        if (http1_mod.ffiTryDispatch(server, conn, parse.view)) break;
+        // buffered bytes are processed after resume. Gated on `embedded` so a
+        // normal server never runs the FFI route match on the hot path.
+        if (server.embedded and http1_mod.ffiTryDispatch(server, conn, parse.view)) break;
 
         var mw_ctx = middleware.Context{
             .protocol = .http1,
