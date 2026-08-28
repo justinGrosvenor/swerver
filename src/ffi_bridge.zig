@@ -34,6 +34,11 @@ const HEADER_BLOCK_CAP = 40 * 1024;
 // old 512 so custom headers (cookies, cache directives) do not push the encode
 // over the buffer; blocks beyond it fail closed rather than corrupt.
 const RESPONSE_HEADER_RESERVE = 8 * 1024;
+// The header_space http1.zig's streamBodyChunks path keys off (search
+// "header_space" there). A body over buffer_size - this takes the streaming
+// borrow path, so the response cap reserve must never fall below it. Keep in
+// sync with http1.zig; ffi_bridge cannot import http1 (http1 imports ffi_bridge).
+const STREAM_HEADER_SPACE = 512;
 
 /// C callback the reactor invokes when a request is parked. Must be
 /// thread-safe (Bun's JSCallback with threadsafe:true is). It should return
@@ -186,10 +191,16 @@ pub const Bridge = struct {
     /// streamBodyChunks, whose borrowed pending_body would dangle after freeSlot
     /// returns the slot) AND leaves room for encodeResponse to prepend the
     /// status line and headers. Response header blocks larger than the reserve
-    /// fail closed (the socket closes cleanly) rather than corrupt. The reserve
-    /// is floored at half the buffer so a small buffer still admits some body.
+    /// fail closed (the socket closes cleanly) rather than corrupt.
+    ///
+    /// The reserve must never drop below http1.zig's streaming header_space
+    /// (STREAM_HEADER_SPACE): streamBodyChunks fires when body_len exceeds
+    /// buffer_size - header_space, so a smaller reserve would let a body onto the
+    /// borrow path and reintroduce the dangle. It grows toward
+    /// RESPONSE_HEADER_RESERVE for header room, clamped to half the buffer so a
+    /// mid-size buffer still admits some body.
     pub fn setResponseCapacity(self: *Bridge, buffer_size: usize) void {
-        const reserve = @min(RESPONSE_HEADER_RESERVE, buffer_size / 2);
+        const reserve = @max(STREAM_HEADER_SPACE, @min(RESPONSE_HEADER_RESERVE, buffer_size / 2));
         self.response_cap = @min(RESP_BODY_CAP, buffer_size -| reserve);
     }
 
