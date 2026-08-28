@@ -293,6 +293,35 @@ pub const IoRuntime = struct {
         };
     }
 
+    /// Set up the cross-thread wake mechanism for this loop. After this, wake()
+    /// (callable from any thread) makes a blocked poll return promptly with a
+    /// wake event the dispatch layer recognizes and drains. Used by embedders
+    /// (libswerver/FFI) to nudge the reactor when a host thread has enqueued a
+    /// completion; the regular server never calls it. Only kqueue is wired so
+    /// far; epoll/io_uring get an eventfd wake alongside FFI Linux support.
+    pub fn registerWake(self: *IoRuntime) !void {
+        return switch (self.backend_state) {
+            .bsd_kqueue => |*kq| kq.registerWake(),
+            else => error.UnsupportedBackend,
+        };
+    }
+
+    /// Signal the loop from any thread. No-op if registerWake was not called.
+    pub fn wake(self: *IoRuntime) void {
+        switch (self.backend_state) {
+            .bsd_kqueue => |*kq| kq.wake(),
+            else => {},
+        }
+    }
+
+    /// Clear the wake signal after handling a wake event (level-triggered).
+    pub fn drainWake(self: *IoRuntime) void {
+        switch (self.backend_state) {
+            .bsd_kqueue => |*kq| kq.drainWake(),
+            else => {},
+        }
+    }
+
     pub fn registerUdpSocket(self: *IoRuntime, fd: std.posix.fd_t) !void {
         return switch (self.backend_state) {
             .bsd_kqueue => |*kq| kq.registerUdpSocket(fd),
