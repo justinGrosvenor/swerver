@@ -95,27 +95,34 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
     draining.store(false, .release);
     reload_requested.store(false, .release);
 
-    const sa = std.posix.Sigaction{
-        .handler = .{ .handler = handleShutdownSignal },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
-    std.posix.sigaction(std.posix.SIG.INT, &sa, null);
-    // Ignore SIGPIPE — SSL_shutdown/SSL_write on a closed socket triggers it
-    const pipe_sa = std.posix.Sigaction{
-        .handler = .{ .handler = std.posix.SIG.IGN },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    std.posix.sigaction(std.posix.SIG.PIPE, &pipe_sa, null);
-    // Install SIGHUP handler for config hot reload
-    const reload_sa = std.posix.Sigaction{
-        .handler = .{ .handler = handleReloadSignal },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    std.posix.sigaction(std.posix.SIG.HUP, &reload_sa, null);
+    // When embedded in a host process, do NOT install process-wide signal
+    // handlers — that would hijack the host's TERM/INT/PIPE/HUP dispositions.
+    // Shutdown is driven purely by requestShutdown() (a thread-safe atomic the
+    // loop polls every <=10ms), and SIGPIPE is avoided by MSG_NOSIGNAL / the
+    // host's own disposition.
+    if (!server.embedded) {
+        const sa = std.posix.Sigaction{
+            .handler = .{ .handler = handleShutdownSignal },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
+        std.posix.sigaction(std.posix.SIG.INT, &sa, null);
+        // Ignore SIGPIPE — SSL_shutdown/SSL_write on a closed socket triggers it
+        const pipe_sa = std.posix.Sigaction{
+            .handler = .{ .handler = std.posix.SIG.IGN },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.PIPE, &pipe_sa, null);
+        // Install SIGHUP handler for config hot reload
+        const reload_sa = std.posix.Sigaction{
+            .handler = .{ .handler = handleReloadSignal },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.HUP, &reload_sa, null);
+    }
 
     // Install the PG park-resume hook here rather than at Server init:
     // initWithRouter returns the Server by value, so `server` only has

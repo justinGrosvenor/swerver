@@ -85,6 +85,11 @@ pub const BoundListener = struct {
 pub const Server = struct {
     allocator: std.mem.Allocator,
     cfg: config.ServerConfig,
+    /// When embedded in a host process (libswerver/FFI), the reactor must not
+    /// install process-wide signal handlers (TERM/INT/PIPE/HUP) — that would
+    /// hijack the host's dispositions. Shutdown is driven by requestShutdown()
+    /// instead. Set by the embed path before run().
+    embedded: bool = false,
     io: runtime.IoRuntime,
     app_router: router.Router,
     listener_fd: ?std.posix.fd_t,
