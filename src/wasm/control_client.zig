@@ -288,7 +288,7 @@ pub const ControlClient = struct {
                 .info_wait, .ready => self.handleReadable(io_rt, now_ms),
                 else => {},
             },
-            .accept, .datagram => {},
+            .accept, .datagram, .wake => {},
         }
     }
 

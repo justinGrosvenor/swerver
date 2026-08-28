@@ -339,6 +339,11 @@ pub const Connection = struct {
         /// in the per-worker wasm host_call.Table, not on the Connection. Like
         /// db_parked, this pauses every gate that checks `x402 != .none`.
         wasm_parked,
+        /// Request parked awaiting a host (FFI) handler. The park entry lives in
+        /// the process-global ffi_bridge slot pool. Like db_parked, this pauses
+        /// every gate that checks `x402 != .none`; the reactor resumes it when
+        /// the host calls swerver_respond.
+        ffi_parked,
     };
 
     pub fn init(index: u32) Connection {

@@ -46,6 +46,7 @@ const usage_mod = @import("../middleware/usage.zig");
 const forward_mod = @import("../proxy/forward.zig");
 const clock = @import("../runtime/clock.zig");
 const preencoded = @import("preencoded.zig");
+const ffi_bridge = @import("../ffi_bridge.zig");
 const write_queue = @import("write_queue.zig");
 const cache_mod = @import("../proxy/cache.zig");
 const otel_mod = @import("../middleware/otel.zig");
@@ -1315,6 +1316,10 @@ pub fn dispatchToRouter(server: *Server, conn: *connection.Connection, req_view:
     // Empty unless preencoded is enabled, so this is a no-op for normal servers.
     if (preencoded.tryDispatchPreencodedH1(server, conn, req_view) == .dispatched) return;
 
+    // FFI (host) routes: park and hand off to the host callback. Returns true
+    // when the request matched an FFI route (parked, or answered 503/413 here).
+    if (ffiTryDispatch(server, conn, req_view)) return;
+
     var mw_ctx = middleware.Context{
         .protocol = .http1,
         .buffer_ops = .{
@@ -1359,6 +1364,41 @@ pub fn dispatchToRouter(server: *Server, conn: *connection.Connection, req_view:
     };
     if (server.otel) |otel_exp| {
         otel_exp.recordSpan(req_view.method, req_view.path, result.resp.status, otel_start, clock.realtimeNanos() orelse 0);
+    }
+}
+
+/// Match the request against the FFI route table; if it matches, park the
+/// connection and hand the request to the host callback. Returns true when the
+/// request was an FFI route (and is now parked, or was answered here on
+/// backpressure), false when no FFI route claims the path.
+pub fn ffiTryDispatch(server: *Server, conn: *connection.Connection, req_view: request.RequestView) bool {
+    const route_id = ffi_bridge.instance.match(req_view.path) orelse return false;
+    const body = req_view.body.sliceOrNull() orelse "";
+    switch (ffi_bridge.instance.park(conn.index, conn.id, route_id, req_view.getMethodName(), req_view.path, body)) {
+        .parked => {
+            conn.x402 = .ffi_parked;
+            return true;
+        },
+        .no_callback, .no_slot => {
+            queueResponse(server, conn, .{
+                .status = 503,
+                .headers = &.{},
+                .body = .{ .bytes = "Service Unavailable" },
+            }) catch {
+                conn.close_after_write = true;
+            };
+            return true;
+        },
+        .too_large => {
+            queueResponse(server, conn, .{
+                .status = 413,
+                .headers = &.{},
+                .body = .{ .bytes = "Payload Too Large" },
+            }) catch {
+                conn.close_after_write = true;
+            };
+            return true;
+        },
     }
 }
 

@@ -540,6 +540,9 @@ pub const EventKind = enum {
     write,
     err,
     datagram,
+    /// Cross-thread wake (registerWake). Carries no connection; the loop drains
+    /// the wake pipe and any host completion queues.
+    wake,
 };
 
 /// Capability flags describing what a backend can do. The server
@@ -674,6 +677,11 @@ fn translateKqueueEvents(events: []const kqueue_backend.Kevent, out: []Event) us
     var count: usize = 0;
     for (events) |ev| {
         if (count >= out.len) break;
+        if (ev.udata == kqueue_backend.WAKE_TOKEN) {
+            out[count] = .{ .kind = .wake, .conn_id = 0, .bytes = 0, .handle = null };
+            count += 1;
+            continue;
+        }
         if ((ev.flags & kqueue_backend.EV_ERROR) != 0) {
             // Determine conn_id: listener=0, UDP=special, connections are offset by 1
             const conn_id: u64 = if (ev.udata == 0)

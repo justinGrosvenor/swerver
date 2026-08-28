@@ -13,6 +13,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const swerver = @import("swerver");
+const ffi_bridge = swerver.ffi_bridge;
 
 const Server = swerver.Server;
 const ServerBuilder = swerver.ServerBuilder;
@@ -35,7 +36,7 @@ const Embed = struct {
 
 /// ABI version. Bumped when the exported surface changes.
 export fn swerver_abi_version() u32 {
-    return 2;
+    return 3;
 }
 
 export fn swerver_build_id() [*:0]const u8 {
@@ -53,6 +54,12 @@ export fn swerver_init(config_json: [*]const u8, config_json_len: usize) ?*Embed
 }
 
 fn initInner(bytes: []const u8) !*Embed {
+    // Set up the FFI bridge (idempotent) and clear any routes/callback from a
+    // previous embed cycle. Routes and the callback are registered between init
+    // and start via swerver_route / swerver_on_request.
+    try ffi_bridge.instance.init(gpa);
+    ffi_bridge.instance.resetRoutes();
+
     const embed = try gpa.create(Embed);
     errdefer gpa.destroy(embed);
 
@@ -90,6 +97,59 @@ fn initInner(bytes: []const u8) !*Embed {
     return embed;
 }
 
+/// Register an FFI route by path prefix. Requests whose path starts with
+/// `pattern` are handed to the host callback instead of the router. Call
+/// between swerver_init and swerver_start. Returns 0 on success, -1 if the
+/// route table is full or the pattern is invalid.
+export fn swerver_route(embed: *Embed, pattern: [*]const u8, pattern_len: usize, route_id: u32) c_int {
+    _ = embed;
+    return if (ffi_bridge.instance.addRoute(pattern[0..pattern_len], route_id)) 0 else -1;
+}
+
+/// Register the host request callback (a thread-safe C function pointer, e.g.
+/// a Bun JSCallback). The reactor invokes it with a req_id when a request is
+/// parked; the host reads it with swerver_request and answers with
+/// swerver_respond. Call between swerver_init and swerver_start.
+export fn swerver_on_request(embed: *Embed, cb: ffi_bridge.RequestCallback) void {
+    _ = embed;
+    ffi_bridge.instance.setCallback(cb);
+}
+
+/// Host thread: pop the next parked request id, or 0 if none are pending. The
+/// host drains this in a loop (on the wake callback, and/or on a timer), reads
+/// each with swerver_request, and answers with swerver_respond.
+export fn swerver_poll() u64 {
+    return ffi_bridge.instance.pollRequest();
+}
+
+/// Host thread: re-arm the coalesced wake after draining to empty. Call when
+/// swerver_poll returns 0, then poll once more to catch a request that arrived
+/// mid-drain.
+export fn swerver_notify_done() void {
+    ffi_bridge.instance.notifyDone();
+}
+
+/// Fill `out` (6 usize slots) with [method_ptr, method_len, path_ptr,
+/// path_len, body_ptr, body_len] for a parked request. Returns 0 on success,
+/// -1 if req_id is stale. Pointers are valid until swerver_respond(req_id).
+export fn swerver_request(req_id: u64, out: [*]usize) c_int {
+    return ffi_bridge.instance.requestInfo(req_id, out[0..6]);
+}
+
+/// Answer a parked request. `ctype` is the Content-Type value (may be empty).
+/// Callable from any thread; wakes the reactor, which resumes the connection.
+/// Returns 0 on success, -1 if req_id is stale/already answered, -2 if too big.
+export fn swerver_respond(
+    req_id: u64,
+    status: u16,
+    ctype: [*]const u8,
+    ctype_len: usize,
+    body: [*]const u8,
+    body_len: usize,
+) c_int {
+    return ffi_bridge.instance.respond(req_id, status, ctype[0..ctype_len], body[0..body_len]);
+}
+
 /// Start serving on a background thread. Returns 0 on success, negative on
 /// error. Returns immediately; the listeners are bound as the reactor starts,
 /// so the host should poll-connect until the port accepts before sending
@@ -116,6 +176,9 @@ export fn swerver_stop(embed: *Embed) void {
         t.join();
         embed.thread = null;
     }
+    // The reactor thread is gone; clear the bridge's pointer to this server's
+    // io (about to be freed) and its callback.
+    ffi_bridge.instance.resetRoutes();
     embed.server.deinit(); // also destroys the proxy it was given
     gpa.destroy(embed.server);
     embed.loaded.deinit();
