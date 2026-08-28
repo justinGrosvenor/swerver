@@ -297,11 +297,12 @@ pub const IoRuntime = struct {
     /// (callable from any thread) makes a blocked poll return promptly with a
     /// wake event the dispatch layer recognizes and drains. Used by embedders
     /// (libswerver/FFI) to nudge the reactor when a host thread has enqueued a
-    /// completion; the regular server never calls it. Only kqueue is wired so
-    /// far; epoll/io_uring get an eventfd wake alongside FFI Linux support.
+    /// completion; the regular server never calls it. kqueue and epoll are
+    /// wired (self-pipe); the io_uring backends still need a ring-safe wake.
     pub fn registerWake(self: *IoRuntime) !void {
         return switch (self.backend_state) {
             .bsd_kqueue => |*kq| kq.registerWake(),
+            .linux_epoll => |*ep| ep.registerWake(),
             else => error.UnsupportedBackend,
         };
     }
@@ -310,6 +311,7 @@ pub const IoRuntime = struct {
     pub fn wake(self: *IoRuntime) void {
         switch (self.backend_state) {
             .bsd_kqueue => |*kq| kq.wake(),
+            .linux_epoll => |*ep| ep.wake(),
             else => {},
         }
     }
@@ -318,6 +320,7 @@ pub const IoRuntime = struct {
     pub fn drainWake(self: *IoRuntime) void {
         switch (self.backend_state) {
             .bsd_kqueue => |*kq| kq.drainWake(),
+            .linux_epoll => |*ep| ep.drainWake(),
             else => {},
         }
     }
@@ -766,6 +769,14 @@ fn translateEpollEvents(events: []const epoll_backend.EpollEvent, out: []Event) 
     for (events) |ev| {
         if (count >= out.len) break;
         const raw_id = ev.data.u64;
+
+        // Cross-thread wake (registerWake): carries no connection; the loop
+        // drains the FFI completion ring on this event, same as kqueue.
+        if (raw_id == epoll_backend.WAKE_ID) {
+            out[count] = .{ .kind = .wake, .conn_id = 0, .bytes = 0, .handle = null };
+            count += 1;
+            continue;
+        }
 
         // Check for error conditions
         if ((ev.events & epoll_backend.EPOLLERR) != 0 or (ev.events & epoll_backend.EPOLLHUP) != 0) {
