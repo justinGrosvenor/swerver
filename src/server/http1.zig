@@ -1318,7 +1318,8 @@ pub fn dispatchToRouter(server: *Server, conn: *connection.Connection, req_view:
 
     // FFI (host) routes: park and hand off to the host callback. Returns true
     // when the request matched an FFI route (parked, or answered 503/413 here).
-    if (ffiTryDispatch(server, conn, req_view)) return;
+    // Gated on `embedded` so a normal server skips the match on the hot path.
+    if (server.embedded and ffiTryDispatch(server, conn, req_view)) return;
 
     var mw_ctx = middleware.Context{
         .protocol = .http1,

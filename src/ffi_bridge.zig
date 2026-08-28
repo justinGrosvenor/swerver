@@ -16,6 +16,11 @@ const io_mod = @import("runtime/io.zig");
 
 pub const MAX_ROUTES = 64;
 pub const MAX_SLOTS = 256;
+// Ring capacity: a power of two so index wrap is a mask, not a prime modulo.
+// Must exceed MAX_SLOTS (producers do no fullness check; capacity is RING_CAP-1
+// usable, and at most MAX_SLOTS requests are ever outstanding).
+const RING_CAP = 512;
+const RING_MASK = RING_CAP - 1;
 const PATH_CAP = 4096;
 const METHOD_CAP = 16;
 const CTYPE_CAP = 256;
@@ -72,18 +77,23 @@ pub const Bridge = struct {
 
     // SPSC completion ring (host -> reactor): host pushes (tail) a slot index
     // in respond(), reactor pops (head) in popCompletion().
-    ring: [MAX_SLOTS + 1]u32 = undefined,
-    ring_head: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-    ring_tail: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-
+    ring: [RING_CAP]u32 = undefined,
     // SPSC request ring (reactor -> host): reactor pushes (tail) a req_id in
     // park(), host pops (head) in pollRequest(). The host drains this ring; the
     // callback is only a coalesced wake (Bun's thread-safe callback is unsafe
     // to invoke per-request under load), armed at most once per drain cycle.
-    preq: [MAX_SLOTS + 1]u64 = undefined,
-    preq_head: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-    preq_tail: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-    notify: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    preq: [RING_CAP]u64 = undefined,
+    // Each index and the coalesced-wake flag gets its own cache line: a
+    // producer index written by one thread must not share a line with a
+    // consumer index (or another producer index) written by the other, or the
+    // line ping-pongs between cores on every request (SPSC false sharing).
+    // align(64) starts each on a line; declared consecutively so the padding of
+    // one covers the next. Mirrors SpscFdQueue in io_uring_native.zig.
+    ring_head: std.atomic.Value(usize) align(64) = std.atomic.Value(usize).init(0),
+    ring_tail: std.atomic.Value(usize) align(64) = std.atomic.Value(usize).init(0),
+    preq_head: std.atomic.Value(usize) align(64) = std.atomic.Value(usize).init(0),
+    preq_tail: std.atomic.Value(usize) align(64) = std.atomic.Value(usize).init(0),
+    notify: std.atomic.Value(bool) align(64) = std.atomic.Value(bool).init(false),
 
     pub fn init(self: *Bridge, allocator: std.mem.Allocator) !void {
         if (self.ready) return;
@@ -196,21 +206,26 @@ pub const Bridge = struct {
         s.req_body_len = @intCast(body.len);
         s.status = 0;
         s.resp_body_len = 0;
-        s.awaiting.store(true, .release);
+        // .monotonic: the slot payload is published by the preq_tail release
+        // store below, which the host acquires — this flag needs no ordering.
+        s.awaiting.store(true, .monotonic);
 
         const req_id = (@as(u64, s.nonce) << 32) | idx;
 
-        // Publish onto the request ring (reactor is the sole producer).
+        // Publish onto the request ring (reactor is the sole producer). The
+        // release store publishes the slot bytes written above.
         const tail = self.preq_tail.load(.monotonic);
         self.preq[tail] = req_id;
-        self.preq_tail.store((tail + 1) % self.preq.len, .release);
+        self.preq_tail.store((tail + 1) & RING_MASK, .release);
 
         // Coalesced wake: invoke the host callback only on the false->true edge
-        // of `notify`, so at most one callback is outstanding per drain cycle.
-        // The host clears notify (notifyDone) after draining. This keeps the
-        // thread-safe callback invocation rare instead of per-request.
-        if (self.notify.cmpxchgStrong(false, true, .acq_rel, .monotonic) == null) {
-            if (self.callback) |cb| cb(req_id);
+        // of `notify`. Double-checked: a relaxed load elides the locked RMW on
+        // the common batched path (host lagging, notify already true), so only
+        // the actual transition pays the cmpxchg.
+        if (self.callback != null and self.notify.load(.monotonic) == false) {
+            if (self.notify.cmpxchgStrong(false, true, .acq_rel, .monotonic) == null) {
+                self.callback.?(req_id);
+            }
         }
         return .parked;
     }
@@ -221,7 +236,7 @@ pub const Bridge = struct {
         const tail = self.preq_tail.load(.acquire);
         if (head == tail) return 0;
         const req_id = self.preq[head];
-        self.preq_head.store((head + 1) % self.preq.len, .release);
+        self.preq_head.store((head + 1) & RING_MASK, .monotonic);
         return req_id;
     }
 
@@ -279,7 +294,7 @@ pub const Bridge = struct {
 
         // Publish onto the ring (release pairs with the reactor's acquire load).
         const tail = self.ring_tail.load(.monotonic);
-        const next = (tail + 1) % self.ring.len;
+        const next = (tail + 1) & RING_MASK;
         self.ring[tail] = @truncate(req_id);
         self.ring_tail.store(next, .release);
 
@@ -303,7 +318,7 @@ pub const Bridge = struct {
         const tail = self.ring_tail.load(.acquire);
         if (head == tail) return null;
         const idx = self.ring[head];
-        self.ring_head.store((head + 1) % self.ring.len, .release);
+        self.ring_head.store((head + 1) & RING_MASK, .monotonic);
         const s = &self.slots[idx];
         return .{
             .slot = idx,
@@ -336,6 +351,19 @@ test "bridge: route match longest prefix" {
     try std.testing.expectEqual(@as(?u32, 2), b.match("/api/users/7"));
     try std.testing.expectEqual(@as(?u32, 1), b.match("/api/orders"));
     try std.testing.expectEqual(@as(?u32, null), b.match("/static/x"));
+}
+
+test "bridge: cross-thread ring indices sit on separate cache lines" {
+    const line = 64;
+    // Each producer/consumer index and the wake flag must start on its own
+    // cache line so a store by one thread does not invalidate an index the
+    // other thread reads/writes (SPSC false sharing).
+    inline for (.{ "ring_head", "ring_tail", "preq_head", "preq_tail", "notify" }) |field| {
+        try std.testing.expectEqual(@as(usize, 0), @offsetOf(Bridge, field) % line);
+    }
+    // And no two of them land on the same line.
+    try std.testing.expect(@offsetOf(Bridge, "ring_tail") != @offsetOf(Bridge, "preq_tail"));
+    try std.testing.expect(@offsetOf(Bridge, "preq_tail") != @offsetOf(Bridge, "notify"));
 }
 
 test "bridge: coalesced wake fires once per drain cycle" {
