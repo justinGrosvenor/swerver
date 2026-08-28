@@ -783,10 +783,20 @@ fn ffiResumeCompletion(server: *Server, c: ffi_bridge.Bridge.Completion) void {
     if (conn.x402 != .ffi_parked) return;
     conn.x402 = .none;
 
-    var hdr = [_]response_mod.Header{.{ .name = "content-type", .value = c.ctype }};
+    var headers_buf: [128]response_mod.Header = undefined;
+    var content_type = [_]response_mod.Header{.{ .name = "content-type", .value = c.ctype }};
+    const headers = if (c.headers.len > 0)
+        decodeFfiHeaders(c.headers, &headers_buf) orelse {
+            conn.close_after_write = true;
+            return;
+        }
+    else if (c.ctype.len > 0)
+        content_type[0..1]
+    else
+        content_type[0..0];
     const resp = response_mod.Response{
         .status = c.status,
-        .headers = if (c.ctype.len > 0) hdr[0..1] else hdr[0..0],
+        .headers = headers,
         .body = if (c.body.len > 0) .{ .bytes = c.body } else .none,
     };
     http1_mod.queueResponse(server, conn, resp) catch {
@@ -803,6 +813,25 @@ fn ffiResumeCompletion(server: *Server, c: ffi_bridge.Bridge.Completion) void {
     if (postconn.id == c.conn_id and postconn.state != .closed and !postconn.close_after_write and postconn.x402 == .none) {
         if (postconn.fd) |pfd| server.io.rearmRecv(c.conn_index, pfd);
     }
+}
+
+fn decodeFfiHeaders(block: []const u8, out: []response_mod.Header) ?[]const response_mod.Header {
+    var offset: usize = 0;
+    var count: usize = 0;
+    while (offset < block.len) {
+        if (count == out.len) return null;
+        const name_len = std.mem.indexOfScalar(u8, block[offset..], 0) orelse return null;
+        if (name_len == 0) return null;
+        const name = block[offset .. offset + name_len];
+        offset += name_len + 1;
+        if (offset > block.len) return null;
+        const value_len = std.mem.indexOfScalar(u8, block[offset..], 0) orelse return null;
+        const value = block[offset .. offset + value_len];
+        offset += value_len + 1;
+        out[count] = .{ .name = name, .value = value };
+        count += 1;
+    }
+    return out[0..count];
 }
 
 fn pgResume(ctx: *anyopaque, outcome: *const pg_client_mod.Outcome) void {

@@ -1375,7 +1375,7 @@ pub fn dispatchToRouter(server: *Server, conn: *connection.Connection, req_view:
 pub fn ffiTryDispatch(server: *Server, conn: *connection.Connection, req_view: request.RequestView) bool {
     const route_id = ffi_bridge.instance.match(req_view.path) orelse return false;
     const body = req_view.body.sliceOrNull() orelse "";
-    switch (ffi_bridge.instance.park(conn.index, conn.id, route_id, req_view.getMethodName(), req_view.path, body)) {
+    switch (ffi_bridge.instance.park(conn.index, conn.id, route_id, req_view.getMethodName(), req_view.path, body, req_view.headers)) {
         .parked => {
             conn.x402 = .ffi_parked;
             return true;
