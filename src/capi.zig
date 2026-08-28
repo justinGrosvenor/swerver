@@ -24,6 +24,7 @@ const Proxy = swerver.proxy.handler.Proxy;
 // Embedders link libc, so the C allocator is the natural choice: thread-safe
 // and free of teardown of its own.
 const gpa = std.heap.c_allocator;
+var embed_active = std.atomic.Value(bool).init(false);
 
 /// Opaque handle returned by swerver_init and passed to the other calls.
 const Embed = struct {
@@ -36,7 +37,7 @@ const Embed = struct {
 
 /// ABI version. Bumped when the exported surface changes.
 export fn swerver_abi_version() u32 {
-    return 3;
+    return 5;
 }
 
 export fn swerver_build_id() [*:0]const u8 {
@@ -47,7 +48,12 @@ export fn swerver_build_id() [*:0]const u8 {
 /// --config file). Returns an opaque handle, or null on parse/validation
 /// failure. Does not start serving; call swerver_start.
 export fn swerver_init(config_json: [*]const u8, config_json_len: usize) ?*Embed {
+    if (embed_active.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) {
+        std.log.err("swerver_init failed: only one embedded server is supported per process", .{});
+        return null;
+    }
     return initInner(config_json[0..config_json_len]) catch |err| {
+        embed_active.store(false, .release);
         std.log.err("swerver_init failed: {}", .{err});
         return null;
     };
@@ -58,6 +64,7 @@ fn initInner(bytes: []const u8) !*Embed {
     // previous embed cycle. Routes and the callback are registered between init
     // and start via swerver_route / swerver_on_request.
     try ffi_bridge.instance.init(gpa);
+    errdefer ffi_bridge.instance.deinit(gpa);
     ffi_bridge.instance.resetRoutes();
 
     const embed = try gpa.create(Embed);
@@ -73,7 +80,11 @@ fn initInner(bytes: []const u8) !*Embed {
     var cfg = embed.loaded.server_config;
     // An embedder must never fork the host: force single-process mode.
     cfg.workers = 1;
+    // The reactor runs on a background thread; pickBackend uses this to select a
+    // cross-thread-safe backend (epoll on Linux, not the thread-pinned io_uring).
+    cfg.embedded = true;
     try cfg.validate();
+    ffi_bridge.instance.setResponseCapacity(cfg.buffer_pool.buffer_size);
 
     if (embed.loaded.routes.len > 0 and embed.loaded.upstreams.len > 0) {
         const p = try gpa.create(Proxy);
@@ -115,6 +126,22 @@ export fn swerver_on_request(embed: *Embed, cb: ffi_bridge.RequestCallback) void
     ffi_bridge.instance.setCallback(cb);
 }
 
+/// Connect the push-wake channel to a unix socket the host is listening on, so
+/// the reactor can wake the host on park instead of the host polling on a timer.
+/// The host listens (e.g. Bun.listen({unix})), then calls this; on a `data`
+/// event the host calls swerver_wake_clear and drains with swerver_poll.
+/// Returns 0 on success, -1 on failure. Call after swerver_init.
+export fn swerver_wake_connect(embed: *Embed, path: [*]const u8, path_len: usize) c_int {
+    _ = embed;
+    return if (ffi_bridge.instance.connectJsWake(path[0..path_len])) 0 else -1;
+}
+
+/// Host thread: re-arm the push wake and drain any pending wake bytes. Call on
+/// each wake, before draining the request ring.
+export fn swerver_wake_clear() void {
+    ffi_bridge.instance.clearJsWake();
+}
+
 /// Host thread: pop the next parked request id, or 0 if none are pending. The
 /// host drains this in a loop (on the wake callback, and/or on a timer), reads
 /// each with swerver_request, and answers with swerver_respond.
@@ -129,11 +156,18 @@ export fn swerver_notify_done() void {
     ffi_bridge.instance.notifyDone();
 }
 
-/// Fill `out` (6 usize slots) with [method_ptr, method_len, path_ptr,
-/// path_len, body_ptr, body_len] for a parked request. Returns 0 on success,
-/// -1 if req_id is stale. Pointers are valid until swerver_respond(req_id).
+/// Fill `out` (8 usize slots) with [method_ptr, method_len, path_ptr,
+/// path_len, body_ptr, body_len, response_ptr, response_cap] for a parked
+/// request. Returns 0 on success; pointers are valid until it is answered.
 export fn swerver_request(req_id: u64, out: [*]usize) c_int {
-    return ffi_bridge.instance.requestInfo(req_id, out[0..6]);
+    return ffi_bridge.instance.requestInfo(req_id, out[0..8]);
+}
+
+/// Fill `out` with [headers_ptr, headers_len]. Headers are packed as
+/// NUL-delimited name/value pairs and remain valid until the request is
+/// answered. Returns 0 on success or -1 for a stale request id.
+export fn swerver_request_headers(req_id: u64, out: [*]usize) c_int {
+    return ffi_bridge.instance.requestHeaders(req_id, out[0..2]);
 }
 
 /// Answer a parked request. `ctype` is the Content-Type value (may be empty).
@@ -150,6 +184,46 @@ export fn swerver_respond(
     return ffi_bridge.instance.respond(req_id, status, ctype[0..ctype_len], body[0..body_len]);
 }
 
+/// Answer with arbitrary response headers packed as NUL-delimited name/value
+/// pairs. The bridge copies both headers and body before waking the reactor.
+/// Returns 0 on success, -1 if stale/already answered, or -2 if too large.
+export fn swerver_respond_full(
+    req_id: u64,
+    status: u16,
+    headers: [*]const u8,
+    headers_len: usize,
+    body: [*]const u8,
+    body_len: usize,
+) c_int {
+    return ffi_bridge.instance.respondFull(req_id, status, headers[0..headers_len], body[0..body_len]);
+}
+
+/// Answer with arbitrary packed headers and a body already written into the
+/// response slot exposed by swerver_request.
+export fn swerver_respond_inplace_full(
+    req_id: u64,
+    status: u16,
+    headers: [*]const u8,
+    headers_len: usize,
+    body_len: usize,
+) c_int {
+    return ffi_bridge.instance.respondInplaceFull(req_id, status, headers[0..headers_len], body_len);
+}
+
+/// Answer a parked request whose body was written DIRECTLY into the slot's
+/// response buffer (via the resp_ptr from swerver_request) — no body copy. Only
+/// status, content-type, and length are recorded. Same return codes as
+/// swerver_respond.
+export fn swerver_respond_inplace(
+    req_id: u64,
+    status: u16,
+    ctype: [*]const u8,
+    ctype_len: usize,
+    body_len: usize,
+) c_int {
+    return ffi_bridge.instance.respondInplace(req_id, status, ctype[0..ctype_len], body_len);
+}
+
 /// Start serving on a background thread. Returns 0 on success, negative on
 /// error. Returns immediately; the listeners are bound as the reactor starts,
 /// so the host should poll-connect until the port accepts before sending
@@ -158,6 +232,21 @@ export fn swerver_start(embed: *Embed) c_int {
     if (embed.thread != null) return -1;
     embed.thread = std.Thread.spawn(.{}, runThread, .{embed}) catch return -2;
     return 0;
+}
+
+/// Close FFI route admission without stopping the reactor. Embedders use this
+/// before awaiting host-language handlers: new FFI requests receive 503 while
+/// admitted slots and their completions drain. The final swerver_stop shuts
+/// down the reactor and frees the server.
+export fn swerver_shutdown(embed: *Embed) void {
+    ffi_bridge.instance.beginShutdown();
+    embed.server.io.wake();
+}
+
+/// Number of admitted host requests still occupying bridge slots. After
+/// swerver_shutdown, embedders drain this to zero before swerver_stop.
+export fn swerver_pending() u32 {
+    return ffi_bridge.instance.pending();
 }
 
 fn runThread(embed: *Embed) void {
@@ -183,4 +272,6 @@ export fn swerver_stop(embed: *Embed) void {
     gpa.destroy(embed.server);
     embed.loaded.deinit();
     gpa.destroy(embed);
+    ffi_bridge.instance.deinit(gpa);
+    embed_active.store(false, .release);
 }

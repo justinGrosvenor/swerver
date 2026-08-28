@@ -13,6 +13,8 @@
 
 const std = @import("std");
 const io_mod = @import("runtime/io.zig");
+const net = @import("runtime/net.zig");
+const request = @import("protocol/request.zig");
 
 pub const MAX_ROUTES = 64;
 pub const MAX_SLOTS = 256;
@@ -26,6 +28,17 @@ const METHOD_CAP = 16;
 const CTYPE_CAP = 256;
 const REQ_BODY_CAP = 32 * 1024;
 const RESP_BODY_CAP = 128 * 1024;
+const HEADER_BLOCK_CAP = 40 * 1024;
+// Room reserved (per response) for the status line plus response headers so a
+// response body plus its headers still fit in one pool buffer. Larger than the
+// old 512 so custom headers (cookies, cache directives) do not push the encode
+// over the buffer; blocks beyond it fail closed rather than corrupt.
+const RESPONSE_HEADER_RESERVE = 8 * 1024;
+// The header_space http1.zig's streamBodyChunks path keys off (search
+// "header_space" there). A body over buffer_size - this takes the streaming
+// borrow path, so the response cap reserve must never fall below it. Keep in
+// sync with http1.zig; ffi_bridge cannot import http1 (http1 imports ffi_bridge).
+const STREAM_HEADER_SPACE = 512;
 
 /// C callback the reactor invokes when a request is parked. Must be
 /// thread-safe (Bun's JSCallback with threadsafe:true is). It should return
@@ -52,18 +65,23 @@ const Slot = struct {
     path_len: u16 = 0,
     req_body: []u8 = &.{},
     req_body_len: u32 = 0,
+    req_headers: []u8 = &.{},
+    req_headers_len: u32 = 0,
 
     status: u16 = 0,
     ctype: [CTYPE_CAP]u8 = undefined,
     ctype_len: u16 = 0,
     resp_body: []u8 = &.{},
     resp_body_len: u32 = 0,
+    resp_headers: []u8 = &.{},
+    resp_headers_len: u32 = 0,
 };
 
 pub const ParkResult = enum { parked, no_slot, no_callback, too_large };
 
 pub const Bridge = struct {
     ready: bool = false,
+    response_cap: usize = RESP_BODY_CAP,
     callback: ?RequestCallback = null,
     io: ?*io_mod.IoRuntime = null,
 
@@ -94,6 +112,16 @@ pub const Bridge = struct {
     preq_head: std.atomic.Value(usize) align(64) = std.atomic.Value(usize).init(0),
     preq_tail: std.atomic.Value(usize) align(64) = std.atomic.Value(usize).init(0),
     notify: std.atomic.Value(bool) align(64) = std.atomic.Value(bool).init(false),
+    accepting: std.atomic.Value(bool) align(64) = std.atomic.Value(bool).init(false),
+    active: std.atomic.Value(u32) align(64) = std.atomic.Value(u32).init(0),
+
+    // Push wake for the host: a unix socket (connectJsWake) the host listens on.
+    // On park the reactor writes one byte, coalesced by `wake_pending` so at
+    // most one wake is outstanding — the host clears it (clearJsWake) before
+    // draining, so a park during the drain re-arms. Replaces the host busy-
+    // polling on a ~1ms timer.
+    js_wake_w: std.posix.fd_t align(64) = -1,
+    wake_pending: std.atomic.Value(bool) align(64) = std.atomic.Value(bool).init(false),
 
     pub fn init(self: *Bridge, allocator: std.mem.Allocator) !void {
         if (self.ready) return;
@@ -101,25 +129,25 @@ pub const Bridge = struct {
         errdefer allocator.free(self.slots);
         self.free = try allocator.alloc(u32, MAX_SLOTS);
         errdefer allocator.free(self.free);
+        var initialized: usize = 0;
+        errdefer for (self.slots[0..initialized]) |*s| freeSlotBuffers(allocator, s);
         for (self.slots, 0..) |*s, i| {
-            s.* = .{};
-            s.req_body = try allocator.alloc(u8, REQ_BODY_CAP);
-            s.resp_body = try allocator.alloc(u8, RESP_BODY_CAP);
+            s.* = try allocSlotBuffers(allocator);
+            initialized += 1;
             self.free[i] = @intCast(i);
         }
         self.free_top = MAX_SLOTS;
         self.route_count = 0;
+        self.accepting.store(true, .monotonic);
         self.ready = true;
     }
 
     pub fn deinit(self: *Bridge, allocator: std.mem.Allocator) void {
         if (!self.ready) return;
-        for (self.slots) |*s| {
-            allocator.free(s.req_body);
-            allocator.free(s.resp_body);
-        }
+        for (self.slots) |*s| freeSlotBuffers(allocator, s);
         allocator.free(self.slots);
         allocator.free(self.free);
+        if (self.js_wake_w >= 0) _ = std.c.close(self.js_wake_w);
         self.* = .{};
     }
 
@@ -134,6 +162,13 @@ pub const Bridge = struct {
         self.preq_head.store(0, .monotonic);
         self.preq_tail.store(0, .monotonic);
         self.notify.store(false, .monotonic);
+        self.accepting.store(false, .monotonic);
+        self.active.store(0, .monotonic);
+        self.wake_pending.store(false, .monotonic);
+        if (self.js_wake_w >= 0) {
+            _ = std.c.close(self.js_wake_w);
+            self.js_wake_w = -1;
+        }
         self.free_top = MAX_SLOTS;
         for (self.slots, 0..) |*s, i| {
             s.in_use = false;
@@ -148,6 +183,55 @@ pub const Bridge = struct {
 
     pub fn setIo(self: *Bridge, io: *io_mod.IoRuntime) void {
         self.io = io;
+        self.accepting.store(true, .release);
+    }
+
+    /// Bound the response body so the whole response fits in one pool buffer.
+    /// This keeps the body on queueResponse's single-buffer copy path (never
+    /// streamBodyChunks, whose borrowed pending_body would dangle after freeSlot
+    /// returns the slot) AND leaves room for encodeResponse to prepend the
+    /// status line and headers. Response header blocks larger than the reserve
+    /// fail closed (the socket closes cleanly) rather than corrupt.
+    ///
+    /// The reserve must never drop below http1.zig's streaming header_space
+    /// (STREAM_HEADER_SPACE): streamBodyChunks fires when body_len exceeds
+    /// buffer_size - header_space, so a smaller reserve would let a body onto the
+    /// borrow path and reintroduce the dangle. It grows toward
+    /// RESPONSE_HEADER_RESERVE for header room, clamped to half the buffer so a
+    /// mid-size buffer still admits some body.
+    pub fn setResponseCapacity(self: *Bridge, buffer_size: usize) void {
+        const reserve = @max(STREAM_HEADER_SPACE, @min(RESPONSE_HEADER_RESERVE, buffer_size / 2));
+        self.response_cap = @min(RESP_BODY_CAP, buffer_size -| reserve);
+    }
+
+    /// Stop admitting host-handled requests while the reactor remains alive to
+    /// drain slots already handed to the host.
+    pub fn beginShutdown(self: *Bridge) void {
+        self.accepting.store(false, .release);
+    }
+
+    /// Number of admitted requests whose slots have not returned to the pool.
+    pub fn pending(self: *Bridge) u32 {
+        return self.active.load(.acquire);
+    }
+
+    /// Connect the wake channel to a unix socket the host is listening on (Bun
+    /// only integrates its own sockets into its event loop, not a raw fd). On
+    /// park the reactor writes one coalesced byte to this socket; the host's
+    /// listener delivers a `data` event and drains the ring. Returns true on
+    /// success. Call after the host's listener is up.
+    pub fn connectJsWake(self: *Bridge, path: []const u8) bool {
+        if (self.js_wake_w >= 0) return true;
+        const fd = net.connectUnixBlocking(path, 2000) catch return false;
+        self.js_wake_w = fd;
+        return true;
+    }
+
+    /// Host: re-arm the wake before draining, so a park during the drain writes
+    /// a fresh wake byte instead of being missed. The wake bytes themselves are
+    /// consumed by the host's socket `data` handler.
+    pub fn clearJsWake(self: *Bridge) void {
+        self.wake_pending.store(false, .release);
     }
 
     pub fn addRoute(self: *Bridge, pattern: []const u8, route_id: u32) bool {
@@ -186,9 +270,20 @@ pub const Bridge = struct {
         method: []const u8,
         path: []const u8,
         body: []const u8,
+        headers: []const request.Header,
     ) ParkResult {
         if (method.len > METHOD_CAP or path.len > PATH_CAP or body.len > REQ_BODY_CAP) return .too_large;
-        if (self.free_top == 0) return .no_slot;
+        _ = packedHeadersLength(headers) orelse return .too_large;
+        if (!self.accepting.load(.acquire)) return .no_callback;
+        _ = self.active.fetchAdd(1, .acq_rel);
+        if (!self.accepting.load(.acquire)) {
+            _ = self.active.fetchSub(1, .release);
+            return .no_callback;
+        }
+        if (self.free_top == 0) {
+            _ = self.active.fetchSub(1, .release);
+            return .no_slot;
+        }
 
         self.free_top -= 1;
         const idx = self.free[self.free_top];
@@ -204,8 +299,10 @@ pub const Bridge = struct {
         s.path_len = @intCast(path.len);
         @memcpy(s.req_body[0..body.len], body);
         s.req_body_len = @intCast(body.len);
+        s.req_headers_len = @intCast(packHeaders(s.req_headers, headers));
         s.status = 0;
         s.resp_body_len = 0;
+        s.resp_headers_len = 0;
         // .monotonic: the slot payload is published by the preq_tail release
         // store below, which the host acquires — this flag needs no ordering.
         s.awaiting.store(true, .monotonic);
@@ -217,6 +314,24 @@ pub const Bridge = struct {
         const tail = self.preq_tail.load(.monotonic);
         self.preq[tail] = req_id;
         self.preq_tail.store((tail + 1) & RING_MASK, .release);
+
+        // Push wake: write one byte to the host's pipe, coalesced so at most one
+        // wake is outstanding. Under load the host is already draining (pending
+        // stays true) so this is a relaxed load, no syscall. When the host is
+        // blocked on the pipe, the false->true edge writes the wake byte.
+        if (self.js_wake_w >= 0 and self.wake_pending.load(.monotonic) == false) {
+            if (self.wake_pending.cmpxchgStrong(false, true, .acq_rel, .monotonic) == null) {
+                const b = [_]u8{1};
+                // A failed write (EAGAIN when the tiny wake buffer is full, or a
+                // broken socket) must NOT leave wake_pending stuck true — that
+                // would silently disarm all future wakes. Re-arm so the next park
+                // retries; the request is already on the ring for the host to
+                // drain. At worst the host reads a harmless extra wake byte.
+                if (std.c.write(self.js_wake_w, &b, 1) != 1) {
+                    self.wake_pending.store(false, .release);
+                }
+            }
+        }
 
         // Coalesced wake: invoke the host callback only on the false->true edge
         // of `notify`. Double-checked: a relaxed load elides the locked RMW on
@@ -260,7 +375,11 @@ pub const Bridge = struct {
     /// Fill `out` with [method_ptr, method_len, path_ptr, path_len, body_ptr,
     /// body_len] for the parked request. Returns 0 on success, -1 if req_id is
     /// stale/invalid. Pointers are valid until respond() is called.
-    pub fn requestInfo(self: *Bridge, req_id: u64, out: *[6]usize) c_int {
+    /// Fill `out` with [method_ptr, method_len, path_ptr, path_len, body_ptr,
+    /// body_len, resp_ptr, resp_cap]. resp_ptr/resp_cap let the host serialize
+    /// the response directly into the slot's response buffer (a writable view)
+    /// and answer with respondInplace — no copy of the response body.
+    pub fn requestInfo(self: *Bridge, req_id: u64, out: *[8]usize) c_int {
         const s = self.resolve(req_id) orelse return -1;
         out[0] = @intFromPtr(&s.method);
         out[1] = s.method_len;
@@ -268,7 +387,27 @@ pub const Bridge = struct {
         out[3] = s.path_len;
         out[4] = @intFromPtr(s.req_body.ptr);
         out[5] = s.req_body_len;
+        out[6] = @intFromPtr(s.resp_body.ptr);
+        out[7] = self.response_cap;
         return 0;
+    }
+
+    /// Expose the packed request header block as NUL-delimited name/value
+    /// pairs. Pointers remain valid until the request is answered.
+    pub fn requestHeaders(self: *Bridge, req_id: u64, out: *[2]usize) c_int {
+        const s = self.resolve(req_id) orelse return -1;
+        out[0] = @intFromPtr(s.req_headers.ptr);
+        out[1] = s.req_headers_len;
+        return 0;
+    }
+
+    // Publish a filled slot onto the completion ring and wake the reactor.
+    // Caller has already claimed `awaiting`.
+    fn publish(self: *Bridge, req_id: u64) void {
+        const tail = self.ring_tail.load(.monotonic);
+        self.ring[tail] = @truncate(req_id);
+        self.ring_tail.store((tail + 1) & RING_MASK, .release);
+        if (self.io) |io| io.wake();
     }
 
     /// Host-thread: record the response and hand the slot back to the reactor.
@@ -282,23 +421,83 @@ pub const Bridge = struct {
         body: []const u8,
     ) c_int {
         const s = self.resolve(req_id) orelse return -1;
-        if (ctype.len > CTYPE_CAP or body.len > RESP_BODY_CAP) return -2;
-        // Exactly-once: only the first respond for this park wins.
+        if (ctype.len > CTYPE_CAP or body.len > self.response_cap) return -2;
+        // Exactly-once: claim BEFORE writing the slot so a losing double-respond
+        // cannot corrupt the response the winner already published.
         if (s.awaiting.cmpxchgStrong(true, false, .acq_rel, .monotonic) != null) return -1;
-
         s.status = status;
         @memcpy(s.ctype[0..ctype.len], ctype);
         s.ctype_len = @intCast(ctype.len);
         @memcpy(s.resp_body[0..body.len], body);
         s.resp_body_len = @intCast(body.len);
+        s.resp_headers_len = 0;
+        self.publish(req_id);
+        return 0;
+    }
 
-        // Publish onto the ring (release pairs with the reactor's acquire load).
-        const tail = self.ring_tail.load(.monotonic);
-        const next = (tail + 1) & RING_MASK;
-        self.ring[tail] = @truncate(req_id);
-        self.ring_tail.store(next, .release);
+    /// Answer with a packed NUL-delimited response header block and copied body.
+    pub fn respondFull(
+        self: *Bridge,
+        req_id: u64,
+        status: u16,
+        headers: []const u8,
+        body: []const u8,
+    ) c_int {
+        const s = self.resolve(req_id) orelse return -1;
+        if (headers.len > HEADER_BLOCK_CAP or body.len > self.response_cap) return -2;
+        if (s.awaiting.cmpxchgStrong(true, false, .acq_rel, .monotonic) != null) return -1;
+        s.status = status;
+        @memcpy(s.resp_headers[0..headers.len], headers);
+        s.resp_headers_len = @intCast(headers.len);
+        @memcpy(s.resp_body[0..body.len], body);
+        s.resp_body_len = @intCast(body.len);
+        s.ctype_len = 0;
+        self.publish(req_id);
+        return 0;
+    }
 
-        if (self.io) |io| io.wake();
+    /// Answer with packed response headers and a body already written into the
+    /// slot's response buffer. This preserves the direct-write fast path when
+    /// a host response also carries cookies, cache directives, or other fields.
+    pub fn respondInplaceFull(
+        self: *Bridge,
+        req_id: u64,
+        status: u16,
+        headers: []const u8,
+        body_len: usize,
+    ) c_int {
+        const s = self.resolve(req_id) orelse return -1;
+        if (headers.len > HEADER_BLOCK_CAP or body_len > self.response_cap) return -2;
+        if (s.awaiting.cmpxchgStrong(true, false, .acq_rel, .monotonic) != null) return -1;
+        s.status = status;
+        @memcpy(s.resp_headers[0..headers.len], headers);
+        s.resp_headers_len = @intCast(headers.len);
+        s.resp_body_len = @intCast(body_len);
+        s.ctype_len = 0;
+        self.publish(req_id);
+        return 0;
+    }
+
+    /// Host-thread: answer with the response body ALREADY written into the
+    /// slot's response buffer (via the resp_ptr view). Only status/content-type
+    /// and the length are recorded — no body copy. Returns 0, -1 (stale/done),
+    /// -2 (content-type or length exceeds capacity).
+    pub fn respondInplace(
+        self: *Bridge,
+        req_id: u64,
+        status: u16,
+        ctype: []const u8,
+        body_len: usize,
+    ) c_int {
+        const s = self.resolve(req_id) orelse return -1;
+        if (ctype.len > CTYPE_CAP or body_len > self.response_cap) return -2;
+        if (s.awaiting.cmpxchgStrong(true, false, .acq_rel, .monotonic) != null) return -1;
+        s.status = status;
+        @memcpy(s.ctype[0..ctype.len], ctype);
+        s.ctype_len = @intCast(ctype.len);
+        s.resp_body_len = @intCast(body_len);
+        s.resp_headers_len = 0;
+        self.publish(req_id);
         return 0;
     }
 
@@ -310,6 +509,7 @@ pub const Bridge = struct {
         status: u16,
         ctype: []const u8,
         body: []const u8,
+        headers: []const u8,
     };
 
     /// Pop one completed slot, or null if the ring is empty. Reactor-only.
@@ -327,6 +527,7 @@ pub const Bridge = struct {
             .status = s.status,
             .ctype = s.ctype[0..s.ctype_len],
             .body = s.resp_body[0..s.resp_body_len],
+            .headers = s.resp_headers[0..s.resp_headers_len],
         };
     }
 
@@ -336,8 +537,52 @@ pub const Bridge = struct {
         s.in_use = false;
         self.free[self.free_top] = idx;
         self.free_top += 1;
+        _ = self.active.fetchSub(1, .release);
     }
 };
+
+fn allocSlotBuffers(allocator: std.mem.Allocator) !Slot {
+    var slot: Slot = .{};
+    slot.req_body = try allocator.alloc(u8, REQ_BODY_CAP);
+    errdefer allocator.free(slot.req_body);
+    slot.resp_body = try allocator.alloc(u8, RESP_BODY_CAP);
+    errdefer allocator.free(slot.resp_body);
+    slot.req_headers = try allocator.alloc(u8, HEADER_BLOCK_CAP);
+    errdefer allocator.free(slot.req_headers);
+    slot.resp_headers = try allocator.alloc(u8, HEADER_BLOCK_CAP);
+    return slot;
+}
+
+fn freeSlotBuffers(allocator: std.mem.Allocator, slot: *Slot) void {
+    allocator.free(slot.req_body);
+    allocator.free(slot.resp_body);
+    allocator.free(slot.req_headers);
+    allocator.free(slot.resp_headers);
+}
+
+fn packedHeadersLength(headers: []const request.Header) ?usize {
+    var total: usize = 0;
+    for (headers) |header| {
+        total = std.math.add(usize, total, header.name.len + header.value.len + 2) catch return null;
+        if (total > HEADER_BLOCK_CAP) return null;
+    }
+    return total;
+}
+
+fn packHeaders(out: []u8, headers: []const request.Header) usize {
+    var offset: usize = 0;
+    for (headers) |header| {
+        @memcpy(out[offset..][0..header.name.len], header.name);
+        offset += header.name.len;
+        out[offset] = 0;
+        offset += 1;
+        @memcpy(out[offset..][0..header.value.len], header.value);
+        offset += header.value.len;
+        out[offset] = 0;
+        offset += 1;
+    }
+    return offset;
+}
 
 /// Process-global bridge instance (one embedded server per process).
 pub var instance: Bridge = .{};
@@ -358,12 +603,30 @@ test "bridge: cross-thread ring indices sit on separate cache lines" {
     // Each producer/consumer index and the wake flag must start on its own
     // cache line so a store by one thread does not invalidate an index the
     // other thread reads/writes (SPSC false sharing).
-    inline for (.{ "ring_head", "ring_tail", "preq_head", "preq_tail", "notify" }) |field| {
+    inline for (.{ "ring_head", "ring_tail", "preq_head", "preq_tail", "notify", "accepting", "active" }) |field| {
         try std.testing.expectEqual(@as(usize, 0), @offsetOf(Bridge, field) % line);
     }
     // And no two of them land on the same line.
     try std.testing.expect(@offsetOf(Bridge, "ring_tail") != @offsetOf(Bridge, "preq_tail"));
     try std.testing.expect(@offsetOf(Bridge, "preq_tail") != @offsetOf(Bridge, "notify"));
+}
+
+test "bridge: shutdown gate rejects new requests and drains admitted slots" {
+    var b = Bridge{};
+    try b.init(std.testing.allocator);
+    defer b.deinit(std.testing.allocator);
+    b.accepting.store(true, .release);
+
+    try std.testing.expectEqual(ParkResult.parked, b.park(1, 2, 3, "GET", "/slow", "", &.{}));
+    try std.testing.expectEqual(@as(u32, 1), b.pending());
+    b.beginShutdown();
+    try std.testing.expectEqual(ParkResult.no_callback, b.park(1, 3, 3, "GET", "/late", "", &.{}));
+
+    const req_id = b.pollRequest();
+    try std.testing.expectEqual(@as(c_int, 0), b.respond(req_id, 200, "text/plain", "done"));
+    const completion = b.popCompletion() orelse return error.TestExpectedEqual;
+    b.freeSlot(completion.slot);
+    try std.testing.expectEqual(@as(u32, 0), b.pending());
 }
 
 test "bridge: coalesced wake fires once per drain cycle" {
@@ -381,9 +644,9 @@ test "bridge: coalesced wake fires once per drain cycle" {
 
     // Three parks with no drain in between: the callback fires only once
     // (false->true edge), and all three req_ids are queued.
-    _ = b.park(0, 1, 0, "GET", "/a", "");
-    _ = b.park(0, 2, 0, "GET", "/b", "");
-    _ = b.park(0, 3, 0, "GET", "/c", "");
+    _ = b.park(0, 1, 0, "GET", "/a", "", &.{});
+    _ = b.park(0, 2, 0, "GET", "/b", "", &.{});
+    _ = b.park(0, 3, 0, "GET", "/c", "", &.{});
     try std.testing.expectEqual(@as(u32, 1), S.count);
     try std.testing.expect(b.pollRequest() != 0);
     try std.testing.expect(b.pollRequest() != 0);
@@ -391,7 +654,7 @@ test "bridge: coalesced wake fires once per drain cycle" {
     try std.testing.expectEqual(@as(u64, 0), b.pollRequest());
     // After draining and re-arming, the next park wakes again.
     b.notifyDone();
-    _ = b.park(0, 4, 0, "GET", "/d", "");
+    _ = b.park(0, 4, 0, "GET", "/d", "", &.{});
     try std.testing.expectEqual(@as(u32, 2), S.count);
 }
 
@@ -400,13 +663,24 @@ test "bridge: park/poll/respond/drain round-trip" {
     try b.init(std.testing.allocator);
     defer b.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(ParkResult.parked, b.park(3, 99, 0, "POST", "/api/x", "hello"));
+    const headers = [_]request.Header{
+        .{ .name = "host", .value = "example.test" },
+        .{ .name = "x-request-id", .value = "abc123" },
+    };
+    try std.testing.expectEqual(ParkResult.parked, b.park(3, 99, 0, "POST", "/api/x", "hello", &headers));
     const req_id = b.pollRequest();
     try std.testing.expect(req_id != 0);
 
-    var info: [6]usize = undefined;
+    var info: [8]usize = undefined;
     try std.testing.expectEqual(@as(c_int, 0), b.requestInfo(req_id, &info));
     try std.testing.expectEqual(@as(usize, 5), info[5]); // body len
+    var header_info: [2]usize = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), b.requestHeaders(req_id, &header_info));
+    const header_bytes: [*]const u8 = @ptrFromInt(header_info[0]);
+    try std.testing.expectEqualStrings(
+        "host\x00example.test\x00x-request-id\x00abc123\x00",
+        header_bytes[0..header_info[1]],
+    );
 
     try std.testing.expectEqual(@as(c_int, 0), b.respond(req_id, 200, "application/json", "{\"ok\":true}"));
     // Double respond rejected.
@@ -419,4 +693,51 @@ test "bridge: park/poll/respond/drain round-trip" {
     try std.testing.expectEqualStrings("{\"ok\":true}", c.body);
     b.freeSlot(c.slot);
     try std.testing.expectEqual(@as(?Bridge.Completion, null), b.popCompletion());
+}
+
+test "bridge: in-place response publishes slot bytes" {
+    var b = Bridge{};
+    try b.init(std.testing.allocator);
+    defer b.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(
+        ParkResult.parked,
+        b.park(3, 9, 1, "GET", "/json", "", &.{}),
+    );
+    const req_id = b.pollRequest();
+    try std.testing.expect(req_id != 0);
+
+    var info: [8]usize = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), b.requestInfo(req_id, &info));
+    const response: [*]u8 = @ptrFromInt(info[6]);
+    @memcpy(response[0..11], "{\"ok\":true}");
+
+    try std.testing.expectEqual(@as(c_int, 0), b.respondInplace(req_id, 201, "application/json", 11));
+    const completion = b.popCompletion() orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u16, 201), completion.status);
+    try std.testing.expectEqualStrings("application/json", completion.ctype);
+    try std.testing.expectEqualStrings("{\"ok\":true}", completion.body);
+    b.freeSlot(completion.slot);
+}
+
+test "bridge: full response preserves packed headers" {
+    var b = Bridge{};
+    try b.init(std.testing.allocator);
+    defer b.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(
+        ParkResult.parked,
+        b.park(7, 11, 2, "GET", "/cookies", "", &.{}),
+    );
+    const req_id = b.pollRequest();
+    try std.testing.expect(req_id != 0);
+
+    const headers = "content-type\x00text/plain\x00set-cookie\x00session=abc; HttpOnly\x00";
+    try std.testing.expectEqual(@as(c_int, 0), b.respondFull(req_id, 202, headers, "accepted"));
+    const completion = b.popCompletion() orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u16, 202), completion.status);
+    try std.testing.expectEqualStrings(headers, completion.headers);
+    try std.testing.expectEqualStrings("", completion.ctype);
+    try std.testing.expectEqualStrings("accepted", completion.body);
+    b.freeSlot(completion.slot);
 }
