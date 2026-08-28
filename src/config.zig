@@ -38,6 +38,11 @@ pub const ServerConfig = struct {
     /// one worker becomes the Nether primary client; set `workers: 1` if parking
     /// filters / tenant cold starts must work on every worker (see master.zig).
     workers: u16 = 0,
+    /// Set by libswerver embedders (not from JSON): the reactor runs on a
+    /// background thread while the host thread answers requests. On Linux that
+    /// cross-thread model requires epoll (io_uring's SINGLE_ISSUER ring is
+    /// pinned to its creating thread), so pickBackend avoids io_uring when set.
+    embedded: bool = false,
     /// Max connections per IP address. 0 = unlimited.
     per_ip_limit: u16 = 0,
     /// Graceful shutdown drain timeout in milliseconds.

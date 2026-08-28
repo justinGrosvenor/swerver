@@ -610,7 +610,7 @@ pub fn isExternalId(conn_id: u64) bool {
     return (conn_id >> 32) == (EXTERNAL_ID_BIT >> 32);
 }
 
-fn pickBackend(_: config.ServerConfig) Backend {
+fn pickBackend(cfg: config.ServerConfig) Backend {
     // Diagnostic / opt-in override: SWERVER_BACKEND=epoll|poll|native
     // forces a specific backend. `native` is the opt-in entry for the
     // Allow forcing a specific backend via env var for A/B testing.
@@ -629,6 +629,11 @@ fn pickBackend(_: config.ServerConfig) Backend {
     }
     return switch (@import("builtin").os.tag) {
         .linux => blk: {
+            // Embedded (libswerver/FFI): the host thread nudges the reactor
+            // across threads via registerWake, and io_uring's SINGLE_ISSUER
+            // ring is pinned to its creating thread, so io_uring traps here.
+            // epoll's self-pipe wake is cross-thread safe.
+            if (cfg.embedded) break :blk .linux_epoll;
             // Default: native io_uring when available. The inline
             // accept path (POLL_ADD on listener + `accept4()` drain
             // loop) matches the poll backend on connection-churn,

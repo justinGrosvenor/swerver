@@ -80,6 +80,9 @@ fn initInner(bytes: []const u8) !*Embed {
     var cfg = embed.loaded.server_config;
     // An embedder must never fork the host: force single-process mode.
     cfg.workers = 1;
+    // The reactor runs on a background thread; pickBackend uses this to select a
+    // cross-thread-safe backend (epoll on Linux, not the thread-pinned io_uring).
+    cfg.embedded = true;
     try cfg.validate();
     ffi_bridge.instance.setResponseCapacity(cfg.buffer_pool.buffer_size);
 
