@@ -47,6 +47,7 @@ const accept_mod = @import("accept.zig");
 const http1_mod = @import("http1.zig");
 const pg_client_mod = @import("../db/pg/client.zig");
 const pg_handler_api = @import("../db/pg/handler_api.zig");
+const ffi_bridge = @import("../ffi_bridge.zig");
 const wasm_host_call_mod = if (build_options.enable_wasm) @import("../wasm/host_call.zig") else struct {};
 const wasm_control_mod = if (build_options.enable_wasm) @import("../wasm/control_client.zig") else struct {};
 // The WASM filter host-call (park) deadline is configurable per-server via
@@ -95,27 +96,34 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
     draining.store(false, .release);
     reload_requested.store(false, .release);
 
-    const sa = std.posix.Sigaction{
-        .handler = .{ .handler = handleShutdownSignal },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
-    std.posix.sigaction(std.posix.SIG.INT, &sa, null);
-    // Ignore SIGPIPE — SSL_shutdown/SSL_write on a closed socket triggers it
-    const pipe_sa = std.posix.Sigaction{
-        .handler = .{ .handler = std.posix.SIG.IGN },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    std.posix.sigaction(std.posix.SIG.PIPE, &pipe_sa, null);
-    // Install SIGHUP handler for config hot reload
-    const reload_sa = std.posix.Sigaction{
-        .handler = .{ .handler = handleReloadSignal },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    std.posix.sigaction(std.posix.SIG.HUP, &reload_sa, null);
+    // When embedded in a host process, do NOT install process-wide signal
+    // handlers — that would hijack the host's TERM/INT/PIPE/HUP dispositions.
+    // Shutdown is driven purely by requestShutdown() (a thread-safe atomic the
+    // loop polls every <=10ms), and SIGPIPE is avoided by MSG_NOSIGNAL / the
+    // host's own disposition.
+    if (!server.embedded) {
+        const sa = std.posix.Sigaction{
+            .handler = .{ .handler = handleShutdownSignal },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
+        std.posix.sigaction(std.posix.SIG.INT, &sa, null);
+        // Ignore SIGPIPE — SSL_shutdown/SSL_write on a closed socket triggers it
+        const pipe_sa = std.posix.Sigaction{
+            .handler = .{ .handler = std.posix.SIG.IGN },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.PIPE, &pipe_sa, null);
+        // Install SIGHUP handler for config hot reload
+        const reload_sa = std.posix.Sigaction{
+            .handler = .{ .handler = handleReloadSignal },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.HUP, &reload_sa, null);
+    }
 
     // Install the PG park-resume hook here rather than at Server init:
     // initWithRouter returns the Server by value, so `server` only has
@@ -128,6 +136,14 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
     server.setupWasmControl();
     if (build_options.enable_wasm) {
         if (server.wasmControlClient()) |cc| cc.installResume(@ptrCast(server), wasmCompleteThunk, wasmFailThunk);
+    }
+
+    // Embedded (FFI) servers: register the cross-thread wake so a host thread
+    // can nudge the reactor after enqueuing a completion, and point the bridge
+    // at this loop's io so respond() can wake it.
+    if (server.embedded) {
+        server.io.registerWake() catch |err| std.log.warn("embed: registerWake failed: {}", .{err});
+        ffi_bridge.instance.setIo(&server.io);
     }
 
     try server.io.start();
@@ -323,6 +339,12 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
                         }
                     }
                 },
+                .wake => {
+                    // Cross-thread wake (embedder nudged the reactor after a
+                    // host completion). Clear the wake pipe; the FFI drain below
+                    // (run every iteration) processes the completions.
+                    server.io.drainWake();
+                },
                 .datagram => {
                     // Native io_uring backend: the multishot recvmsg
                     // CQE delivered the packet payload + peer addr
@@ -479,7 +501,7 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
                         .err => handleError(server, index) catch |err| {
                             std.log.debug("handleError conn={} failed: {}", .{ index, err });
                         },
-                        .accept, .datagram => unreachable,
+                        .accept, .datagram, .wake => unreachable,
                     }
                 },
             }
@@ -554,6 +576,14 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
             admin_mod.pollAdmin(server);
             settlement_mod.flush();
         }
+        // Drain host (FFI) completions: a host thread answered a parked
+        // request, wrote the response into the slot, and woke us. Resume runs
+        // here on the reactor thread (it mutates non-atomic connection state).
+        while (ffi_bridge.instance.popCompletion()) |c| {
+            ffiResumeCompletion(server, c);
+            ffi_bridge.instance.freeSlot(c.slot);
+        }
+
         // Drain async x402 facilitator results.
         while (x402_client.pollResult()) |result| {
             switch (result.kind) {
@@ -739,6 +769,34 @@ const PG_RESUME_BUF_SIZE: usize = 24 * 1024;
 /// the continuation, then queues its response and restarts the
 /// connection's I/O (writes first, then any pipelined requests that
 /// were gated behind the park).
+/// Resume a connection parked on an FFI host handler. Runs on the reactor
+/// thread (drained from the bridge ring). Mirrors pgResume's tail: validate the
+/// connection generation (the client may have disconnected while the host
+/// worked), queue the response, and restart I/O.
+fn ffiResumeCompletion(server: *Server, c: ffi_bridge.Bridge.Completion) void {
+    const conn = server.io.getConnection(c.conn_index) orelse return;
+    if (conn.id != c.conn_id) return; // recycled slot: client is gone
+    if (conn.x402 != .ffi_parked) return;
+    conn.x402 = .none;
+
+    var hdr = [_]response_mod.Header{.{ .name = "content-type", .value = c.ctype }};
+    const resp = response_mod.Response{
+        .status = c.status,
+        .headers = if (c.ctype.len > 0) hdr[0..1] else hdr[0..0],
+        .body = if (c.body.len > 0) .{ .bytes = c.body } else .none,
+    };
+    http1_mod.queueResponse(server, conn, resp) catch {
+        conn.close_after_write = true;
+    };
+
+    if (conn.write_count > 0) handleWrite(server, c.conn_index) catch {};
+    handleRead(server, c.conn_index) catch {};
+    const postconn = server.io.getConnection(c.conn_index) orelse return;
+    if (postconn.id == c.conn_id and postconn.state != .closed and !postconn.close_after_write and postconn.x402 == .none) {
+        if (postconn.fd) |pfd| server.io.rearmRecv(c.conn_index, pfd);
+    }
+}
+
 fn pgResume(ctx: *anyopaque, outcome: *const pg_client_mod.Outcome) void {
     const server: *Server = @ptrCast(@alignCast(ctx));
     // Generation check: the HTTP connection may have been closed and
@@ -1824,7 +1882,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
     var memo_path: []const u8 = "";
 
     while (conn.state != .closed and conn.read_buffered_bytes > 0 and conn.canEnqueueWrite() and !conn.hasPendingFile()) {
-        if (conn.x402 == .pending or conn.x402 == .settle_pending or conn.x402 == .db_parked or conn.x402 == .wasm_parked) break;
+        if (conn.x402 == .pending or conn.x402 == .settle_pending or conn.x402 == .db_parked or conn.x402 == .wasm_parked or conn.x402 == .ffi_parked) break;
         // Opportunistic inline write drain: push enqueued responses
         // to the kernel while still processing pipelined requests.
         // At low connection counts (e.g. 512 conns / 64 workers =
@@ -2306,6 +2364,12 @@ pub fn handleRead(server: *Server, index: u32) !void {
             },
             .not_cached => {},
         }
+
+        // FFI (host) route: park the request and hand it to the host callback.
+        // The connection enters .ffi_parked; the reactor resumes it when the
+        // host calls swerver_respond. Break the pipeline loop — remaining
+        // buffered bytes are processed after resume.
+        if (http1_mod.ffiTryDispatch(server, conn, parse.view)) break;
 
         var mw_ctx = middleware.Context{
             .protocol = .http1,

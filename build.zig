@@ -67,6 +67,25 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    // --- libswerver: C ABI shared library for FFI embedding ---
+    // Built on demand with `zig build lib` (not part of the default build).
+    const capi_module = b.createModule(.{
+        .root_source_file = b.path("src/capi.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    capi_module.addImport("swerver", swerver_module);
+    capi_module.addOptions("build_options", options);
+    const lib = b.addLibrary(.{
+        .name = "swerver",
+        .root_module = capi_module,
+        .linkage = .dynamic,
+    });
+    const lib_install = b.addInstallArtifact(lib, .{});
+    const lib_step = b.step("lib", "Build libswerver (C ABI shared library for FFI)");
+    lib_step.dependOn(&lib_install.step);
+
     // --- Test targets ---
     // Each test variant needs its own module because build_options differ.
 

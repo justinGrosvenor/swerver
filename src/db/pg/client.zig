@@ -351,7 +351,7 @@ pub const PgClient = struct {
                 .busy => self.pumpBusyRead(io_rt, slot_idx, now_ms),
                 else => {},
             },
-            .accept, .datagram => {},
+            .accept, .datagram, .wake => {},
         }
     }
 

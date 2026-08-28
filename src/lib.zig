@@ -88,6 +88,7 @@
 
 pub const config = @import("config.zig");
 pub const config_file = @import("config_file.zig");
+pub const ffi_bridge = @import("ffi_bridge.zig");
 pub const config_fetch = @import("config_fetch.zig");
 
 /// Config-driven bootstrap: `bootstrap.run(allocator, .{ .config_path = ...,

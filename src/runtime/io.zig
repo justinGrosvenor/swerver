@@ -293,6 +293,35 @@ pub const IoRuntime = struct {
         };
     }
 
+    /// Set up the cross-thread wake mechanism for this loop. After this, wake()
+    /// (callable from any thread) makes a blocked poll return promptly with a
+    /// wake event the dispatch layer recognizes and drains. Used by embedders
+    /// (libswerver/FFI) to nudge the reactor when a host thread has enqueued a
+    /// completion; the regular server never calls it. Only kqueue is wired so
+    /// far; epoll/io_uring get an eventfd wake alongside FFI Linux support.
+    pub fn registerWake(self: *IoRuntime) !void {
+        return switch (self.backend_state) {
+            .bsd_kqueue => |*kq| kq.registerWake(),
+            else => error.UnsupportedBackend,
+        };
+    }
+
+    /// Signal the loop from any thread. No-op if registerWake was not called.
+    pub fn wake(self: *IoRuntime) void {
+        switch (self.backend_state) {
+            .bsd_kqueue => |*kq| kq.wake(),
+            else => {},
+        }
+    }
+
+    /// Clear the wake signal after handling a wake event (level-triggered).
+    pub fn drainWake(self: *IoRuntime) void {
+        switch (self.backend_state) {
+            .bsd_kqueue => |*kq| kq.drainWake(),
+            else => {},
+        }
+    }
+
     pub fn registerUdpSocket(self: *IoRuntime, fd: std.posix.fd_t) !void {
         return switch (self.backend_state) {
             .bsd_kqueue => |*kq| kq.registerUdpSocket(fd),
@@ -511,6 +540,9 @@ pub const EventKind = enum {
     write,
     err,
     datagram,
+    /// Cross-thread wake (registerWake). Carries no connection; the loop drains
+    /// the wake pipe and any host completion queues.
+    wake,
 };
 
 /// Capability flags describing what a backend can do. The server
@@ -645,6 +677,11 @@ fn translateKqueueEvents(events: []const kqueue_backend.Kevent, out: []Event) us
     var count: usize = 0;
     for (events) |ev| {
         if (count >= out.len) break;
+        if (ev.udata == kqueue_backend.WAKE_TOKEN) {
+            out[count] = .{ .kind = .wake, .conn_id = 0, .bytes = 0, .handle = null };
+            count += 1;
+            continue;
+        }
         if ((ev.flags & kqueue_backend.EV_ERROR) != 0) {
             // Determine conn_id: listener=0, UDP=special, connections are offset by 1
             const conn_id: u64 = if (ev.udata == 0)
