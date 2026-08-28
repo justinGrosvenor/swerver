@@ -29,6 +29,11 @@ const CTYPE_CAP = 256;
 const REQ_BODY_CAP = 32 * 1024;
 const RESP_BODY_CAP = 128 * 1024;
 const HEADER_BLOCK_CAP = 40 * 1024;
+// Room reserved (per response) for the status line plus response headers so a
+// response body plus its headers still fit in one pool buffer. Larger than the
+// old 512 so custom headers (cookies, cache directives) do not push the encode
+// over the buffer; blocks beyond it fail closed rather than corrupt.
+const RESPONSE_HEADER_RESERVE = 8 * 1024;
 
 /// C callback the reactor invokes when a request is parked. Must be
 /// thread-safe (Bun's JSCallback with threadsafe:true is). It should return
@@ -176,11 +181,16 @@ pub const Bridge = struct {
         self.accepting.store(true, .release);
     }
 
-    /// Keep borrowed slot bodies on queueResponse's synchronous single-buffer
-    /// path. Larger bodies can leave a borrowed pending_body on pool pressure,
-    /// which would outlive the slot after freeSlot.
+    /// Bound the response body so the whole response fits in one pool buffer.
+    /// This keeps the body on queueResponse's single-buffer copy path (never
+    /// streamBodyChunks, whose borrowed pending_body would dangle after freeSlot
+    /// returns the slot) AND leaves room for encodeResponse to prepend the
+    /// status line and headers. Response header blocks larger than the reserve
+    /// fail closed (the socket closes cleanly) rather than corrupt. The reserve
+    /// is floored at half the buffer so a small buffer still admits some body.
     pub fn setResponseCapacity(self: *Bridge, buffer_size: usize) void {
-        self.response_cap = @min(RESP_BODY_CAP, buffer_size -| 512);
+        const reserve = @min(RESPONSE_HEADER_RESERVE, buffer_size / 2);
+        self.response_cap = @min(RESP_BODY_CAP, buffer_size -| reserve);
     }
 
     /// Stop admitting host-handled requests while the reactor remains alive to

@@ -783,11 +783,15 @@ fn ffiResumeCompletion(server: *Server, c: ffi_bridge.Bridge.Completion) void {
     if (conn.x402 != .ffi_parked) return;
     conn.x402 = .none;
 
-    var headers_buf: [128]response_mod.Header = undefined;
+    var headers_buf: [256]response_mod.Header = undefined;
     var content_type = [_]response_mod.Header{.{ .name = "content-type", .value = c.ctype }};
     const headers = if (c.headers.len > 0)
         decodeFfiHeaders(c.headers, &headers_buf) orelse {
-            conn.close_after_write = true;
+            // Malformed block, or more headers than headers_buf holds: nothing is
+            // queued, so setting close_after_write alone would leave the socket
+            // hung until idle timeout. Close it outright (the caller still frees
+            // the bridge slot after we return).
+            server.closeConnection(conn);
             return;
         }
     else if (c.ctype.len > 0)
