@@ -861,7 +861,8 @@ pub const Proxy = struct {
                 };
 
                 net.setSocketTimeouts(fd, route.timeouts.send_ms, route.timeouts.read_ms);
-                net.setNoDelay(fd);
+                // TCP_NODELAY is invalid on AF_UNIX upstreams (ENOPROTOOPT).
+                if (connect_server.unix_path.len == 0) net.setNoDelay(fd);
 
                 var new_conn = pool_mod.UpstreamConnection.init(fd, server_idx, now_ms, slot);
                 new_conn.state = .idle;
@@ -1183,7 +1184,8 @@ pub const Proxy = struct {
                 };
 
                 net.setSocketTimeouts(fd, route.timeouts.send_ms, route.timeouts.read_ms);
-                net.setNoDelay(fd);
+                // TCP_NODELAY is invalid on AF_UNIX upstreams (ENOPROTOOPT).
+                if (connect_server_b.unix_path.len == 0) net.setNoDelay(fd);
 
                 var new_conn = pool_mod.UpstreamConnection.init(fd, server_idx_b, now_ms, slot);
                 new_conn.state = .idle;
