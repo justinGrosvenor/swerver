@@ -1,0 +1,44 @@
+name: prebuilts
+
+# Build and publish the per-platform prebuilt packages (@swerver/<os>-<arch>)
+# that swerverts consumes as optionalDependencies. Zig cross-compiles every
+# target from a single macOS host (native darwin + cross to linux), so one job
+# builds and publishes all four. Requires an NPM_TOKEN secret with publish
+# rights on the @swerver scope.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "version to publish (e.g. 0.1.0-alpha.31)"
+        required: true
+
+jobs:
+  publish:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Build prebuilt packages
+        run: VERSION="${{ github.event.release.tag_name || inputs.version }}" scripts/build-prebuilts.sh
+
+      - name: Publish each platform package
+        run: |
+          for dir in dist/npm/*/; do
+            echo "publishing $(basename "$dir")"
+            (cd "$dir" && npm publish --access public)
+          done
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

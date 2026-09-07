@@ -312,18 +312,20 @@ fn evaluateJwt(req: request.RequestView, cfg: JwtConfig) AuthResult {
 
     var payload_buf: [2048]u8 = undefined;
     const payload_json = base64UrlDecode(payload_b64, &payload_buf) orelse return .{ .reject = UNAUTHORIZED };
-    if (!validateJwtPayload(payload_json, cfg)) return .{ .reject = FORBIDDEN };
+    var payload_scratch: [8192]u8 = undefined;
+    const payload = parseJsonValue(payload_json, &payload_scratch) orelse return .{ .reject = FORBIDDEN };
+    if (!validateJwtPayload(payload, cfg)) return .{ .reject = FORBIDDEN };
 
-    // Build AuthInfo with owned copies — payload_buf is stack-local
+    // Copy claims into AuthInfo before payload_buf/payload_scratch expire.
     var info = AuthInfo{};
 
-    if (extractClaim(payload_json, "sub")) |sub| {
+    if (stringClaim(payload, "sub")) |sub| {
         info.setConsumer(sub);
         info.addHeader("X-Consumer-Name", sub);
     }
 
     for (cfg.claims_to_headers) |mapping| {
-        if (extractClaim(payload_json, mapping.claim)) |val| {
+        if (stringClaim(payload, mapping.claim)) |val| {
             info.addHeader(mapping.header, val);
         }
     }
@@ -376,30 +378,31 @@ pub fn base64UrlDecode(input: []const u8, buf: []u8) ?[]const u8 {
 }
 
 fn validateJwtHeader(json: []const u8) bool {
-    const alg = extractClaim(json, "alg") orelse return false;
+    var scratch: [8192]u8 = undefined;
+    const alg = extractClaim(json, "alg", &scratch) orelse return false;
     return std.mem.eql(u8, alg, "HS256");
 }
 
-fn validateJwtPayload(json: []const u8, cfg: JwtConfig) bool {
+fn validateJwtPayload(parsed: std.json.Value, cfg: JwtConfig) bool {
     const skew = cfg.clock_skew_seconds;
     const now_ns = clock_realtimeNanos();
     if (now_ns == 0) return false;
     const now: i64 = @intCast(@divTrunc(now_ns, 1_000_000_000));
 
-    const exp = extractNumericClaim(json, "exp") orelse return false;
+    const exp = numericClaim(parsed, "exp") orelse return false;
     if (now > exp + skew) return false;
 
-    if (extractNumericClaim(json, "nbf")) |nbf| {
+    if (numericClaim(parsed, "nbf")) |nbf| {
         if (now < nbf - skew) return false;
     }
 
     if (cfg.issuer) |expected_iss| {
-        const actual_iss = extractClaim(json, "iss") orelse return false;
+        const actual_iss = stringClaim(parsed, "iss") orelse return false;
         if (!std.mem.eql(u8, actual_iss, expected_iss)) return false;
     }
 
     if (cfg.audience) |expected_aud| {
-        const actual_aud = extractClaim(json, "aud") orelse return false;
+        const actual_aud = stringClaim(parsed, "aud") orelse return false;
         if (!std.mem.eql(u8, actual_aud, expected_aud)) return false;
     }
 
@@ -411,8 +414,15 @@ fn clock_realtimeNanos() i128 {
     return clock_mod.realtimeNanos() orelse 0;
 }
 
-pub fn extractClaim(json: []const u8, key: []const u8) ?[]const u8 {
-    const parsed = parseJsonValue(json) orelse return null;
+/// Extract a decoded string claim using caller-owned parsing storage. The
+/// result borrows `json` or `scratch`; both must remain alive and unchanged
+/// until it is consumed. Reusing scratch invalidates earlier results. Returns
+/// null for invalid JSON, a missing/non-string claim, or insufficient scratch.
+pub fn extractClaim(json: []const u8, key: []const u8, scratch: []u8) ?[]const u8 {
+    return stringClaim(parseJsonValue(json, scratch) orelse return null, key);
+}
+
+fn stringClaim(parsed: std.json.Value, key: []const u8) ?[]const u8 {
     const obj = switch (parsed) {
         .object => |o| o,
         else => return null,
@@ -424,8 +434,7 @@ pub fn extractClaim(json: []const u8, key: []const u8) ?[]const u8 {
     };
 }
 
-fn extractNumericClaim(json: []const u8, key: []const u8) ?i64 {
-    const parsed = parseJsonValue(json) orelse return null;
+fn numericClaim(parsed: std.json.Value, key: []const u8) ?i64 {
     const obj = switch (parsed) {
         .object => |o| o,
         else => return null,
@@ -438,12 +447,10 @@ fn extractNumericClaim(json: []const u8, key: []const u8) ?i64 {
     };
 }
 
-/// Shared JSON parse helper — uses a stack-backed arena so that no heap
-/// allocation occurs on the hot path. The returned Value contains string
-/// slices that point directly into `json`.
-fn parseJsonValue(json: []const u8) ?std.json.Value {
-    var fba_buf: [8192]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
+/// Object tables and decoded escape sequences borrow caller-owned scratch;
+/// unescaped strings can borrow json. Neither buffer may expire before use.
+fn parseJsonValue(json: []const u8, scratch: []u8) ?std.json.Value {
+    var fba = std.heap.FixedBufferAllocator.init(scratch);
     return std.json.parseFromSliceLeaky(std.json.Value, fba.allocator(), json, .{}) catch null;
 }
 
@@ -845,7 +852,7 @@ test "jwt: crlf in claim value rejected" {
     const secret = "test-secret-key-for-hmac";
     const header_b64 = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
     // payload: {"sub":"evil\r\nX-Admin: true","exp":9999999999}
-    // The \r\n is literal bytes 0x0d 0x0a in the JSON value
+    // JSON escapes decode to actual CRLF bytes in the claim value.
     const payload_b64 = "eyJzdWIiOiJldmlsXHJcblgtQWRtaW46IHRydWUiLCJleHAiOjk5OTk5OTk5OTl9";
     const signed_part = header_b64 ++ "." ++ payload_b64;
     var sig: [32]u8 = undefined;
@@ -874,11 +881,7 @@ test "jwt: crlf in claim value rejected" {
     const result = evaluate(req, .{ .jwt = cfg });
     switch (result) {
         .allow => |*info| {
-            // If the claim contained literal \r\n bytes, addHeader would reject it.
-            // The test payload has escaped \r\n (JSON literal backslash-r backslash-n),
-            // which our naive parser returns as "evil\\r\\nX-Admin: true" — no real
-            // CRLF bytes. But the CRLF check in addHeader would catch real 0x0d/0x0a.
-            // The key property: injected_count should be 0 or values should be safe.
+            // Decoded CRLF must never reach an injected response header.
             for (info.headers()) |*hdr| {
                 for (hdr.value()) |ch| {
                     try std.testing.expect(ch != '\r' and ch != '\n');
@@ -896,27 +899,95 @@ test "base64url decode" {
 }
 
 test "extract claim from json" {
+    var scratch: [8192]u8 = undefined;
     const json = "{\"sub\":\"user-1\",\"iss\":\"test-issuer\",\"aud\":\"my-app\"}";
-    try std.testing.expectEqualStrings("user-1", extractClaim(json, "sub").?);
-    try std.testing.expectEqualStrings("test-issuer", extractClaim(json, "iss").?);
-    try std.testing.expectEqualStrings("my-app", extractClaim(json, "aud").?);
-    try std.testing.expect(extractClaim(json, "nope") == null);
+    try std.testing.expectEqualStrings("user-1", extractClaim(json, "sub", &scratch).?);
+    try std.testing.expectEqualStrings("test-issuer", extractClaim(json, "iss", &scratch).?);
+    try std.testing.expectEqualStrings("my-app", extractClaim(json, "aud", &scratch).?);
+    try std.testing.expect(extractClaim(json, "nope", &scratch) == null);
 }
 
 test "extract claim: immune to substring injection" {
+    var scratch: [8192]u8 = undefined;
     // Audit issue #27: a crafted payload with an embedded key in a prior
     // value must not trick the parser into returning the wrong claim.
     const json =
         \\{"fake":"\"sub\":\"admin\"","sub":"user"}
     ;
-    try std.testing.expectEqualStrings("user", extractClaim(json, "sub").?);
+    try std.testing.expectEqualStrings("user", extractClaim(json, "sub", &scratch).?);
 }
 
 test "extract numeric claim from json" {
+    var scratch: [8192]u8 = undefined;
     const json = "{\"exp\":1700000000,\"nbf\":1699000000}";
-    try std.testing.expectEqual(@as(i64, 1700000000), extractNumericClaim(json, "exp").?);
-    try std.testing.expectEqual(@as(i64, 1699000000), extractNumericClaim(json, "nbf").?);
-    try std.testing.expect(extractNumericClaim(json, "nope") == null);
+    const parsed = parseJsonValue(json, &scratch).?;
+    try std.testing.expectEqual(@as(i64, 1700000000), numericClaim(parsed, "exp").?);
+    try std.testing.expectEqual(@as(i64, 1699000000), numericClaim(parsed, "nbf").?);
+    try std.testing.expect(numericClaim(parsed, "nope") == null);
+}
+
+test "extract claim: decoded strings borrow caller scratch" {
+    var scratch: [8192]u8 = undefined;
+    var other: [8192]u8 = undefined;
+    const value = extractClaim("{\"sub\":\"us\\u0065r\"}", "sub", &scratch).?;
+    // A second parse must not overwrite an earlier caller's decoded string.
+    _ = extractClaim("{\"sub\":\"oth\\u0065r\"}", "sub", &other);
+    try std.testing.expectEqualStrings("user", value);
+    try std.testing.expect(@intFromPtr(value.ptr) >= @intFromPtr(&scratch));
+    try std.testing.expect(@intFromPtr(value.ptr) + value.len <= @intFromPtr(&scratch) + scratch.len);
+    try std.testing.expect(extractClaim("{\"sub\":\"user\"}", "sub", &.{}) == null);
+    try std.testing.expect(extractClaim("{\"sub\":", "sub", &scratch) == null);
+    try std.testing.expect(extractClaim("{\"sub\":123}", "sub", &scratch) == null);
+}
+
+test "jwt: escaped claims remain valid through validation and header copies" {
+    const payload =
+        \\{"sub":"us\u0065r","iss":"iss\u0075er","aud":"a\u0070p","role":"adm\u0069n","exp":9999999999}
+    ;
+    const result = try evaluateTestJwt(payload, .{
+        .secret = "test-secret",
+        .issuer = "issuer",
+        .audience = "app",
+        .claims_to_headers = &.{.{ .claim = "role", .header = "X-Role" }},
+    });
+    switch (result) {
+        .allow => |*info| {
+            try std.testing.expectEqualStrings("user", info.consumerName());
+            try std.testing.expectEqual(@as(u8, 2), info.injected_count);
+            try std.testing.expectEqualStrings("user", info.headers()[0].value());
+            try std.testing.expectEqualStrings("admin", info.headers()[1].value());
+        },
+        .reject => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect((try evaluateTestJwt(payload, .{ .secret = "test-secret", .issuer = "wrong" })) == .reject);
+    try std.testing.expect((try evaluateTestJwt("{\"sub\":", .{ .secret = "test-secret" })) == .reject);
+
+    // Valid JSON below the decoded payload limit, but its object/array storage
+    // exceeds the bounded arena. Reject it without allocation or a trap.
+    var oversized: [1800]u8 = undefined;
+    const prefix = "{\"exp\":9999999999,\"padding\":[";
+    @memcpy(oversized[0..prefix.len], prefix);
+    var n = prefix.len;
+    for (0..700) |_| {
+        @memcpy(oversized[n..][0..2], "0,");
+        n += 2;
+    }
+    @memcpy(oversized[n..][0..3], "0]}");
+    try std.testing.expect((try evaluateTestJwt(oversized[0 .. n + 3], .{ .secret = "test-secret" })) == .reject);
+}
+
+fn evaluateTestJwt(payload: []const u8, cfg: JwtConfig) !AuthResult {
+    var encoded: [4096]u8 = undefined;
+    const payload_b64 = std.base64.url_safe_no_pad.Encoder.encode(&encoded, payload);
+    var signed_buf: [4608]u8 = undefined;
+    const signed = try std.fmt.bufPrint(&signed_buf, "eyJhbGciOiJIUzI1NiJ9.{s}", .{payload_b64});
+    var signature: [32]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&signature, signed, cfg.secret);
+    var sig_buf: [44]u8 = undefined;
+    const sig_b64 = std.base64.url_safe_no_pad.Encoder.encode(&sig_buf, &signature);
+    var token_buf: [4800]u8 = undefined;
+    const token = try std.fmt.bufPrint(&token_buf, "Bearer {s}.{s}", .{ signed, sig_b64 });
+    return evaluate(.{ .method = .GET, .path = "/", .headers = &.{.{ .name = "Authorization", .value = token }} }, .{ .jwt = cfg });
 }
 
 test "auth none allows everything" {

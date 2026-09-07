@@ -132,7 +132,7 @@ pub const Config = struct {
     /// is the concurrency ceiling for parks: once all instances are pinned the
     /// next park is refused (now with connection backpressure instead of a bare
     /// 503, see POOL_BACKPRESSURE_MS). The park Table (`host_call.Table.CAP`,
-    /// currently 64) is the HARD ceiling across all filters on a worker, so
+    /// currently 1024) is the HARD ceiling across all filters on a worker, so
     /// sizing a single filter's pool above CAP buys nothing. Cost: each extra
     /// instance reserves another `max_memory_pages` (default 4 MiB) of linear
     /// memory per worker. Rule of thumb: instances = min(expected concurrent

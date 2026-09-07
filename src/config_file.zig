@@ -55,7 +55,7 @@ pub const WasmFilterConfig = struct {
     /// Once all instances are pinned the next park is refused with connection
     /// backpressure (a 503 plus a brief read-pause) rather than a CPU-burning
     /// bare 503, so the pool size sets the smooth-degradation ceiling. The park
-    /// table CAP (host_call.Table.CAP, currently 64) is the hard ceiling across
+    /// table CAP (host_call.Table.CAP, currently 1024) is the hard ceiling across
     /// all filters on a worker; sizing above it buys nothing. Each extra
     /// instance reserves ~4 MiB of linear memory. See filter.Config.instances.
     instances: usize = 1,

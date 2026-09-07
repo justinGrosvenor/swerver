@@ -76,9 +76,9 @@ zig build -Doptimize=ReleaseFast -Denable-tls=true -Denable-http2=true -Denable-
 Tagged alpha releases publish cross-compiled binaries for linux-{x86_64, aarch64} and macos-{x86_64, aarch64} on the [Releases page](https://github.com/justinGrosvenor/swerver/releases). Download, extract, and run:
 
 ```bash
-curl -LO https://github.com/justinGrosvenor/swerver/releases/download/v0.1.0-alpha.23/swerver-v0.1.0-alpha.23-linux-x86_64.tar.gz
-tar -xzf swerver-v0.1.0-alpha.23-linux-x86_64.tar.gz
-./swerver-v0.1.0-alpha.23-linux-x86_64 --config config.json
+curl -LO https://github.com/justinGrosvenor/swerver/releases/download/v0.1.0-alpha.32/swerver-v0.1.0-alpha.32-linux-x86_64.tar.gz
+tar -xzf swerver-v0.1.0-alpha.32-linux-x86_64.tar.gz
+./swerver-v0.1.0-alpha.32-linux-x86_64 --config config.json
 ```
 
 > **Release binaries are built without TLS, HTTP/2, or HTTP/3.** OpenSSL linking requires the host toolchain, so the cross-compiled binaries ship as HTTP/1.1-only. Build from source or use the Docker image for full protocol support.
@@ -99,7 +99,7 @@ In your downstream project's `build.zig.zon`:
     .version = "0.1.0",
     .dependencies = .{
         .swerver = .{
-            .url = "https://github.com/justinGrosvenor/swerver/archive/refs/tags/v0.1.0-alpha.23.tar.gz",
+            .url = "https://github.com/justinGrosvenor/swerver/archive/refs/tags/v0.1.0-alpha.32.tar.gz",
             // .hash will be filled in by `zig fetch --save`
         },
     },

@@ -17,9 +17,17 @@ pub const EPOLLERR: u32 = 0x008;
 pub const EPOLLHUP: u32 = 0x010;
 pub const EPOLLET: u32 = 0x80000000;
 
+// data.u64 marker for the cross-thread wake pipe. Distinct from the listener
+// (0), the UDP socket (maxInt - 1), and any connection id (conn_id + 1).
+pub const WAKE_ID: u64 = std.math.maxInt(u64);
+
 pub const EpollBackend = struct {
     epfd: i32,
     events: []EpollEvent,
+    // Self-pipe for cross-thread wake (registerWake). Any thread writes a byte
+    // to wake_w to nudge the loop; the read end is registered with WAKE_ID.
+    wake_r: i32 = -1,
+    wake_w: i32 = -1,
 
     pub fn init(allocator: std.mem.Allocator, max_events: usize) !EpollBackend {
         if (!is_linux) return error.Unsupported;
@@ -39,8 +47,46 @@ pub const EpollBackend = struct {
     pub fn deinit(self: *EpollBackend, allocator: std.mem.Allocator) void {
         allocator.free(self.events);
         if (is_linux) {
+            if (self.wake_r >= 0) _ = linux.close(@intCast(self.wake_r));
+            if (self.wake_w >= 0) _ = linux.close(@intCast(self.wake_w));
             _ = linux.close(@intCast(self.epfd));
         }
+    }
+
+    /// Cross-thread wake: a self-pipe whose read end is registered with the
+    /// epoll set under WAKE_ID. Embedders (libswerver/FFI) call wake() from the
+    /// host thread to nudge the reactor when a completion is enqueued. Idempotent.
+    pub fn registerWake(self: *EpollBackend) !void {
+        if (!is_linux) return error.Unsupported;
+        if (self.wake_r >= 0) return; // already set up
+        var fds: [2]c_int = undefined;
+        if (std.c.pipe(&fds) != 0) return error.PipeFailed;
+        const nonblock: c_int = 1 << @bitOffsetOf(std.posix.O, "NONBLOCK");
+        for (fds) |fd| {
+            _ = std.c.fcntl(fd, std.posix.F.SETFD, @as(c_int, std.posix.FD_CLOEXEC));
+            const fl = std.c.fcntl(fd, std.posix.F.GETFL);
+            _ = std.c.fcntl(fd, std.posix.F.SETFL, fl | nonblock);
+        }
+        self.wake_r = fds[0];
+        self.wake_w = fds[1];
+        var ev = EpollEvent{ .events = EPOLLIN, .data = .{ .u64 = WAKE_ID } };
+        const rc = linux.epoll_ctl(self.epfd, linux.EPOLL.CTL_ADD, self.wake_r, &ev);
+        _ = unwrapSyscall(rc) catch return error.EpollCtlFailed;
+    }
+
+    /// Signal the loop from any thread. No-op if registerWake was not called.
+    pub fn wake(self: *const EpollBackend) void {
+        if (self.wake_w < 0) return;
+        const byte = [_]u8{1};
+        _ = std.c.write(self.wake_w, &byte, 1);
+    }
+
+    /// Drain the wake pipe after handling a wake event.
+    pub fn drainWake(self: *const EpollBackend) void {
+        if (self.wake_r < 0) return;
+        var buf: [64]u8 = undefined;
+        // Nonblocking read: EAGAIN (n < 0) or EOF (n == 0) ends the drain.
+        while (std.c.read(self.wake_r, &buf, buf.len) > 0) {}
     }
 
     pub fn poll(self: *EpollBackend, timeout_ms: u32) ![]EpollEvent {
