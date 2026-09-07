@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 0.1.0-alpha.32 — 2026-09-06
+
+### FFI embedding
+
+- **feat: embed swerver through libswerver (C ABI 5).** Run the server on a
+  background thread, register host routes, and receive requests through a
+  polling ring or coalesced socket wakeups. Request and response headers,
+  in-place response bodies, and graceful draining are supported. Linux
+  embedding selects epoll with cross-thread wake support. Build the shared
+  library with `zig build lib -Doptimize=ReleaseFast`; hosts must target ABI 5.
+- **fix: FFI response storage survives through delivery.** Response capacity
+  reserves the server's header space, and malformed packed response headers
+  close the connection cleanly.
+
 ### Authentication, FFI, and proxy caching
 
 - **fix: JWT parsing keeps decoded claims in caller-owned storage.** Payloads
@@ -12,14 +26,17 @@
 - **fix: concurrent FFI responses no longer overwrite completion entries.**
   Queue publication uses a short producer lock; body copies remain independent.
   Request IDs are claimed atomically so delayed duplicate responses cannot
-  claim a recycled slot. The C ABI is unchanged.
+  claim a recycled slot. These concurrency fixes preserve C ABI 5.
 - **fix: shared cache directives and response variation are enforced.**
   Cache-Control directive names are case-insensitive, quoted values are parsed,
   and responses with unsupported Vary fields bypass storage. Configured Vary
   keys distinguish missing, empty, and repeated request fields.
-- **fix: WASM capacity tests support 1,024 parked requests.** Large control
+- **feat: WASM host calls support 1,024 parked requests, up from 64.** Token
+  indices use 10 bits, with a 22-bit generation counter. Large control test
   fixtures use heap storage, and overflow/recovery tests use unique connection
   IDs beyond the capacity boundary.
+- **fix: Unix upstream connections skip TCP_NODELAY.** Unix domain sockets
+  no longer fail setup because of a TCP-only socket option.
 
 ### HTTP/2 / gRPC
 
@@ -29,6 +46,20 @@
   to plaintext already in the connection buffer. A `WANT_READ` then stranded
   body-bearing multiplexed requests on edge-triggered backends. Buffered H2
   work is now resumed first, with partial-frame and socket-backpressure guards.
+
+### Validation
+
+- All feature test-matrix steps pass, with additional WASM, WASM + HTTP/2,
+  and WASM + HTTP/3 coverage. Live HTTP tests cover cache policy and variation.
+- The `swerver-benchmarks/js-compare` FFI suite completed 24 measured runs
+  (three per version per scenario, 15 seconds each, 64 connections) without
+  reported socket or HTTP errors. Compared with commit `0551f21`, median
+  throughput changed by -0.41% (pipeline), -1.32% (baseline), +1.27% (JSON),
+  and +1.73% (static) on an Apple M4 Max. These differences were within the
+  observed run variation; the isolated loop's 14% cost did not appear in
+  the HTTP benchmark.
+
+## Previously released changes
 
 ### WASM / Tier-2
 
