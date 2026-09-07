@@ -3,8 +3,8 @@
 //! the x402 cross-thread pattern. The reactor parks the connection and invokes
 //! a thread-safe host callback; the host later calls `respond()` from its own
 //! thread, which copies the response into the slot, enqueues the slot on a
-//! lock-free SPSC ring, and wakes the loop. The reactor drains the ring and
-//! resumes the parked connection ON ITS OWN THREAD (resume mutates non-atomic
+//! ring with serialized producers, and wakes the loop. The reactor drains the
+//! ring and resumes the connection ON ITS OWN THREAD (resume mutates non-atomic
 //! reactor state, so it must never run on the host thread).
 //!
 //! One bridge per process (embedded servers are single-instance). All slot
@@ -53,7 +53,9 @@ const Route = struct {
 
 const Slot = struct {
     in_use: bool = false, // reactor-owned
-    awaiting: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    // A live request ID, or zero once claimed. Checking the generation and
+    // claiming the slot must be ONE atomic operation across host threads.
+    awaiting: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     nonce: u32 = 0,
     conn_index: u32 = 0,
     conn_id: u64 = 0,
@@ -93,8 +95,8 @@ pub const Bridge = struct {
     free: []u32 = &.{},
     free_top: usize = 0,
 
-    // SPSC completion ring (host -> reactor): host pushes (tail) a slot index
-    // in respond(), reactor pops (head) in popCompletion().
+    // Completion ring (host -> reactor): a short lock serializes producers.
+    // Body copies happen before taking it; the reactor consumes without a lock.
     ring: [RING_CAP]u32 = undefined,
     // SPSC request ring (reactor -> host): reactor pushes (tail) a req_id in
     // park(), host pops (head) in pollRequest(). The host drains this ring; the
@@ -107,6 +109,7 @@ pub const Bridge = struct {
     // line ping-pongs between cores on every request (SPSC false sharing).
     // align(64) starts each on a line; declared consecutively so the padding of
     // one covers the next. Mirrors SpscFdQueue in io_uring_native.zig.
+    publish_lock: std.atomic.Mutex align(64) = .unlocked,
     ring_head: std.atomic.Value(usize) align(64) = std.atomic.Value(usize).init(0),
     ring_tail: std.atomic.Value(usize) align(64) = std.atomic.Value(usize).init(0),
     preq_head: std.atomic.Value(usize) align(64) = std.atomic.Value(usize).init(0),
@@ -172,7 +175,7 @@ pub const Bridge = struct {
         self.free_top = MAX_SLOTS;
         for (self.slots, 0..) |*s, i| {
             s.in_use = false;
-            s.awaiting.store(false, .monotonic);
+            s.awaiting.store(0, .monotonic);
             self.free[i] = @intCast(i);
         }
     }
@@ -290,6 +293,7 @@ pub const Bridge = struct {
         var s = &self.slots[idx];
         s.in_use = true;
         s.nonce +%= 1;
+        if (s.nonce == 0) s.nonce = 1; // zero is reserved for no live request
         s.conn_index = conn_index;
         s.conn_id = conn_id;
         s.route_id = route_id;
@@ -303,11 +307,9 @@ pub const Bridge = struct {
         s.status = 0;
         s.resp_body_len = 0;
         s.resp_headers_len = 0;
-        // .monotonic: the slot payload is published by the preq_tail release
-        // store below, which the host acquires — this flag needs no ordering.
-        s.awaiting.store(true, .monotonic);
-
         const req_id = (@as(u64, s.nonce) << 32) | idx;
+        // Publish to direct request readers as well as the polling host.
+        s.awaiting.store(req_id, .release);
 
         // Publish onto the request ring (reactor is the sole producer). The
         // release store publishes the slot bytes written above.
@@ -365,10 +367,9 @@ pub const Bridge = struct {
     // ── Host thread: read request, write response ───────────────────────────
     fn resolve(self: *Bridge, req_id: u64) ?*Slot {
         const idx: u32 = @truncate(req_id);
-        if (idx >= MAX_SLOTS) return null;
+        if (req_id == 0 or idx >= self.slots.len) return null;
         const s = &self.slots[idx];
-        const nonce: u32 = @truncate(req_id >> 32);
-        if (s.nonce != nonce) return null;
+        if (s.awaiting.load(.acquire) != req_id) return null;
         return s;
     }
 
@@ -404,9 +405,13 @@ pub const Bridge = struct {
     // Publish a filled slot onto the completion ring and wake the reactor.
     // Caller has already claimed `awaiting`.
     fn publish(self: *Bridge, req_id: u64) void {
+        // Only the three queue operations below are serialized. Never hold the
+        // lock while copying a body, invoking a callback, or waking the reactor.
+        while (!self.publish_lock.tryLock()) std.atomic.spinLoopHint();
         const tail = self.ring_tail.load(.monotonic);
         self.ring[tail] = @truncate(req_id);
         self.ring_tail.store((tail + 1) & RING_MASK, .release);
+        self.publish_lock.unlock();
         if (self.io) |io| io.wake();
     }
 
@@ -424,7 +429,7 @@ pub const Bridge = struct {
         if (ctype.len > CTYPE_CAP or body.len > self.response_cap) return -2;
         // Exactly-once: claim BEFORE writing the slot so a losing double-respond
         // cannot corrupt the response the winner already published.
-        if (s.awaiting.cmpxchgStrong(true, false, .acq_rel, .monotonic) != null) return -1;
+        if (s.awaiting.cmpxchgStrong(req_id, 0, .acq_rel, .monotonic) != null) return -1;
         s.status = status;
         @memcpy(s.ctype[0..ctype.len], ctype);
         s.ctype_len = @intCast(ctype.len);
@@ -445,7 +450,7 @@ pub const Bridge = struct {
     ) c_int {
         const s = self.resolve(req_id) orelse return -1;
         if (headers.len > HEADER_BLOCK_CAP or body.len > self.response_cap) return -2;
-        if (s.awaiting.cmpxchgStrong(true, false, .acq_rel, .monotonic) != null) return -1;
+        if (s.awaiting.cmpxchgStrong(req_id, 0, .acq_rel, .monotonic) != null) return -1;
         s.status = status;
         @memcpy(s.resp_headers[0..headers.len], headers);
         s.resp_headers_len = @intCast(headers.len);
@@ -468,7 +473,7 @@ pub const Bridge = struct {
     ) c_int {
         const s = self.resolve(req_id) orelse return -1;
         if (headers.len > HEADER_BLOCK_CAP or body_len > self.response_cap) return -2;
-        if (s.awaiting.cmpxchgStrong(true, false, .acq_rel, .monotonic) != null) return -1;
+        if (s.awaiting.cmpxchgStrong(req_id, 0, .acq_rel, .monotonic) != null) return -1;
         s.status = status;
         @memcpy(s.resp_headers[0..headers.len], headers);
         s.resp_headers_len = @intCast(headers.len);
@@ -491,7 +496,7 @@ pub const Bridge = struct {
     ) c_int {
         const s = self.resolve(req_id) orelse return -1;
         if (ctype.len > CTYPE_CAP or body_len > self.response_cap) return -2;
-        if (s.awaiting.cmpxchgStrong(true, false, .acq_rel, .monotonic) != null) return -1;
+        if (s.awaiting.cmpxchgStrong(req_id, 0, .acq_rel, .monotonic) != null) return -1;
         s.status = status;
         @memcpy(s.ctype[0..ctype.len], ctype);
         s.ctype_len = @intCast(ctype.len);
@@ -740,4 +745,111 @@ test "bridge: full response preserves packed headers" {
     try std.testing.expectEqualStrings("", completion.ctype);
     try std.testing.expectEqualStrings("accepted", completion.body);
     b.freeSlot(completion.slot);
+}
+
+test "bridge: concurrent responders and reactor drain preserve every response across wraparound" {
+    const worker_count = 16;
+    const Worker = struct {
+        bridge: *Bridge,
+        start: std.atomic.Value(bool) = .init(false),
+        finished: std.atomic.Value(u32) = .init(0),
+        errors: std.atomic.Value(u32) = .init(0),
+
+        fn run(self: *@This(), id: u64, index: usize, conn_id: u64) void {
+            defer _ = self.finished.fetchAdd(1, .release);
+            while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
+            var body: [8]u8 = undefined;
+            std.mem.writeInt(u64, &body, conn_id, .little);
+            var info: [8]usize = undefined;
+            if (self.bridge.requestInfo(id, &info) != 0) {
+                _ = self.errors.fetchAdd(1, .monotonic);
+                return;
+            }
+            if (index % 4 >= 2) {
+                const dest: [*]u8 = @ptrFromInt(info[6]);
+                @memcpy(dest[0..body.len], &body);
+            }
+            const status: u16 = @intCast(200 + index);
+            const rc = switch (index % 4) {
+                0 => self.bridge.respond(id, status, "text/plain", &body),
+                1 => self.bridge.respondFull(id, status, "x-test\x00yes\x00", &body),
+                2 => self.bridge.respondInplace(id, status, "text/plain", body.len),
+                else => self.bridge.respondInplaceFull(id, status, "x-test\x00yes\x00", body.len),
+            };
+            if (rc != 0 or self.bridge.respond(id, 500, "", "duplicate") != -1) {
+                _ = self.errors.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+    var b = Bridge{};
+    try b.init(std.testing.allocator);
+    defer b.deinit(std.testing.allocator);
+    for (0..64) |round| {
+        var worker = Worker{ .bridge = &b };
+        var threads: [worker_count]std.Thread = undefined;
+        var spawned: usize = 0;
+        defer {
+            worker.start.store(true, .release);
+            for (threads[0..spawned]) |thread| thread.join();
+        }
+        for (&threads, 0..) |*thread, i| {
+            const conn_id = round * worker_count + i + 1;
+            try std.testing.expectEqual(ParkResult.parked, b.park(@intCast(i), conn_id, 1, "GET", "/", "", &.{}));
+            thread.* = try std.Thread.spawn(.{}, Worker.run, .{ &worker, b.pollRequest(), i, conn_id });
+            spawned += 1;
+        }
+        // Close admission in the last round while already-admitted responses
+        // are still outstanding. They must still complete and release slots.
+        if (round == 63) b.beginShutdown();
+        worker.start.store(true, .release);
+        var seen = [_]bool{false} ** worker_count;
+        var count: usize = 0;
+        while (true) {
+            if (b.popCompletion()) |c| {
+                defer b.freeSlot(c.slot);
+                try std.testing.expect(c.conn_index < worker_count);
+                try std.testing.expect(!seen[c.conn_index]);
+                seen[c.conn_index] = true;
+                count += 1;
+                const conn_id: u64 = round * worker_count + c.conn_index + 1;
+                try std.testing.expectEqual(conn_id, c.conn_id);
+                try std.testing.expectEqual(@as(u16, @intCast(200 + c.conn_index)), c.status);
+                try std.testing.expectEqual(@as(usize, 8), c.body.len);
+                try std.testing.expectEqual(conn_id, std.mem.readInt(u64, c.body[0..8], .little));
+                try std.testing.expectEqualStrings(if (c.conn_index % 2 == 0) "" else "x-test\x00yes\x00", c.headers);
+            } else if (worker.finished.load(.acquire) == worker_count) {
+                // Acquire above observes every publication before the final
+                // completion check, even if the first pop raced a producer.
+                if (b.ring_head.load(.monotonic) == b.ring_tail.load(.acquire)) break;
+            } else std.atomic.spinLoopHint();
+        }
+        try std.testing.expectEqual(@as(u32, 0), worker.errors.load(.acquire));
+        try std.testing.expectEqual(@as(usize, worker_count), count);
+        try std.testing.expectEqual(@as(u32, 0), b.pending());
+    }
+    try std.testing.expectEqual(ParkResult.no_callback, b.park(0, 1, 1, "GET", "/", "", &.{}));
+}
+
+test "bridge: stale response cannot claim a reused slot" {
+    var b = Bridge{};
+    try b.init(std.testing.allocator);
+    defer b.deinit(std.testing.allocator);
+    _ = b.park(0, 1, 1, "GET", "/old", "", &.{});
+    const old_id = b.pollRequest();
+    const previously_resolved = b.resolve(old_id).?;
+    try std.testing.expectEqual(@as(c_int, 0), b.respond(old_id, 200, "", "old"));
+    b.freeSlot(b.popCompletion().?.slot);
+    _ = b.park(0, 2, 1, "GET", "/new", "", &.{});
+    const new_id = b.pollRequest();
+    try std.testing.expect(b.resolve(new_id).? == previously_resolved);
+    // Model a delayed responder that resolved the old ID before reuse. It
+    // cannot claim the new occupant, even with that already-resolved pointer.
+    try std.testing.expect(previously_resolved.awaiting.cmpxchgStrong(old_id, 0, .acq_rel, .monotonic) != null);
+    try std.testing.expectEqual(@as(c_int, -1), b.respondFull(old_id, 500, "", "stale"));
+    try std.testing.expectEqual(@as(c_int, 0), b.respond(new_id, 201, "", "new"));
+    const c = b.popCompletion().?;
+    try std.testing.expectEqual(@as(u64, 2), c.conn_id);
+    try std.testing.expectEqualStrings("new", c.body);
+    b.freeSlot(c.slot);
+    try std.testing.expectEqual(@as(u32, 0), b.pending());
 }

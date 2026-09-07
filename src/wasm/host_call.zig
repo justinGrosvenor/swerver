@@ -162,7 +162,7 @@ pub const CancelReason = enum { host_call_failed, timed_out };
 pub const Table = struct {
     /// Max concurrent parked filters per worker. Bounded like the PG park table;
     /// also bounded implicitly by the instance pool sizes (each park pins one).
-    pub const CAP = 64;
+    pub const CAP = 1024;
 
     // Token layout: the low INDEX_BITS are the slot index, the rest a per-slot
     // generation. The generation makes a token unique to ONE park. When a slot is
@@ -172,11 +172,11 @@ pub const Table = struct {
     // (the ControlClient has no cancel-by-token, so a parked-then-disconnected
     // request's reply can still arrive) -- is rejected by live() instead of
     // resuming the new occupant with the wrong host-call result.
-    const INDEX_BITS = 8; // CAP (64) fits in 8 bits
+    const INDEX_BITS = 10; // CAP (1024) fits in 10 bits
     const INDEX_MASK: Token = (1 << INDEX_BITS) - 1;
     // The index must fit in INDEX_BITS, else live()'s mask would alias slots and
     // the generation could be truncated. Pin it at comptime so raising CAP past
-    // 256 is a compile error, not a silent token-aliasing bug.
+    // 1024 is a compile error, not a silent token-aliasing bug.
     comptime {
         std.debug.assert(CAP <= INDEX_MASK + 1);
     }
@@ -184,10 +184,10 @@ pub const Table = struct {
     const Slot = struct {
         active: bool = false,
         /// Bumped each time the slot is claimed; packed into the token so a stale
-        /// token for a prior occupant fails the live() check. Wraps (u24 space is
-        /// ~16M parks per slot); a collision needs exactly that many reuses
+        /// token for a prior occupant fails the live() check. Wraps (u22 space is
+        /// ~4M parks per slot); a collision needs exactly that many reuses
         /// between a stale token and its check, which cannot occur in practice.
-        generation: u24 = 0,
+        generation: u22 = 0,
         instance: *filter.Instance = undefined,
         conn_index: u32 = 0,
         conn_id: u64 = 0,
@@ -482,7 +482,7 @@ pub const Table = struct {
         const idx = token & INDEX_MASK;
         if (idx >= self.slots.len) return null;
         const s = &self.slots[idx];
-        const gen: u24 = @truncate(token >> INDEX_BITS);
+        const gen: u22 = @truncate(token >> INDEX_BITS);
         // Reject a stale token: the slot is free, or was reused by a later park
         // (different generation). This is what stops request A's late host-call
         // reply from resuming request B after B reused A's freed slot.
@@ -647,7 +647,7 @@ test "host_call table: full table returns null token" {
     const inst = pool.acquire() orelse return error.AcquireFailed;
     const r = request.RequestView{ .method = .GET, .path = "/enrich", .headers = &.{} };
     try testing.expect(filter.invokeOutcome(inst, &r, filter.DEFAULT_FUEL) == .parked);
-    try testing.expect(table.park(inst, r, 999, 999, 0, .http1, 5000, filter.DEFAULT_FUEL, null) == null);
+    try testing.expect(table.park(inst, r, Table.CAP, Table.CAP, 0, .http1, 5000, filter.DEFAULT_FUEL, null) == null);
     _ = filter.cancelPark(inst);
 }
 
@@ -893,7 +893,7 @@ test "D2-5 park table: full fails closed, then recovers after a slot frees" {
     const inst = pool.acquire() orelse return error.AcquireFailed;
     const r = request.RequestView{ .method = .GET, .path = "/enrich", .headers = &.{} };
     try testing.expect(filter.invokeOutcome(inst, &r, filter.DEFAULT_FUEL) == .parked);
-    try testing.expect(table.park(inst, r, 999, 999, 0, .http1, 5000, filter.DEFAULT_FUEL, null) == null);
+    try testing.expect(table.park(inst, r, Table.CAP, Table.CAP, 0, .http1, 5000, filter.DEFAULT_FUEL, null) == null);
     _ = filter.cancelPark(inst);
     try testing.expectEqual(@as(usize, Table.CAP), table.liveCount());
 
@@ -902,7 +902,7 @@ test "D2-5 park table: full fails closed, then recovers after a slot frees" {
     try testing.expectEqual(@as(usize, Table.CAP - 1), table.liveCount());
     const inst2 = pool.acquire() orelse return error.AcquireFailed;
     try testing.expect(filter.invokeOutcome(inst2, &r, filter.DEFAULT_FUEL) == .parked);
-    const tok = table.park(inst2, r, 1000, 1000, 0, .http1, 5000, filter.DEFAULT_FUEL, null);
+    const tok = table.park(inst2, r, Table.CAP + 1, Table.CAP + 1, 0, .http1, 5000, filter.DEFAULT_FUEL, null);
     try testing.expect(tok != null);
     try testing.expectEqual(@as(usize, Table.CAP), table.liveCount());
 }

@@ -36,6 +36,8 @@ jobs:
         run: zig build -Doptimize=ReleaseFast --summary all
       - name: Test (all feature-flag variants)
         run: zig build test-matrix --summary all
+      - name: Proxy cache policy (HTTP integration)
+        run: bash scripts/test-proxy-cache.sh
       # WASM edge functions are gated behind -Denable-wasm (off by default), so
       # the steps above never compile src/wasm, vendor/wasm3, or the
       # if (build_options.enable_wasm) integration blocks in
@@ -73,6 +75,8 @@ jobs:
         run: zig build -Doptimize=ReleaseFast --summary all
       - name: Test (all feature-flag variants)
         run: zig build test-matrix --summary all
+      - name: Proxy cache policy (HTTP integration)
+        run: bash scripts/test-proxy-cache.sh
       # Same wasm coverage as Linux; macOS additionally exercises the
       # vendor/wasm3/shim/endian.h path that @cImport translate-c needs here.
       - name: WASM edge functions check + test (-Denable-wasm)

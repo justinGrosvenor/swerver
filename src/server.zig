@@ -32,6 +32,10 @@ const config_file_mod = @import("config_file.zig");
 const wasm_manager_mod = if (build_options.enable_wasm) @import("wasm/manager.zig") else struct {};
 const wasm_host_call_mod = if (build_options.enable_wasm) @import("wasm/host_call.zig") else struct {};
 const wasm_control_mod = if (build_options.enable_wasm) @import("wasm/control_client.zig") else struct {};
+// The mock host-call ring must hold as many parks as the host-call Table, or
+// tokens beyond its length are dropped and those filters hang until the park
+// deadline. Track Table.CAP (0 when wasm is compiled out; the mock is pruned).
+const WASM_MOCK_PENDING_CAP = if (build_options.enable_wasm) wasm_host_call_mod.Table.CAP else 0;
 const accept_mod = @import("server/accept.zig");
 const http3_mod = @import("server/http3.zig");
 const http2_mod = @import("server/http2.zig");
@@ -129,7 +133,7 @@ pub const Server = struct {
     /// The pending ring holds park tokens awaiting mock completion.
     wasm_mock_enabled: bool = false,
     wasm_mock_reply: []const u8 = "ok",
-    wasm_mock_pending: [64]u32 = undefined,
+    wasm_mock_pending: [WASM_MOCK_PENDING_CAP]u32 = undefined,
     wasm_mock_count: usize = 0,
     /// Nether control-socket path for the real host-call transport (C3). When
     /// non-empty and wasm is enabled, a ControlClient is built at run() start and

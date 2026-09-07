@@ -172,6 +172,9 @@ export fn swerver_request_headers(req_id: u64, out: [*]usize) c_int {
 
 /// Answer a parked request. `ctype` is the Content-Type value (may be empty).
 /// Callable from any thread; wakes the reactor, which resumes the connection.
+/// Concurrent response calls are supported. The host must finish reading the
+/// request and writing any in-place body before answering it; stop must wait
+/// for host response calls to finish. Request polling has a single consumer.
 /// Returns 0 on success, -1 if req_id is stale/already answered, -2 if too big.
 export fn swerver_respond(
     req_id: u64,

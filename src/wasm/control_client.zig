@@ -873,7 +873,8 @@ fn verifyProtoVersion(report: []const u8) bool {
 const testing = std.testing;
 
 test "control pool distributes calls across ready lanes and preserves single-lane default" {
-    var pool: ControlPool = undefined;
+    const pool = try testing.allocator.create(ControlPool);
+    defer testing.allocator.destroy(pool);
     pool.init("/tmp/unused.sock", 0);
     try testing.expectEqual(@as(u8, 1), pool.lane_count);
 
@@ -944,7 +945,9 @@ const Captured = struct {
 test "tryConsumeReply: handshake then a command reply complete the right token" {
     Captured.reset();
     var dummy: u8 = 0;
-    var cc = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
+    const cc = try testing.allocator.create(ControlClient);
+    defer testing.allocator.destroy(cc);
+    cc.* = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
     cc.installResume(@ptrCast(&dummy), Captured.complete, Captured.fail);
 
     // We drive the framing layer directly; no fd is touched because every reply
@@ -977,7 +980,9 @@ test "tryConsumeReply: handshake then a command reply complete the right token" 
 test "tryConsumeReply: partial trailer is not consumed until newline" {
     Captured.reset();
     var dummy: u8 = 0;
-    var cc = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
+    const cc = try testing.allocator.create(ControlClient);
+    defer testing.allocator.destroy(cc);
+    cc.* = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
     cc.installResume(@ptrCast(&dummy), Captured.complete, Captured.fail);
     var io_rt: io_mod.IoRuntime = undefined;
 
@@ -1001,7 +1006,9 @@ test "tryConsumeReply: partial trailer is not consumed until newline" {
 test "R2b: escaped 0x1e in the body un-escapes and does not break framing" {
     Captured.reset();
     var dummy: u8 = 0;
-    var cc = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
+    const cc = try testing.allocator.create(ControlClient);
+    defer testing.allocator.destroy(cc);
+    cc.* = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
     cc.installResume(@ptrCast(&dummy), Captured.complete, Captured.fail);
     var io_rt: io_mod.IoRuntime = undefined;
 
@@ -1023,7 +1030,9 @@ test "R2b: escaped 0x1e in the body un-escapes and does not break framing" {
 test "R2b: escaped 0x1f round-trips; escape-free bodies are byte-identical" {
     Captured.reset();
     var dummy: u8 = 0;
-    var cc = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
+    const cc = try testing.allocator.create(ControlClient);
+    defer testing.allocator.destroy(cc);
+    cc.* = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
     cc.installResume(@ptrCast(&dummy), Captured.complete, Captured.fail);
     var io_rt: io_mod.IoRuntime = undefined;
 
@@ -1048,7 +1057,9 @@ test "R2b: escaped 0x1f round-trips; escape-free bodies are byte-identical" {
 test "R2b: an escape pair split across two reads decodes once the frame completes" {
     Captured.reset();
     var dummy: u8 = 0;
-    var cc = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
+    const cc = try testing.allocator.create(ControlClient);
+    defer testing.allocator.destroy(cc);
+    cc.* = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
     cc.installResume(@ptrCast(&dummy), Captured.complete, Captured.fail);
     var io_rt: io_mod.IoRuntime = undefined;
 
@@ -1075,7 +1086,9 @@ test "R2b: an escape pair split across two reads decodes once the frame complete
 test "R2b: a dangling trailing escape at a truncation edge is dropped, trailer kept" {
     Captured.reset();
     var dummy: u8 = 0;
-    var cc = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
+    const cc = try testing.allocator.create(ControlClient);
+    defer testing.allocator.destroy(cc);
+    cc.* = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
     cc.installResume(@ptrCast(&dummy), Captured.complete, Captured.fail);
 
     // Drive deliverCommandReply directly with a body whose final byte is a bare
@@ -1092,7 +1105,9 @@ test "R2b: a dangling trailing escape at a truncation edge is dropped, trailer k
 test "tryConsumeReply: a bare ERR at handshake fails fast (no hang)" {
     Captured.reset();
     var dummy: u8 = 0;
-    var cc = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
+    const cc = try testing.allocator.create(ControlClient);
+    defer testing.allocator.destroy(cc);
+    cc.* = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
     cc.installResume(@ptrCast(&dummy), Captured.complete, Captured.fail);
     var io_rt: io_mod.IoRuntime = undefined; // fd<0, so fail() never touches it
 
@@ -1108,7 +1123,9 @@ test "tryConsumeReply: a bare ERR at handshake fails fast (no hang)" {
 test "command-phase bare ERR settles and fails the call fast (guest not ready)" {
     Captured.reset();
     var dummy: u8 = 0;
-    var cc = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
+    const cc = try testing.allocator.create(ControlClient);
+    defer testing.allocator.destroy(cc);
+    cc.* = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
     cc.installResume(@ptrCast(&dummy), Captured.complete, Captured.fail);
     var io_rt: io_mod.IoRuntime = undefined; // not dereferenced on these paths
 
@@ -1138,7 +1155,9 @@ test "command-phase bare ERR settles and fails the call fast (guest not ready)" 
 test "startCall queues when not ready and fails closed when disabled" {
     Captured.reset();
     var dummy: u8 = 0;
-    var cc = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
+    const cc = try testing.allocator.create(ControlClient);
+    defer testing.allocator.destroy(cc);
+    cc.* = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
     cc.installResume(@ptrCast(&dummy), Captured.complete, Captured.fail);
     var io_rt: io_mod.IoRuntime = undefined;
 
@@ -1162,7 +1181,9 @@ test "startCall queues when not ready and fails closed when disabled" {
 test "startCall: a reserved __verb__ payload fails closed and never enqueues" {
     Captured.reset();
     var dummy: u8 = 0;
-    var cc = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
+    const cc = try testing.allocator.create(ControlClient);
+    defer testing.allocator.destroy(cc);
+    cc.* = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
     cc.installResume(@ptrCast(&dummy), Captured.complete, Captured.fail);
     var io_rt: io_mod.IoRuntime = undefined; // never touched: the guard fails before any I/O
 
@@ -1194,7 +1215,9 @@ test "startCall: a reserved __verb__ payload fails closed and never enqueues" {
 test "startCall: embedded-newline and leading-ws control-verb injection is blocked" {
     Captured.reset();
     var dummy: u8 = 0;
-    var cc = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
+    const cc = try testing.allocator.create(ControlClient);
+    defer testing.allocator.destroy(cc);
+    cc.* = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
     cc.installResume(@ptrCast(&dummy), Captured.complete, Captured.fail);
     var io_rt: io_mod.IoRuntime = undefined; // guard fails before any I/O
 
@@ -1228,7 +1251,9 @@ test "startCall: embedded-newline and leading-ws control-verb injection is block
 test "handleReadable: real fd read path parses a framed reply and completes" {
     Captured.reset();
     var dummy: u8 = 0;
-    var cc = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
+    const cc = try testing.allocator.create(ControlClient);
+    defer testing.allocator.destroy(cc);
+    cc.* = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
     cc.installResume(@ptrCast(&dummy), Captured.complete, Captured.fail);
     var io_rt: io_mod.IoRuntime = undefined; // touched only on the (unhit) fail path
 
@@ -1258,7 +1283,9 @@ test "handleReadable: real fd read path parses a framed reply and completes" {
 test "R2: an over-cap command reply is body-truncated but keeps its exit trailer" {
     Captured.reset();
     var dummy: u8 = 0;
-    var cc = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
+    const cc = try testing.allocator.create(ControlClient);
+    defer testing.allocator.destroy(cc);
+    cc.* = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
     cc.installResume(@ptrCast(&dummy), Captured.complete, Captured.fail);
     var io_rt: io_mod.IoRuntime = undefined;
 
@@ -1285,7 +1312,9 @@ test "R2: an over-cap command reply is body-truncated but keeps its exit trailer
 test "R2: a reply larger than the recv buffer drains to the trailer; socket stays clean" {
     Captured.reset();
     var dummy: u8 = 0;
-    var cc = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
+    const cc = try testing.allocator.create(ControlClient);
+    defer testing.allocator.destroy(cc);
+    cc.* = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
     cc.installResume(@ptrCast(&dummy), Captured.complete, Captured.fail);
     var io_rt: io_mod.IoRuntime = undefined;
 
@@ -1349,7 +1378,9 @@ test "issueAt: command_deadline uses the configured command_timeout_ms (default 
 
     // Default (unset): the 30s const is the per-command budget.
     {
-        var cc = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
+        const cc = try testing.allocator.create(ControlClient);
+        defer testing.allocator.destroy(cc);
+        cc.* = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
         cc.installResume(@ptrCast(&dummy), Captured.complete, Captured.fail);
         cc.fd = fds[0];
         cc.state = .ready;
@@ -1360,7 +1391,9 @@ test "issueAt: command_deadline uses the configured command_timeout_ms (default 
 
     // Override (server sets a sub-second budget): the deadline tracks it.
     {
-        var cc = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
+        const cc = try testing.allocator.create(ControlClient);
+        defer testing.allocator.destroy(cc);
+        cc.* = ControlClient.init("/tmp/unused.sock", DEFAULT_SLOT);
         cc.installResume(@ptrCast(&dummy), Captured.complete, Captured.fail);
         cc.fd = fds[0];
         cc.state = .ready;

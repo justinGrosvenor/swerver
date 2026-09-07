@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Authentication, FFI, and proxy caching
+
+- **fix: JWT parsing keeps decoded claims in caller-owned storage.** Payloads
+  are parsed once and remain alive through validation and header injection.
+  The public Zig helper is now `auth.extractClaim(json, key, scratch)`: pass
+  a writable parsing buffer (8 KiB matches the built-in validator). The returned
+  string borrows the JSON or scratch until either is modified or released.
+- **fix: concurrent FFI responses no longer overwrite completion entries.**
+  Queue publication uses a short producer lock; body copies remain independent.
+  Request IDs are claimed atomically so delayed duplicate responses cannot
+  claim a recycled slot. The C ABI is unchanged.
+- **fix: shared cache directives and response variation are enforced.**
+  Cache-Control directive names are case-insensitive, quoted values are parsed,
+  and responses with unsupported Vary fields bypass storage. Configured Vary
+  keys distinguish missing, empty, and repeated request fields.
+- **fix: WASM capacity tests support 1,024 parked requests.** Large control
+  fixtures use heap storage, and overflow/recovery tests use unique connection
+  IDs beyond the capacity boundary.
+
 ### HTTP/2 / gRPC
 
 - **fix: TLS H2 resumes plaintext buffered behind write backpressure.** When

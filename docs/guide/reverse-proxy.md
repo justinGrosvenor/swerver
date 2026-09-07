@@ -185,6 +185,16 @@ Add a `cache` block to a route for a per-route LRU response cache:
 | `max_entries` | LRU capacity for this route |
 | `vary` | Header names that partition the cache key |
 
+`Accept-Encoding` is included automatically. A response is cached only when
+every field listed in its `Vary` headers is covered by the effective cache
+keys. For example, add `Accept-Language` to `vary` to cache language variants;
+otherwise a response declaring `Vary: Accept-Language` bypasses the cache.
+`Vary: *` always bypasses storage. Field names are compared case-insensitively.
+
+Responses with `private`, `no-store`, or `no-cache` directives are not stored,
+regardless of directive capitalization. Malformed cache directives also bypass
+storage. Repeated `max-age` directives use the shortest supplied lifetime.
+
 ## Traffic splitting
 
 `traffic_split` distributes requests across upstreams by weight, the mechanism for canary and blue-green rollouts. Weights are relative; below sends 10% to the canary:

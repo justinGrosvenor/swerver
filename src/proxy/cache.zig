@@ -162,15 +162,15 @@ pub const ResponseCache = struct {
         else
             "";
         if (resp_status != 200) return;
-        if (!isCacheable(resp_headers)) return;
+        const policy = cachePolicy(resp_headers, vary_keys) orelse return;
         // RFC 7234 §3.2: a shared cache must not store a response to a request
         // with Authorization (or one carrying credentials via Cookie) absent
         // an explicit allowance, and must never replay a Set-Cookie to other
-        // clients. Both are checked in isCacheable/requestPreventsCaching.
+        // clients. Both are checked in cachePolicy/requestPreventsCaching.
         if (requestPreventsCaching(req_headers)) return;
 
         const key = computeKey(method, path, body, vary_keys, req_headers);
-        const effective_ttl = extractMaxAge(resp_headers) orelse ttl_ms;
+        const effective_ttl = policy.max_age_ms orelse ttl_ms;
 
         // If entry already exists for this key, evict and replace
         if (self.map.get(key)) |existing| {
@@ -403,8 +403,9 @@ fn computeKey(
     for (vary_keys) |vk| {
         for (req_headers) |hdr| {
             if (std.ascii.eqlIgnoreCase(hdr.name, vk)) {
+                h.update("\x01");
                 h.update(hdr.value);
-                break;
+                h.update("\x00");
             }
         }
         h.update("\x00");
@@ -428,22 +429,100 @@ fn computeVaryHash(
     return h.final();
 }
 
-fn isCacheable(headers: []const response_mod.Header) bool {
+const CachePolicy = struct {
+    max_age_ms: ?u64 = null,
+};
+
+/// Parse once for both storage eligibility and TTL. Unknown directives are
+/// ignored, but malformed policy is never used to admit a shared response.
+fn cachePolicy(headers: []const response_mod.Header, vary_keys: []const []const u8) ?CachePolicy {
+    var policy = CachePolicy{};
     for (headers) |hdr| {
         if (std.ascii.eqlIgnoreCase(hdr.name, "Cache-Control")) {
-            if (std.mem.indexOf(u8, hdr.value, "no-store") != null) return false;
-            if (std.mem.indexOf(u8, hdr.value, "no-cache") != null) return false;
-            if (std.mem.indexOf(u8, hdr.value, "private") != null) return false;
+            var directives = DirectiveIterator{ .remaining = hdr.value };
+            while (directives.next() catch return null) |directive| {
+                if (std.ascii.eqlIgnoreCase(directive.name, "no-store") or
+                    std.ascii.eqlIgnoreCase(directive.name, "no-cache") or
+                    std.ascii.eqlIgnoreCase(directive.name, "private")) return null;
+                if (std.ascii.eqlIgnoreCase(directive.name, "max-age")) {
+                    const value = directive.value orelse return null;
+                    if (value.len == 0) return null;
+                    for (value) |c| if (!std.ascii.isDigit(c)) return null;
+                    const seconds = std.fmt.parseInt(u32, value, 10) catch return null;
+                    const ms = @as(u64, seconds) * 1000;
+                    // Conflicting repetitions never extend the shorter TTL.
+                    policy.max_age_ms = if (policy.max_age_ms) |prev| @min(prev, ms) else ms;
+                }
+            }
         }
-        // Never store a personalized cookie in a shared cache — it would be
-        // replayed to every other client (session fixation / leakage).
-        if (std.ascii.eqlIgnoreCase(hdr.name, "Set-Cookie")) return false;
-        // Vary: * means the response is uncacheable (RFC 9110 §12.5.5). We
-        // only key on operator-configured vary headers, so any other Vary
-        // value we cannot honor is treated conservatively as uncacheable.
+        if (std.ascii.eqlIgnoreCase(hdr.name, "Set-Cookie")) return null;
         if (std.ascii.eqlIgnoreCase(hdr.name, "Vary")) {
-            const v = std.mem.trim(u8, hdr.value, " \t");
-            if (std.mem.eql(u8, v, "*")) return false;
+            var fields = std.mem.splitScalar(u8, hdr.value, ',');
+            while (fields.next()) |raw| {
+                const field = std.mem.trim(u8, raw, " \t");
+                if (field.len == 0) continue;
+                if (!isToken(field) or std.mem.eql(u8, field, "*")) return null;
+                var covered = false;
+                for (vary_keys) |key| {
+                    if (std.ascii.eqlIgnoreCase(field, key)) {
+                        covered = true;
+                        break;
+                    }
+                }
+                // Only configured/effective keys can be looked up later. An
+                // upstream cannot introduce a new variation without bypassing.
+                if (!covered) return null;
+            }
+        }
+    }
+    return policy;
+}
+
+const DirectiveIterator = struct {
+    remaining: []const u8,
+    const Directive = struct { name: []const u8, value: ?[]const u8 };
+
+    fn next(self: *DirectiveIterator) error{InvalidDirective}!?Directive {
+        self.remaining = std.mem.trimStart(u8, self.remaining, " \t,");
+        if (self.remaining.len == 0) return null;
+        var end: usize = 0;
+        while (end < self.remaining.len and self.remaining[end] != '=' and self.remaining[end] != ',') : (end += 1) {}
+        const name = std.mem.trim(u8, self.remaining[0..end], " \t");
+        if (!isToken(name)) return error.InvalidDirective;
+        self.remaining = self.remaining[end..];
+        if (self.remaining.len == 0 or self.remaining[0] == ',') return .{ .name = name, .value = null };
+
+        self.remaining = std.mem.trimStart(u8, self.remaining[1..], " \t");
+        if (self.remaining.len == 0) return error.InvalidDirective;
+        var value: []const u8 = undefined;
+        if (self.remaining[0] == '"') {
+            // Commas and escaped quotes in a quoted value do not delimit a
+            // directive. Numeric TTLs below reject escapes rather than guess.
+            end = 1;
+            while (end < self.remaining.len and self.remaining[end] != '"') : (end += 1) {
+                if (self.remaining[end] == '\\') end += 1;
+            }
+            if (end >= self.remaining.len) return error.InvalidDirective;
+            value = self.remaining[1..end];
+            self.remaining = std.mem.trimStart(u8, self.remaining[end + 1 ..], " \t");
+            if (self.remaining.len > 0 and self.remaining[0] != ',') return error.InvalidDirective;
+        } else {
+            end = std.mem.indexOfScalar(u8, self.remaining, ',') orelse self.remaining.len;
+            value = std.mem.trim(u8, self.remaining[0..end], " \t");
+            if (!isToken(value)) return error.InvalidDirective;
+            self.remaining = self.remaining[end..];
+        }
+        return .{ .name = name, .value = value };
+    }
+};
+
+fn isToken(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |c| {
+        if (std.ascii.isAlphanumeric(c)) continue;
+        switch (c) {
+            '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => {},
+            else => return false,
         }
     }
     return true;
@@ -458,23 +537,6 @@ fn requestPreventsCaching(req_headers: []const request_mod.Header) bool {
         if (std.ascii.eqlIgnoreCase(hdr.name, "Cookie")) return true;
     }
     return false;
-}
-
-fn extractMaxAge(headers: []const response_mod.Header) ?u64 {
-    for (headers) |hdr| {
-        if (std.ascii.eqlIgnoreCase(hdr.name, "Cache-Control")) {
-            if (std.mem.indexOf(u8, hdr.value, "max-age=")) |pos| {
-                const start = pos + 8;
-                var end = start;
-                while (end < hdr.value.len and hdr.value[end] >= '0' and hdr.value[end] <= '9') : (end += 1) {}
-                if (end > start) {
-                    const secs = std.fmt.parseInt(u32, hdr.value[start..end], 10) catch return null;
-                    return @as(u64, secs) * 1000;
-                }
-            }
-        }
-    }
-    return null;
 }
 
 fn isHopByHopResponse(name: []const u8) bool {
@@ -555,6 +617,59 @@ test "cache respects no-store" {
     cache.store(.GET, "/private", null, &req_headers, &.{}, 200, &resp_headers, "secret", 60_000, 1000);
     const result = cache.lookup(.GET, "/private", null, &req_headers, &.{}, 2000);
     try std.testing.expect(result == .miss);
+}
+
+test "cache policy handles directive names, quoted values, and repeated fields" {
+    var cache = try ResponseCache.init(std.testing.allocator, 16);
+    defer cache.deinit();
+    for ([_][]const u8{
+        "Private, Max-Age=60",             "NO-STORE",     "No-Cache",    "pRiVaTe = \"X-User, X-Role\"",
+        "public, no-cache=\"Set-Cookie\"", "max-age=oops", "max-age=\"2", "max-age=2junk",
+    }) |value| {
+        cache.store(.GET, "/secret", null, &.{}, &.{}, 200, &.{
+            .{ .name = "Cache-Control", .value = "public" },
+            .{ .name = "cache-control", .value = value },
+        }, "secret", 60_000, 1000);
+        try std.testing.expect(cache.lookup(.GET, "/secret", null, &.{}, &.{}, 1001) == .miss);
+    }
+    const headers = [_]response_mod.Header{
+        .{ .name = "Cache-Control", .value = "x-private=yes, note=\"no-store, \\\"private\\\"\", x-max-age=0" },
+        .{ .name = "cache-control", .value = " MaX-aGe = \"2\" , public" },
+        .{ .name = "CACHE-CONTROL", .value = "max-age=60" },
+    };
+    cache.store(.GET, "/public", null, &.{}, &.{}, 200, &headers, "public", 60_000, 1000);
+    try std.testing.expect(cache.lookup(.GET, "/public", null, &.{}, &.{}, 2000) == .hit);
+    try std.testing.expect(cache.lookup(.GET, "/public", null, &.{}, &.{}, 3001) == .miss);
+}
+
+test "cache bypasses uncovered Vary and keys all configured variants" {
+    var cache = try ResponseCache.init(std.testing.allocator, 16);
+    defer cache.deinit();
+    const english = [_]request_mod.Header{.{ .name = "Accept-Language", .value = "en" }};
+    const french = [_]request_mod.Header{.{ .name = "Accept-Language", .value = "fr" }};
+    const headers = [_]response_mod.Header{
+        .{ .name = "Vary", .value = " accept-language , ACCEPT-ENCODING" },
+        .{ .name = "vary", .value = "Accept-Language" },
+    };
+    cache.store(.GET, "/greeting", null, &english, &.{"accept-encoding"}, 200, &headers, "Hello", 60_000, 1);
+    try std.testing.expect(cache.lookup(.GET, "/greeting", null, &french, &.{"accept-encoding"}, 2) == .miss);
+
+    const keys = &.{ "Accept-Language", "Accept-Encoding" };
+    cache.store(.GET, "/greeting", null, &english, keys, 200, &headers, "Hello", 60_000, 1);
+    cache.store(.GET, "/greeting", null, &french, keys, 200, &headers, "Bonjour", 60_000, 1);
+    try std.testing.expectEqualStrings("Hello", cache.lookup(.GET, "/greeting", null, &english, keys, 2).hit.body);
+    try std.testing.expectEqualStrings("Bonjour", cache.lookup(.GET, "/greeting", null, &french, keys, 2).hit.body);
+    const repeated = [_]request_mod.Header{
+        english[0], .{ .name = "accept-language", .value = "fr" },
+    };
+    try std.testing.expect(cache.lookup(.GET, "/greeting", null, &repeated, keys, 2) == .miss);
+    cache.store(.GET, "/absent", null, &.{}, keys, 200, &headers, "absent", 60_000, 1);
+    try std.testing.expect(cache.lookup(.GET, "/absent", null, &.{.{ .name = "Accept-Language", .value = "" }}, keys, 2) == .miss);
+
+    for ([_][]const u8{ "Accept-Language, *", "X-Unknown", "Bad Header" }) |value| {
+        cache.store(.GET, "/bypass", null, &english, keys, 200, &.{.{ .name = "Vary", .value = value }}, "wrong", 60_000, 1);
+        try std.testing.expect(cache.lookup(.GET, "/bypass", null, &english, keys, 2) == .miss);
+    }
 }
 
 test "cache does not store Set-Cookie responses" {
