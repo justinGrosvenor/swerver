@@ -2013,7 +2013,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
     var memo_path: []const u8 = "";
 
     while (conn.state != .closed and conn.read_buffered_bytes > 0 and conn.canEnqueueWrite() and !conn.hasPendingFile()) {
-        if (conn.x402 == .pending or conn.x402 == .settle_pending or conn.x402 == .db_parked or conn.x402 == .wasm_parked or conn.x402 == .ffi_parked or conn.x402 == .handler_parked) break;
+        if (conn.x402.responsePending()) break;
         // Opportunistic inline write drain: push enqueued responses
         // to the kernel while still processing pipelined requests.
         // At low connection counts (e.g. 512 conns / 64 workers =
@@ -3131,7 +3131,10 @@ fn handleWritePass(server: *Server, index: u32) !WritePass {
         // Readiness backends can report writability before a suspended handler
         // has produced its response. Connection: close applies AFTER that
         // response; an empty queue here does not mean the request is finished.
-        if (conn.x402 == .handler_parked) return .done;
+        // This covers every async park (facilitator, DB, WASM, FFI, native
+        // handler): closing here would strand the pending response and answer
+        // the client with an empty reply.
+        if (conn.x402.responsePending()) return .done;
         if (conn.close_after_write) {
             server.closeConnection(conn);
             return .done;

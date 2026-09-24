@@ -35,10 +35,19 @@ jobs:
         run: VERSION="${{ github.event.release.tag_name || inputs.version }}" scripts/build-prebuilts.sh
 
       - name: Publish each platform package
+        # Skip a version already on npm (e.g. published manually for this
+        # release) so the run stays green, but still publish genuinely new
+        # versions -- a real auth or publish failure there is not masked.
         run: |
           for dir in dist/npm/*/; do
-            echo "publishing $(basename "$dir")"
-            (cd "$dir" && npm publish --access public)
+            name=$(node -p "require('./$dir/package.json').name")
+            ver=$(node -p "require('./$dir/package.json').version")
+            if npm view "$name@$ver" version >/dev/null 2>&1; then
+              echo "$name@$ver already published, skipping"
+            else
+              echo "publishing $name@$ver"
+              (cd "$dir" && npm publish --access public)
+            fi
           done
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
