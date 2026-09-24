@@ -6,7 +6,7 @@ A handler is a plain function that takes a `*HandlerContext` and returns a `resp
 const HandlerFn = *const fn (ctx: *swerver.router.HandlerContext) swerver.response.Response;
 ```
 
-Handlers are **synchronous**: they run to completion between `recv()` calls on the connection. That's what lets `ctx.request.headers` and `ctx.request.body` be `[]const u8` slices straight into the receive buffer, with no copy. There is no allocator parameter and no error union: build a `Response` and return it.
+Each handler callback runs synchronously on the reactor thread. That's what lets `ctx.request.headers` and `ctx.request.body` borrow the receive buffer without a copy. Build a `Response` and return it, or use [async handlers](async-handlers.md) to suspend for a timer or event and finish in a continuation.
 
 ## The request
 

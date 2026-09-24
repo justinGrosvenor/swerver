@@ -7,6 +7,7 @@ const connection = @import("runtime/connection.zig");
 const buffer_pool = @import("runtime/buffer_pool.zig");
 const clock = @import("runtime/clock.zig");
 const router = @import("router/router.zig");
+const suspension = @import("runtime/suspension.zig");
 const net = @import("runtime/net.zig");
 const http1 = @import("protocol/http1.zig");
 const response_mod = @import("response/response.zig");
@@ -166,6 +167,7 @@ pub const Server = struct {
     /// Native PostgreSQL client (null unless the "postgres" config block
     /// is present).
     pg_client: ?*pg_client_mod.PgClient = null,
+    suspensions: suspension.Table = suspension.Table.init(undefined, 0),
     /// Client-mode TLS provider for the PG client (null when sslmode is
     /// disable or TLS is compiled out). Owned here — mirrors
     /// tcp_tls_provider — and must outlive pg_client's slot sessions.
@@ -345,6 +347,7 @@ pub const Server = struct {
             .cfg = cfg,
             .io = io_runtime,
             .app_router = app_router,
+            .suspensions = suspension.Table.init(allocator, cfg.max_connections),
             .listener_fd = null,
             .listeners_count = 0,
             .udp_fd = null,
@@ -464,6 +467,7 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Server) void {
+        self.suspensions.deinit();
         // QUIC handler must be freed before its TLS provider
         if (self.quic) |*q| q.deinit();
         if (self.tcp_tls_provider) |*p| p.deinit();
@@ -1584,7 +1588,12 @@ pub const Server = struct {
         return .{ .status = 200, .headers = hdrs[0..nh], .body = .{ .bytes = entry.body } };
     }
 
+    pub fn suspensionHandle(self: *Server, id: suspension.Identity) suspension.Handle {
+        return .{ .table = &self.suspensions, .identity = id };
+    }
+
     pub fn closeConnection(self: *Server, conn: *connection.Connection) void {
+        self.suspensions.cancelConnection(conn.index, conn.id, .disconnected);
         // Drop any PG park before the slot can be recycled: the
         // in-flight op runs to completion and its outcome is discarded
         // (generation-checked), so the continuation can never write

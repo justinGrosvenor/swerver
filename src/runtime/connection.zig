@@ -344,6 +344,8 @@ pub const Connection = struct {
         /// every gate that checks `x402 != .none`; the reactor resumes it when
         /// the host calls swerver_respond.
         ffi_parked,
+        /// Native handler continuation, owned by the worker suspension table.
+        handler_parked,
     };
 
     pub fn init(index: u32) Connection {

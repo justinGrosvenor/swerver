@@ -1254,6 +1254,7 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
             .conn_index = conn.index,
             .conn_id = conn.id,
         },
+        .suspension = server.suspensionHandle(.{ .conn_index = conn.index, .conn_id = conn.id }),
         .wasm = .{
             .table = if (build_options.enable_wasm) @ptrCast(&server.wasm_host_calls) else null,
             .conn_index = conn.index,
@@ -1266,6 +1267,7 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
             .start_ctx = @ptrCast(server),
         },
     };
+    scratch.otel_start = otel_start;
     const result = server.app_router.handle(req_view, &mw_ctx, &scratch);
     if (scratch.arena_handle) |handle| server.io.releaseBuffer(handle);
     if (result.pause_reads_ms) |pause_ms| {
@@ -1355,8 +1357,10 @@ pub fn dispatchToRouter(server: *Server, conn: *connection.Connection, req_view:
             .conn_index = conn.index,
             .conn_id = conn.id,
         },
+        .suspension = server.suspensionHandle(.{ .conn_index = conn.index, .conn_id = conn.id }),
     };
     const otel_start = if (server.otel != null) clock.realtimeNanos() orelse 0 else 0;
+    scratch.otel_start = otel_start;
     const result = server.app_router.handle(req_view, &mw_ctx, &scratch);
     if (scratch.arena_handle) |handle| server.io.releaseBuffer(handle);
     if (result.pause_reads_ms) |pause_ms| {
@@ -1416,6 +1420,10 @@ pub fn ffiTryDispatch(server: *Server, conn: *connection.Connection, req_view: r
 /// never double-respond.
 pub fn handleParkSentinel(server: *Server, conn: *connection.Connection, resp: response_mod.Response) bool {
     if (resp.isParked()) {
+        if (server.suspensions.has(.{ .conn_index = conn.index, .conn_id = conn.id })) {
+            conn.x402 = .handler_parked;
+            return true;
+        }
         if (server.pg_client) |pgc| {
             if (pgc.hasParkFor(conn.index, conn.id)) {
                 conn.x402 = .db_parked;
