@@ -346,6 +346,20 @@ pub const Connection = struct {
         ffi_parked,
         /// Native handler continuation, owned by the worker suspension table.
         handler_parked,
+
+        /// True while an async response is still pending: an x402 facilitator
+        /// call, a DB/WASM/FFI park, or a native handler continuation. A
+        /// readiness backend (epoll/kqueue) can report the socket writable
+        /// before that response has been produced, so callers use this to avoid
+        /// treating an empty write queue as a finished request -- most
+        /// importantly, to NOT honor `close_after_write` and tear the connection
+        /// down out from under the still-pending response.
+        pub fn responsePending(self: X402State) bool {
+            return switch (self) {
+                .none, .resolved_allow, .resolved_reject => false,
+                .pending, .settle_pending, .db_parked, .wasm_parked, .ffi_parked, .handler_parked => true,
+            };
+        }
     };
 
     pub fn init(index: u32) Connection {
