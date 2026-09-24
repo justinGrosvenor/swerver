@@ -321,6 +321,7 @@ pub fn handleHttp2Read(server: *Server, conn: *connection.Connection) !void {
                 },
                 .err => |err_event| {
                     if (err_event.stream_id != 0) {
+                        server.suspensions.cancelRequest(.{ .conn_index = conn.index, .conn_id = conn.id, .stream_id = err_event.stream_id, .protocol = .http2 }, .reset);
                         sendRstStream(server, conn, err_event.stream_id, @intFromEnum(err_event.code));
                         // Server-initiated stream RST: release any WASM filter
                         // parked on it (E2a), same as a peer RST_STREAM, so a
@@ -332,6 +333,7 @@ pub fn handleHttp2Read(server: *Server, conn: *connection.Connection) !void {
                     }
                 },
                 .stream_reset => |rst_event| {
+                    server.suspensions.cancelRequest(.{ .conn_index = conn.index, .conn_id = conn.id, .stream_id = rst_event.stream_id, .protocol = .http2 }, .reset);
                     // Peer RST_STREAM: release any WASM filter parked on this
                     // stream (E2a) so the pinned instance returns to its pool.
                     // No-op (generation-checked) when nothing is parked. Also
@@ -1046,6 +1048,7 @@ fn dispatchHttp2Request(
         .arena_buf = arena_buf,
         .arena_handle = arena_handle,
         .buffer_ops = mw_ctx.buffer_ops,
+        .suspension = server.suspensionHandle(.{ .conn_index = conn.index, .conn_id = conn.id, .stream_id = stream_id, .protocol = .http2 }),
     };
     // Real per-stream park binding (E2a): a parking WASM filter suspends THIS
     // stream (recorded in the host_call table, keyed by stream_id) and resumes
@@ -1069,7 +1072,8 @@ fn dispatchHttp2Request(
     // (no frames queued, stream stays open); wasmResume delivers the response on
     // this stream once the host call completes. Checked before queueHttp2Response
     // so the park sentinel is never serialized.
-    if (build_options.enable_wasm and result.resp.isParked()) {
+    if (result.resp.isParked()) {
+        if (server.suspensions.has(scratch.suspension.identity)) return;
         if (server.wasmHasParkForStream(conn.index, conn.id, stream_id)) return;
         // Sentinel without a live park (programmer error / orphaned park): fail
         // closed on this stream and release any orphaned park to avoid a leak.

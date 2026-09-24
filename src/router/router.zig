@@ -10,6 +10,8 @@ const io_runtime = @import("../runtime/io.zig");
 const pg_client_mod = @import("../db/pg/client.zig");
 const pg_handler_api = @import("../db/pg/handler_api.zig");
 const build_options = @import("build_options");
+const suspension = @import("../runtime/suspension.zig");
+const deferred = @import("deferred.zig");
 // WASM edge filters (design 10.0). Gated so router.zig compiles without the
 // vendored wasm3 dependency; the Route stores the pool as an opaque pointer so
 // the struct itself needs no gating.
@@ -161,6 +163,8 @@ pub const HandlerContext = struct {
     charge_amount: []const u8 = "",
     /// PostgreSQL query surface: `ctx.pg.query(...)`.
     pg: PgHandle = .{},
+    /// Reactor-owned waits. Only plain stash values survive a suspension.
+    suspension: suspension.Handle = .{},
 
     pub const Param = struct {
         name: []const u8,
@@ -577,6 +581,7 @@ pub const GroupBuilder = struct {
 };
 
 pub const HandlerScratch = struct {
+    otel_start: i128 = 0,
     response_buf: []u8,
     response_headers: []response.Header,
     arena_buf: []u8,
@@ -586,6 +591,7 @@ pub const HandlerScratch = struct {
     /// dispatch layer when a PG client is configured; the zero value
     /// makes `ctx.pg.query()` fail with error.NotConnected.
     pg: PgBinding = .{},
+    suspension: suspension.Handle = .{},
     /// WASM edge-filter park-and-resume binding (design 10.0). Set by the H1
     /// dispatch layer when wasm is enabled. The zero value (table == null) makes
     /// a parking filter fail closed (no park path), preserving direct
@@ -1141,6 +1147,7 @@ pub const Router = struct {
             .response_header_count = 0,
             .arena = std.heap.FixedBufferAllocator.init(scratch.arena_buf),
             .pg = .{ .binding = scratch.pg },
+            .suspension = scratch.suspension,
         };
 
         // Only capture request start time if post-response hooks exist
@@ -1151,20 +1158,11 @@ pub const Router = struct {
         }
 
         var result_resp: response.Response = undefined;
-        const result_pause: ?u64 = null;
-        var ran_handler = false;
         // Response headers staged by a WASM filter's modify decision; merged
         // below alongside middleware headers. Borrows the filter instance
         // scratch, valid until the response is serialized (single-threaded,
         // non-reentrant per worker).
         var wasm_modify_headers: []const response.Header = &.{};
-        // Response headers staged by a WASM filter's Phase 2b on_response hook.
-        // Same lifetime/merge discipline as wasm_modify_headers.
-        var wasm_response_headers: []const response.Header = &.{};
-        // Set when on_response replaced the body with instance-scratch bytes;
-        // surfaced via RouteResult.wasm_body_borrowed.
-        var wasm_body_borrowed = false;
-
         var path_matched = false;
         for (self.routes[0..self.route_count]) |r| {
             if (!self.matchRoute(&r, path_only, &ctx)) continue;
@@ -1314,70 +1312,29 @@ pub const Router = struct {
                 }
             }
 
+            var preparation = deferred.Prepare{
+                .allocator = if (scratch.suspension.table) |t| t.allocator else undefined,
+                .ctx = &ctx,
+                .route = &r,
+                .payment = &x402_result,
+                .policy = &effective_policy,
+                .mw_headers = self.middleware_chain.getResponseHeaders(),
+                .wasm_headers = wasm_modify_headers,
+                .otel_start = scratch.otel_start,
+            };
+            ctx.suspension.app_state = ctx.app_state;
+            ctx.suspension.prepare = deferred.Prepare.capture;
+            ctx.suspension.prepare_ctx = &preparation;
             result_resp = r.handler(&ctx);
-            ran_handler = true;
-            if (result_resp.status >= 200 and result_resp.status < 300) {
-                if (x402_result == .allow and x402_result.allow.needs_settlement) {
-                    if (self.facilitator) |fac| {
-                        const settle = x402.facilitatorSettle(fac, x402_result.allow.payment_header, &effective_policy, ctx.charge_amount);
-                        if (settle.success) {
-                            if (settle.receipt_b64.len > 0) {
-                                x402_receipt_tls = .{ .name = "PAYMENT-RESPONSE", .value = settle.receipt_b64 };
-                                x402_receipt_v1_tls = .{ .name = "X-PAYMENT-RESPONSE", .value = settle.receipt_b64 };
-                                x402_has_receipt = true;
-                            }
-                            if (effective_policy.settlement_url.len > 0) {
-                                const amount = if (ctx.charge_amount.len > 0) ctx.charge_amount else effective_policy.price;
-                                settlement.enqueue(effective_policy.gateway_id, settle.transaction, effective_policy.network, effective_policy.asset, amount, path_only);
-                            }
-                        } else {
-                            std.log.warn("x402 settlement failed: {s}", .{settle.error_reason});
-                            result_resp = .{ .status = 502, .headers = &.{}, .body = .{ .bytes = "{\"error\":\"payment settlement failed\"}" } };
-                        }
-                    }
-                }
+            if (ctx.suspension.did_park) {
+                if (result_resp.isParked()) return .{ .resp = result_resp };
+                scratch.suspension.table.?.cancelRequest(scratch.suspension.identity, .abandoned);
             }
-
-            // Phase 2b: response-phase WASM filter. Runs AFTER the handler
-            // produced result_resp and BEFORE the header merge, so its staged
-            // headers join the merge. Status/body edits apply directly (the
-            // server recomputes Content-Length from the replaced body). FAIL-OPEN:
-            // a trap leaves result_resp untouched (the request already passed
-            // policy). Only compiled with -Denable-wasm.
-            if (build_options.enable_wasm) {
-                if (r.wasm_pool) |pool_ptr| {
-                    const pool: *wasm_filter.Pool = @ptrCast(@alignCast(pool_ptr));
-                    if (pool.hasResponseHook()) {
-                        // The response phase reuses the SAME pooled instance whose
-                        // scratch the request-phase modify headers point into;
-                        // copy them to stable storage BEFORE runResponse so the
-                        // merge below does not read clobbered bytes.
-                        if (wasm_modify_headers.len > 0) {
-                            wasm_modify_headers = stabilizeWasmModifyHeaders(wasm_modify_headers);
-                        }
-                        const edit = pool.runResponse(&req, &result_resp, r.wasm_fuel);
-                        // S3: a trapping response hook fails OPEN by default; a
-                        // pool marked response_fail_closed serves a fresh 503
-                        // instead so a redaction/scrub trap cannot leak the
-                        // original response body or headers.
-                        if (edit.trapped and pool.response_fail_closed) {
-                            result_resp = .{ .status = 503, .headers = &.{}, .body = .{ .bytes = "edge function response error" } };
-                            wasm_response_headers = &.{};
-                            break;
-                        }
-                        if (edit.new_status) |s| result_resp.status = s;
-                        if (edit.new_body) |b| {
-                            result_resp.body = .{ .bytes = b };
-                            wasm_body_borrowed = true;
-                        }
-                        wasm_response_headers = edit.add_headers;
-                    }
-                }
-            }
-            break;
+            return self.finishMatched(&ctx, r, result_resp, x402_result, effective_policy, self.middleware_chain.getResponseHeaders(), wasm_modify_headers);
         }
 
-        if (!ran_handler) {
+        {
+            ctx.suspension = .{};
             // No route matched - 404 / 405
             if (path_matched) {
                 result_resp = if (self.method_not_allowed_handler) |handler|
@@ -1392,6 +1349,94 @@ pub const Router = struct {
             }
         }
 
+        return self.finishResponse(req, mw_ctx, result_resp, self.middleware_chain.getResponseHeaders(), wasm_modify_headers, &.{}, false);
+    }
+
+    pub fn finishSuspension(self: *Router, attachment: suspension.Attachment, initial: response.Response, response_buf: []u8) RouteResult {
+        const state: *deferred.State = @ptrCast(@alignCast(attachment.ctx));
+        x402_has_receipt = false;
+        var headers: [MAX_RESPONSE_HEADERS]response.Header = undefined;
+        var ctx = HandlerContext{
+            .request = state.req,
+            .middleware_ctx = &state.mw_ctx,
+            .response_buf = response_buf,
+            .response_headers = &headers,
+            .arena = std.heap.FixedBufferAllocator.init(&.{}),
+            .charge_amount = state.charge,
+        };
+        return self.finishMatched(&ctx, state.route, initial, state.payment, state.policy, state.mw_headers, state.wasm_headers);
+    }
+
+    fn finishMatched(self: *Router, ctx: *HandlerContext, r: Route, initial: response.Response, x402_result: x402.EvaluateResult, effective_policy: x402.RoutePaymentConfig, mw_headers: []const response.Header, modify_headers: []const response.Header) RouteResult {
+        const req = ctx.request;
+        const path_only = req.path[0..(std.mem.indexOfScalar(u8, req.path, '?') orelse req.path.len)];
+        var result_resp = initial;
+        var wasm_modify_headers = modify_headers;
+        var wasm_response_headers: []const response.Header = &.{};
+        var wasm_body_borrowed = false;
+        if (result_resp.status >= 200 and result_resp.status < 300) {
+            if (x402_result == .allow and x402_result.allow.needs_settlement) {
+                if (self.facilitator) |fac| {
+                    const settle = x402.facilitatorSettle(fac, x402_result.allow.payment_header, &effective_policy, ctx.charge_amount);
+                    if (settle.success) {
+                        if (settle.receipt_b64.len > 0) {
+                            x402_receipt_tls = .{ .name = "PAYMENT-RESPONSE", .value = settle.receipt_b64 };
+                            x402_receipt_v1_tls = .{ .name = "X-PAYMENT-RESPONSE", .value = settle.receipt_b64 };
+                            x402_has_receipt = true;
+                        }
+                        if (effective_policy.settlement_url.len > 0) {
+                            const amount = if (ctx.charge_amount.len > 0) ctx.charge_amount else effective_policy.price;
+                            settlement.enqueue(effective_policy.gateway_id, settle.transaction, effective_policy.network, effective_policy.asset, amount, path_only);
+                        }
+                    } else {
+                        std.log.warn("x402 settlement failed: {s}", .{settle.error_reason});
+                        result_resp = .{ .status = 502, .headers = &.{}, .body = .{ .bytes = "{\"error\":\"payment settlement failed\"}" } };
+                    }
+                }
+            }
+        }
+
+        // Phase 2b: response-phase WASM filter. Runs AFTER the handler
+        // produced result_resp and BEFORE the header merge, so its staged
+        // headers join the merge. Status/body edits apply directly (the
+        // server recomputes Content-Length from the replaced body). FAIL-OPEN:
+        // a trap leaves result_resp untouched (the request already passed
+        // policy). Only compiled with -Denable-wasm.
+        if (build_options.enable_wasm) {
+            if (r.wasm_pool) |pool_ptr| {
+                const pool: *wasm_filter.Pool = @ptrCast(@alignCast(pool_ptr));
+                if (pool.hasResponseHook()) {
+                    // The response phase reuses the SAME pooled instance whose
+                    // scratch the request-phase modify headers point into;
+                    // copy them to stable storage BEFORE runResponse so the
+                    // merge below does not read clobbered bytes.
+                    if (wasm_modify_headers.len > 0) {
+                        wasm_modify_headers = stabilizeWasmModifyHeaders(wasm_modify_headers);
+                    }
+                    const edit = pool.runResponse(&req, &result_resp, r.wasm_fuel);
+                    // S3: a trapping response hook fails OPEN by default; a
+                    // pool marked response_fail_closed serves a fresh 503
+                    // instead so a redaction/scrub trap cannot leak the
+                    // original response body or headers.
+                    if (edit.trapped and pool.response_fail_closed) {
+                        result_resp = .{ .status = 503, .headers = &.{}, .body = .{ .bytes = "edge function response error" } };
+                        wasm_response_headers = &.{};
+                        return self.finishResponse(req, ctx.middleware_ctx, result_resp, mw_headers, wasm_modify_headers, &.{}, false);
+                    }
+                    if (edit.new_status) |s| result_resp.status = s;
+                    if (edit.new_body) |b| {
+                        result_resp.body = .{ .bytes = b };
+                        wasm_body_borrowed = true;
+                    }
+                    wasm_response_headers = edit.add_headers;
+                }
+            }
+        }
+        return self.finishResponse(req, ctx.middleware_ctx, result_resp, mw_headers, wasm_modify_headers, wasm_response_headers, wasm_body_borrowed);
+    }
+
+    fn finishResponse(self: *Router, req: request.RequestView, mw_ctx: *middleware.Context, initial: response.Response, mw_headers: []const response.Header, wasm_modify_headers: []const response.Header, wasm_response_headers: []const response.Header, wasm_body_borrowed: bool) RouteResult {
+        var result_resp = initial;
         // Merge middleware-accumulated response headers (e.g. security headers
         // from middleware/security.zig .modify decisions) into the outgoing
         // response. Preencoded fast paths bake these in at build time; the
@@ -1400,7 +1445,6 @@ pub const Router = struct {
         // at every call site. Safe because router.handle() is non-reentrant
         // per thread and the protocol layer serializes the response bytes
         // before the next request on the same thread.
-        const mw_headers = self.middleware_chain.getResponseHeaders();
         if (mw_headers.len > 0 or x402_has_receipt or wasm_modify_headers.len > 0 or wasm_response_headers.len > 0) {
             const handler_headers = result_resp.headers;
             const merge_cap = merged_headers_tls.len;
@@ -1448,7 +1492,7 @@ pub const Router = struct {
             self.middleware_chain.executePost(mw_ctx, req, result_resp, elapsed_ns);
         }
 
-        return .{ .resp = result_resp, .pause_reads_ms = result_pause, .wasm_body_borrowed = wasm_body_borrowed };
+        return .{ .resp = result_resp, .pause_reads_ms = null, .wasm_body_borrowed = wasm_body_borrowed };
     }
 
     /// Quick O(route_count) check: does ANY registered route's path
@@ -1849,6 +1893,106 @@ const TestRig = struct {
         return router.handle(req, &self.mw_ctx, &sc);
     }
 };
+
+test "suspension: owns middleware metadata and runs post hooks once after a chain" {
+    const t = std.testing;
+    const Probe = struct {
+        var pre_count: usize = 0;
+        var post_count: usize = 0;
+        var valid: bool = false;
+        fn pre(ctx: *middleware.Context, _: request.RequestView) middleware.Decision {
+            pre_count += 1;
+            ctx.setRequestId("original-id");
+            return .{ .modify = .{ .response_headers = &.{.{ .name = "X-Before", .value = "kept" }} } };
+        }
+        fn post(ctx: *middleware.Context, req: request.RequestView, resp: response.Response, _: u64) void {
+            post_count += 1;
+            valid = resp.status == 201 and std.mem.eql(u8, req.path, "/delayed") and
+                std.mem.eql(u8, ctx.request_id.?, "original-id") and
+                std.mem.eql(u8, req.body.slice, "payload") and
+                std.mem.eql(u8, req.headers[0].value, "original");
+        }
+        fn handler(ctx: *HandlerContext) response.Response {
+            return ctx.suspension.sleep(0, u32, 42, continueWait) catch unreachable;
+        }
+        fn continueWait(ctx: *suspension.ResumeContext) response.Response {
+            if (ctx.stash(u32).* == 42)
+                return ctx.suspension.sleep(0, u32, 43, continueWait) catch unreachable;
+            return ctx.text(201, "done");
+        }
+    };
+    Probe.pre_count = 0;
+    Probe.post_count = 0;
+    Probe.valid = false;
+    var app = Router.init(.{});
+    app.setMiddleware(middleware.Chain.init(&.{Probe.pre}, &.{Probe.post}));
+    try app.post("/delayed", Probe.handler);
+    var table = suspension.Table.init(t.allocator, 1);
+    defer table.deinit();
+    var rig = TestRig{};
+    var scratch = rig.scratch();
+    scratch.suspension = .{ .table = &table, .identity = .{ .conn_index = 0, .conn_id = 1 } };
+    var path = "/delayed".*;
+    var body = "payload".*;
+    var header = "original".*;
+    const req = request.RequestView{ .method = .POST, .path = &path, .headers = &.{.{ .name = "X-Input", .value = &header }}, .body = .{ .slice = &body } };
+    try t.expect(app.handle(req, &rig.mw_ctx, &scratch).resp.isParked());
+    @memset(&path, 'x');
+    @memset(&body, 'x');
+    @memset(&header, 'x');
+    rig.mw_ctx.setRequestId("overwritten");
+    try t.expectEqual(@as(usize, 0), Probe.post_count);
+    var first = table.pop(std.math.maxInt(u64)).?;
+    var ctx = suspension.ResumeContext{ .event = first.event, .bytes = &first.bytes, .response_buf = &rig.response_buf, .suspension = .{ .table = &table, .identity = first.identity, .attachment = first.attachment } };
+    try t.expect(first.continuation(&ctx).isParked());
+    first.release();
+    var last = table.pop(std.math.maxInt(u64)).?;
+    defer last.release();
+    ctx.bytes = &last.bytes;
+    const result = app.finishSuspension(last.attachment.?, last.continuation(&ctx), &rig.response_buf);
+    try t.expectEqual(@as(u16, 201), result.resp.status);
+    try t.expectEqualStrings("kept", headerValue(result.resp, "X-Before").?);
+    try t.expectEqual(@as(usize, 1), Probe.pre_count);
+    try t.expectEqual(@as(usize, 1), Probe.post_count);
+    try t.expect(Probe.valid);
+    try t.expectEqual(@as(usize, 0), table.count);
+}
+
+test "suspension: rejected snapshots and abandoned parks release their slots" {
+    const t = std.testing;
+    const Probe = struct {
+        var cancels: usize = 0;
+        fn cancel(_: *suspension.CancelContext) void {
+            cancels += 1;
+        }
+        fn continueWait(ctx: *suspension.ResumeContext) response.Response {
+            return ctx.text(200, "done");
+        }
+        fn handler(ctx: *HandlerContext) response.Response {
+            _ = ctx.suspension.wait(1000, void, {}, continueWait, .{ .on_cancel = cancel }) catch |err|
+                return ctx.text(if (err == error.SnapshotTooLarge) 413 else 503, "unavailable");
+            return ctx.text(200, "abandoned");
+        }
+    };
+    Probe.cancels = 0;
+    var app = Router.init(.{});
+    try app.post("/wait", Probe.handler);
+    var rig = TestRig{};
+    try t.expectEqual(@as(u16, 503), rig.run(&app, .POST, "/wait").resp.status);
+    var table = suspension.Table.init(t.allocator, 1);
+    defer table.deinit();
+    var scratch = rig.scratch();
+    scratch.suspension = .{ .table = &table, .identity = .{ .conn_index = 0, .conn_id = 1 } };
+    var body: [65537]u8 = undefined;
+    var req = request.RequestView{ .method = .POST, .path = "/wait", .headers = &.{}, .body = .{ .slice = &body } };
+    try t.expectEqual(@as(u16, 413), app.handle(req, &rig.mw_ctx, &scratch).resp.status);
+    try t.expectEqual(@as(usize, 0), table.count);
+    try t.expectEqual(@as(usize, 0), Probe.cancels);
+    req.body = .{ .slice = "" };
+    try t.expectEqual(@as(u16, 200), app.handle(req, &rig.mw_ctx, &scratch).resp.status);
+    try t.expectEqual(@as(usize, 0), table.count);
+    try t.expectEqual(@as(usize, 1), Probe.cancels);
+}
 
 fn bodyBytes(resp: response.Response) []const u8 {
     return switch (resp.body) {

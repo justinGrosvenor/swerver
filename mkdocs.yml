@@ -94,6 +94,7 @@ nav:
   - Guide:
       - Routing: guide/routing.md
       - Handlers & responses: guide/handlers.md
+      - Async handlers: guide/async-handlers.md
       - Middleware: guide/middleware.md
       - Configuration: guide/configuration.md
       - TLS, HTTP/2 & HTTP/3: guide/protocols.md

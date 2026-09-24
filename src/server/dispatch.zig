@@ -48,6 +48,8 @@ const http1_mod = @import("http1.zig");
 const pg_client_mod = @import("../db/pg/client.zig");
 const pg_handler_api = @import("../db/pg/handler_api.zig");
 const ffi_bridge = @import("../ffi_bridge.zig");
+const suspension = @import("../runtime/suspension.zig");
+const deferred = @import("../router/deferred.zig");
 const wasm_host_call_mod = if (build_options.enable_wasm) @import("../wasm/host_call.zig") else struct {};
 const wasm_control_mod = if (build_options.enable_wasm) @import("../wasm/control_client.zig") else struct {};
 // The WASM filter host-call (park) deadline is configurable per-server via
@@ -299,7 +301,10 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
         // when housekeeping is due so we don't block while work waits.
         const housekeeping_interval_ms: u64 = 100;
         const needs_housekeeping = (now_ms -% last_housekeeping_ms) >= housekeeping_interval_ms;
-        const timeout_ms: u32 = if (needs_housekeeping) 0 else 10;
+        var timeout_ms: u32 = if (needs_housekeeping) 0 else 10;
+        if (server.suspensions.count != 0) {
+            if (clock.Instant.now()) |now| timeout_ms = server.suspensions.pollTimeout(now.ns, timeout_ms);
+        }
         const events = try server.io.pollWithTimeout(timeout_ms);
 
         // Process I/O events BEFORE housekeeping so that requests
@@ -307,7 +312,8 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
         // Housekeeping (timeout scans, proxy maintenance, admin poll)
         // can add milliseconds of work; deferring it avoids penalizing
         // requests that arrived while we were waiting.
-        if (events.len == 0 and !needs_housekeeping) continue;
+        // Timer expiry is work even when poll returns no socket events.
+        if (events.len == 0 and !needs_housekeeping and server.suspensions.count == 0) continue;
         for (events) |event| {
             switch (event.kind) {
                 .accept => {
@@ -478,7 +484,7 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
                             if (postconn.id == pre_id and
                                 postconn.state != .closed and
                                 !postconn.close_after_write and
-                                postconn.x402 == .none)
+                                (postconn.x402 == .none or postconn.x402 == .handler_parked))
                             {
                                 if (postconn.fd) |pfd| {
                                     server.io.rearmRecv(index, pfd);
@@ -557,6 +563,13 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
                 }
             }
             if (server.quic) |*q| {
+                if (server.suspensions.count != 0) {
+                    var it = q.pool.iterator();
+                    while (it.next()) |c| {
+                        if (!c.isAlive() or c.isIdleTimedOut())
+                            server.suspensions.cancelConnection(std.math.maxInt(u32), c.id, .disconnected);
+                    }
+                }
                 q.cleanup();
             }
             if (server.proxy) |proxy| {
@@ -576,6 +589,8 @@ pub fn runLoop(server: *Server, run_for_ms: ?u64) !void {
             admin_mod.pollAdmin(server);
             settlement_mod.flush();
         }
+        drainSuspensions(server);
+
         // Drain host (FFI) completions: a host thread answered a parked
         // request, wrote the response into the slot, and woke us. Resume runs
         // here on the reactor thread (it mutates non-atomic connection state).
@@ -989,6 +1004,8 @@ pub fn wasmResume(server: *Server, completion: wasm_host_call_mod.Completion) vo
                     .conn_index = completion.conn_index,
                     .conn_id = completion.conn_id,
                 },
+                .suspension = server.suspensionHandle(.{ .conn_index = completion.conn_index, .conn_id = completion.conn_id }),
+                .otel_start = conn.wasm_proxy_resume.otel_start,
                 .wasm = .{
                     .table = if (build_options.enable_wasm) @ptrCast(&server.wasm_host_calls) else null,
                     .conn_index = completion.conn_index,
@@ -1052,8 +1069,77 @@ fn restartConnIo(server: *Server, conn_index: u32, conn_id: u64) void {
     }
     const rconn = server.io.getConnection(conn_index) orelse return;
     if (rconn.id != conn_id or rconn.state == .closed) return;
-    if (!rconn.close_after_write and rconn.x402 == .none) {
+    if (!rconn.close_after_write and (rconn.x402 == .none or rconn.x402 == .handler_parked)) {
         if (rconn.fd) |pfd| server.io.rearmRecv(conn_index, pfd);
+    }
+}
+
+/// Run a bounded batch after I/O events. A zero-delay continuation chain cannot
+/// starve the reactor; newly parked work is handled on a subsequent loop turn.
+pub fn drainSuspensions(server: *Server) void {
+    if (server.suspensions.count == 0) return;
+    const now = clock.Instant.now() orelse return;
+    const budget = @min(server.suspensions.count, 256);
+    for (0..budget) |_| {
+        var out = server.suspensions.pop(now.ns) orelse break;
+        defer out.release();
+        const id = out.identity;
+        const conn = if (id.protocol == .http3) null else server.io.getConnection(id.conn_index);
+        const alive = if (id.protocol == .http3) blk: {
+            if (server.quic) |*q| break :blk q.pool.findById(id.conn_id) != null;
+            break :blk false;
+        } else if (conn) |c|
+            c.id == id.conn_id and c.state != .closed and (id.protocol != .http1 or c.x402 == .handler_parked)
+        else
+            false;
+        if (!alive) {
+            out.cancelled(.disconnected);
+            continue;
+        }
+        if (id.protocol == .http1) conn.?.x402 = .none;
+        var buf: [router.RESPONSE_BUF_SIZE]u8 = undefined;
+        var ctx = suspension.ResumeContext{
+            .app_state = out.app_state,
+            .event = out.event,
+            .response_buf = &buf,
+            .bytes = &out.bytes,
+            .suspension = .{ .table = &server.suspensions, .identity = id, .attachment = out.attachment, .app_state = out.app_state },
+        };
+        var resp = out.continuation(&ctx);
+        if (ctx.suspension.did_park) {
+            if (resp.isParked()) {
+                if (id.protocol == .http1) conn.?.x402 = .handler_parked;
+                continue;
+            }
+            server.suspensions.cancelRequest(id, .abandoned);
+        }
+        if (resp.isParked()) resp = Server.internalErrorResponse();
+        const state: ?*deferred.State = if (out.attachment) |a| @ptrCast(@alignCast(a.ctx)) else null;
+        if (out.attachment) |a| resp = server.app_router.finishSuspension(a, resp, &buf).resp;
+        if (state) |s| {
+            if (s.otel_start != 0) {
+                if (server.otel) |exp| exp.recordSpan(s.req.method, s.req.path, resp.status, s.otel_start, clock.realtimeNanos() orelse 0);
+            }
+        }
+        switch (id.protocol) {
+            .http1 => {
+                http1_mod.queueResponse(server, conn.?, resp) catch {
+                    conn.?.close_after_write = true;
+                };
+                // A callback may return more than fits the first output buffer.
+                // Copy any borrowed spill before its stash/attachment expires.
+                if (conn.?.pending_body.len > 0) http1_mod.materializePendingBody(server, conn.?);
+                restartConnIo(server, id.conn_index, id.conn_id);
+            },
+            .http2 => {
+                http2_mod.queueHttp2Response(server, conn.?, @intCast(id.stream_id), resp, if (state) |s| s.req.method == .HEAD else false) catch {};
+                restartConnIo(server, id.conn_index, id.conn_id);
+            },
+            .http3 => {
+                defer if (resp.body == .managed) server.io.releaseBuffer(resp.body.managed.handle);
+                http3_mod.deliverResume(server, id.conn_id, id.stream_id, resp);
+            },
+        }
     }
 }
 
@@ -1367,6 +1453,7 @@ fn wasmResumeHttp2(server: *Server, completion: wasm_host_call_mod.Completion) v
                     .arena_buf = arena_buf,
                     .arena_handle = arena_handle,
                     .buffer_ops = mw_ctx.buffer_ops,
+                    .suspension = server.suspensionHandle(.{ .conn_index = completion.conn_index, .conn_id = completion.conn_id, .stream_id = stream_id, .protocol = .http2 }),
                     .wasm = .{
                         .table = @ptrCast(&server.wasm_host_calls),
                         .conn_index = completion.conn_index,
@@ -1384,6 +1471,7 @@ fn wasmResumeHttp2(server: *Server, completion: wasm_host_call_mod.Completion) v
                 // rather than serializing the park sentinel (H3-resume parity).
                 // A sentinel with no live park is failed closed.
                 if (result.resp.isParked()) {
+                    if (server.suspensions.has(scratch.suspension.identity)) return;
                     if (server.wasmHasParkForStream(completion.conn_index, completion.conn_id, stream_id)) return;
                     server.wasmCancelForStream(completion.conn_index, completion.conn_id, stream_id);
                     http2_mod.queueHttp2Response(server, conn, stream_id, Server.internalErrorResponse(), is_head) catch {};
@@ -1500,6 +1588,7 @@ fn wasmResumeHttp3(server: *Server, completion: wasm_host_call_mod.Completion) v
                 .arena_buf = arena_buf,
                 .arena_handle = arena_handle,
                 .buffer_ops = mw_ctx.buffer_ops,
+                .suspension = server.suspensionHandle(.{ .conn_index = std.math.maxInt(u32), .conn_id = conn_id, .stream_id = stream_id, .protocol = .http3 }),
                 .wasm = .{
                     .table = @ptrCast(&server.wasm_host_calls),
                     .conn_index = completion.conn_index,
@@ -1515,6 +1604,7 @@ fn wasmResumeHttp3(server: *Server, completion: wasm_host_call_mod.Completion) v
             // The handler may itself park again (PG, or another host call): leave
             // the stream suspended rather than sending the park sentinel.
             if (result.resp.isParked()) {
+                if (server.suspensions.has(scratch.suspension.identity)) return;
                 if (server.wasmHasParkForStream(completion.conn_index, conn_id, stream_id)) return;
                 server.wasmCancelForStream(completion.conn_index, conn_id, stream_id);
                 http3_mod.deliverResume(server, conn_id, stream_id, response_mod.Response{
@@ -1923,7 +2013,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
     var memo_path: []const u8 = "";
 
     while (conn.state != .closed and conn.read_buffered_bytes > 0 and conn.canEnqueueWrite() and !conn.hasPendingFile()) {
-        if (conn.x402 == .pending or conn.x402 == .settle_pending or conn.x402 == .db_parked or conn.x402 == .wasm_parked or conn.x402 == .ffi_parked) break;
+        if (conn.x402 == .pending or conn.x402 == .settle_pending or conn.x402 == .db_parked or conn.x402 == .wasm_parked or conn.x402 == .ffi_parked or conn.x402 == .handler_parked) break;
         // Opportunistic inline write drain: push enqueued responses
         // to the kernel while still processing pipelined requests.
         // At low connection counts (e.g. 512 conns / 64 workers =
@@ -2457,12 +2547,14 @@ pub fn handleRead(server: *Server, index: u32) !void {
             .arena_buf = arena_buf,
             .arena_handle = arena_handle,
             .buffer_ops = mw_ctx.buffer_ops,
+            .otel_start = otel_start,
             .pg = .{
                 .client = server.pg_client,
                 .io_rt = &server.io,
                 .conn_index = conn.index,
                 .conn_id = conn.id,
             },
+            .suspension = server.suspensionHandle(.{ .conn_index = conn.index, .conn_id = conn.id }),
             .wasm = .{
                 // *wasm.host_call.Table (opaque); null when wasm is compiled out,
                 // which makes a parking filter fail closed.
@@ -2756,6 +2848,29 @@ fn setupWebSocketTunnel(
 /// Result of one drain pass — see handleWrite.
 const WritePass = enum { done, reenter_read };
 
+test "native suspension: writable empty queue does not close a waiting request" {
+    const t = std.testing;
+    var cfg = config.ServerConfig.default();
+    cfg.max_connections = 1;
+    cfg.buffer_pool = .{ .buffer_size = 1024, .buffer_count = 2 };
+    const server = try t.allocator.create(Server);
+    defer t.allocator.destroy(server);
+    try server.initInPlace(t.allocator, cfg, router.Router.init(.{}));
+    defer server.deinit();
+    const conn = server.io.acquireConnection(server.io.nowMs()) orelse return error.OutOfMemory;
+    const fd = try std.posix.openat(std.posix.AT.FDCWD, "/dev/null", .{}, 0);
+    conn.fd = fd;
+    defer if (conn.fd != null) server.closeConnection(conn);
+    try conn.transition(.active, server.io.nowMs());
+    conn.close_after_write = true;
+    conn.x402 = .handler_parked;
+    const phase = conn.timeout_phase;
+    try t.expectEqual(WritePass.done, try handleWritePass(server, conn.index));
+    try t.expectEqual(fd, conn.fd.?);
+    try t.expectEqual(connection.State.active, conn.state);
+    try t.expectEqual(phase, conn.timeout_phase);
+}
+
 /// Free the heap buffer backing a large proxied response once its queued
 /// tail (conn.pending_body) has fully drained. No-op otherwise. The buffer
 /// is also freed by closeConnection if the connection dies first.
@@ -3013,6 +3128,10 @@ fn handleWritePass(server: *Server, index: u32) !WritePass {
     // Check if all writes are complete
     if (conn.state == .closed) return .done;
     if (conn.write_count == 0 and !conn.hasPendingBody() and !conn.hasPendingFile() and !conn.hasPendingH2Streams()) {
+        // Readiness backends can report writability before a suspended handler
+        // has produced its response. Connection: close applies AFTER that
+        // response; an empty queue here does not mean the request is finished.
+        if (conn.x402 == .handler_parked) return .done;
         if (conn.close_after_write) {
             server.closeConnection(conn);
             return .done;

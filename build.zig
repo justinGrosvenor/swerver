@@ -211,6 +211,17 @@ pub fn build(b: *std.Build) void {
     const example_step = b.step("example", "Run embedded API example");
     example_step.dependOn(&example_run.step);
 
+    const async_module = b.createModule(.{
+        .root_source_file = b.path("examples/async/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    async_module.addImport("swerver", swerver_module);
+    const async_exe = b.addExecutable(.{ .name = "swerver-async-example", .root_module = async_module });
+    const async_install = b.addInstallArtifact(async_exe, .{});
+    b.step("async-example", "Build native handler suspension example").dependOn(&async_install.step);
+
     const gateway_module = b.createModule(.{
         .root_source_file = b.path("examples/gateway/main.zig"),
         .target = target,
@@ -313,6 +324,7 @@ pub fn build(b: *std.Build) void {
     const check_step = b.step("check", "Compile all artifacts without running (signature-drift guard)");
     check_step.dependOn(&exe.step);
     check_step.dependOn(&example_exe.step);
+    check_step.dependOn(&async_exe.step);
     check_step.dependOn(&gateway_exe.step);
     check_step.dependOn(&bench_exe.step);
     check_step.dependOn(&tests.step);
@@ -337,15 +349,15 @@ const FeatureFlags = struct {
 // (a sandboxed filter has no ambient syscall surface) and m3_api_uvwasi.c
 // (external dep, not vendored). See vendor/wasm3/PATCHES.md.
 const WASM3_FILES = [_][]const u8{
-    "m3_core.c",   "m3_env.c",      "m3_module.c",   "m3_parse.c",
-    "m3_compile.c", "m3_emit.c",    "m3_optimize.c", "m3_exec.c",
-    "m3_function.c", "m3_bind.c",   "m3_code.c",     "m3_info.c",
+    "m3_core.c",     "m3_env.c",  "m3_module.c",   "m3_parse.c",
+    "m3_compile.c",  "m3_emit.c", "m3_optimize.c", "m3_exec.c",
+    "m3_function.c", "m3_bind.c", "m3_code.c",     "m3_info.c",
     "m3_api_libc.c",
 };
 
 const WASM3_CFLAGS = [_][]const u8{
-    "-std=gnu11",          "-Wall",                  "-Wextra",
-    "-Wno-unused-function", "-Wno-unused-parameter", "-Wno-unused-variable",
+    "-std=gnu11",           "-Wall",                   "-Wextra",
+    "-Wno-unused-function", "-Wno-unused-parameter",   "-Wno-unused-variable",
     "-O3",                  "-fno-sanitize=undefined",
 };
 

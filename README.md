@@ -23,6 +23,8 @@ HTTP/3   ──┘      │
 
 📖 **Documentation: [docs.swerver.net](https://docs.swerver.net)**: getting started, routing, handlers, middleware, configuration, the reverse proxy, and the PostgreSQL client.
 
+Native handlers can [suspend for timers or events](docs/guide/async-handlers.md) while the reactor continues serving ready requests.
+
 ## What
 
 swerver is a fast, complete HTTP/1/2/3 gateway written in pure Zig: three protocols (HTTP/1.1, HTTP/2, and HTTP/3 over QUIC), TLS termination, routing, a full middleware chain, a reverse proxy, and an async PostgreSQL client. It runs among the fastest entries on HttpArena's 64-core benchmark, including the json-tls workload (TLS termination plus JSON serialization) at 1.95M req/s, and ranks high across baseline, pipelined, HTTP/2, and HTTP/3.

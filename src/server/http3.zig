@@ -92,7 +92,7 @@ pub fn netPeerFromQuic(qaddr: *const quic_handler.connection_pool.SockAddrStorag
 /// No-op if the connection was freed while parked (the peer disconnected or the
 /// stream/connection was reset): the lookup fails and there is nobody to serve.
 /// Called from dispatch.wasmResumeHttp3, which runs off the datagram flow.
-pub fn deliverResume(server: *Server, conn_id: u64, stream_id: u32, resp: response_mod.Response) void {
+pub fn deliverResume(server: *Server, conn_id: u64, stream_id: u64, resp: response_mod.Response) void {
     const quic = &(server.quic orelse return);
     const udp_fd = server.udp_fd orelse return;
     const conn = quic.pool.findById(conn_id) orelse return;
@@ -107,8 +107,8 @@ pub fn deliverResume(server: *Server, conn_id: u64, stream_id: u32, resp: respon
 /// table) when nothing is parked on the stream. Compiled in all builds; the
 /// cancel itself is wasm-gated inside `wasmCancelForStream`.
 fn releaseResetParks(server: *Server, conn: *quic_connection.Connection, reset_streams: []const u64) void {
-    if (!build_options.enable_wasm) return;
     for (reset_streams) |sid| {
+        server.suspensions.cancelRequest(.{ .conn_index = H3_CONN_INDEX, .conn_id = conn.id, .stream_id = sid, .protocol = .http3 }, .reset);
         server.wasmCancelForStream(H3_CONN_INDEX, conn.id, @truncate(sid));
     }
 }
@@ -266,7 +266,7 @@ fn processOneDatagram(
         // (E2b) before dispatching this packet's request events, so a reset that
         // arrives in the same packet as new work cannot resume onto a dead
         // stream. No-op when nothing is parked.
-        if (build_options.enable_wasm and result.reset_streams.len > 0) {
+        if (result.reset_streams.len > 0) {
             releaseResetParks(server, conn, result.reset_streams);
         }
         for (result.http3_events) |event| {
@@ -299,6 +299,7 @@ fn processOneDatagram(
             // host-call deadline tick is the backstop for the idle-timeout
             // cleanup path (pool.cleanup), which frees connections without a
             // Server reference; a late completion there fails pool.findById.
+            server.suspensions.cancelConnection(H3_CONN_INDEX, conn.id, .disconnected);
             if (build_options.enable_wasm) server.wasmCancelForConn(H3_CONN_INDEX, conn.id);
             quic.pool.removeConnection(conn);
         }
@@ -421,6 +422,7 @@ fn handleHttp3Request(
         .arena_buf = arena_buf,
         .arena_handle = arena_handle,
         .buffer_ops = mw_ctx.buffer_ops,
+        .suspension = server.suspensionHandle(.{ .conn_index = H3_CONN_INDEX, .conn_id = conn.id, .stream_id = req.stream_id, .protocol = .http3 }),
     };
     // Real per-stream park binding (E2b): a parking WASM filter suspends THIS
     // stream (recorded in the host_call table, keyed by the QUIC connection id +
@@ -445,7 +447,8 @@ fn handleHttp3Request(
     // (no frames sent, stream stays open); wasmResume delivers the response on
     // this stream once the host call completes. Checked before the send so the
     // park sentinel is never serialized.
-    if (build_options.enable_wasm and result.resp.isParked()) {
+    if (result.resp.isParked()) {
+        if (server.suspensions.has(scratch.suspension.identity)) return;
         if (server.wasmHasParkForStream(H3_CONN_INDEX, conn.id, stream_id32)) return;
         // Sentinel without a live park (orphaned park): fail closed on this
         // stream and release any orphan to avoid an instance leak.
@@ -875,6 +878,55 @@ fn testEnrichRouter(pool: *anyopaque, with_plain: bool) !router.Router {
     return app_router;
 }
 
+test "native suspension h3: chained response, stream reset and connection cancellation" {
+    if (!build_options.enable_http3) return error.SkipZigTest;
+    const susp = @import("../runtime/suspension.zig");
+    const dispatch_mod = @import("dispatch.zig");
+    const Probe = struct {
+        var resumed: usize = 0;
+        var cancelled: usize = 0;
+        fn onCancel(_: *susp.CancelContext) void {
+            cancelled += 1;
+        }
+        fn next(ctx: *susp.ResumeContext) response_mod.Response {
+            resumed += 1;
+            if (ctx.stash(u8).* == 0)
+                return ctx.suspension.sleep(0, u8, 1, next) catch unreachable;
+            return ctx.text(200, "finished");
+        }
+        fn handler(ctx: *router.HandlerContext) response_mod.Response {
+            if (std.mem.eql(u8, ctx.request.path, "/timer"))
+                return ctx.suspension.sleep(0, u8, 0, next) catch unreachable;
+            return (ctx.suspension.wait(60000, u8, 1, next, .{ .on_cancel = onCancel }) catch unreachable).response;
+        }
+    };
+    Probe.resumed = 0;
+    Probe.cancelled = 0;
+    var app = router.Router.init(.{});
+    try app.get("/timer", Probe.handler);
+    try app.get("/wait", Probe.handler);
+    try app.get("/plain", h3PlainHandler);
+    var env = try TestH3Env.init(testing.allocator, app);
+    defer env.deinit();
+    env.dispatch(0, "/timer");
+    env.dispatch(4, "/plain");
+    try testing.expectEqual(@as(usize, 1), env.server.suspensions.count);
+    dispatch_mod.drainSuspensions(env.server);
+    dispatch_mod.drainSuspensions(env.server);
+    try testing.expectEqual(@as(usize, 2), Probe.resumed);
+    try testing.expectEqual(@as(usize, 0), env.server.suspensions.count);
+    env.dispatch(8, "/wait");
+    // Native identities retain all 62 QUIC stream-id bits.
+    env.dispatch((@as(u64, 1) << 32) + 8, "/wait");
+    try testing.expectEqual(@as(usize, 2), env.server.suspensions.count);
+    releaseResetParks(env.server, env.conn, &.{8});
+    try testing.expectEqual(@as(usize, 1), env.server.suspensions.count);
+    try testing.expectEqual(@as(usize, 1), Probe.cancelled);
+    env.server.suspensions.cancelConnection(H3_CONN_INDEX, env.conn.id, .disconnected);
+    try testing.expectEqual(@as(usize, 0), env.server.suspensions.count);
+    try testing.expectEqual(@as(usize, 2), Probe.cancelled);
+}
+
 test "wasm h3: stream park then resume releases on its stream; sibling flows while parked" {
     if (build_options.enable_http3 and build_options.enable_wasm) {
         const dispatch_mod = @import("dispatch.zig");
@@ -976,4 +1028,3 @@ test "wasm h3: connection close during park releases the pinned instance (no lea
         try testing.expect(pool.acquire() != null);
     } else return error.SkipZigTest;
 }
-

@@ -13,6 +13,7 @@ const master = @import("master.zig");
 const buffer_pool = @import("runtime/buffer_pool.zig");
 const connection = @import("runtime/connection.zig");
 const clock = @import("runtime/clock.zig");
+const suspension = @import("runtime/suspension.zig");
 const io = @import("runtime/io.zig");
 const net = @import("runtime/net.zig");
 const json_write = @import("runtime/json_write.zig");
@@ -133,6 +134,7 @@ comptime {
     _ = buffer_pool;
     _ = connection;
     _ = clock;
+    _ = suspension;
     _ = io;
     _ = net;
     _ = json_write;

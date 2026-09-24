@@ -105,6 +105,8 @@ pub const Server = server_mod.Server;
 pub const ServerBuilder = @import("server_builder.zig").ServerBuilder;
 pub const Master = @import("master.zig").Master;
 pub const router = @import("router/router.zig");
+/// Reactor-owned handler waits, continuation contexts, and completion tokens.
+pub const suspension = @import("runtime/suspension.zig");
 pub const request = @import("protocol/request.zig");
 pub const response = @import("response/response.zig");
 pub const middleware = @import("middleware/middleware.zig");

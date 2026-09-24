@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.1.0-alpha.33 — 2026-09-23
+
+- Add native handler suspension with monotonic timers, explicit completion tokens,
+  typed value stashes, cancellation cleanup, and chained continuations. HTTP/1.1
+  preserves pipeline order; HTTP/2 and HTTP/3 suspend individual streams.
+- Keep native waits in a lazy, bounded per-worker registry sized by
+  `max_connections`, independent of PostgreSQL, WASM, and FFI park capacity.
+  Deferred responses retain middleware metadata and use normal finalization.
+- Add an async handler example and live HTTP/1.1 and HTTP/2 regression checks.
+
 ## 0.1.0-alpha.32 — 2026-09-06
 
 ### FFI embedding
