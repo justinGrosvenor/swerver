@@ -19,16 +19,16 @@ jobs:
   publish:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
       - name: Install Zig 0.16.0
-        uses: mlugg/setup-zig@v1
+        uses: mlugg/setup-zig@v2.2.1
         with:
           version: 0.16.0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7.1.0
         with:
-          node-version: 20
+          node-version: 24.22.1
           registry-url: https://registry.npmjs.org
 
       - name: Build prebuilt packages

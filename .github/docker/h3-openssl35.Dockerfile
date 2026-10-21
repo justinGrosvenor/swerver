@@ -29,6 +29,7 @@ RUN apt-get update \
         xz-utils \
         libssl-dev \
         zlib1g-dev \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' libssl3t64)" ge '3.5.7-1~deb13u3' \
     && rm -rf /var/lib/apt/lists/*
 
 # Download Zig 0.16.0 stable for the build arch and verify its sha256. This
