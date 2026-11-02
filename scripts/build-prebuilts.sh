@@ -1,7 +1,7 @@
 #!/bin/bash
-# Build the per-platform prebuilt packages consumed by swerverts. Each
+# Build the per-platform prebuilt packages consumed by swerver-ts. Each
 # @swerver/<os>-<arch> package holds the swerver binary and libswerver for one
-# platform and is published so swerverts can list them as optionalDependencies
+# platform and is published so swerver-ts can list them as optionalDependencies
 # (npm/bun install only the one matching the host, esbuild/@swc style).
 #
 # Usage: VERSION=0.1.0 scripts/build-prebuilts.sh

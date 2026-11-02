@@ -1,7 +1,7 @@
 name: prebuilts
 
 # Build and publish the per-platform prebuilt packages (@swerver/<os>-<arch>)
-# that swerverts consumes as optionalDependencies. Zig cross-compiles every
+# that swerver-ts consumes as optionalDependencies. Zig cross-compiles every
 # target from a single macOS host (native darwin + cross to linux), so one job
 # builds and publishes all four. Requires an NPM_TOKEN secret with publish
 # rights on the @swerver scope.
