@@ -119,7 +119,7 @@ jobs:
 
   cross-compile-linux:
     runs-on: macos-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7.0.1
         with:
