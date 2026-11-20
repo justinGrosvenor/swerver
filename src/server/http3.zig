@@ -349,8 +349,12 @@ fn handleHttp3Request(
     }
 
     // --- Cold path: full router dispatch ---
+    const peer = net.PeerAddress{ .storage = peer_addr };
     var mw_ctx = middleware.Context{
         .protocol = .http3,
+        .is_tls = true,
+        .client_ip = peer.getIp4Bytes(),
+        .client_ip6 = peer.getIp6Bytes(),
         .buffer_ops = .{
             .ctx = &server.io,
             .acquire = write_queue.acquireBufferOpaque,

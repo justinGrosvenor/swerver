@@ -155,20 +155,6 @@ pub fn handleHttp2Read(server: *Server, conn: *connection.Connection) !void {
         }
         server.io.onReadConsumed(conn, ingest.consumed_bytes);
 
-        // Pending headers table: h2 POST/PUT with a body sends a
-        // HEADERS frame (end_stream=false) followed by one or more
-        // DATA frames. We stash the headers here and match them
-        // up with the next DATA(end_stream=true) for the same
-        // stream_id so the router sees a complete request with
-        // a non-empty body. Before this PR, the .data arm was
-        // `_ = data;` and body-bearing requests were silently
-        // dropped — visible on the Mixed GET+POST benchmark
-        // where swerver was at 12K vs actix's 33K.
-        //
-        // Scope: single-ingest-batch for small bodies, persistent
-        // conn.h2_pending slots for bodies spanning TCP reads.
-        var pending_headers: [16]?http2.HeadersEvent = [_]?http2.HeadersEvent{null} ** 16;
-        var pending_count: usize = 0;
         var ctrl_buf: [256]u8 = undefined;
         var ctrl_len: usize = 0;
         const h2_pending = conn.h2_pending orelse return;
@@ -200,15 +186,6 @@ pub fn handleHttp2Read(server: *Server, conn: *connection.Connection) !void {
                             try dispatchHttp2Request(server, conn, hdr.stream_id, hdr.request, "");
                         }
                     } else {
-                        // Body-bearing request. Stash in batch-local
-                        // array AND persist to connection for cross-
-                        // TCP-read delivery.
-                        if (pending_count < pending_headers.len) {
-                            pending_headers[pending_count] = hdr;
-                            pending_count += 1;
-                        }
-                        // Persist to connection-level slots so DATA
-                        // arriving in a later TCP read can find them.
                         var stashed = false;
                         for (h2_pending) |*slot| {
                             if (!slot.active) {
@@ -231,75 +208,10 @@ pub fn handleHttp2Read(server: *Server, conn: *connection.Connection) !void {
                     }
                 },
                 .data => |data_ev| {
-                    // Find matching stashed HEADERS for this stream_id.
-                    var matched: ?usize = null;
-                    var i: usize = 0;
-                    while (i < pending_count) : (i += 1) {
-                        if (pending_headers[i]) |p| {
-                            if (p.stream_id == data_ev.stream_id) {
-                                matched = i;
-                                break;
-                            }
-                        }
-                    }
-                    if (matched) |idx| {
-                        const hdr_opt = pending_headers[idx];
-                        pending_headers[idx] = null;
-                        if (hdr_opt) |hdr| {
-                            if (data_ev.end_stream) {
-                                try dispatchHttp2Request(server, conn, hdr.stream_id, hdr.request, data_ev.data);
-                                // Clear persistent slot too
-                                for (h2_pending) |*slot| {
-                                    if (slot.active and slot.stream_id == data_ev.stream_id) {
-                                        slot.clear();
-                                        break;
-                                    }
-                                }
-                            } else {
-                                // Multi-DATA: accumulate in persistent slot
-                                accumulateH2Body(server, conn, data_ev);
-                            }
-                        }
-                    } else {
-                        // No batch-local match — check persistent slots
-                        // for headers that arrived in a previous TCP read.
-                        var found_persistent = false;
-                        for (h2_pending) |*slot| {
-                            if (slot.active and slot.stream_id == data_ev.stream_id) {
-                                found_persistent = true;
-                                if (data_ev.end_stream) {
-                                    // Collect full body: slot body + this DATA frame
-                                    const body = if (slot.body_handle) |bh|
-                                        bh.bytes[0..slot.body_len]
-                                    else
-                                        "";
-                                    // If slot has accumulated body, combine with final chunk
-                                    if (body.len > 0 and data_ev.data.len > 0) {
-                                        // Append final chunk to accumulated buffer
-                                        if (slot.body_len + data_ev.data.len <= slot.body_handle.?.bytes.len) {
-                                            @memcpy(slot.body_handle.?.bytes[slot.body_len .. slot.body_len + data_ev.data.len], data_ev.data);
-                                            slot.body_len += data_ev.data.len;
-                                        }
-                                        const full_body = slot.body_handle.?.bytes[0..slot.body_len];
-                                        try dispatchHttp2Request(server, conn, slot.stream_id, slot.toRequestView(full_body), full_body);
-                                    } else {
-                                        // Only this frame's data (or only accumulated)
-                                        const final_body = if (data_ev.data.len > 0) data_ev.data else body;
-                                        try dispatchHttp2Request(server, conn, slot.stream_id, slot.toRequestView(final_body), final_body);
-                                    }
-                                    if (slot.body_handle) |bh| {
-                                        if (slot.body_is_body_pool) server.io.releaseBodyBuffer(bh) else server.io.releaseBuffer(bh);
-                                    }
-                                    slot.clear();
-                                } else {
-                                    accumulateH2Body(server, conn, data_ev);
-                                }
-                                break;
-                            }
-                        }
-                        if (!found_persistent) {
-                            // Orphaned DATA frame — stream will time out on the client side.
-                        }
+                    for (h2_pending) |*slot| {
+                        if (!slot.active or slot.stream_id != data_ev.stream_id) continue;
+                        try handleBodyData(server, conn, slot, data_ev);
+                        break;
                     }
                 },
                 .settings => |settings_event| {
@@ -912,34 +824,39 @@ fn sendRstStream(server: *Server, conn: *connection.Connection, stream_id: u32, 
     if (conn.http2_stack) |stack| stack.closeStream(stream_id);
 }
 
-fn accumulateH2Body(server: *Server, conn: *connection.Connection, data_ev: http2.DataEvent) void {
-    const pending = conn.h2_pending orelse return;
-    for (pending) |*slot| {
-        if (slot.active and slot.stream_id == data_ev.stream_id) {
-            if (slot.body_handle == null) {
-                slot.body_handle = server.io.acquireBodyBuffer() orelse {
-                    sendRstStream(server, conn, data_ev.stream_id, 0x7);
-                    slot.active = false;
-                    return;
-                };
-                slot.body_len = 0;
-                slot.body_is_body_pool = true;
-            }
-            const buf = slot.body_handle.?.bytes;
-            const avail = buf.len - slot.body_len;
-            if (data_ev.data.len > avail) {
-                sendRstStream(server, conn, data_ev.stream_id, 0x3);
-                slot.active = false;
-                if (slot.body_handle) |bh| {
-                    if (slot.body_is_body_pool) server.io.releaseBodyBuffer(bh) else server.io.releaseBuffer(bh);
-                    slot.body_handle = null;
-                }
-                return;
-            }
-            @memcpy(buf[slot.body_len .. slot.body_len + data_ev.data.len], data_ev.data);
-            slot.body_len += data_ev.data.len;
+fn handleBodyData(server: *Server, conn: *connection.Connection, slot: *connection.PendingH2Body, frame: http2.DataEvent) !void {
+    var finished = true;
+    defer if (finished) {
+        if (slot.body_handle) |bh| server.io.releaseBodyBuffer(bh);
+        slot.clear();
+    };
+    if (frame.data.len > server.cfg.limits.max_body_bytes -| slot.body_len) {
+        sendRstStream(server, conn, slot.stream_id, 0xb);
+        return;
+    }
+    if (frame.end_stream and slot.body_handle == null) {
+        try dispatchHttp2Request(server, conn, slot.stream_id, slot.toRequestView(frame.data), frame.data);
+        return;
+    }
+    if (slot.body_handle == null) {
+        slot.body_handle = server.io.acquireBodyBuffer() orelse {
+            sendRstStream(server, conn, slot.stream_id, 0x7);
             return;
-        }
+        };
+        slot.body_is_body_pool = true;
+    }
+    const buf = slot.body_handle.?.bytes;
+    if (frame.data.len > buf.len - slot.body_len) {
+        sendRstStream(server, conn, slot.stream_id, 0xb);
+        return;
+    }
+    @memcpy(buf[slot.body_len..][0..frame.data.len], frame.data);
+    slot.body_len += frame.data.len;
+    if (frame.end_stream) {
+        const body = buf[0..slot.body_len];
+        try dispatchHttp2Request(server, conn, slot.stream_id, slot.toRequestView(body), body);
+    } else {
+        finished = false;
     }
 }
 
@@ -1169,7 +1086,9 @@ test "wasm h2: stream park then resume delivers on its stream; sibling flows whi
         try app_router.get("/plain", h2PlainHandler);
         _ = app_router.attachWasmFilter("/enrich", &pool, wasm_filter_mod.DEFAULT_FUEL);
 
-        var server = try Server.initWithRouter(allocator, cfg, app_router);
+        const server = try allocator.create(Server);
+        defer allocator.destroy(server);
+        try server.initInPlace(allocator, cfg, app_router);
         defer server.deinit();
         server.wasm_mock_enabled = true;
         server.wasm_mock_reply = "ok"; // probe resumes /enrich to .allow
@@ -1185,7 +1104,7 @@ test "wasm h2: stream park then resume delivers on its stream; sibling flows whi
         // Stream 1 -> /enrich: the filter stages a host_call and PARKS. No frames
         // are queued for it yet; the stream stays suspended.
         const req1 = request.RequestView{ .method = .GET, .path = "/enrich", .headers = &.{} };
-        try dispatchHttp2Request(&server, conn, 1, req1, "");
+        try dispatchHttp2Request(server, conn, 1, req1, "");
         try testing.expectEqual(@as(usize, 1), server.wasm_host_calls.liveCount());
         try testing.expect(server.wasmHasParkForStream(conn.index, conn.id, 1));
         try testing.expect(findH2Frame(conn, .headers, 1) == null);
@@ -1194,7 +1113,7 @@ test "wasm h2: stream park then resume delivers on its stream; sibling flows whi
         // Stream 3 -> /plain: a SIBLING stream completes immediately while stream
         // 1 is still parked. The connection kept multiplexing.
         const req3 = request.RequestView{ .method = .GET, .path = "/plain", .headers = &.{} };
-        try dispatchHttp2Request(&server, conn, 3, req3, "");
+        try dispatchHttp2Request(server, conn, 3, req3, "");
         const sib_body = findH2Frame(conn, .data, 3) orelse return error.SiblingNotDelivered;
         try testing.expectEqualStrings("plain-ok", sib_body);
         // Stream 1 still parked, still no response.
@@ -1205,7 +1124,7 @@ test "wasm h2: stream park then resume delivers on its stream; sibling flows whi
         // re-dispatch the handler -> deliver "enriched" on stream 1.
         const n = server.wasm_mock_count;
         var k: usize = 0;
-        while (k < n) : (k += 1) dispatch.wasmComplete(&server, server.wasm_mock_pending[k], "ok");
+        while (k < n) : (k += 1) dispatch.wasmComplete(server, server.wasm_mock_pending[k], "ok");
         server.wasm_mock_count = 0;
 
         try testing.expectEqual(@as(usize, 0), server.wasm_host_calls.liveCount()); // released
@@ -1214,7 +1133,7 @@ test "wasm h2: stream park then resume delivers on its stream; sibling flows whi
         // HEADERS for stream 1 present too.
         try testing.expect(findH2Frame(conn, .headers, 1) != null);
 
-        drainH2WriteQueue(&server, conn);
+        drainH2WriteQueue(server, conn);
     } else return error.SkipZigTest;
 }
 
@@ -1237,7 +1156,9 @@ test "wasm h2: RST_STREAM during park releases the pinned instance (no leak)" {
         try app_router.get("/enrich", h2EnrichHandler);
         _ = app_router.attachWasmFilter("/enrich", &pool, wasm_filter_mod.DEFAULT_FUEL);
 
-        var server = try Server.initWithRouter(allocator, cfg, app_router);
+        const server = try allocator.create(Server);
+        defer allocator.destroy(server);
+        try server.initInPlace(allocator, cfg, app_router);
         defer server.deinit();
         server.wasm_mock_enabled = true;
         server.wasm_mock_reply = "ok";
@@ -1254,7 +1175,7 @@ test "wasm h2: RST_STREAM during park releases the pinned instance (no leak)" {
 
         // Park stream 1. The single pool instance is now pinned.
         const req1 = request.RequestView{ .method = .GET, .path = "/enrich", .headers = &.{} };
-        try dispatchHttp2Request(&server, conn, 1, req1, "");
+        try dispatchHttp2Request(server, conn, 1, req1, "");
         try testing.expectEqual(@as(usize, 1), server.wasm_host_calls.liveCount());
 
         // Feed an RST_STREAM frame for stream 1 through the real read path. The
@@ -1271,13 +1192,13 @@ test "wasm h2: RST_STREAM during park releases the pinned instance (no leak)" {
         conn.read_offset = 0;
         conn.read_buffered_bytes = http2.Preface.len + rst_len;
 
-        try handleHttp2Read(&server, conn);
+        try handleHttp2Read(server, conn);
 
         try testing.expectEqual(@as(usize, 0), server.wasm_host_calls.liveCount()); // released
         // The freed instance is reacquirable from the single-instance pool.
         try testing.expect(pool.acquire() != null);
 
-        drainH2WriteQueue(&server, conn);
+        drainH2WriteQueue(server, conn);
         server.io.releaseBuffer(rbuf);
         conn.read_buffer = null;
     } else return error.SkipZigTest;
@@ -1349,7 +1270,9 @@ test "h2: in-memory body larger than first-frame + one pool buffer is delivered 
     var app_router = router.Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
     try app_router.get("/big", h2BigBodyHandler);
 
-    var server = try Server.initWithRouter(allocator, cfg, app_router);
+    const server = try allocator.create(Server);
+    defer allocator.destroy(server);
+    try server.initInPlace(allocator, cfg, app_router);
     defer server.deinit();
 
     const conn = server.io.acquireConnection(server.io.nowMs()) orelse return error.OutOfMemory;
@@ -1368,20 +1291,56 @@ test "h2: in-memory body larger than first-frame + one pool buffer is delivered 
     conn.http2_stack = &stack;
 
     const req = request.RequestView{ .method = .GET, .path = "/big", .headers = &.{} };
-    try dispatchHttp2Request(&server, conn, 1, req, "");
+    try dispatchHttp2Request(server, conn, 1, req, "");
 
     // Pump: collect DATA payloads, then drain the pending stash until done.
     var got: [H2_BIG_BODY.len + 4096]u8 = undefined;
-    var n: usize = collectH2Data(&server, conn, 1, &got, 0);
+    var n: usize = collectH2Data(server, conn, 1, &got, 0);
     var spins: usize = 0;
     while (conn.hasPendingH2Responses()) : (spins += 1) {
         if (spins > 64) return error.DrainStuck;
-        drainPendingH2Streams(&server, conn);
-        n = collectH2Data(&server, conn, 1, &got, n);
+        drainPendingH2Streams(server, conn);
+        n = collectH2Data(server, conn, 1, &got, n);
     }
-    n = collectH2Data(&server, conn, 1, &got, n);
+    n = collectH2Data(server, conn, 1, &got, n);
 
     // The whole body arrived, byte-identical (was: 16 KiB + RST_STREAM).
     try testing.expectEqual(H2_BIG_BODY.len, n);
     try testing.expectEqualSlices(u8, &H2_BIG_BODY, got[0..n]);
+}
+
+test "a fragmented request dispatches only when its complete body fits" {
+    if (!build_options.enable_http2) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    var cfg = config.ServerConfig.default();
+    cfg.max_connections = 1;
+    cfg.buffer_pool = .{ .buffer_size = 8192, .buffer_count = 8, .body_buffer_size = 4, .body_buffer_count = 1 };
+    var app = router.Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
+    try app.post("/echo", struct {
+        fn echo(ctx: *router.HandlerContext) response_mod.Response {
+            return .{ .status = 200, .headers = &.{}, .body = .{ .bytes = ctx.request.body.sliceOrNull().? } };
+        }
+    }.echo);
+    const server = try allocator.create(Server);
+    defer allocator.destroy(server);
+    try server.initInPlace(allocator, cfg, app);
+    defer server.deinit();
+    const conn = server.io.acquireConnection(0).?;
+    defer server.io.releaseConnection(conn);
+    defer drainH2WriteQueue(server, conn);
+    conn.protocol = .http2;
+    var stack = http2.Stack.init();
+    conn.http2_stack = &stack;
+    var slot: connection.PendingH2Body = .{};
+    const req = request.RequestView{ .method = .POST, .path = "/echo", .headers = &.{} };
+    for ([_][]const u8{ "cde", "cd" }, [_]u32{ 1, 3 }) |tail, id| {
+        _ = stack.openTestStream(id);
+        try testing.expect(slot.stash(id, req));
+        try handleBodyData(server, conn, &slot, .{ .stream_id = id, .data = "ab", .end_stream = false });
+        try handleBodyData(server, conn, &slot, .{ .stream_id = id, .data = tail, .end_stream = true });
+        try testing.expect(!slot.active);
+    }
+    try testing.expect(findH2Frame(conn, .rst_stream, 1) != null);
+    try testing.expect(findH2Frame(conn, .headers, 1) == null);
+    try testing.expectEqualStrings("abcd", findH2Frame(conn, .data, 3).?);
 }

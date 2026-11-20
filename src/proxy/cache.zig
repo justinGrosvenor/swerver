@@ -90,7 +90,7 @@ pub const ResponseCache = struct {
         vary_keys: []const []const u8,
         now_ms: u64,
     ) LookupResult {
-        if (!method.isCacheable()) return .miss;
+        if (!method.isCacheable() or requestPreventsCaching(req_headers)) return .miss;
         // RFC 10008 sec 2.7: the cache key MUST incorporate the request
         // content. A body-bearing cacheable request (QUERY) whose body is not
         // contiguous in memory cannot be keyed, so it never touches the cache.
@@ -704,6 +704,13 @@ test "cache does not store responses to authenticated requests" {
     };
     cache.store(.GET, "/cookied", null, &cookie_req, &.{}, 200, &resp_headers, "secret", 60_000, 1000);
     try std.testing.expect(cache.lookup(.GET, "/cookied", null, &.{}, &.{}, 2000) == .miss);
+
+    // A public response already cached for the same path must also bypass
+    // lookup when the next request carries credentials.
+    cache.store(.GET, "/public", null, &.{}, &.{}, 200, &resp_headers, "public", 60_000, 1000);
+    try std.testing.expect(cache.lookup(.GET, "/public", null, &.{}, &.{}, 2000) == .hit);
+    try std.testing.expect(cache.lookup(.GET, "/public", null, &auth_req, &.{}, 2000) == .miss);
+    try std.testing.expect(cache.lookup(.GET, "/public", null, &cookie_req, &.{}, 2000) == .miss);
 }
 
 test "cache keys on accept-encoding so compressed entries are not mis-served" {

@@ -131,6 +131,24 @@ const FORBIDDEN = response.Response{
 
 // ── Main evaluate ──────────────────────────────────────────────
 
+/// Client headers may never supply a claim or identity field owned by the
+/// configured authenticator, even when that field is absent in its result.
+pub fn ownsHeader(method: AuthMethod, name: []const u8) bool {
+    switch (method) {
+        .jwt => |cfg| for (cfg.claims_to_headers) |mapping| {
+            if (std.ascii.eqlIgnoreCase(mapping.header, name)) return true;
+        },
+        .forward_auth => |cfg| for (cfg.headers_upstream) |header| {
+            if (std.ascii.eqlIgnoreCase(header, name)) return true;
+        },
+        .chain => |cfg| for (cfg.methods) |child| {
+            if (ownsHeader(child, name)) return true;
+        },
+        else => {},
+    }
+    return false;
+}
+
 pub fn evaluate(req: request.RequestView, auth: AuthMethod) AuthResult {
     return evaluateWithDepth(req, auth, 0);
 }

@@ -12,7 +12,6 @@ const grpc_mod = @import("../middleware/grpc.zig");
 /// Handles forwarding HTTP requests to upstream servers and
 /// relaying responses back to clients. Manages header manipulation,
 /// hop-by-hop header filtering, and proxy header injection.
-
 /// Context for a proxy request
 pub const ForwardContext = struct {
     /// Original client request
@@ -26,11 +25,12 @@ pub const ForwardContext = struct {
     /// Selected upstream server
     server: *const upstream.Server,
     /// Connection to upstream
-    upstream_conn: *pool_mod.UpstreamConnection,
+    upstream_conn: ?*pool_mod.UpstreamConnection = null,
     /// Buffer for building upstream request
-    request_buf: []u8,
+    request_buf: []u8 = &.{},
     /// Buffer for reading upstream response
-    response_buf: []u8,
+    response_buf: []u8 = &.{},
+    websocket_upgrade: bool = false,
     /// Auth-injected headers to add to upstream request
     auth_headers: []const auth_mod.InjectedHeader = &.{},
     /// Client certificate subject DN (mTLS), e.g. "/CN=myservice/O=MyOrg"
@@ -78,116 +78,7 @@ pub fn buildUpstreamRequest(
     buf: []u8,
     ctx: *const ForwardContext,
 ) !usize {
-    var pos: usize = 0;
-
-    // Request line
-    const method_name = ctx.client_request.getMethodName();
-    const path = rewritePath(ctx.client_request.path, ctx.route.rewrite);
-
-    pos += (std.fmt.bufPrint(buf[pos..], "{s} {s} HTTP/1.1\r\n", .{ method_name, path }) catch return error.BufferFull).len;
-
-    // Host header
-    if (ctx.route.headers.preserve_host) {
-        if (ctx.client_request.getHeader("Host")) |host| {
-            pos += (std.fmt.bufPrint(buf[pos..], "Host: {s}\r\n", .{host}) catch return error.BufferFull).len;
-        } else {
-            pos += try writeHostHeader(buf[pos..], ctx.server);
-        }
-    } else {
-        pos += try writeHostHeader(buf[pos..], ctx.server);
-    }
-
-    // RFC 9110 §7.6.1: Parse Connection header to find dynamic hop-by-hop headers
-    var dynamic_hop_by_hop: [16][]const u8 = undefined;
-    var dynamic_hop_count: usize = 0;
-    if (ctx.client_request.getHeader("Connection")) |conn_value| {
-        var it = std.mem.splitScalar(u8, conn_value, ',');
-        while (it.next()) |token| {
-            const trimmed = std.mem.trim(u8, token, " \t");
-            if (trimmed.len > 0 and dynamic_hop_count < dynamic_hop_by_hop.len) {
-                dynamic_hop_by_hop[dynamic_hop_count] = trimmed;
-                dynamic_hop_count += 1;
-            }
-        }
-    }
-
-    // Forward non-hop-by-hop headers (gRPC requests preserve te/trailer)
-    const is_grpc = grpc_mod.isGrpcRequest(ctx.client_request.headers);
-    for (ctx.client_request.headers) |hdr| {
-        // Skip static hop-by-hop headers
-        if (if (is_grpc) upstream.isHopByHopGrpc(hdr.name) else upstream.isHopByHop(hdr.name)) continue;
-
-        // For gRPC: only forward "te: trailers", not other te values
-        if (is_grpc and std.ascii.eqlIgnoreCase(hdr.name, "te")) {
-            if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, hdr.value, " \t"), "trailers")) continue;
-        }
-
-        // Skip dynamic hop-by-hop headers from Connection header
-        var is_dynamic_hop = false;
-        for (dynamic_hop_by_hop[0..dynamic_hop_count]) |dh| {
-            if (std.ascii.eqlIgnoreCase(hdr.name, dh)) {
-                is_dynamic_hop = true;
-                break;
-            }
-        }
-        if (is_dynamic_hop) continue;
-
-        // Skip Host (handled above)
-        if (std.ascii.eqlIgnoreCase(hdr.name, "host")) continue;
-        // Skip Via (handled separately in addProxyHeaders chaining logic)
-        if (std.ascii.eqlIgnoreCase(hdr.name, "via")) continue;
-        // Skip client Content-Length: the body may have been re-framed
-        // (e.g. chunked decoded), so the original value can disagree with
-        // what we forward — a request-smuggling vector. We always emit a
-        // computed Content-Length below.
-        if (std.ascii.eqlIgnoreCase(hdr.name, "content-length")) continue;
-        // Strip client-supplied trusted identity/forwarding headers; the
-        // proxy re-injects authoritative values below.
-        if (upstream.isProxyTrustedHeader(hdr.name)) continue;
-
-        // Check if header should be removed
-        var should_remove = false;
-        for (ctx.route.headers.remove_request) |remove_name| {
-            if (std.ascii.eqlIgnoreCase(hdr.name, remove_name)) {
-                should_remove = true;
-                break;
-            }
-        }
-        if (should_remove) continue;
-
-        pos += (std.fmt.bufPrint(buf[pos..], "{s}: {s}\r\n", .{ hdr.name, hdr.value }) catch return error.BufferFull).len;
-    }
-
-    // Add configured request headers
-    for (ctx.route.headers.set_request) |hdr| {
-        pos += (std.fmt.bufPrint(buf[pos..], "{s}: {s}\r\n", .{ hdr.name, hdr.value }) catch return error.BufferFull).len;
-    }
-
-    // Auth-injected identity headers (values owned by AuthInfo inline buffers)
-    for (ctx.auth_headers) |*hdr| {
-        pos += (std.fmt.bufPrint(buf[pos..], "{s}: {s}\r\n", .{ hdr.name, hdr.value() }) catch return error.BufferFull).len;
-    }
-
-    // Add proxy headers if enabled
-    if (ctx.route.headers.add_proxy_headers) {
-        pos = try addProxyHeaders(buf, pos, ctx);
-    }
-
-    // Content-Length computed from the body we actually forward (the client's
-    // header was skipped above)
-    const body_len = ctx.client_request.body.len();
-    if (body_len > 0) {
-        pos += (std.fmt.bufPrint(buf[pos..], "Content-Length: {d}\r\n", .{body_len}) catch return error.BufferFull).len;
-    }
-
-    // Connection header for keep-alive
-    pos += (std.fmt.bufPrint(buf[pos..], "Connection: keep-alive\r\n", .{}) catch return error.BufferFull).len;
-
-    // End of headers
-    if (pos + 2 > buf.len) return error.BufferFull;
-    buf[pos] = '\r';
-    buf[pos + 1] = '\n';
-    pos += 2;
+    var pos = try buildUpstreamRequestHeaders(buf, ctx, ctx.client_request.body.len());
 
     // Body (if any) — proxy forward only handles small bodies (slice)
     if (ctx.client_request.body.sliceOrNull()) |body_slice| {
@@ -289,7 +180,7 @@ pub fn buildUpstreamRequestHeaders(
 
     // Forward non-hop-by-hop headers (gRPC requests preserve te/trailer)
     const is_grpc_b = grpc_mod.isGrpcRequest(ctx.client_request.headers);
-    for (ctx.client_request.headers) |hdr| {
+    headers: for (ctx.client_request.headers) |hdr| {
         if (if (is_grpc_b) upstream.isHopByHopGrpc(hdr.name) else upstream.isHopByHop(hdr.name)) continue;
 
         if (is_grpc_b and std.ascii.eqlIgnoreCase(hdr.name, "te")) {
@@ -304,22 +195,13 @@ pub fn buildUpstreamRequestHeaders(
             }
         }
         if (is_dynamic_hop) continue;
-        if (std.ascii.eqlIgnoreCase(hdr.name, "host")) continue;
-        if (std.ascii.eqlIgnoreCase(hdr.name, "via")) continue;
-        if (std.ascii.eqlIgnoreCase(hdr.name, "content-length")) continue;
-        // Strip client-supplied trusted identity/forwarding headers; the
-        // proxy re-injects authoritative values below.
-        if (upstream.isProxyTrustedHeader(hdr.name)) continue;
-
-        var should_remove = false;
-        for (ctx.route.headers.remove_request) |remove_name| {
-            if (std.ascii.eqlIgnoreCase(hdr.name, remove_name)) {
-                should_remove = true;
-                break;
-            }
+        if (!isSafeHeaderValue(hdr.name) or !isSafeHeaderValue(hdr.value)) return error.InvalidHeader;
+        if (std.ascii.eqlIgnoreCase(hdr.name, "host") or std.ascii.eqlIgnoreCase(hdr.name, "via") or
+            std.ascii.eqlIgnoreCase(hdr.name, "content-length") or upstream.isProxyTrustedHeader(hdr.name)) continue;
+        for (ctx.route.headers.remove_request) |removed| {
+            if (std.ascii.eqlIgnoreCase(hdr.name, removed)) continue :headers;
         }
-        if (should_remove) continue;
-
+        if (auth_mod.ownsHeader(ctx.route.auth, hdr.name)) continue;
         pos += (std.fmt.bufPrint(buf[pos..], "{s}: {s}\r\n", .{ hdr.name, hdr.value }) catch return error.BufferFull).len;
     }
 
@@ -338,21 +220,14 @@ pub fn buildUpstreamRequestHeaders(
         pos = try addProxyHeaders(buf, pos, ctx);
     }
 
-    // Content-Length for the body
     if (body_len > 0) {
         pos += (std.fmt.bufPrint(buf[pos..], "Content-Length: {d}\r\n", .{body_len}) catch return error.BufferFull).len;
     }
 
-    // Connection header for keep-alive
-    pos += (std.fmt.bufPrint(buf[pos..], "Connection: keep-alive\r\n", .{}) catch return error.BufferFull).len;
-
-    // End of headers
-    if (pos + 2 > buf.len) return error.BufferFull;
-    buf[pos] = '\r';
-    buf[pos + 1] = '\n';
-    pos += 2;
-
-    return pos;
+    const ending = if (ctx.websocket_upgrade) "Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n" else "Connection: keep-alive\r\n\r\n";
+    if (ending.len > buf.len - pos) return error.BufferFull;
+    @memcpy(buf[pos..][0..ending.len], ending);
+    return pos + ending.len;
 }
 
 /// Validate that a string contains no control characters (CR, LF, null)
@@ -1015,6 +890,7 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 /// Create error response for proxy failures
 pub fn createErrorResponse(status: u16) response.Response {
     const body = switch (status) {
+        413 => "Payload Too Large",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
         504 => "Gateway Timeout",
@@ -1343,4 +1219,29 @@ test "shouldRetry" {
     try std.testing.expect(shouldRetry(504, &config));
     try std.testing.expect(!shouldRetry(500, &config));
     try std.testing.expect(!shouldRetry(200, &config));
+}
+
+test "websocket handshake uses the verified consumer and route headers" {
+    var info = auth_mod.AuthInfo{};
+    info.addHeader("X-Consumer-Name", "alice");
+    const ctx = ForwardContext{
+        .client_request = .{ .method = .GET, .path = "/chat", .headers = &.{
+            .{ .name = "Sec-WebSocket-Protocol", .value = "chat" },
+            .{ .name = "X-Consumer-Name", .value = "unverified" },
+            .{ .name = "X-Role", .value = "unverified" },
+        } },
+        .client_ip = null,
+        .client_tls = true,
+        .route = &.{ .path_prefix = "/", .upstream = "chat", .auth = .{ .forward_auth = .{ .url = "http://localhost", .headers_upstream = &.{"X-Role"} } } },
+        .server = &.{ .address = "localhost", .port = 80 },
+        .auth_headers = info.headers(),
+        .websocket_upgrade = true,
+    };
+    var buf: [1024]u8 = undefined;
+    const head = buf[0..try buildUpstreamRequestHeaders(&buf, &ctx, 0)];
+    try std.testing.expect(std.mem.indexOf(u8, head, "X-Role:") == null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, head, "X-Consumer-Name:"));
+    try std.testing.expect(std.mem.indexOf(u8, head, "X-Consumer-Name: alice\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, head, "Sec-WebSocket-Protocol: chat\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, head, "Connection: Upgrade\r\n\r\n"));
 }

@@ -40,8 +40,6 @@ const metrics_mw = @import("../middleware/metrics_mw.zig");
 
 const x402_mod = @import("../middleware/x402.zig");
 const auth_mod = @import("../middleware/auth.zig");
-const ratelimit_mod = @import("../middleware/ratelimit.zig");
-const usage_mod = @import("../middleware/usage.zig");
 const ws_mod = @import("../proxy/websocket.zig");
 const accept_mod = @import("accept.zig");
 const http1_mod = @import("http1.zig");
@@ -1190,7 +1188,7 @@ fn proxyForwardAndRespond(
         try http1_mod.queueResponse(server, conn, Server.internalErrorResponse());
         return .responded;
     }
-    const cache_cfg = proxy.config.routes[route_idx].cache;
+    const cache_cfg = proxy.config.routes[route_idx].sharedCache();
 
     // Recompute the vary keys exactly as the pre-forward cache lookup did: base
     // vary from config + the implicit accept-encoding key (the proxy may compress
@@ -2275,43 +2273,25 @@ pub fn handleRead(server: *Server, index: u32) !void {
                         },
                     }
                 }
-                const auth_result = auth_mod.evaluate(parse.view, matched_route.auth);
-                switch (auth_result) {
-                    .allow => {},
-                    .reject => |resp| {
+                const admission = proxy_mod.admit(matched_route, parse.view, conn.cached_peer_ip, conn.cached_peer_ip6, server.now_ms);
+                const auth_info_ptr: *const auth_mod.AuthInfo = switch (admission) {
+                    .allow => |*info| info,
+                    .reject => |denied| {
+                        if (denied.pause_ms) |ms| conn.setRateLimitPause(server.now_ms, ms);
                         if (parse.view.method.allowsRequestBody()) conn.close_after_write = true;
-                        try http1_mod.queueResponse(server, conn, resp);
+                        try http1_mod.queueResponse(server, conn, denied.resp);
                         if (conn.read_buffered_bytes == 0) break;
                         continue;
                     },
-                }
-                const auth_info_ptr: ?*const auth_mod.AuthInfo = switch (auth_result) {
-                    .allow => |*info| info,
-                    .reject => null,
                 };
-                if (auth_info_ptr) |ai| {
-                    const name = ai.consumerName();
-                    if (name.len > 0) usage_mod.record(name, server.now_ms);
-                }
-                if (matched_route.rate_limit) |rl_cfg| {
-                    const consumer = if (auth_info_ptr) |ai| ai.consumerName() else "";
-                    const client_key = if (conn.cached_peer_ip) |ip4|
-                        ratelimit_mod.IpKey.fromIpv4(ip4)
-                    else if (conn.cached_peer_ip6) |ip6|
-                        ratelimit_mod.IpKey.fromIpv6(ip6)
-                    else
-                        null;
-                    if (ratelimit_mod.evaluateRoute(consumer, client_key, rl_cfg)) |rl_resp| {
-                        conn.setRateLimitPause(server.now_ms, rl_resp.pause_ms);
-                        if (parse.view.method.allowsRequestBody()) conn.close_after_write = true;
-                        try http1_mod.queueResponse(server, conn, rl_resp.resp);
-                        if (conn.read_buffered_bytes == 0) break;
-                        continue;
-                    }
-                }
                 if (matched_route.body_schema) |route_schema| {
                     const body_slice = parse.view.body.sliceOrNull() orelse "";
-                    if (body_slice.len > 0 and body_slice.len <= 1024 * 1024) {
+                    if (body_slice.len > 1024 * 1024) {
+                        conn.close_after_write = true;
+                        try http1_mod.queueResponse(server, conn, http1_mod.errorResponseFor(.body_too_large));
+                        return;
+                    }
+                    if (body_slice.len > 0) {
                         const vr = body_schema_mod.validate(route_schema, body_slice);
                         if (!vr.valid) {
                             var err_buf: [1024]u8 = undefined;
@@ -2336,7 +2316,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
                         const ip_len = std.fmt.bufPrint(&ws_ip_buf, "{d}.{d}.{d}.{d}", .{ ip4[0], ip4[1], ip4[2], ip4[3] }) catch "";
                         if (ip_len.len > 0) ws_client_ip = ws_ip_buf[0..ip_len.len];
                     }
-                    setupWebSocketTunnel(server, conn, parse.view, matched_route, proxy, ws_client_ip);
+                    setupWebSocketTunnel(server, conn, parse.view, matched_route, proxy, ws_client_ip, auth_info_ptr);
                     return;
                 }
 
@@ -2359,7 +2339,7 @@ pub fn handleRead(server: *Server, index: u32) !void {
                 const cert_dn: ?[]const u8 = if (conn.tls_session) |*session| session.getPeerCertSubject(&cert_dn_buf) else null;
 
                 // Response cache: check before forwarding to upstream
-                const cache_cfg = matched_route.cache;
+                const cache_cfg = matched_route.sharedCache();
                 // The proxy may gzip/deflate the response based on the client's
                 // Accept-Encoding (proxy.maybeCompress), and that happens before
                 // the cache store below — so the cached body can be compressed.
@@ -2729,7 +2709,15 @@ fn setupWebSocketTunnel(
     matched_route: *const upstream_mod.ProxyRoute,
     proxy: *proxy_mod.Proxy,
     client_ip: ?[]const u8,
+    auth_info: ?*const auth_mod.AuthInfo,
 ) void {
+    // Upgrades cannot run the WASM continuation or settle a paid response.
+    if (matched_route.wasm_pool != null or matched_route.wasm_required or matched_route.x402 != null) {
+        http1_mod.queueResponse(server, conn, ws_mod.errorResp(501)) catch {
+            conn.close_after_write = true;
+        };
+        return;
+    }
     const effective_upstream = matched_route.selectUpstream();
     const upstream_def = proxy.upstreams_by_name.get(effective_upstream) orelse {
         http1_mod.queueResponse(server, conn, ws_mod.errorResp(502)) catch {
@@ -2762,7 +2750,17 @@ fn setupWebSocketTunnel(
     };
 
     var resp_buf: [4096]u8 = undefined;
-    const result = ws_mod.performUpgrade(req, selection.server.address, selection.server.port, matched_route, client_ip, &resp_buf, upstream_def.allow_private);
+    var dn_buf: [256]u8 = undefined;
+    const result = ws_mod.performUpgrade(&.{
+        .client_request = req,
+        .server = selection.server,
+        .route = matched_route,
+        .client_ip = client_ip,
+        .client_tls = conn.is_tls,
+        .auth_headers = if (auth_info) |info| info.headers() else &.{},
+        .client_cert_dn = if (conn.tls_session) |*session| session.getPeerCertSubject(&dn_buf) else null,
+        .websocket_upgrade = true,
+    }, &resp_buf, upstream_def.allow_private);
 
     switch (result) {
         .err => |resp| {
@@ -3543,7 +3541,9 @@ test "tls h2 resumes buffered plaintext after write backpressure clears" {
     var app_router = router.Router.init(.{ .require_payment = false, .payment_required_b64 = "" });
     try app_router.get("/", bufferedH2Handler);
 
-    var server = try Server.initWithRouter(allocator, cfg, app_router);
+    const server = try allocator.create(Server);
+    defer allocator.destroy(server);
+    try server.initInPlace(allocator, cfg, app_router);
     defer server.deinit();
 
     const conn = server.io.acquireConnection(server.io.nowMs()) orelse return error.OutOfMemory;
@@ -3589,7 +3589,7 @@ test "tls h2 resumes buffered plaintext after write backpressure clears" {
         }
     }
     const buffered_before = conn.read_buffered_bytes;
-    try http2_mod.handleHttp2Read(&server, conn);
+    try http2_mod.handleHttp2Read(server, conn);
     try std.testing.expectEqual(buffered_before, conn.read_buffered_bytes);
 
     // Model the TLS drain reopening capacity, then exercise the helper called
@@ -3599,7 +3599,7 @@ test "tls h2 resumes buffered plaintext after write backpressure clears" {
         server.io.releaseBuffer(entry.handle);
         conn.popWrite();
     }
-    try std.testing.expect(try resumeBufferedTlsH2(&server, conn));
+    try std.testing.expect(try resumeBufferedTlsH2(server, conn));
     try std.testing.expectEqual(@as(usize, 0), conn.read_buffered_bytes);
     try std.testing.expect(conn.write_count > 0);
 }

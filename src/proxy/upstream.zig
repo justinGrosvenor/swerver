@@ -10,7 +10,6 @@ const body_schema = @import("../middleware/body_schema.zig");
 ///
 /// Defines upstream server groups for reverse proxy load balancing.
 /// Supports weighted servers, backup servers, and health-based routing.
-
 /// Configuration for an upstream server group
 pub const Upstream = struct {
     /// Unique name for this upstream (used in proxy routes)
@@ -194,6 +193,12 @@ pub const ProxyRoute = struct {
     /// runs the wasm filter, which parks for a Tier-2 cold start whose reply
     /// names the socket. Null means ordinary routing. See proxy.zig.
     tenant: ?TenantRouting = null,
+
+    pub fn sharedCache(self: *const ProxyRoute) ?cache_mod.CacheConfig {
+        // Both cache reads and writes must use the same route identity policy.
+        if (self.auth != .none or self.x402 != null or self.wasm_pool != null or self.wasm_required or self.tenant != null) return null;
+        return self.cache;
+    }
 
     /// Resolve the upstream name, applying traffic split if configured.
     pub fn selectUpstream(self: *const ProxyRoute) []const u8 {

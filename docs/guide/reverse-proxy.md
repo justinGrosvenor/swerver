@@ -175,7 +175,7 @@ Add a `cache` block to a route for a per-route LRU response cache:
 {
   "path_prefix": "/catalog/",
   "upstream": "api",
-  "cache": { "ttl_s": 60, "max_entries": 1000, "vary": ["Accept", "Authorization"] }
+  "cache": { "ttl_s": 60, "max_entries": 1000, "vary": ["Accept", "Accept-Language"] }
 }
 ```
 
@@ -190,6 +190,8 @@ every field listed in its `Vary` headers is covered by the effective cache
 keys. For example, add `Accept-Language` to `vary` to cache language variants;
 otherwise a response declaring `Vary: Accept-Language` bypasses the cache.
 `Vary: *` always bypasses storage. Field names are compared case-insensitively.
+
+Routes with authentication, x402 payments, WASM filters, or tenant routing bypass the shared cache. Requests carrying `Authorization` or `Cookie` also bypass lookup and storage.
 
 Responses with `private`, `no-store`, or `no-cache` directives are not stored,
 regardless of directive capitalization. Malformed cache directives also bypass
@@ -222,13 +224,15 @@ storage. Repeated `max-age` directives use the shortest supplied lifetime.
 
 ## WebSocket proxying
 
-WebSocket upgrades are tunneled transparently. The proxy detects the `Upgrade: websocket` header, forwards the handshake to the upstream, and on a `101 Switching Protocols` response switches to a bidirectional byte tunnel (no HTTP framing). The tunnel closes when either side disconnects.
+WebSocket upgrades are tunneled transparently. The proxy detects the `Upgrade: websocket` header, forwards the handshake to the upstream, and on a `101 Switching Protocols` response switches to a bidirectional byte tunnel (no HTTP framing). The tunnel closes when either side disconnects. The handshake uses the route’s verified identity and header rules. Upgrades on payment-gated or WASM-filtered routes return 501.
 
 ## gRPC-aware proxying
 
 gRPC runs over HTTP/2, which the proxy forwards natively. It maps gRPC status codes to HTTP status codes and preserves gRPC trailers.
 
 ## Authentication
+
+HTTP/1.1, HTTP/2, and HTTP/3 enforce proxy route authentication and rate limits. Payment-gated proxy routes currently require HTTP/1.1 and return 501 on HTTP/2 and HTTP/3.
 
 Per-route auth is configured under `routes[].auth`. Set `type` and the fields it needs:
 

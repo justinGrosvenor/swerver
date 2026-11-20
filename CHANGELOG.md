@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+## 0.1.0-alpha.35 — 2026-11-19
+
+### Gateway security
+
+- HTTP/2 and HTTP/3 proxy routes now enforce authentication, rate limits, and
+  request body schemas before forwarding. Deployments that rely on swerver for
+  access control should upgrade. Paid proxy routes require HTTP/1.1 and return
+  501 on HTTP/2 and HTTP/3.
+- Authenticated, paid, WASM-filtered, and tenant routes bypass the shared
+  response cache. Requests carrying Authorization or Cookie also bypass it.
+  This prevents one API-key consumer from receiving another consumer's response.
+- WebSocket handshakes apply the route's forwarding rules and verified identity
+  headers. Upgrades on paid or WASM-filtered routes return 501.
+- HTTP/2 rejects fragmented requests that exceed its body buffering capacity
+  before a handler can receive a truncated body.
+
+Rebuild gateway deployments with their existing feature flags and restart them
+with the updated binary. Synchronous upstream I/O can still delay unrelated
+requests on the same worker when a backend is slow.
+
 ## 0.1.0-alpha.33 — 2026-09-23
 
 - Add native handler suspension with monotonic timers, explicit completion tokens,

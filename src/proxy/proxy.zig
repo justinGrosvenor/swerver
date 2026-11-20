@@ -8,6 +8,9 @@ const health = @import("health.zig");
 const request = @import("../protocol/request.zig");
 const response = @import("../response/response.zig");
 const middleware = @import("../middleware/middleware.zig");
+const ratelimit = @import("../middleware/ratelimit.zig");
+const body_schema = @import("../middleware/body_schema.zig");
+const usage = @import("../middleware/usage.zig");
 const auth_mod = @import("../middleware/auth.zig");
 const x402 = @import("../middleware/x402.zig");
 const cache_mod = @import("cache.zig");
@@ -95,6 +98,27 @@ fn bodyViewToRequestBody(bv: forward.BodyView) request.RequestBody {
 }
 
 var proxy_modify_warned = false;
+
+pub const Admission = union(enum) {
+    allow: auth_mod.AuthInfo,
+    reject: struct { resp: response.Response, pause_ms: ?u64 = null },
+};
+
+pub fn admit(route: *const upstream.ProxyRoute, req: request.RequestView, ip4: ?[4]u8, ip6: ?[16]u8, now_ms: u64) Admission {
+    const info = switch (auth_mod.evaluate(req, route.auth)) {
+        .reject => |resp| return .{ .reject = .{ .resp = resp } },
+        .allow => |info| info,
+    };
+    const consumer = info.consumerName();
+    if (consumer.len != 0) usage.record(consumer, now_ms);
+    if (route.rate_limit) |limit| {
+        const ip = if (ip4) |addr| ratelimit.IpKey.fromIpv4(addr) else if (ip6) |addr| ratelimit.IpKey.fromIpv6(addr) else null;
+        if (ratelimit.evaluateRoute(consumer, ip, limit)) |denied| {
+            return .{ .reject = .{ .resp = denied.resp, .pause_ms = denied.pause_ms } };
+        }
+    }
+    return .{ .allow = info };
+}
 
 /// Run a route's WASM edge filter (if any) against `req_view`. Returns a
 /// short-circuit Response when the filter rejects (or fails closed); null to
@@ -245,7 +269,6 @@ fn runWasmResponseFilter(
 /// Main entry point for proxying requests to upstream servers.
 /// Handles route matching, server selection, request forwarding,
 /// response streaming, and retry logic.
-
 /// Proxy configuration
 pub const ProxyConfig = struct {
     /// All configured upstreams
@@ -730,16 +753,42 @@ pub const Proxy = struct {
         client_ip: ?[]const u8,
         client_tls: bool,
         now_ms: u64,
-        auth_info: ?*const auth_mod.AuthInfo,
+        caller_auth: ?*const auth_mod.AuthInfo,
         client_cert_dn: ?[]const u8,
         wasm: WasmBinding,
     ) ProxyResult {
-        _ = mw_ctx;
-
         // Find matching route
         const route = self.matchRoute(&req) orelse {
             return .{ .resp = forward.createErrorResponse(502), .proxy = self };
         };
+
+        var verified: auth_mod.AuthInfo = undefined;
+        var auth_info = caller_auth;
+        if (mw_ctx.protocol != .http1) {
+            // Verification and settlement for paid proxy routes currently depend
+            // on the HTTP/1 connection lifecycle. Never forward an unpaid stream.
+            if (route.x402 != null) return .{ .proxy = self, .resp = .{ .status = 501, .headers = &.{}, .body = .{ .bytes = "Payment requires HTTP/1.1" } } };
+            if (wasm.resume_decision != null) {
+                // Rebuild identity from the owned request without charging the limiter twice.
+                verified = switch (auth_mod.evaluate(req, route.auth)) {
+                    .reject => |resp| return .{ .proxy = self, .resp = resp },
+                    .allow => |info| info,
+                };
+            } else {
+                verified = switch (admit(route, req, mw_ctx.client_ip, mw_ctx.client_ip6, now_ms)) {
+                    .reject => |denied| return .{ .proxy = self, .resp = denied.resp, .pause_reads_ms = denied.pause_ms },
+                    .allow => |info| info,
+                };
+                if (route.body_schema) |schema| {
+                    if (req.body.len() > 1024 * 1024) return .{ .proxy = self, .resp = forward.createErrorResponse(413) };
+                    if (req.body.len() != 0) {
+                        const body = req.body.sliceOrNull() orelse return .{ .proxy = self, .resp = forward.createErrorResponse(413) };
+                        if (!body_schema.validate(schema, body).valid) return .{ .proxy = self, .resp = .{ .status = 400, .headers = &.{}, .body = .{ .bytes = "Invalid request body" } } };
+                    }
+                }
+            }
+            auth_info = &verified;
+        }
 
         // Tenant-as-upstream (park-concurrency Phase 1): a warm registry HIT (or
         // the socket a just-resumed cold-start filter named via set_upstream)
@@ -2186,11 +2235,53 @@ test "handle() forwards inline bodies larger than the request buffer (8KB-64KB 5
         .headers = &.{.{ .name = "host", .value = "test.local" }},
         .body = .{ .slice = body },
     };
-    var mw_ctx: middleware.Context = undefined;
+    var mw_ctx: middleware.Context = .{};
     var pr = proxy.handle(req, &mw_ctx, null, false, 12345, null, null, .{});
     defer pr.release();
     upstream_thread.join();
 
     try std.testing.expectEqual(@as(u16, 200), pr.resp.status);
     try std.testing.expectEqual(body.len, got_body_len);
+}
+
+test "stream proxy admission precedes upstream selection" {
+    const keys = [_]auth_mod.ApiKey{.{ .key = "accepted", .name = "customer" }};
+    const route = upstream.ProxyRoute{ .path_prefix = "/", .upstream = "absent", .auth = .{ .api_key = .{ .keys = &keys } }, .cache = .{} };
+    try std.testing.expect(route.sharedCache() == null);
+    const schema_route = upstream.ProxyRoute{ .path_prefix = "/schema", .upstream = "absent", .body_schema = &.{ .schema_type = .integer } };
+    const payment_route = upstream.ProxyRoute{ .path_prefix = "/paid", .upstream = "absent", .x402 = .{ .price = "1", .network = "test", .asset = "test", .pay_to = "test" } };
+    const limited_route = upstream.ProxyRoute{ .path_prefix = "/limited", .upstream = "absent", .rate_limit = .{ .key = .ip, .requests_per_second = 1, .burst_size = 1 } };
+    var proxy = try Proxy.init(std.testing.allocator, .{ .upstreams = &.{}, .routes = &.{ schema_route, payment_route, limited_route, route } });
+    defer proxy.deinit();
+    for ([_]middleware.Context.Protocol{ .http2, .http3 }) |protocol| {
+        var ctx = middleware.Context{ .protocol = protocol };
+        var req = request.RequestView{ .method = .GET, .path = "/", .headers = &.{} };
+        var denied = proxy.handle(req, &ctx, null, true, 0, null, null, .{});
+        defer denied.release();
+        try std.testing.expectEqual(@as(u16, 401), denied.resp.status);
+        req.headers = &.{.{ .name = "X-API-Key", .value = "accepted" }};
+        var admitted = proxy.handle(req, &ctx, null, true, 0, null, null, .{});
+        defer admitted.release();
+        // Only admitted requests reach the missing upstream.
+        try std.testing.expectEqual(@as(u16, 502), admitted.resp.status);
+        req.path = "/paid";
+        var paid = proxy.handle(req, &ctx, null, true, 0, null, null, .{});
+        defer paid.release();
+        try std.testing.expectEqual(@as(u16, 501), paid.resp.status);
+        req.path = "/schema";
+        req.method = .POST;
+        req.body = .{ .slice = "false" };
+        var invalid = proxy.handle(req, &ctx, null, true, 0, null, null, .{});
+        defer invalid.release();
+        try std.testing.expectEqual(@as(u16, 400), invalid.resp.status);
+
+        ctx.client_ip = .{ 192, 0, 2, if (protocol == .http2) 21 else 31 };
+        req.path = "/limited";
+        var first = proxy.handle(req, &ctx, null, true, 0, null, null, .{});
+        defer first.release();
+        try std.testing.expectEqual(@as(u16, 502), first.resp.status);
+        var limited = proxy.handle(req, &ctx, null, true, 0, null, null, .{});
+        defer limited.release();
+        try std.testing.expectEqual(@as(u16, 429), limited.resp.status);
+    }
 }

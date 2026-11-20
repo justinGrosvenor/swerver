@@ -57,6 +57,7 @@ pub const PendingH2Body = struct {
     path_buf: [512]u8 = undefined,
     header_count: u16 = 0,
     header_storage_len: u16 = 0,
+    method_raw_len: u16 = 0,
     header_storage: [2048]u8 = undefined,
     header_entries: [32]request.Header = undefined,
     body_handle: ?buffer_pool.BufferHandle = null,
@@ -70,11 +71,14 @@ pub const PendingH2Body = struct {
         self.method = req.method;
         self.path_len = @intCast(req.path.len);
         @memcpy(self.path_buf[0..req.path.len], req.path);
-        var off: u16 = 0;
+        if (req.method_raw.len > self.header_storage.len) return false;
+        self.method_raw_len = @intCast(req.method_raw.len);
+        @memcpy(self.header_storage[0..req.method_raw.len], req.method_raw);
+        var off: u16 = self.method_raw_len;
         var count: u16 = 0;
         for (req.headers) |h| {
             const needed = h.name.len + h.value.len;
-            if (off + needed > self.header_storage.len or count >= self.header_entries.len) break;
+            if (off + needed > self.header_storage.len or count >= self.header_entries.len) return false;
             @memcpy(self.header_storage[off .. off + h.name.len], h.name);
             const name_start = off;
             off += @intCast(h.name.len);
@@ -103,6 +107,7 @@ pub const PendingH2Body = struct {
     pub fn toRequestView(self: *const PendingH2Body, body: []const u8) request.RequestView {
         return .{
             .method = self.method,
+            .method_raw = self.header_storage[0..self.method_raw_len],
             .path = self.path(),
             .headers = self.header_entries[0..self.header_count],
             .body = .{ .slice = body },

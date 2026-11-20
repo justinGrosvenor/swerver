@@ -39,10 +39,8 @@ const http1_proto = @import("../protocol/http1.zig");
 const router = @import("../router/router.zig");
 const middleware = @import("../middleware/middleware.zig");
 const auth_mod = @import("../middleware/auth.zig");
-const ratelimit_mod = @import("../middleware/ratelimit.zig");
 const x402_mod = @import("../middleware/x402.zig");
 const x402_client = @import("../middleware/x402_client.zig");
-const usage_mod = @import("../middleware/usage.zig");
 const forward_mod = @import("../proxy/forward.zig");
 const clock = @import("../runtime/clock.zig");
 const preencoded = @import("preencoded.zig");
@@ -785,7 +783,8 @@ pub fn initBodyAccumulation(
     hparse: http1_proto.HeaderParseResult,
     buffer_handle: buffer_pool.BufferHandle,
 ) !void {
-    const discard = server.app_router.bodyPolicyForRoute(hparse.view.method, hparse.view.path) == .discard;
+    const matches_proxy = if (server.proxy) |proxy| proxy.matchRoute(&hparse.view) != null else false;
+    const discard = !matches_proxy and server.app_router.bodyPolicyForRoute(hparse.view.method, hparse.view.path) == .discard;
     const accum_ptr = server.allocator.create(connection.BodyAccumState) catch return error.OutOfMemory;
     accum_ptr.* = .{
         .content_length = hparse.content_length,
@@ -1049,44 +1048,24 @@ pub fn dispatchWithAccumulatedBody(server: *Server, conn: *connection.Connection
                     },
                 }
             }
-            const auth_result = auth_mod.evaluate(hparse.view, matched_route.auth);
-            switch (auth_result) {
-                .allow => {},
-                .reject => |resp| {
+            const admission = proxy_mod.admit(matched_route, hparse.view, conn.cached_peer_ip, conn.cached_peer_ip6, server.now_ms);
+            const auth_info_ptr: *const auth_mod.AuthInfo = switch (admission) {
+                .allow => |*info| info,
+                .reject => |denied| {
+                    if (denied.pause_ms) |ms| conn.setRateLimitPause(server.now_ms, ms);
                     cleanupBodyAccumulation(server, conn);
-                    queueResponse(server, conn, resp) catch {
+                    queueResponse(server, conn, denied.resp) catch {
                         conn.close_after_write = true;
                     };
                     return;
                 },
-            }
-            const auth_info_ptr: ?*const auth_mod.AuthInfo = switch (auth_result) {
-                .allow => |*info| info,
-                .reject => null,
             };
-            if (auth_info_ptr) |ai| {
-                const name = ai.consumerName();
-                if (name.len > 0) usage_mod.record(name, server.now_ms);
-            }
-            if (matched_route.rate_limit) |rl_cfg| {
-                const consumer = if (auth_info_ptr) |ai| ai.consumerName() else "";
-                const client_key: ?ratelimit_mod.IpKey = if (conn.cached_peer_ip) |ip4|
-                    ratelimit_mod.IpKey.fromIpv4(ip4)
-                else if (conn.cached_peer_ip6) |ip6|
-                    ratelimit_mod.IpKey.fromIpv6(ip6)
-                else
-                    null;
-                if (ratelimit_mod.evaluateRoute(consumer, client_key, rl_cfg)) |rl_resp| {
-                    conn.setRateLimitPause(server.now_ms, rl_resp.pause_ms);
-                    cleanupBodyAccumulation(server, conn);
-                    queueResponse(server, conn, rl_resp.resp) catch {
-                        conn.close_after_write = true;
-                    };
+            if (matched_route.body_schema) |route_schema| {
+                if (body_view.totalLen() > 1024 * 1024 or (accum.discard_body and accum.bytes_decoded != 0)) {
+                    abortBodyAccumulation(server, conn, 413);
                     return;
                 }
-            }
-            if (matched_route.body_schema) |route_schema| {
-                if (!accum.discard_body and body_view.totalLen() > 0 and body_view.totalLen() <= 1024 * 1024) {
+                if (body_view.totalLen() > 0) {
                     const vr = validateBodyAgainstSchema(route_schema, &body_view);
                     if (!vr.valid) {
                         var err_buf: [1024]u8 = undefined;
